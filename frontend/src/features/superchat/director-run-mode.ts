@@ -1,6 +1,6 @@
 import type { TaskState } from "@/task-center/types";
 
-export type DirectorRunMode = "manual_confirm" | "episode_auto";
+export type DirectorRunMode = "manual_confirm" | "episode_auto" | "pipeline_auto";
 export type DirectorVoicePolicy = "system" | "custom";
 export type DirectorAutoConfirmationStage =
   | "awaiting_start"
@@ -29,12 +29,19 @@ const STORAGE_PREFIX = "director.episodeRunMode";
 const MAX_HANDLED_KEYS = 80;
 
 const MAINLINE_EPISODE_TASK_TYPES = new Set([
+  "ingest_fast",
+  "build_characters",
+  "build_props",
   "build_episodes",
   "identity_planner",
   "character_portrait",
   "identity_image",
+  "content_rewriter",
+  "literal_script_writer",
   "script_writer",
   "build_scenes",
+  "episode_scene_planner",
+  "episode_prop_planner",
   "scene_reference_asset",
   "prop_reference_asset",
   "sketch_grid_generation",
@@ -76,10 +83,12 @@ export function loadDirectorRunState(project: string): DirectorAutoRunState {
     const parsed = JSON.parse(window.localStorage.getItem(storageKey(project)) || "null") as
       | Partial<DirectorAutoRunState>
       | null;
-    if (!parsed || parsed.mode !== "episode_auto") return defaultDirectorRunState();
+    if (!parsed || (parsed.mode !== "episode_auto" && parsed.mode !== "pipeline_auto")) {
+      return defaultDirectorRunState();
+    }
     const savedConfirmationStage = parsed.confirmationStage;
     return {
-      mode: "episode_auto",
+      mode: parsed.mode,
       // Stored auto runs from before the confirmation gate must not bypass
       // the new explicit second-confirmation requirement after an upgrade.
       confirmationStage:
@@ -134,6 +143,19 @@ export function activateDirectorEpisodeAuto(): DirectorAutoRunState {
   };
 }
 
+export function activateDirectorProjectAuto(): DirectorAutoRunState {
+  return {
+    mode: "pipeline_auto",
+    confirmationStage: "awaiting_start",
+    activatedAt: Date.now(),
+    episode: null,
+    handledKeys: [],
+    voicePolicy: null,
+    voiceChoiceRequired: false,
+    voicePrerequisiteErrors: [],
+  };
+}
+
 export function awaitDirectorEpisodeAutoConfirmation(
   state: DirectorAutoRunState,
 ): DirectorAutoRunState {
@@ -153,12 +175,16 @@ export function confirmDirectorEpisodeAuto(
   };
 }
 
+function isAutoRunMode(mode: DirectorRunMode): boolean {
+  return mode === "episode_auto" || mode === "pipeline_auto";
+}
+
 export function isDirectorEpisodeAutoConfirmed(state: DirectorAutoRunState): boolean {
-  return state.mode === "episode_auto" && state.confirmationStage === "confirmed";
+  return isAutoRunMode(state.mode) && state.confirmationStage === "confirmed";
 }
 
 export function isDirectorEpisodeAutoSession(state: DirectorAutoRunState): boolean {
-  return state.mode === "episode_auto"
+  return isAutoRunMode(state.mode)
     && (state.confirmationStage === "confirmed"
       || state.confirmationStage === "awaiting_intervention");
 }
@@ -194,9 +220,17 @@ export function directorAutoConfirmationTransportText(
 
 export function resolveDirectorVoicePolicy(text: string): DirectorVoicePolicy | null {
   const normalized = text.trim();
-  const system = /(?:系统声(?:线|音|一)|系统配音|捏导匹配)/u.test(normalized);
+  const system = /(?:系统声(?:线|音|一)|系统配音|捏导匹配|捏塘匹配)/u.test(normalized);
   const custom = /(?:自定义声(?:线|音)|上传(?:或录制)?|录制声线|声音采样|自定义配音)/u.test(normalized);
-  if (system === custom) return null;
+  if (system === custom) {
+    // The confirmation prompt offers "1）系统声线 2）自定义声线"; accept the
+    // bare option numbers too, otherwise a reply of "1" is missent as chat.
+    const numeric = normalized.match(/^[（(]?\s*([12１２])\s*[）)．.、]?/u);
+    if (numeric) {
+      return numeric[1] === "1" || numeric[1] === "１" ? "system" : "custom";
+    }
+    return null;
+  }
   return system ? "system" : "custom";
 }
 
@@ -259,6 +293,40 @@ export function directorAutoRunTransportText(text: string): string {
     "[/DRAMACLAW_RUN_MODE]";
 }
 
+export function directorPipelineAutoConfirmationTransportText(
+  text: string,
+  options: { voiceChoiceRequired?: boolean; voiceErrors?: string[] } = {},
+): string {
+  const voiceInstruction = options.voiceChoiceRequired
+    ? " Before starting, the user must choose a voice policy. Explicitly present both Chinese choices: " +
+      "‘1）缺失声线由捏导自动匹配系统声线；2）我会到「捏塘」上传或录制自定义声线。’ " +
+      `${options.voiceErrors?.length ? `Known missing items: ${options.voiceErrors.join("；")}. ` : ""}` +
+      "Ask the user to reply 系统声线 or 自定义声线; do not start yet."
+    : " Then ask the user to reply 继续 or 确认 to start.";
+  return `${text}\n\n[DRAMACLAW_RUN_MODE_CONFIRMATION]\n`+
+    "The user selected 一键成片 but has not completed the required second confirmation. " +
+    "Do not call any write, generation, or mutation tool in this turn. Reply briefly in Chinese: " +
+    "state that 一键成片 will automatically prepare the whole project (characters, episodes, " +
+    "portraits) and produce every unfinished episode through final composition, and will pause on " +
+    "failure, unmet prerequisites, destructive or ambiguous actions, or choices that require the " +
+    `user.${voiceInstruction}\n` +
+    "[/DRAMACLAW_RUN_MODE_CONFIRMATION]";
+}
+
+export function directorPipelineAutoRunTransportText(text: string): string {
+  return `${text}\n\n[DRAMACLAW_RUN_MODE]\nmode=pipeline_auto\n`+
+    "The user enabled 一键成片 in the outer 捏导 UI. Treat this as approval to automatically produce " +
+    "the whole project: complete global preparation (characters, episodes, portraits) and then every " +
+    "unfinished episode through final composition, one safe mainline write per turn, without " +
+    "per-step confirmation and without stopping between episodes. Pause only on a task failure or " +
+    "cancellation, a missing required configuration, a missing voice policy when voice prerequisites " +
+    "block audio, destructive actions, or a genuinely ambiguous choice. Keep the one-write-per-turn " +
+    "limit. This mode never applies Agent-credit billing. The durable auto coordinator is already " +
+    "running now: do not merely describe what 一键成片 will do in the future; inspect current state, " +
+    "report the concrete active task or start the next safe task, and say clearly that automatic " +
+    "production has started.\n[/DRAMACLAW_RUN_MODE]";
+}
+
 export function directorAutoUserMessageTransportText(text: string): string {
   return `${text}\n\n[DRAMACLAW_AUTO_USER_MESSAGE]\n`+
     "The durable backend already owns progression of the active outer 捏导 episode auto run. First " +
@@ -304,13 +372,16 @@ export function decideDirectorAutoTask(
 ): DirectorAutoTaskDecision {
   if (!isDirectorEpisodeAutoConfirmed(state)) return { action: "ignore" };
   if (!isDirectorAutoPipelineTask(task)) return { action: "ignore" };
+  const isProjectAuto = state.mode === "pipeline_auto";
   // Episode planning is a project-level task (episode=0). Once it finishes,
-  // 本集自动 enters the newly planned pipeline at episode 1.
+  // auto mode enters the newly planned pipeline at episode 1.
   const episode = task.episode > 0
     ? task.episode
     : state.episode ?? (task.task_type === "build_episodes" ? 1 : null);
   if (!episode) return { action: "ignore" };
-  if (task.episode > 0 && state.episode !== null && state.episode !== task.episode) {
+  // A project-scope (one-click) run spans every episode, so it must not pin to
+  // a single bound episode the way an episode-scope run does.
+  if (!isProjectAuto && task.episode > 0 && state.episode !== null && state.episode !== task.episode) {
     return { action: "ignore" };
   }
   if (taskTimestamp(task) < state.activatedAt) return { action: "ignore" };
@@ -323,7 +394,11 @@ export function decideDirectorAutoTask(
   }
   if (task.status !== "completed") return { action: "ignore" };
   if (task.task_type === "compose_episode") {
-    return { action: "complete", episode, key };
+    // A project run keeps going into the next episode; only the server decides
+    // when the whole project is complete.
+    return isProjectAuto
+      ? { action: "continue", episode, key }
+      : { action: "complete", episode, key };
   }
   return { action: "continue", episode, key };
 }

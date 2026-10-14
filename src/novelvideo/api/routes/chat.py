@@ -441,10 +441,38 @@ class ChatNotificationIn(BaseModel):
 class DirectorAutoStartIn(BaseModel):
     episode: int = Field(default=1, ge=1)
     voice_policy: str | None = Field(default=None, pattern="^(system|custom)$")
+    scope: str = Field(default="episode", pattern="^(episode|project)$")
+    target_episodes: int = Field(default=0, ge=0)
+    driver: str = Field(default="agent", pattern="^(agent|deterministic)$")
+    config: dict[str, Any] | None = None
 
 
 class DirectorAutoSuspendIn(BaseModel):
     reason: str = Field(default="等待用户确认是否修改", max_length=500)
+
+
+#: Project-config keys a one-click run may persist up front. Mirrors the
+#: user-selectable fields of ``ProjectUpdate``; anything else is ignored.
+_AUTO_CONFIG_KEYS = frozenset(
+    {
+        "spine_template",
+        "aspect_ratio",
+        "visual_style",
+        "narration_style",
+        "ethnicity",
+        "rhythm",
+        "tts_provider",
+        "tts_model",
+        "tts_voice",
+        "video_backend",
+        "video_resolution",
+        "add_subtitles",
+    }
+)
+
+
+def _auto_config_updates(config: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in config.items() if key in _AUTO_CONFIG_KEYS}
 
 
 def _director_auto_payload(run: Any | None) -> dict[str, Any]:
@@ -458,6 +486,9 @@ def _director_auto_payload(run: Any | None) -> dict[str, Any]:
         "updated_at": run.updated_at,
         "last_error": run.last_error or None,
         "voice_policy": run.voice_policy or None,
+        "scope": getattr(run, "scope", "episode"),
+        "target_episodes": getattr(run, "target_episodes", 0),
+        "driver": getattr(run, "driver", "agent"),
     }
 
 
@@ -485,11 +516,22 @@ async def start_director_auto_run(
     ctx = await resolve_project_context(
         user=user, project_id=project, required_role="editor"
     )
+    if payload.config:
+        require_project_home_node(ctx, operation="configure project for auto production")
+        updates = _auto_config_updates(payload.config)
+        if updates:
+            from novelvideo.project_config import save_project_config_in_state_dir
+
+            save_project_config_in_state_dir(ctx.state_dir, config=updates)
     run = await director_auto_coordinator.start(
         username=str(user["username"]),
         ctx=ctx,
         episode=payload.episode,
         voice_policy=payload.voice_policy or "",
+        scope=payload.scope,
+        target_episodes=payload.target_episodes,
+        config=payload.config or {},
+        driver=payload.driver,
     )
     return {"ok": True, "data": _director_auto_payload(run)}
 

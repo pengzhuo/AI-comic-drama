@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskState } from "@/task-center/types";
 import {
   activateDirectorEpisodeAuto,
+  activateDirectorProjectAuto,
   awaitDirectorEpisodeAutoConfirmation,
   confirmDirectorEpisodeAuto,
   decideDirectorAutoTask,
@@ -12,6 +13,8 @@ import {
   directorAutoRunTransportText,
   directorAutoUserMessageTransportText,
   directorAutoVoiceChoiceTransportText,
+  directorPipelineAutoConfirmationTransportText,
+  directorPipelineAutoRunTransportText,
   emphasizeDirectorVoiceChoiceLabels,
   isDirectorEpisodeAutoSession,
   isDirectorEpisodeAutoStartIntent,
@@ -214,6 +217,53 @@ describe("director episode auto mode", () => {
     expect(resolveDirectorVoicePolicy("我去捏塘上传或录制")).toBe("custom");
     expect(resolveDirectorVoicePolicy("使用自定义声音")).toBe("custom");
     expect(resolveDirectorVoicePolicy("你说系统还是自定义？")).toBeNull();
+  });
+
+  it("persists and confirms the project-scope one-click run", () => {
+    const active = activateDirectorProjectAuto();
+    saveDirectorRunState("project-a", active);
+    expect(loadDirectorRunState("project-a").mode).toBe("pipeline_auto");
+
+    const confirmed = confirmDirectorEpisodeAuto(active);
+    expect(isDirectorEpisodeAutoSession(confirmed)).toBe(true);
+  });
+
+  it("keeps a project-scope run spanning multiple episodes instead of pinning one", () => {
+    const state = {
+      ...confirmDirectorEpisodeAuto(activateDirectorProjectAuto()),
+      episode: 8,
+    };
+    expect(decideDirectorAutoTask(state, task({ episode: 9 })).action).toBe("continue");
+    // Composition ends the episode, not the whole project.
+    expect(decideDirectorAutoTask(
+      state,
+      task({ task_type: "compose_episode", episode: 9 }),
+    ).action).toBe("continue");
+    // Global preparation tasks are also tracked.
+    expect(decideDirectorAutoTask(
+      state,
+      task({ task_type: "build_characters", episode: 0 }),
+    ).action).toBe("continue");
+  });
+
+  it("describes one-click production across global prep and every episode", () => {
+    const text = directorPipelineAutoRunTransportText("开始");
+    expect(text).toContain("mode=pipeline_auto");
+    expect(text).toContain("without stopping between episodes");
+    expect(text).toContain("one-write-per-turn");
+    expect(text).not.toContain("mode=episode_auto");
+
+    const confirmText = directorPipelineAutoConfirmationTransportText("开始");
+    expect(confirmText).toContain("一键成片");
+    expect(confirmText).toContain("Do not call any write, generation, or mutation tool");
+  });
+
+  it("accepts bare option numbers as a voice choice", () => {
+    expect(resolveDirectorVoicePolicy("1")).toBe("system");
+    expect(resolveDirectorVoicePolicy("1）")).toBe("system");
+    expect(resolveDirectorVoicePolicy("（1）")).toBe("system");
+    expect(resolveDirectorVoicePolicy("２")).toBe("custom");
+    expect(resolveDirectorVoicePolicy("2. ")).toBe("custom");
   });
 
   it("emphasizes only the two labels inside a voice-choice prompt", () => {

@@ -1,14 +1,14 @@
 ---
 name: workflows
-description: "Use in Freezone/虾画 chat when the user selects a Skill or asks to create, plan, analyze, or expand a dynamic canvas workflow for short drama, ads, ecommerce, product video, MV, text, image, video, or audio production."
-compatibility: Requires Freezone/虾画 chat surface and preferably injected canvas context. Canvas execution is delegated to freezone-canvas-node-operator after user confirmation.
+description: "Use in Freezone/捏画 chat when the user selects a Skill or asks to create, plan, analyze, or expand a dynamic canvas workflow for short drama, ads, ecommerce, product video, MV, text, image, video, or audio production."
+compatibility: Requires Freezone/捏画 chat surface and preferably injected canvas context. Canvas execution is delegated to freezone-canvas-node-operator after user confirmation.
 ---
 
 # Workflows Skill
 
-你是虾画的动态工作流技能总入口。你根据用户选择的 Skill 和本次需求生成精简的 `freezone_workflow_intent.v1`；工具把它确定性编译并保存为可确认的工作流草稿。不要创建 CreativePlan、Skill Session 或其它模型生成的中间 Plan。
+你是捏画的动态工作流技能总入口。你根据用户选择的 Skill 和本次需求生成精简的 `freezone_workflow_intent.v1`；工具把它确定性编译并保存为可确认的工作流草稿。不要创建 CreativePlan、Skill Session 或其它模型生成的中间 Plan。
 
-工作流 skill 不依赖外部项目主线。它只基于用户输入、前端注入的当前项目/画布资源上下文，以及虾画节点能力来规划生产流程。
+工作流 skill 不依赖外部项目主线。它只基于用户输入、前端注入的当前项目/画布资源上下文，以及捏画节点能力来规划生产流程。
 
 用户从输入框选择 `/skill-id` 后，Hermes 会原生加载对应 Workflow Skill。必须使用该 Skill 固定的 `skill_id` 直接调用 `freezone_get_workflow_skill(skill_id=..., inputs=...)`，不得再次语义路由。`inputs` 只填写用户已经明确提供的结构化参数。正常规划只使用 `available_recipes` 摘要，不读取完整 Recipe `system_prompt`。
 

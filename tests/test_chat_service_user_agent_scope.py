@@ -147,7 +147,7 @@ def test_mainline_script_creation_still_requires_uploaded_script():
     )
 
     assert routed is not None
-    assert "虾料" in routed
+    assert "捏料" in routed
 
 
 def test_freezone_workflow_can_expand_an_idea_into_script_nodes():
@@ -5686,7 +5686,7 @@ async def test_freezone_hermes_recovers_once_from_repeated_read(
             prompts.append(prompt)
             yield backend_sdk.ChatBackendEvent(
                 type="complete",
-                text="本轮操作已停止：虾导重复读取同一项状态。",
+                text="本轮操作已停止：捏导重复读取同一项状态。",
                 guard={
                     "reason": "tool_call_guard",
                     "guard_reason": "repeated_read",
@@ -6510,7 +6510,7 @@ def test_extract_tool_chat_error_maps_render_prereq_task_error():
 
     assert chat_error is not None
     assert "Render 任务没有生成可用图片" in chat_error
-    assert "虾塘" in chat_error
+    assert "捏塘" in chat_error
     assert raw_error in chat_error
 
 

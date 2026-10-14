@@ -45,6 +45,8 @@ _DRAMACLAW_HERMES_PROVIDER = f"custom:{_DRAMACLAW_HERMES_PROVIDER_NAME}"
 _DRAMACLAW_HERMES_KEY_ENV = "NEWAPI_API_KEY"
 _DEFAULT_HERMES_MODEL_API_MODE = "chat_completions"
 _DEFAULT_HERMES_MODEL_CONTEXT_LENGTH = "131072"
+#: Below this the Hermes agent loop cannot hold a normal tool-use turn.
+_MIN_HERMES_MODEL_CONTEXT_LENGTH = 8192
 
 _CONFIG_YAML_TEMPLATE = """# DramaClaw-managed hermes config.
 # Toolset whitelist enforces L1 defense (no direct file write / shell).
@@ -423,7 +425,15 @@ def _hermes_model_context_length() -> str:
     except ValueError:
         _log.warning("invalid HERMES_MODEL_CONTEXT_LENGTH=%r, using default", raw)
         return _DEFAULT_HERMES_MODEL_CONTEXT_LENGTH
-    return str(value) if value > 0 else _DEFAULT_HERMES_MODEL_CONTEXT_LENGTH
+    if value <= 0:
+        return _DEFAULT_HERMES_MODEL_CONTEXT_LENGTH
+    if value < _MIN_HERMES_MODEL_CONTEXT_LENGTH:
+        _log.warning(
+            "HERMES_MODEL_CONTEXT_LENGTH=%d is very small for the agent runtime; "
+            "verify the gateway model window",
+            value,
+        )
+    return str(value)
 
 
 def _default_config_yaml() -> str:

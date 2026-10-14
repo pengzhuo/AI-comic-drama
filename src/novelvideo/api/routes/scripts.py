@@ -3,6 +3,7 @@
 2.0 主线以 SQLite/Cognee 为唯一脚本状态源；不再读写 scripts/epXXX_script.json。
 """
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -757,6 +758,91 @@ async def generate_seedance2_prompt(
             "prompt_source": updated_config.prompt_source,
         },
     }
+
+
+# In-process registry for the async "AI optimize" job. The composer upstream can
+# take minutes (or hang), so the button enqueues here and polls instead of
+# holding a request open. Jobs are process-local and intentionally not durable.
+_SEEDANCE2_PROMPT_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _seedance2_prompt_job_key(project: str, episode_num: int, beat_num: int) -> str:
+    return f"{project}:{episode_num}:{beat_num}"
+
+
+async def _run_seedance2_prompt_job(
+    key: str,
+    project: str,
+    episode_num: int,
+    beat_num: int,
+    body: Seedance2PromptGenerateRequest | None,
+    user: dict,
+) -> None:
+    try:
+        res = await generate_seedance2_prompt(
+            project=project,
+            episode_num=episode_num,
+            beat_num=beat_num,
+            body=body,
+            user=user,
+        )
+        if isinstance(res, dict) and res.get("ok"):
+            _SEEDANCE2_PROMPT_JOBS[key] = {
+                "status": "succeeded",
+                "data": res.get("data") or {},
+                "error": "",
+            }
+        else:
+            _SEEDANCE2_PROMPT_JOBS[key] = {
+                "status": "failed",
+                "data": {},
+                "error": (res or {}).get("error") if isinstance(res, dict) else "生成失败",
+            }
+    except Exception as exc:  # noqa: BLE001 - surface the failure to the poller
+        logger.exception("Seedance2 prompt async job failed: %s", key)
+        _SEEDANCE2_PROMPT_JOBS[key] = {
+            "status": "failed",
+            "data": {},
+            "error": str(exc),
+        }
+
+
+@router.post(
+    "/projects/{project}/episodes/{episode_num}/beats/{beat_num}/seedance2-prompt/generate-async"
+)
+async def generate_seedance2_prompt_async(
+    project: str,
+    episode_num: int,
+    beat_num: int,
+    body: Seedance2PromptGenerateRequest | None = None,
+    user: dict = Depends(get_api_user),
+):
+    """Enqueue the AI prompt optimization and return immediately (poll the status)."""
+    key = _seedance2_prompt_job_key(project, episode_num, beat_num)
+    job = _SEEDANCE2_PROMPT_JOBS.get(key)
+    if job and job.get("status") == "running":
+        return {"ok": True, "data": {"status": "running"}}
+    _SEEDANCE2_PROMPT_JOBS[key] = {"status": "running", "data": {}, "error": ""}
+    asyncio.create_task(
+        _run_seedance2_prompt_job(key, project, episode_num, beat_num, body, user)
+    )
+    return {"ok": True, "data": {"status": "running"}}
+
+
+@router.get(
+    "/projects/{project}/episodes/{episode_num}/beats/{beat_num}/seedance2-prompt/generate-async-status"
+)
+async def generate_seedance2_prompt_async_status(
+    project: str,
+    episode_num: int,
+    beat_num: int,
+    user: dict = Depends(get_api_user),
+):
+    key = _seedance2_prompt_job_key(project, episode_num, beat_num)
+    job = _SEEDANCE2_PROMPT_JOBS.get(key)
+    if job is None:
+        return {"ok": True, "data": {"status": "idle"}}
+    return {"ok": True, "data": job}
 
 
 @router.put("/projects/{project}/episodes/{episode_num}/script")

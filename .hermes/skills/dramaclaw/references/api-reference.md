@@ -1,4 +1,4 @@
-# DramaClaw 虾导 API 快速参考
+# DramaClaw 捏导 API 快速参考
 
 **Base URL**: `$DRAMACLAW_API_URL/api/v1`
 **认证**: `Authorization: Bearer $DRAMACLAW_AGENT_TOKEN`
@@ -10,7 +10,7 @@
 | 方法 | 路径 | 用途 |
 |------|------|------|
 | `GET` | `/projects` | 列出所有项目 |
-| `POST` | `/projects` | 创建项目 `{"name":"..."}`；仅前端/系统使用，虾导流程不调用 |
+| `POST` | `/projects` | 创建项目 `{"name":"..."}`；仅前端/系统使用，捏导流程不调用 |
 | `GET` | `/projects/{project}` | 获取项目配置 |
 | `PATCH` | `/projects/{project}` | 更新配置 |
 
@@ -94,7 +94,7 @@
 | 方法 | 路径 | 用途 |
 |------|------|------|
 | `POST` | `/projects/{project}/episodes/{ep}/audio/generate` | 批量语音生成 [ASYNC: audio_generation_indextts2]；当前主线用这个 |
-| `POST` | `/projects/{project}/episodes/{ep}/audio/system-voices/prepare` | 经用户确认后准备系统声线 [ASYNC: system_voice_setup]；仅虾导使用，不启动 TTS |
+| `POST` | `/projects/{project}/episodes/{ep}/audio/system-voices/prepare` | 经用户确认后准备系统声线 [ASYNC: system_voice_setup]；仅捏导使用，不启动 TTS |
 | `POST` | `/projects/{project}/episodes/{ep}/beats/{beat}/audio` | 重做单beat音频 (SYNC) |
 
 旧 `/tts/generate`、`/tts/preview`、`/tts/voices` 已移除，不要调用。

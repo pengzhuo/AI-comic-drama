@@ -11,7 +11,7 @@ DramaClaw CE 通过 NewAPI 兼容网关调用文本、视觉理解、Embedding�
 
 | 模式 | 适用场景 | 需要配置的内容 |
 |---|---|---|
-| 官方 | 直接使用 RelayClaw（虾驿）提供的模型 | 只需 DC Key |
+| 官方 | 直接使用 RelayClaw（捏驿）提供的模型 | 只需 DC Key |
 | 自定义 | 所有模型都通过自定义 NewAPI 配置 | 初始化 NewAPI、供应商渠道、业务模型、Embedding、媒体模型 |
 | 本地 + 官方混合 | 官方模型照常使用，同时新增本地 ComfyUI 视频模型，或用本地模型覆盖同名官方模型 | 官方 DC Key、本地 NewAPI、ComfyUI URL 和 Workflow |
 
@@ -19,7 +19,7 @@ DramaClaw CE 通过 NewAPI 兼容网关调用文本、视觉理解、Embedding�
 
 ## Agent 模型
 
-虾导 Agent 可以跟随当前模型渠道，也可以单独使用第三方服务。在 **Agent 模型** 中选择 **第三方**，填写兼容 OpenAI 的 Base URL、API Key 和模型名称。第三方服务必须支持 OpenAI Responses API 和工具调用。该配置只影响 Agent，图片、视频、音频、Embedding 和其他业务模型仍使用当前选择的模型渠道。
+捏导 Agent 可以跟随当前模型渠道，也可以单独使用第三方服务。在 **Agent 模型** 中选择 **第三方**，填写兼容 OpenAI 的 Base URL、API Key 和模型名称。第三方服务必须支持 OpenAI Responses API 和工具调用。该配置只影响 Agent，图片、视频、音频、Embedding 和其他业务模型仍使用当前选择的模型渠道。
 
 密钥只保存在 CE 本地设置数据库中，浏览器仅能看到脱敏预览。修改第三方地址时必须重新输入 API Key，避免已保存密钥被意外发送到另一个主机。选择 **跟随当前渠道** 即可恢复官方、自定义或混合模式原有的 Agent 路由。
 
@@ -43,7 +43,7 @@ DramaClaw CE 通过 NewAPI 兼容网关调用文本、视觉理解、Embedding�
 - **自动更新官方模型列表**默认关闭。开启后，后端默认每 5 分钟检查一次；打开对应设置面板时也会立即检查。
 - 下载的模型列表保存在本地 `state/local/official_media_models.json`，重启后继续生效。
 - DramaClaw 不会安装低于当前生效版本的远端列表。应用升级后，如果新版内置列表比本地缓存更新，会优先使用新版内置列表。
-- 开启自动更新后，已打开的虾画浏览器每分钟观察一次目录状态；内容 SHA256 变化时会自动刷新图片和视频模型列表。
+- 开启自动更新后，已打开的捏画浏览器每分钟观察一次目录状态；内容 SHA256 变化时会自动刷新图片和视频模型列表。
 - 状态接口会返回当前内容的 SHA256、发布 Git revision、发布时间、远端地址和最近一次更新错误，便于确认每个实例实际使用的版本。
 
 用户在自定义模式中维护的渠道、模型映射和能力配置不受官方模型列表更新影响。
@@ -193,7 +193,7 @@ Embedding 模型和维度在项目创建时绑定。修改配置只自动影响�
 
 媒体模型配置同时决定：
 
-- 虾画中是否显示该模型。
+- 捏画中是否显示该模型。
 - 显示名称与排序。
 - 发送给 NewAPI 的上游模型名。
 - 分辨率、比例、图片质量、时长等控件选项。
@@ -202,7 +202,7 @@ Embedding 模型和维度在项目创建时绑定。修改配置只自动影响�
 - 是否显示真人审核选项。
 - 模型专属请求参数。
 
-主线内置模型提供默认能力基线，不能从配置中删除。我的配置可以新增图片或视频模型，并编辑自定义模型能力。保存后刷新虾画，模型列表和控件会使用最新配置。
+主线内置模型提供默认能力基线，不能从配置中删除。我的配置可以新增图片或视频模型，并编辑自定义模型能力。保存后刷新捏画，模型列表和控件会使用最新配置。
 
 模型 ID 是 DramaClaw 使用的稳定名称，**上游模型名**是 NewAPI 渠道实际调用的名称，两者可以不同。
 
@@ -214,14 +214,14 @@ Embedding 模型和维度在项目创建时绑定。修改配置只自动影响�
 
 每个 ComfyUI 渠道配置需要：
 
-- 一个 DramaClaw 使用的模型名称。该名称会注册到本地 NewAPI，并显示在虾画中。
+- 一个 DramaClaw 使用的模型名称。该名称会注册到本地 NewAPI，并显示在捏画中。
 - ComfyUI 服务地址；本机默认是 `http://127.0.0.1:8188`。
 - 一条或多条 Workflow。每条包含唯一的 **Workflow ID** 和从 ComfyUI 导出的 **API Format Workflow JSON**，不能使用浏览器工作流 JSON。
 - 该模型的媒体能力，例如支持模式、比例、分辨率、时长和参考素材数量。
 
 普通本地 ComfyUI 不需要 API Key，可以留空。只有在 ComfyUI 前方部署了要求认证的代理时，才需要按代理方案提供认证信息。
 
-同一个模型名称可以绑定多条 Workflow。DramaClaw 将模型名称、Workflow ID 和 Workflow JSON 保存到 NewAPI，具体选择哪条 Workflow 由虾驿处理；虾画只显示一个统一模型，不再为每条 Workflow 创建一个模型。
+同一个模型名称可以绑定多条 Workflow。DramaClaw 将模型名称、Workflow ID 和 Workflow JSON 保存到 NewAPI，具体选择哪条 Workflow 由捏驿处理；捏画只显示一个统一模型，不再为每条 Workflow 创建一个模型。
 
 MiniMax H3 模板使用模型名 `MiniMax-H3-local`，内置文生、首帧和全能参考三条 Workflow。初始媒体能力为文生视频、首帧和全能参考，分辨率为 `480p`、`768p`、`1080p`，比例为 `21:9`、`16:9`、`4:3`、`1:1`、`3:4`、`9:16`。这些是初始值，仍可在媒体模型能力配置中调整。
 
@@ -242,7 +242,7 @@ ComfyUI API Key 是可选项。Workflow 必须是 API Format，而不是浏览�
 
 ComfyUI 渠道存在时，MiniMax H3 模板按钮会保留在该渠道的 **ComfyUI Workflows** 区域，方便恢复缺少的模板。重复载入时会把模板合并到现有 Workflow 中，保留用户已经配置的同 ID Workflow；当 ComfyUI 地址为空时，会自动填入 `http://127.0.0.1:8188`，不会覆盖非空的自定义地址。
 
-混合模式按模型 ID 路由：本地 ComfyUI 模型可以作为新模型加入虾画；本地存在与官方同名的视频模型时，则使用本地模型覆盖该官方模型。其他模型继续使用官方 RelayClaw。保存视频配置时，DramaClaw 会先保存 ComfyUI 渠道，再保存对应媒体模型。DramaClaw 不会在本地生成失败后自动回退官方，是否重试或改选官方模型由用户决定。混合模式只管理本地视频模型，不要求再次配置 OpenRouter、火山等官方上游渠道。
+混合模式按模型 ID 路由：本地 ComfyUI 模型可以作为新模型加入捏画；本地存在与官方同名的视频模型时，则使用本地模型覆盖该官方模型。其他模型继续使用官方 RelayClaw。保存视频配置时，DramaClaw 会先保存 ComfyUI 渠道，再保存对应媒体模型。DramaClaw 不会在本地生成失败后自动回退官方，是否重试或改选官方模型由用户决定。混合模式只管理本地视频模型，不要求再次配置 OpenRouter、火山等官方上游渠道。
 
 ## 参考媒体存储
 
@@ -275,7 +275,7 @@ Bucket 无需公开读；DramaClaw 使用临时签名 URL 授权上游读取。
 | NewAPI 报 `No available channel for model ...` | 检查逻辑模型映射、渠道是否启用、上游模型名及分组。 |
 | 走 Codex 类中转站（Codex2API 等）时结构化环节报 `Exceeded maximum output retries` | 中转站在 `/v1/chat/completions` 上丢掉了 `tool_calls`。到 NewAPI 后台给该渠道开启 **ChatCompletions → Responses Compatibility**。详见[排错指南](../guides/troubleshooting.md#模型--网关类)。 |
 | 本地 NewAPI 初始化失败 | 检查 NewAPI 服务、SQLite 挂载、目录权限和 `NEWAPI_PROVISIONER_ENABLED`。 |
-| 虾画没有显示新增模型 | 确认模型已启用、媒体类型正确、已保存全部配置并刷新页面。 |
+| 捏画没有显示新增模型 | 确认模型已启用、媒体类型正确、已保存全部配置并刷新页面。 |
 | 模型控件与实际能力不一致 | 检查媒体模型的 `config`，尤其是分辨率、比例、模式和参考素材上限。 |
 | 知识图谱 embedding 失败 | 检查 embedding Key、上游模型、维度和批量大小；429 表示上游限流。 |
 | 参考图或首帧无法读取 | 检查媒体存储配置和临时 URL 是否能被上游公网访问。 |

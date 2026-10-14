@@ -818,14 +818,64 @@ class AssetCompiler:
             output_retries=model_gateway_output_retries(2),
             name="基础场景资产校对员",
         )
-        result = await agent.run(f"""## 已有基础场景
-{chr(10).join(existing_lines) if existing_lines else "（无）"}
+        existing_block = chr(10).join(existing_lines) if existing_lines else "（无）"
+
+        def _task(text: str) -> str:
+            return f"""## 已有基础场景
+{existing_block}
 
 ## 第 {episode.number} 集文本
-{source_text}
-""")
+{text}
+"""
+
+        from novelvideo.utils.long_text import chunk_by_budget, map_reduce
+        from novelvideo.utils.model_context_budget import (
+            TextContextBudget,
+            estimate_tokens,
+        )
+
+        budget = TextContextBudget.from_env("EPISODE_SCENE_RECONCILE_MODEL")
+        base_reserve = (
+            budget.framing_tokens + budget.default_output_tokens if budget else 0
+        )
+        if budget is None or estimate_tokens(_task(source_text)) <= budget.available_input_tokens(
+            base_reserve
+        ):
+            result = await agent.run(_task(source_text))
+            return await self._apply_base_scene_reconcile_output(
+                result.output, source_text, episode, log
+            )
+
+        # Oversized episode: reconcile per chunk and merge decisions; the apply
+        # step dedupes by name/alias so overlapping chunks stay safe.
+        prefix_bytes = estimate_tokens(_task(""))
+        chunks = chunk_by_budget(
+            source_text, budget, reserve_tokens=base_reserve + prefix_bytes + 64
+        )
+
+        async def _reconcile_once(chunk: str):
+            chunk_result = await agent.run(_task(chunk))
+            return chunk_result.output
+
+        def _reduce(results):
+            decisions = [
+                decision
+                for output in results
+                if output is not None
+                for decision in output.scenes
+            ]
+            return EpisodeBaseSceneReconcileOutput(scenes=decisions)
+
+        merged = await map_reduce(
+            source_text,
+            map_fn=_reconcile_once,
+            reduce_fn=_reduce,
+            budget=budget,
+            chunker=lambda _text: chunks,
+            require_all=True,
+        )
         return await self._apply_base_scene_reconcile_output(
-            result.output, source_text, episode, log
+            merged, source_text, episode, log
         )
 
     async def _apply_base_scene_reconcile_output(

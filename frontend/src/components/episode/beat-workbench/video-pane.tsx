@@ -971,11 +971,17 @@ export function VideoPane({
       seedance2DraftRef.current = nextDraft;
       setSeedance2Draft(nextDraft);
       void seedance2Status.refetch?.();
-      toast.success(
-        showHappyHorseConfig || showGrokVideoConfig
-          ? t("episode.workbench.video.seedance2SubjectPromptGenerated")
-          : t("episode.workbench.video.seedance2PromptGenerated"),
-      );
+      if (res.data.prompt_source === "fallback") {
+        // The composer timed out or the upstream failed, so the rule-based
+        // draft was filled instead of an AI result — say so explicitly.
+        toast.warning(t("episode.workbench.video.seedance2PromptFallback"));
+      } else {
+        toast.success(
+          showHappyHorseConfig || showGrokVideoConfig
+            ? t("episode.workbench.video.seedance2SubjectPromptGenerated")
+            : t("episode.workbench.video.seedance2PromptGenerated"),
+        );
+      }
     } catch (error) {
       toast.error(backendErrorToastMessage(error, t));
     }

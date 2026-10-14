@@ -1383,6 +1383,23 @@ async def enrich_character_appearances(
     if not merged:
         return {}
 
+    if synopsis:
+        # The pre-scene character bible is the densest appearance source, but a
+        # long one must not overflow the batch prompt. Cap it once so the cache
+        # key and every batch prompt see the same text.
+        from novelvideo.utils.long_text import fit_text
+        from novelvideo.utils.model_context_budget import TextContextBudget
+
+        _budget = TextContextBudget.from_env()
+        if _budget is not None:
+            synopsis = fit_text(
+                synopsis,
+                _budget,
+                reserve_tokens=_budget.framing_tokens
+                + _budget.default_output_tokens
+                + 8192,
+            )
+
     language = output_language or detect_asset_language(
         "\n".join(
             [

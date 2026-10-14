@@ -38,29 +38,38 @@ function wrapper({ children }: { children: ReactNode }) {
 }
 
 describe("Seedance2 prompt generation query", () => {
-  it("posts current prompt reference and guidance to the per-beat endpoint", async () => {
+  it("enqueues optimization and polls the job status", async () => {
     let requestedPath = "";
     let body: unknown = null;
     server.use(
       http.post(
-        "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate",
+        "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate-async",
         async ({ request }) => {
           requestedPath = new URL(request.url).pathname;
           body = await request.json();
-          return HttpResponse.json({
+          return HttpResponse.json({ ok: true, data: { status: "running" } });
+        },
+      ),
+      http.get(
+        "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate-async-status",
+        () =>
+          HttpResponse.json({
             ok: true,
             data: {
-              final_prompt: "optimized seedance2 prompt",
-              seedance2_config_json:
-                '{"final_prompt":"optimized seedance2 prompt"}',
-              beat: {
-                beat_number: 2,
+              status: "succeeded",
+              data: {
+                final_prompt: "optimized seedance2 prompt",
+                prompt_source: "generated",
                 seedance2_config_json:
                   '{"final_prompt":"optimized seedance2 prompt"}',
+                beat: {
+                  beat_number: 2,
+                  seedance2_config_json:
+                    '{"final_prompt":"optimized seedance2 prompt"}',
+                },
               },
             },
-          });
-        },
+          }),
       ),
     );
 
@@ -76,7 +85,7 @@ describe("Seedance2 prompt generation query", () => {
 
     await waitFor(() => expect(result.current.data).toBeDefined());
     expect(requestedPath).toBe(
-      "/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate",
+      "/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate-async",
     );
     expect(body).toEqual({
       manual_prompt_reference: "current prompt",
@@ -91,23 +100,32 @@ describe("Seedance2 prompt generation query", () => {
     let body: unknown = null;
     server.use(
       http.post(
-        "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate",
+        "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate-async",
         async ({ request }) => {
           body = await request.json();
-          return HttpResponse.json({
+          return HttpResponse.json({ ok: true, data: { status: "running" } });
+        },
+      ),
+      http.get(
+        "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate-async-status",
+        () =>
+          HttpResponse.json({
             ok: true,
             data: {
-              final_prompt: "optimized seedance2 prompt",
-              seedance2_config_json:
-                '{"final_prompt":"optimized seedance2 prompt"}',
-              beat: {
-                beat_number: 2,
+              status: "succeeded",
+              data: {
+                final_prompt: "optimized seedance2 prompt",
+                prompt_source: "generated",
                 seedance2_config_json:
                   '{"final_prompt":"optimized seedance2 prompt"}',
+                beat: {
+                  beat_number: 2,
+                  seedance2_config_json:
+                    '{"final_prompt":"optimized seedance2 prompt"}',
+                },
               },
             },
-          });
-        },
+          }),
       ),
     );
 
@@ -127,7 +145,7 @@ describe("Seedance2 prompt generation query", () => {
   it("parses feature billing errors from the Seedance2 prompt endpoint", async () => {
     server.use(
       http.post(
-        "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate",
+        "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/2/seedance2-prompt/generate-async",
         () =>
           HttpResponse.json(
             {

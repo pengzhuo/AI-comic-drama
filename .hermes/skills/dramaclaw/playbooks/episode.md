@@ -86,7 +86,7 @@ CP2 判定：脚本、场景/道具上下文足够推进草图；当前后端没
 
 **Step 14 音频生成**：使用 `dramaclaw_generate_audio`，即当前 `audio/generate` [ASYNC: `audio_generation_indextts2`]。旧 `/tts/generate` 已移除，不要调用。
 
-若缺少声线，必须明确询问：`1）到「虾塘」上传或录制声线；2）确认由虾导匹配系统声线。` 只有用户明确选择第二项后才能调用 `dramaclaw_prepare_system_voices(confirmed=true)`；它只启动 [ASYNC: `system_voice_setup`]。等待该任务完成后的下一轮，才可继续 Step 14。不得把系统声线说成不可用或泛化为“其它配音方向”。
+若缺少声线，必须明确询问：`1）到「捏塘」上传或录制声线；2）确认由捏导匹配系统声线。` 只有用户明确选择第二项后才能调用 `dramaclaw_prepare_system_voices(confirmed=true)`；它只启动 [ASYNC: `system_voice_setup`]。等待该任务完成后的下一轮，才可继续 Step 14。不得把系统声线说成不可用或泛化为“其它配音方向”。
 
 **局部音频更新**：
 - 当用户修改 beat 的 `audio_type`、`speaker`、`fish_speech_prompt` 或对白文本时，

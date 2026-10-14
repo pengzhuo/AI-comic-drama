@@ -1934,6 +1934,27 @@ async def extract_props_from_graph(
         return []
 
     if novel_text:
+        # Legacy path: the novel is *supplementary evidence* for aliases. Cap it
+        # to the context budget instead of appending a whole novel and letting
+        # the request overflow at the gateway.
+        from novelvideo.utils.long_text import fit_text
+        from novelvideo.utils.model_context_budget import (
+            TextContextBudget,
+            estimate_tokens,
+        )
+
+        budget = TextContextBudget.from_env()
+        if budget is not None:
+            reserve = (
+                budget.framing_tokens
+                + budget.default_output_tokens
+                + estimate_tokens(context_text)
+                + 4096
+            )
+            fitted = fit_text(novel_text, budget, reserve_tokens=reserve)
+            if len(fitted) < len(novel_text):
+                log(f"原文超出上下文预算，截断为前 {len(fitted)} 字符作为补充证据")
+            novel_text = fitted
         context_text += f"\n\n【剧本原文全文】\n{novel_text}"
         log(f"已注入原文全文辅助上下文: {len(novel_text)} 字符")
 

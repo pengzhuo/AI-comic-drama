@@ -24,6 +24,7 @@ from novelvideo.task_backend.cancel import (
     TaskTimedOut,
     is_cancel_requested,
 )
+from novelvideo.task_backend.task_clock import current_task_clock
 
 _TASK_PROCESS_SCOPE: contextvars.ContextVar[dict[str, Any] | None] = (
     contextvars.ContextVar(
@@ -395,9 +396,18 @@ def _cancel_requested_sync(scope: dict[str, Any]) -> bool:
 
 def _deadline_for(scope: dict[str, Any], timeout: int | float | None) -> float | None:
     deadlines: list[float] = []
-    scope_deadline = _optional_float(scope.get("deadline_monotonic"))
-    if scope_deadline is not None:
-        deadlines.append(scope_deadline)
+    clock = current_task_clock()
+    if clock is not None:
+        # Prefer the rolling idle deadline: the frozen envelope deadline is only
+        # a fallback for callers that run without a task clock (e.g. a bare
+        # subprocess worker), and would otherwise kill a healthy task early.
+        clock_deadline = clock.deadline_monotonic
+        if clock_deadline is not None:
+            deadlines.append(clock_deadline)
+    else:
+        scope_deadline = _optional_float(scope.get("deadline_monotonic"))
+        if scope_deadline is not None:
+            deadlines.append(scope_deadline)
     if timeout is not None:
         deadlines.append(time.monotonic() + max(float(timeout), 0.001))
     if not deadlines:

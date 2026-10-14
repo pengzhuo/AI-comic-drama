@@ -330,6 +330,17 @@ async def generate_seedance2_prompt_for_panel(
         assets=assets,
         language=output_language,
     )
+    if (
+        str(config.final_prompt or "").strip()
+        and config.prompt_source == "generated"
+        and config.prompt_inputs_hash
+        and config.prompt_inputs_hash == inputs_hash
+    ):
+        # Inputs are unchanged and an AI prompt already exists for them, so reuse
+        # it instead of paying for another (often slow) composer round-trip.
+        saved_json = dump_seedance2_config(config)
+        beat["seedance2_config_json"] = saved_json
+        return saved_json
     result = await generate_seedance2_prompt(
         mode=config.mode,
         beat=prompt_beat,

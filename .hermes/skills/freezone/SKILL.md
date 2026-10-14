@@ -1,14 +1,14 @@
 ---
 name: freezone
-description: "Use when the active chat surface is 虾画/Freezone/canvas, or when the user asks about canvas nodes, visual boards, selections, graph edits, canvas actions, layout, or Freezone short-video workflow work."
-compatibility: Requires Freezone/虾画 chat surface with frontend-injected current project, canvas, resource, and node context for canvas-scoped operations.
+description: "Use when the active chat surface is 捏画/Freezone/canvas, or when the user asks about canvas nodes, visual boards, selections, graph edits, canvas actions, layout, or Freezone short-video workflow work."
+compatibility: Requires Freezone/捏画 chat surface with frontend-injected current project, canvas, resource, and node context for canvas-scoped operations.
 ---
 
-# Freezone 虾画 Skill
+# Freezone 捏画 Skill
 
 ## 定位
 
-- 这个 skill 是虾画/Freezone 的总入口，负责判断当前是不是画布场景、用户意图属于咨询还是画布操作，以及用户可见回复应该怎么说。
+- 这个 skill 是捏画/Freezone 的总入口，负责判断当前是不是画布场景、用户意图属于咨询还是画布操作，以及用户可见回复应该怎么说。
 - 具体节点职责、连线语义、视频节点和合成节点的产品建模，读取 `references/canvas-modeling-guide.md`。
 - 只有复杂批量命令的字段不明确时，才读取 `references/canvas-command-guide.md`。删除、选择、布局等参数已经明确的单步操作禁止先读取该指南。
 
@@ -27,7 +27,7 @@ compatibility: Requires Freezone/虾画 chat surface with frontend-injected curr
 - **审核失败的返工边界**：内容安全失败不可自动重试，也不可由 Agent 自主修改提示词。先保留原提示词和原始错误，向用户说明是输入素材审核还是输出内容审核；只有用户明确要求修改某个节点的提示词时，才修改该节点一次。修改后再次失败就暂停，等待用户更换素材、调整创意方向或手动编辑，不得继续换词试错。
 - **动态工作流**：工作流选择只使用 Hermes 原生 Skill 机制。用户可在输入框键入 `/` 选择 Workflow Skill；未显式选择且存在多个候选时，使用 `skills_list` 展示并让用户选择。纯图片工作流使用 `text-to-image`，只有用户要求视频阶段时才使用 `text-to-image-video`；社交平台套图需求才使用 `social-content-campaign`。加载后生成精简 `freezone_workflow_intent.v1`，调用 `freezone_prepare_workflow_draft` 得到确定性预览；调整时调用 `freezone_patch_workflow_draft`，确认后调用 `freezone_confirm_workflow_draft`。对于 `ecommerce-ad`、`text-to-image`、`text-to-image-video`、`video-tutorial`、`short-drama-quick`，优先传 `planner={mode:"standard", item_count, total_duration_seconds, deliverable, include_audio, units}`，其中 `units` 只描述每段的标题、内容、旁白和可选 `duration_seconds`；`include_audio=true` 时每个 unit 都必须带 `narration`（该段实际朗读的原文，不能缺省、不能写占位说明）；不要为标准流程选择 Recipe 或编写依赖。用户指定总时长时必须传 `total_duration_seconds`，编译器会为未指定时长的片段进行确定性分配。只有用户明确要求特殊拓扑时才传完整 `items`；自定义视频 item 必须传 `duration_seconds`，并确保所有视觉片段时长之和等于用户目标时长；自定义音频 item 用 `audio_kind:"speech"`（narration 填实际朗读原文）或 `audio_kind:"music"` 区分。不要使用固定 `workflow_type`，不要手写画布命令，也不要调用旧的模板 Plan Builder。草稿校验失败时按返回的 `errors`/`hint` 修正后重试即可，不要读插件源码。
 - **已有图片作为 Recipe 输入**：在 Intent 顶层声明 `external_inputs=[{"id":"source_image","node_id":"画布真实节点 ID","media_kind":"image"}]`，目标 item 用 `reference_inputs=["source_image"]`；自定义 Plan 用同一声明及 `media_input_for` 边。保持源节点原样，等待草稿确认，不要退回普通 `add_next_node` 或手填图片 URL。
-- **外部 Skill 导入**：用户提供 Markdown 并明确要求转成虾画 Skill 时，调用 `freezone_import_external_skill` 提交后台转换，正文完整传入，不手工编码。ZIP 或带引用资料的完整包使用设置中的“导入外部 Skill”上传入口。返回后告知任务与导入编号，不反复轮询、不声称已安装。用户要求查看时调用 `freezone_get_skill_import`；完成的 `import_result.bundle` 是原生 Skill 与 Recipes 草稿，用户要求修改时交给现有 Skill Studio 草稿流程，不创建画布节点。
+- **外部 Skill 导入**：用户提供 Markdown 并明确要求转成捏画 Skill 时，调用 `freezone_import_external_skill` 提交后台转换，正文完整传入，不手工编码。ZIP 或带引用资料的完整包使用设置中的“导入外部 Skill”上传入口。返回后告知任务与导入编号，不反复轮询、不声称已安装。用户要求查看时调用 `freezone_get_skill_import`；完成的 `import_result.bundle` 是原生 Skill 与 Recipes 草稿，用户要求修改时交给现有 Skill Studio 草稿流程，不创建画布节点。
 - **Skill Studio 配置类**：用户明确要求创建、编辑、保存、沉淀 Skill / Recipe / 技能 / 配方时，这是 catalog 配置草稿流程，不是画布写入，也不是纯文本完成。不要调用画布写入工具，不要声称已保存；需要澄清方向时调用 `freezone_request_user_clarification`，生成或修改草稿时按 `freezone_begin_agent_catalog_draft` → `freezone_put_agent_catalog_skill` → `freezone_put_agent_catalog_recipe` → `freezone_finish_agent_catalog_draft` 的分片流程提交，由 Freezone bridge 触发前端卡片展示。
 - **编写或沉淀 Skill / Recipe**：用户要求创建、编写、编辑、总结、抽成、沉淀或保存 Skill / Recipe 时，必须读取 `references/skill-studio-authoring-guide.md`。先判定来源模式再做能力建模：从用户一句话新建时，不要把当前画布当来源；只有用户明确说当前画布/流程/选中节点时，才做画布工作流分析；不要只按 tool schema 字段或节点类型摘要。
 - **全画布理解**：用户要求总结、理解或沉淀整张画布时，优先使用 canvas ontology / canvas summary；不要为了全局理解逐个读取所有节点详情。只有缺少关键字段时，才少量补读关键节点。
@@ -37,7 +37,7 @@ compatibility: Requires Freezone/虾画 chat surface with frontend-injected curr
 
 ### 开放意图的默认响应
 
-开放问题的默认目标是帮助用户缩小方向，而不是替用户抢先改画布。即使当前处在虾画界面、前端注入了画布上下文，也不要把注入上下文当成用户要求落画布。
+开放问题的默认目标是帮助用户缩小方向，而不是替用户抢先改画布。即使当前处在捏画界面、前端注入了画布上下文，也不要把注入上下文当成用户要求落画布。
 
 典型开放意图：
 
@@ -50,7 +50,7 @@ compatibility: Requires Freezone/虾画 chat surface with frontend-injected curr
 
 1. 先给 2-3 个方向或一个简短建议。
 2. 问一个推进问题，例如主题、受众、时长、平台、风格、是否需要落到画布。
-3. 如果方案已经足够明确，可以补一句"你定一个方向后，我可以再帮你整理成虾画节点"，但不要直接执行画布命令。
+3. 如果方案已经足够明确，可以补一句"你定一个方向后，我可以再帮你整理成捏画节点"，但不要直接执行画布命令。
 
 只有在用户出现明确落画布动词时，才进入画布写入原则。不要因为"短片/工作流/分镜"这些词本身就创建节点。
 
@@ -134,7 +134,7 @@ compatibility: Requires Freezone/虾画 chat surface with frontend-injected curr
 
 ### 称呼
 
-- 面向用户时称为"虾画"。
+- 面向用户时称为"捏画"。
 
 ### 回复边界（硬规则）
 
@@ -165,5 +165,5 @@ compatibility: Requires Freezone/虾画 chat surface with frontend-injected curr
 
 ## 工具不可用时
 
-- 如果虾画工具返回 `not_configured`、`not_implemented` 或 `canvas_id is required`，简短说明当前虾画工具尚未完成注入或未绑定画布。
+- 如果捏画工具返回 `not_configured`、`not_implemented` 或 `canvas_id is required`，简短说明当前捏画工具尚未完成注入或未绑定画布。
 - 不要改用 shell、curl、文件读写或猜测本地状态来绕过前端画布工具。

@@ -1,16 +1,16 @@
-# 虾画 Skill Studio 作者指南
+# 捏画 Skill Studio 作者指南
 
 这份指南用于 Skill Studio 创建、编辑、总结、沉淀或保存 Skill / Recipe 的场景，包括：
 
 - 用户从零描述一个想要的新 Skill / Recipe。
 - 用户根据某个工具、节点能力或 tool schema 创建 Skill / Recipe。
-- 用户明确要求把当前虾画画布、当前流程、选中节点或已有工作流总结、沉淀、保存、转成 Skill / Recipe。
+- 用户明确要求把当前捏画画布、当前流程、选中节点或已有工作流总结、沉淀、保存、转成 Skill / Recipe。
 
 目标不是把字段填满，也不是描述画布里“有什么节点”，而是提炼这套能力“为什么能复用”。好的 Skill 应该让下一次类似项目能按同一方法规划、生成、审核和局部返工。
 
 ## 0. 先判定来源模式
 
-在做 capability modeling、读取画布或提问前，必须先判定本轮 Skill Studio 的来源模式。当前处在虾画界面、前端注入了 canvas ontology，并不等于用户要从当前画布沉淀 Skill。
+在做 capability modeling、读取画布或提问前，必须先判定本轮 Skill Studio 的来源模式。当前处在捏画界面、前端注入了 canvas ontology，并不等于用户要从当前画布沉淀 Skill。
 
 ### `new_from_user_brief`
 

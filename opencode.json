@@ -1,0 +1,47 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "AGENTS.md",
+    "docs/agents/repo-map.md"
+  ],
+  "references": {
+    "docs": {
+      "path": "docs",
+      "description": "Use for product behavior, architecture, conventions and agent notes"
+    }
+  },
+  "tool_output": {
+    "max_lines": 300,
+    "max_bytes": 24000
+  },
+  "compaction": {
+    "auto": true,
+    "tail_turns": 12
+  },
+  "agent": {
+    "explore-py": {
+      "description": "Backend investigator: answers questions about src/novelvideo (routes, task runners, services) and returns a concise summary with file:line references. Use for multi-file searches instead of reading large files.",
+      "mode": "subagent",
+      "permission": {
+        "edit": "deny"
+      }
+    },
+    "explore-fe": {
+      "description": "Frontend investigator: answers questions about frontend/src (routes, features, components, queries) and returns a concise summary with file:line references. Use for multi-file searches instead of reading large files.",
+      "mode": "subagent",
+      "permission": {
+        "edit": "deny"
+      }
+    }
+  },
+  "permission": {
+    "bash": {
+      "*": "allow",
+      "git push *": "ask",
+      "git reset --hard *": "ask",
+      "git clean *": "ask",
+      "git rebase *": "ask",
+      "rm -rf *": "ask"
+    }
+  }
+}

@@ -2187,7 +2187,7 @@ async def test_freezone_assistant_rejects_hidden_surface_before_credit_check(
                 {
                     "surface_code": "freezone_assistant",
                     "available": False,
-                    "unavailable_message": "虾导功能暂未开放",
+                    "unavailable_message": "捏导功能暂未开放",
                 }
             ]
 
@@ -2219,7 +2219,7 @@ async def test_freezone_assistant_rejects_hidden_surface_before_credit_check(
         )
 
     assert exc_info.value.status_code == 403
-    assert exc_info.value.detail == "虾导功能暂未开放"
+    assert exc_info.value.detail == "捏导功能暂未开放"
     assert credit_checked is False
 
 

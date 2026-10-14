@@ -317,6 +317,9 @@ async def ask_openrouter(
     }
     if model.lower().startswith("openai/"):
         payload["response_format"] = {"type": "json_object"}
+    from novelvideo.utils.model_context_budget import guard_payload
+
+    guard_payload(payload, {"max_tokens": max_tokens}, model=model)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",

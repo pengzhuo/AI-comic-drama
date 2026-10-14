@@ -38,11 +38,11 @@ TEXT_CONTENT_FILTER_CHAT_ERROR = (
     "模型内容安全过滤拦截了本次文本生成，请调整原文或改写稿中的敏感描述后重试。"
 )
 VOICE_PREREQ_CHAT_PREFIX = (
-    "配音任务没有成功启动：当前缺少声线前置。请到「虾塘」上传或录制缺失的"
-    "项目解说人声线/角色声线，或明确同意由虾导准备系统声线后，再继续生成配音。"
+    "配音任务没有成功启动：当前缺少声线前置。请到「捏塘」上传或录制缺失的"
+    "项目解说人声线/角色声线，或明确同意由捏导准备系统声线后，再继续生成配音。"
 )
 RENDER_PREREQ_CHAT_PREFIX = (
-    "Render 任务没有生成可用图片：当前缺少必要草图前置。请先在「虾塘」生成或确认对应 "
+    "Render 任务没有生成可用图片：当前缺少必要草图前置。请先在「捏塘」生成或确认对应 "
     "Beat 的草图后，再重新生成 Render。"
 )
 FIRST_FRAME_BATCH_SIZE = 9
@@ -50,7 +50,7 @@ AGENT_BATCH_POLL_SECONDS = 2.0
 _AGENT_BATCH_DISPATCHERS: dict[str, threading.Thread] = {}
 _AGENT_BATCH_DISPATCHERS_LOCK = threading.Lock()
 FREEZONE_MAINLINE_WRITE_DENIED_MESSAGE = (
-    "当前虾导运行在虾画画布中，只能查询项目状态或操作画布节点；"
+    "当前捏导运行在捏画画布中，只能查询项目状态或操作画布节点；"
     "不能从这里启动主线视频生成、分集/脚本规划、草图、首帧、配音、成片或单 Beat 视频任务。"
 )
 FREEZONE_DENIED_MAINLINE_WRITE_TOOLS = {
@@ -202,7 +202,7 @@ def _with_chat_error_hints(value: Any) -> Any:
             "chat_notice",
             (
                 f"下一步需要先准备配音声线。缺失项：{detail}。请选择："
-                "1）到「虾塘」上传或录制声线；2）确认由虾导匹配系统声线。"
+                "1）到「捏塘」上传或录制声线；2）确认由捏导匹配系统声线。"
             ),
         )
         result.setdefault(
@@ -210,10 +210,10 @@ def _with_chat_error_hints(value: Any) -> Any:
             (
                 "Tell the user in natural Chinese that first-frame generation is complete, but "
                 "audio generation cannot start yet. Offer two choices: upload or record the listed "
-                "voices in 虾塘, or explicitly approve system voices. Do not prepare system voices "
+                "voices in 捏塘, or explicitly approve system voices. Do not prepare system voices "
                 "without explicit approval. Do not claim TTS started and do not call "
                 "dramaclaw_generate_audio in this turn. The final question MUST explicitly contain "
-                "both Chinese choices: ‘到虾塘上传或录制声线’ and ‘由虾导匹配系统声线’. Never "
+                "both Chinese choices: ‘到捏塘上传或录制声线’ and ‘由捏导匹配系统声线’. Never "
                 "describe system voices as unavailable, an external alternative, or ‘换别的方向’."
             ),
         )
@@ -227,11 +227,11 @@ def _with_chat_error_hints(value: Any) -> Any:
             "agent_instruction",
             (
                 "Reply to the user with chat_error in natural Chinese. Make clear the audio task "
-                "was not started. Offer two choices: go to 虾塘 to upload or record the missing "
+                "was not started. Offer two choices: go to 捏塘 to upload or record the missing "
                 "voice lines, or explicitly approve system voices. Do not prepare system voices "
                 "until the user explicitly chooses that option. Do not start another tool in this turn."
-                " The final question MUST explicitly contain both Chinese choices: ‘到虾塘上传或录制声线’ "
-                "and ‘由虾导匹配系统声线’. Never describe system voices as unavailable, an external "
+                " The final question MUST explicitly contain both Chinese choices: ‘到捏塘上传或录制声线’ "
+                "and ‘由捏导匹配系统声线’. Never describe system voices as unavailable, an external "
                 "alternative, or ‘换别的方向’."
             ),
         )
@@ -246,7 +246,7 @@ def _with_chat_error_hints(value: Any) -> Any:
             (
                 "Reply to the user with chat_error in natural Chinese. Make clear the render "
                 "task did not produce usable images because sketches are missing. Tell the user "
-                "to generate or verify sketches in 虾塘 before retrying render. Do not start "
+                "to generate or verify sketches in 捏塘 before retrying render. Do not start "
                 "another tool in this turn."
             ),
         )
@@ -3008,7 +3008,7 @@ TOOLS = (
         "dramaclaw_control_episode_auto",
         _schema(
             "dramaclaw_control_episode_auto",
-            "Control the durable 本集自动 session in the outer 虾导. Use action='suspend' before "
+            "Control the durable 本集自动 session in the outer 捏导. Use action='suspend' before "
             "asking the user to confirm a possible modification; this pauses only future automatic "
             "steps and never cancels queued/running media tasks. Use action='resume' when the user "
             "declines the modification and wants automatic production to continue. Use action='pause' "

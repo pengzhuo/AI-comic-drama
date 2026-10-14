@@ -402,6 +402,7 @@ async def test_task_limits_shape_and_ce_single_eligible_user(monkeypatch, tmp_pa
 @pytest.mark.asyncio
 async def test_pipeline_status_returns_m07_shape_and_step_map(monkeypatch, tmp_path):
     from novelvideo.api.routes import pipeline
+    from novelvideo import pipeline_status
 
     ctx = _ctx(tmp_path)
 
@@ -428,8 +429,8 @@ async def test_pipeline_status_returns_m07_shape_and_step_map(monkeypatch, tmp_p
         )
 
     monkeypatch.setattr(pipeline, "resolve_project_scope", fake_resolve_project_scope)
-    monkeypatch.setattr(pipeline, "_user_has_configured", lambda *_: False)
-    monkeypatch.setattr(pipeline, "get_task_manager", lambda: TaskStateManager())
+    monkeypatch.setattr(pipeline_status, "_user_has_configured", lambda *_: False)
+    monkeypatch.setattr(pipeline_status, "get_task_manager", lambda: TaskStateManager())
 
     response = await pipeline.pipeline_status(
         project=ctx.project_id,
@@ -451,6 +452,7 @@ async def test_pipeline_status_returns_m07_shape_and_step_map(monkeypatch, tmp_p
 
 def test_m07_http_coverage_exercises_task_center_routes(monkeypatch, tmp_path):
     from novelvideo.api.routes import pipeline, tasks
+    from novelvideo import pipeline_status
 
     ctx = _ctx(tmp_path)
     manager = TaskStateManager()
@@ -512,8 +514,8 @@ def test_m07_http_coverage_exercises_task_center_routes(monkeypatch, tmp_path):
     monkeypatch.setattr(tasks, "get_task_backend", lambda: FakeBackend())
     monkeypatch.setattr(tasks, "get_project_access", lambda: AllowAllProjectAccess())
     monkeypatch.setattr(pipeline, "resolve_project_scope", fake_resolve_project_scope)
-    monkeypatch.setattr(pipeline, "get_task_manager", lambda: manager)
-    monkeypatch.setattr(pipeline, "_user_has_configured", lambda *_: False)
+    monkeypatch.setattr(pipeline_status, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(pipeline_status, "_user_has_configured", lambda *_: False)
 
     app = FastAPI()
     app.include_router(tasks.router, prefix="/api/v1")

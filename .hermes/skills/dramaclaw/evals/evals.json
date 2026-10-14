@@ -64,7 +64,7 @@
     {
       "id": 6,
       "prompt": "帮我写一个赛博朋克女总裁复仇短剧",
-      "expected_output": "Activate dramaclaw because this is an explicit production request, but do not create or ingest a screenplay from the one-line idea; direct the user to upload an existing screenplay in 虾料.",
+      "expected_output": "Activate dramaclaw because this is an explicit production request, but do not create or ingest a screenplay from the one-line idea; direct the user to upload an existing screenplay in 捏料.",
       "files": [],
       "expectations": [
         "Does not call a write or generation tool",

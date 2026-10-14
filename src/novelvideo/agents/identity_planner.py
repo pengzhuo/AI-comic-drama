@@ -35,6 +35,28 @@ if TYPE_CHECKING:
     from novelvideo.cognee import CogneeStore
     from novelvideo.models import NovelEpisode
 
+
+def _fit_identity_content(text: str) -> str:
+    """Cap episode planning content to the planner model budget.
+
+    Identity planning inserts the whole episode's planning content into several
+    prompts; a long episode would otherwise overflow the model window. The text
+    is only trimmed when it does not fit, and the same capped text feeds every
+    pass so they stay consistent.
+    """
+
+    if not text:
+        return text
+    from novelvideo.utils.long_text import fit_text
+    from novelvideo.utils.model_context_budget import TextContextBudget
+
+    budget = TextContextBudget.from_env("IDENTITY_PLANNER_ANALYSIS_MODEL")
+    if budget is None:
+        return text
+    reserve = budget.framing_tokens + budget.default_output_tokens + 8192
+    return fit_text(text, budget, reserve_tokens=reserve)
+
+
 # =============================================================================
 # Output Schema (AI structured output)
 # =============================================================================
@@ -438,7 +460,9 @@ class IdentityPlanner:
             (new_count, resolved_count): 新建身份数 和 总解析身份数
         """
         self.auto_promoted_characters = []
-        content_text = await load_episode_planning_content(self.cognee_store, episode)
+        content_text = _fit_identity_content(
+            await load_episode_planning_content(self.cognee_store, episode)
+        )
         if not content_text or not content_text.strip():
             return 0, 0
         output_language = detect_asset_language(content_text)
@@ -917,7 +941,9 @@ class IdentityPlanner:
     ) -> EpisodeDefaultIdentities:
         """Pass A: 分析每个角色的现实主线默认身份。"""
         if content_text is None:
-            content_text = await self.cognee_store.load_episode_content(episode.number)
+            content_text = _fit_identity_content(
+                await self.cognee_store.load_episode_content(episode.number)
+            )
         if not content_text:
             return EpisodeDefaultIdentities()
         if cast_names is None:
@@ -991,7 +1017,9 @@ class IdentityPlanner:
     ) -> EpisodeIdentityRequirements:
         """Pass B: 全文分析默认身份之外的其他非默认身份。"""
         if content_text is None:
-            content_text = await self.cognee_store.load_episode_content(episode.number)
+            content_text = _fit_identity_content(
+                await self.cognee_store.load_episode_content(episode.number)
+            )
         if not content_text:
             return EpisodeIdentityRequirements()
         if cast_names is None:

@@ -1,4 +1,4 @@
-# DramaClaw 虾导 可编辑字段参考
+# DramaClaw 捏导 可编辑字段参考
 
 Agent 处理用户编辑请求时，查此文档获取具体字段名、类型和可选值。更新请求的返回边界与用户表达方式见 [update-behavior.md](update-behavior.md)。
 

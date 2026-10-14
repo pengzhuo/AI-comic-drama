@@ -120,10 +120,10 @@ def test_dramaclaw_plugin_adds_voice_prereq_chat_error():
 
     assert result["error"] == raw_error
     assert "配音任务没有成功启动" in result["chat_error"]
-    assert "虾塘" in result["chat_error"]
+    assert "捏塘" in result["chat_error"]
     assert raw_error in result["chat_error"]
     assert "Do not start another tool" in result["agent_instruction"]
-    assert "由虾导匹配系统声线" in result["agent_instruction"]
+    assert "由捏导匹配系统声线" in result["agent_instruction"]
     assert "换别的方向" in result["agent_instruction"]
 
 
@@ -147,9 +147,9 @@ def test_dramaclaw_plugin_stops_before_tts_when_pipeline_requires_voice_setup():
 
     data = result["data"]
     assert "下一步需要先准备配音声线" in result["chat_notice"]
-    assert "1）到「虾塘」上传或录制声线" in result["chat_notice"]
-    assert "2）确认由虾导匹配系统声线" in result["chat_notice"]
-    assert "虾塘" in result["agent_instruction"]
+    assert "1）到「捏塘」上传或录制声线" in result["chat_notice"]
+    assert "2）确认由捏导匹配系统声线" in result["chat_notice"]
+    assert "捏塘" in result["agent_instruction"]
     assert "Do not claim TTS started" in result["agent_instruction"]
     assert "chat_error" not in data["audio_prerequisites"]
 
@@ -176,7 +176,7 @@ def test_dramaclaw_plugin_adds_render_prereq_chat_error():
     task = result["data"][0]
     assert task["error"] == raw_error
     assert "Render 任务没有生成可用图片" in task["chat_error"]
-    assert "虾塘" in task["chat_error"]
+    assert "捏塘" in task["chat_error"]
     assert raw_error in task["chat_error"]
     assert "Do not start another tool" in task["agent_instruction"]
 
@@ -791,7 +791,7 @@ def test_dramaclaw_freezone_mode_denies_mainline_writes(monkeypatch):
 
     assert denied["ok"] is False
     assert denied["code"] == "freezone_mainline_write_denied"
-    assert "虾画画布" in denied["chat_error"]
+    assert "捏画画布" in denied["chat_error"]
 
 
 def test_dramaclaw_freezone_mode_denies_whole_canvas_writes(monkeypatch):

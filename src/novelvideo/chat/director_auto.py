@@ -118,10 +118,22 @@ class DirectorAutoRun:
     recovery_keys: tuple[str, ...] = ()
     voice_policy: str = ""
     last_error: str = ""
+    scope: str = "episode"
+    target_episodes: int = 0
+    config_json: str = "{}"
+    driver: str = "agent"
 
     @property
     def context(self) -> ProjectContext:
         return _deserialize_context(self.context_json)
+
+    @property
+    def is_project_scope(self) -> bool:
+        return self.scope == "project"
+
+    @property
+    def is_deterministic(self) -> bool:
+        return self.driver == "deterministic"
 
 
 class DirectorAutoStore:
@@ -149,6 +161,10 @@ class DirectorAutoStore:
               recovery_keys_json TEXT NOT NULL DEFAULT '[]',
               voice_policy TEXT NOT NULL DEFAULT '',
               last_error TEXT NOT NULL DEFAULT '',
+              scope TEXT NOT NULL DEFAULT 'episode',
+              target_episodes INTEGER NOT NULL DEFAULT 0,
+              config_json TEXT NOT NULL DEFAULT '{}',
+              driver TEXT NOT NULL DEFAULT 'agent',
               owner_token TEXT NOT NULL DEFAULT '',
               lease_expires_at REAL NOT NULL DEFAULT 0,
               UNIQUE(username, project_id)
@@ -179,6 +195,26 @@ class DirectorAutoStore:
                 "ALTER TABLE director_auto_runs "
                 "ADD COLUMN lease_expires_at REAL NOT NULL DEFAULT 0"
             )
+        if "scope" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN scope TEXT NOT NULL DEFAULT 'episode'"
+            )
+        if "target_episodes" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN target_episodes INTEGER NOT NULL DEFAULT 0"
+            )
+        if "config_json" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN config_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "driver" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN driver TEXT NOT NULL DEFAULT 'agent'"
+            )
         conn.commit()
         return conn
 
@@ -200,6 +236,10 @@ class DirectorAutoStore:
             recovery_keys=tuple(json.loads(row["recovery_keys_json"] or "[]")),
             voice_policy=str(row["voice_policy"] or ""),
             last_error=str(row["last_error"] or ""),
+            scope=str(row["scope"] or "episode"),
+            target_episodes=int(row["target_episodes"] or 0),
+            config_json=str(row["config_json"] or "{}"),
+            driver=str(row["driver"] or "agent"),
         )
 
     def upsert(self, run: DirectorAutoRun) -> None:
@@ -209,8 +249,9 @@ class DirectorAutoStore:
                 INSERT INTO director_auto_runs(
                   run_id, username, project_id, episode, status, activated_at,
                   updated_at, context_json, baseline_task_ids_json,
-                  handled_task_ids_json, recovery_keys_json, voice_policy, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  handled_task_ids_json, recovery_keys_json, voice_policy, last_error,
+                  scope, target_episodes, config_json, driver
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username, project_id) DO UPDATE SET
                   run_id=excluded.run_id,
                   episode=excluded.episode,
@@ -223,6 +264,10 @@ class DirectorAutoStore:
                   recovery_keys_json=excluded.recovery_keys_json,
                   voice_policy=excluded.voice_policy,
                   last_error=excluded.last_error,
+                  scope=excluded.scope,
+                  target_episodes=excluded.target_episodes,
+                  config_json=excluded.config_json,
+                  driver=excluded.driver,
                   owner_token=CASE
                     WHEN director_auto_runs.run_id != excluded.run_id THEN ''
                     ELSE director_auto_runs.owner_token
@@ -246,6 +291,10 @@ class DirectorAutoStore:
                     json.dumps(list(run.recovery_keys)),
                     run.voice_policy,
                     run.last_error,
+                    run.scope,
+                    int(run.target_episodes or 0),
+                    run.config_json or "{}",
+                    run.driver,
                 ),
             )
 
@@ -345,7 +394,8 @@ class DirectorAutoStore:
                 UPDATE director_auto_runs
                 SET episode=?, status=?, activated_at=?, updated_at=?, context_json=?,
                     baseline_task_ids_json=?, handled_task_ids_json=?,
-                    recovery_keys_json=?, voice_policy=?, last_error=?
+                    recovery_keys_json=?, voice_policy=?, last_error=?,
+                    scope=?, target_episodes=?, config_json=?, driver=?
                 WHERE run_id=? AND status='running' AND owner_token=?
                   AND lease_expires_at>?
                 """,
@@ -360,6 +410,10 @@ class DirectorAutoStore:
                     json.dumps(list(run.recovery_keys)),
                     run.voice_policy,
                     run.last_error,
+                    run.scope,
+                    int(run.target_episodes or 0),
+                    run.config_json or "{}",
+                    run.driver,
                     run.run_id,
                     owner_token,
                     current,
@@ -399,6 +453,10 @@ class DirectorAutoStore:
 
 
 def _relevant_tasks(run: DirectorAutoRun, tasks: Iterable[TaskState]) -> list[TaskState]:
+    if run.is_project_scope:
+        # A project-scope run spans global prep (episode 0) and every episode it
+        # is producing, so it watches all mainline task types.
+        return [task for task in tasks if task.task_type in AUTO_TASK_TYPES]
     return [
         task
         for task in tasks
@@ -490,6 +548,10 @@ class DirectorAutoCoordinator:
         ctx: ProjectContext,
         episode: int,
         voice_policy: str = "",
+        scope: str = "episode",
+        target_episodes: int = 0,
+        config: dict[str, Any] | None = None,
+        driver: str = "agent",
     ) -> DirectorAutoRun:
         tasks = await asyncio.to_thread(get_task_manager().list_tasks_for_project, ctx)
         now = _utc_now()
@@ -497,7 +559,7 @@ class DirectorAutoCoordinator:
             run_id=uuid.uuid4().hex,
             username=username,
             project_id=ctx.project_id,
-            episode=max(int(episode), 1),
+            episode=max(int(episode), 0),
             status="running",
             activated_at=now,
             updated_at=now,
@@ -509,6 +571,10 @@ class DirectorAutoCoordinator:
             ),
             handled_task_ids=(),
             voice_policy=voice_policy if voice_policy in {"system", "custom"} else "",
+            scope="project" if scope == "project" else "episode",
+            target_episodes=max(int(target_episodes or 0), 0),
+            config_json=json.dumps(config or {}, ensure_ascii=False),
+            driver="deterministic" if driver == "deterministic" else "agent",
         )
         await asyncio.to_thread(self.store.upsert, run)
         self._ensure_worker(run)
@@ -815,23 +881,49 @@ class DirectorAutoCoordinator:
             )
             await self._notify(run, "本集自动已暂停：捏导长时间处于忙碌状态。")
             return False
-        prompt = instruction or (
-            "第 {episode} 集成片合成已完成。请只读取并展示正式成片，然后简短收口；不要启动新的写任务。"
-            if final_delivery
-            else (
-                "只继续第 {episode} 集的下一步。不得启动、修改或推进其他集；"
-                "如果第 {episode} 集已经完成最终合成，只展示并收口。"
+        if run.is_project_scope:
+            base_prompt = (
+                "所有剧集的成片合成均已完成。请只读取并展示最终成片，然后简短收口；不要启动新的写任务。"
+                if final_delivery
+                else (
+                    "继续自动制作：若项目准备（配置/角色/分集/肖像）尚未完成，只推进首个缺失的全局步骤；"
+                    "否则只推进第 {episode} 集的下一步。只启动一个写任务，完成后收口。"
+                ).format(episode=run.episode)
             )
-        ).format(episode=run.episode)
-        prompt += (
-            "\n\n[DRAMACLAW_RUN_MODE]\nmode=episode_auto\n"
-            "This is a durable server-owned continuation already confirmed by the user. "
-            "Inspect current state and start at most one safe missing mainline task. Do not ask "
-            "for per-step confirmation. Missing output with satisfied prerequisites should be generated. "
-            "Pause for a current-step failure, destructive action, ambiguity, missing voice choice, or "
-            "unmet prerequisite, except for one exact Portrait repair explicitly authorized in the "
-            "instruction above.\n[/DRAMACLAW_RUN_MODE]"
-        )
+            run_mode_block = (
+                "\n\n[DRAMACLAW_RUN_MODE]\nmode=pipeline_auto\n"
+                "This is a durable, server-owned one-click production run already authorized by the "
+                "user. Advance the mainline pipeline from wherever it is: complete global preparation "
+                "(characters, episodes, portraits) and then each episode through final composition, "
+                "starting at most one write task per turn. Missing output with satisfied prerequisites "
+                "should be generated without per-step confirmation. Do not stop between episodes. "
+                "Pause only for: a task failure or cancellation, a missing required configuration, a "
+                "missing voice policy when voice prerequisites block audio, destructive actions, or a "
+                "genuinely ambiguous choice. Do not ask the user to confirm each step.\n"
+                "[/DRAMACLAW_RUN_MODE]"
+            )
+        else:
+            base_prompt = (
+                "第 {episode} 集成片合成已完成。请只读取并展示正式成片，然后简短收口；不要启动新的写任务。"
+                if final_delivery
+                else (
+                    "只继续第 {episode} 集的下一步。不得启动、修改或推进其他集；"
+                    "如果第 {episode} 集已经完成最终合成，只展示并收口。"
+                )
+            ).format(episode=run.episode)
+            run_mode_block = (
+                "\n\n[DRAMACLAW_RUN_MODE]\nmode=episode_auto\n"
+                "This is a durable server-owned continuation already confirmed by the user. "
+                "Inspect current state and start at most one safe missing mainline task. Do not ask "
+                "for per-step confirmation. Missing output with satisfied prerequisites should be generated. "
+                "Pause for a current-step failure, destructive action, ambiguity, missing voice choice, or "
+                "unmet prerequisite, except for one exact Portrait repair explicitly authorized in the "
+                "instruction above.\n[/DRAMACLAW_RUN_MODE]"
+            )
+        prompt = instruction or base_prompt
+        prompt += run_mode_block
+        if run.is_project_scope and run.target_episodes > 0:
+            prompt += f"\n\n分集规划目标集数：{run.target_episodes}。"
         if run.voice_policy == "system":
             prompt += (
                 "\n\n[DRAMACLAW_VOICE_POLICY]\npolicy=system\n"
@@ -893,6 +985,110 @@ class DirectorAutoCoordinator:
             )
             await self._notify(run, "本集自动已暂停：捏导继续执行失败，请检查服务状态后重试。")
             return False
+
+    async def _open_ctx_store(self, ctx: ProjectContext):
+        from novelvideo.api.deps import make_sqlite_store_for_context
+
+        return await make_sqlite_store_for_context(ctx)
+
+    async def _pause_gate(self, run: DirectorAutoRun) -> str | None:
+        """Return a human-facing reason to stop, or None to keep automating.
+
+        A project-scope run only stops for a choice it must not make on the
+        user's behalf: a missing project configuration, or a missing voice
+        policy once audio prerequisites become the next step. Everything else
+        keeps advancing.
+        """
+
+        from novelvideo.pipeline_status import _user_has_configured, compute_pipeline_status
+
+        ctx = run.context
+        if not _user_has_configured(run.username, ctx.project_name):
+            return "项目配置缺失（如视觉风格、叙事方式等），请先完成配置"
+        store = await self._open_ctx_store(ctx)
+        try:
+            data = await compute_pipeline_status(
+                store=store,
+                username=run.username,
+                project_name=ctx.project_name,
+                project_dir=ctx.output_dir,
+                ctx=ctx,
+                episode=run.episode if run.episode > 0 else None,
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if close:
+                await close()
+        if str(data.get("next_step") or "") == "voice_setup" and not run.voice_policy:
+            return "缺少配音声线，且未选择声线策略（系统声线／自定义声线）"
+        return None
+
+    async def _dispatch_stage(self, run: DirectorAutoRun) -> tuple[bool, str | None]:
+        """Deterministic fast path: enqueue the next stage directly.
+
+        Returns ``(dispatched, signature)``. ``dispatched`` is False when the
+        stage has no deterministic handler or was already attempted, so the
+        caller should fall back to the agent.
+        """
+
+        from novelvideo.pipeline_auto import dispatch_next_stage
+
+        store = await self._open_ctx_store(run.context)
+        try:
+            task_type, signature = await dispatch_next_stage(
+                ctx=run.context,
+                username=run.username,
+                store=store,
+                episode=run.episode,
+                target_episodes=run.target_episodes,
+                attempted=set(run.recovery_keys),
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if close:
+                await close()
+        return task_type is not None, signature
+
+    async def _continue_owned(self, run: DirectorAutoRun) -> bool:
+        """Advance one step: deterministic dispatch when configured, else agent."""
+
+        if run.is_project_scope and run.is_deterministic:
+            try:
+                dispatched, signature = await self._dispatch_stage(run)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "deterministic dispatch failed project=%s", run.project_id
+                )
+                dispatched, signature = False, None
+            if dispatched:
+                if signature and signature not in run.recovery_keys:
+                    recorded = DirectorAutoRun(
+                        **{
+                            **asdict(run),
+                            "updated_at": _utc_now(),
+                            "recovery_keys": tuple(
+                                sorted({*run.recovery_keys, signature})
+                            ),
+                        }
+                    )
+                    await self._update_owned(recorded)
+                return True
+        return await self._agent_continue(run)
+
+    async def _next_incomplete_episode(self, run: DirectorAutoRun) -> int | None:
+        from novelvideo.pipeline_status import incomplete_episodes
+
+        ctx = run.context
+        store = await self._open_ctx_store(ctx)
+        try:
+            episodes = incomplete_episodes(store, ctx.output_dir)
+        finally:
+            close = getattr(store, "close", None)
+            if close:
+                await close()
+        if run.target_episodes and run.target_episodes > 0:
+            episodes = [ep for ep in episodes if ep <= run.target_episodes]
+        return episodes[0] if episodes else None
 
     async def _run(self, run_id: str, username: str, project_id: str) -> None:
         taskless_continuations = 0
@@ -1008,6 +1204,28 @@ class DirectorAutoCoordinator:
                     summary = f"✅ 本批 {len(terminal)} 个任务已完成。"
                 if compose is not None:
                     await self._notify(updated, f"{summary}正在展示第 {run.episode} 集成片。")
+                    if updated.is_project_scope:
+                        next_episode = await self._next_incomplete_episode(updated)
+                        if next_episode is not None:
+                            advanced = DirectorAutoRun(
+                                **{
+                                    **asdict(updated),
+                                    "episode": next_episode,
+                                    "updated_at": _utc_now(),
+                                }
+                            )
+                            if not await self._update_owned(advanced):
+                                return
+                            await self._notify(
+                                advanced,
+                                f"第 {run.episode} 集已完成，成片自动继续制作第 {next_episode} 集。",
+                            )
+                            if not await self._owns_run(run_id):
+                                return
+                            await self._continue_owned(advanced)
+                            taskless_continuations = 0
+                            await asyncio.sleep(POLL_SECONDS)
+                            continue
                     if not await self._owns_run(run_id):
                         return
                     await self._agent_continue(updated, final_delivery=True)
@@ -1020,10 +1238,24 @@ class DirectorAutoCoordinator:
                         return
                     await self._broadcast_status(completed)
                     return
-                await self._notify(updated, f"{summary}本集自动正在继续下一步。")
+                if updated.is_project_scope:
+                    pause_reason = await self._pause_gate(updated)
+                    if pause_reason:
+                        if not await self._owns_run(run_id):
+                            return
+                        await self._pause_owned(
+                            run_id=run_id,
+                            username=username,
+                            project_id=project_id,
+                            reason=pause_reason,
+                        )
+                        await self._notify(updated, f"自动成片已暂停：{pause_reason}。")
+                        return
+                auto_label = "自动成片" if updated.is_project_scope else "本集自动"
+                await self._notify(updated, f"{summary}{auto_label}正在继续下一步。")
                 if not await self._owns_run(run_id):
                     return
-                await self._agent_continue(updated)
+                await self._continue_owned(updated)
                 taskless_continuations = 0
                 await asyncio.sleep(POLL_SECONDS)
                 continue
@@ -1045,7 +1277,7 @@ class DirectorAutoCoordinator:
                 taskless_continuations += 1
                 if not await self._owns_run(run_id):
                     return
-                wrote = await self._agent_continue(run)
+                wrote = await self._continue_owned(run)
                 if not wrote:
                     latest = await asyncio.to_thread(self.store.get, username, project_id)
                     if latest is None or latest.status != "running":

@@ -4056,6 +4056,7 @@
         "seedance2PromptGenerated": "Seedance2 提示词 已优化",
         "seedance2PromptGeneratedOtherBeat": "主体提示词已优化，已写回镜头 #{{n}}",
         "seedance2PromptGenerateFailed": "Seedance2 提示词 生成失败",
+        "seedance2PromptFallback": "AI 优化超时，已填入规则草稿，可稍后重试",
         "videoPrompt": "视频提示词",
         "keyframePrompt": "单个 Beat 视频提示词",
         "generateBeatVideoPrompt": "生成本 Beat 提示词",

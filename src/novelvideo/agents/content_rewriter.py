@@ -175,18 +175,16 @@ async def rewrite_episode_content(
         return ""
 
     min_chars, max_chars = beat_chars_range
-    task = f"""## 剧集信息
+    header = f"""## 剧集信息
 - 标题: {episode_title or "未命名"}
 - 解说主角（第一人称里的“我”）: {protagonist_name or "未绑定"}
 - 解说风格: {narration_style}
 - 目标行数: {target_beats}
 - 每行字数: {min_chars}-{max_chars} 字
-- 改写目标: 生成适合短视频口播的网文主线解说，不是逐段摘要，也不是只摘爆点
+- 改写目标: 生成适合短视频口播的网文主线解说，不是逐段摘要，也不是只摘爆点"""
 
-## 原文
-{source_text}
-
-请输出改写后的逐行文本。"""
+    def _task(text: str) -> str:
+        return f"{header}\n\n## 原文\n{text}\n\n请输出改写后的逐行文本。"
 
     agent = Agent(
         get_newapi_text_pydantic_model(
@@ -200,6 +198,31 @@ async def rewrite_episode_content(
         model_settings=get_newapi_structured_output_model_settings(),
         name="短视频解说改写师",
     )
-    result = await agent.run(task)
-    output: AdaptedContentOutput = result.output
-    return "\n".join(output.lines)
+
+    async def _rewrite_once(text: str) -> str:
+        result = await agent.run(_task(text))
+        output: AdaptedContentOutput = result.output
+        return "\n".join(output.lines)
+
+    from novelvideo.utils.long_text import joined_reduce, map_reduce
+    from novelvideo.utils.model_context_budget import TextContextBudget, estimate_tokens
+
+    budget = TextContextBudget.from_env("CONTENT_REWRITER_MODEL")
+    if budget is None:
+        return await _rewrite_once(source_text)
+
+    base_reserve = budget.framing_tokens + budget.default_output_tokens
+    if estimate_tokens(_task(source_text)) <= budget.available_input_tokens(base_reserve):
+        return await _rewrite_once(source_text)
+
+    # The whole episode does not fit: rewrite per chunk and concatenate. The
+    # reserve includes the shared header so every chunk prompt still fits.
+    reserve = base_reserve + estimate_tokens(header) + 64
+    return await map_reduce(
+        source_text,
+        map_fn=_rewrite_once,
+        reduce_fn=joined_reduce("\n"),
+        budget=budget,
+        reserve_tokens=reserve,
+        require_all=True,
+    )

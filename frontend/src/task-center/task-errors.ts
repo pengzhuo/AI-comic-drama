@@ -25,6 +25,12 @@ export function taskErrorMessage(task: TaskState, t: TFunction): string {
       defaultValue: task.error || t("common.error"),
     });
   }
+  if (task.error_code === "MODEL_CONTEXT_BUDGET_EXCEEDED") {
+    const raw = task.error || t("common.error");
+    // Keep the actionable backend guidance but drop the internal code prefix so
+    // the message reads as user-facing text.
+    return raw.replace(/^MODEL_CONTEXT_BUDGET_EXCEEDED:\s*/, "");
+  }
   const providerMessage = providerErrorMessage(task.error);
   if (providerMessage) return providerMessage;
   return humanizeTaskError(task.error, t);

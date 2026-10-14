@@ -373,23 +373,52 @@ async def translate_freezone_text(
     if not text or not text.strip():
         return "", "zh", "en"
 
-    task = build_freezone_translation_task(
-        text=text,
-        node_type=node_type,
-    )
     from novelvideo.model_gateway_runtime import model_gateway_request_scope
 
-    with model_gateway_request_scope(egress_context):
-        response = await get_freezone_translation_agent().run(task)
-    result = response.output
-    target_language: Literal["zh", "en"] = result.target_language
-    if target_language == result.source_language:
-        target_language = "zh" if result.source_language == "en" else "en"
-    return (
-        result.translated_text.strip(),
-        result.source_language,
-        target_language,
+    async def _translate_once(chunk: str) -> tuple[str, Literal["zh", "en"], Literal["zh", "en"]]:
+        task = build_freezone_translation_task(text=chunk, node_type=node_type)
+        with model_gateway_request_scope(egress_context):
+            response = await get_freezone_translation_agent().run(task)
+        result = response.output
+        target_language: Literal["zh", "en"] = result.target_language
+        if target_language == result.source_language:
+            target_language = "zh" if result.source_language == "en" else "en"
+        return result.translated_text.strip(), result.source_language, target_language
+
+    from novelvideo.utils.long_text import chunk_by_budget, map_reduce
+    from novelvideo.utils.model_context_budget import TextContextBudget, estimate_tokens
+
+    budget = TextContextBudget.from_env("FREEZONE_TRANSLATION_MODEL")
+    if budget is None:
+        return await _translate_once(text)
+
+    prefix_bytes = estimate_tokens(build_freezone_translation_task(text="", node_type=node_type))
+    base_reserve = budget.framing_tokens + budget.default_output_tokens
+    task_bytes = estimate_tokens(build_freezone_translation_task(text=text, node_type=node_type))
+    if task_bytes <= budget.available_input_tokens(base_reserve):
+        return await _translate_once(text)
+
+    # Oversized input: translate chunk by chunk and concatenate in order.
+    chunks = chunk_by_budget(
+        text, budget, reserve_tokens=base_reserve + prefix_bytes + 64
     )
+
+    def _reduce(results: Sequence[tuple[str, str, str] | None]) -> tuple[str, str, str]:
+        translated = "\n\n".join(item[0] for item in results if item)
+        first = next((item for item in results if item), None)
+        source = first[1] if first else "zh"
+        target = first[2] if first else "en"
+        return translated, source, target
+
+    translated, source, target = await map_reduce(
+        text,
+        map_fn=_translate_once,
+        reduce_fn=_reduce,
+        budget=budget,
+        chunker=lambda _text: chunks,
+        require_all=True,
+    )
+    return translated, source, target
 
 
 async def generate_freezone_text(
@@ -574,16 +603,62 @@ async def generate_freezone_story_script(
     if not source_text or not source_text.strip():
         raise ValueError("source_text is required")
 
-    task = build_freezone_story_script_task(
-        source_text=source_text,
-        prompt=prompt,
-        character_refs=character_refs,
-    )
     from novelvideo.model_gateway_runtime import model_gateway_request_scope
 
-    with model_gateway_request_scope(egress_context):
-        response = await get_freezone_story_script_agent(model).run(task)
-    return response.output
+    async def _generate_once(chunk: str):
+        task = build_freezone_story_script_task(
+            source_text=chunk,
+            prompt=prompt,
+            character_refs=character_refs,
+        )
+        with model_gateway_request_scope(egress_context):
+            response = await get_freezone_story_script_agent(model).run(task)
+        return response.output
+
+    from novelvideo.utils.long_text import chunk_by_budget, map_reduce
+    from novelvideo.utils.model_context_budget import TextContextBudget, estimate_tokens
+
+    budget = TextContextBudget.from_env("FREEZONE_STORY_SCRIPT_MODEL")
+    if budget is None:
+        return await _generate_once(source_text)
+
+    prefix_bytes = estimate_tokens(
+        build_freezone_story_script_task(
+            source_text="", prompt=prompt, character_refs=character_refs
+        )
+    )
+    base_reserve = budget.framing_tokens + budget.default_output_tokens
+    task_bytes = estimate_tokens(
+        build_freezone_story_script_task(
+            source_text=source_text, prompt=prompt, character_refs=character_refs
+        )
+    )
+    if task_bytes <= budget.available_input_tokens(base_reserve):
+        return await _generate_once(source_text)
+
+    # Oversized source: generate per chunk and merge rows, renumbering shot_no.
+    from novelvideo.api.schemas import FreezoneStoryScriptGenerateData
+
+    chunks = chunk_by_budget(
+        source_text, budget, reserve_tokens=base_reserve + prefix_bytes + 64
+    )
+
+    def _reduce(results):
+        datas = [item for item in results if item is not None]
+        rows = [row for data in datas for row in data.rows]
+        for index, row in enumerate(rows, start=1):
+            row.shot_no = index
+        title = next((data.title for data in datas if data.title), "")
+        return FreezoneStoryScriptGenerateData(title=title, rows=rows)
+
+    return await map_reduce(
+        source_text,
+        map_fn=_generate_once,
+        reduce_fn=_reduce,
+        budget=budget,
+        chunker=lambda _text: chunks,
+        require_all=True,
+    )
 
 
 def create_freezone_video_story_script_agent() -> Agent:

@@ -38,6 +38,7 @@ from novelvideo.i18n_message import (
 from novelvideo.config import OUTPUT_DIR, STATE_DIR
 from novelvideo.project_context import ProjectContext, require_project_home_node
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
+from novelvideo.task_backend.task_clock import note_task_progress
 from novelvideo.sqlite_schema import ensure_sqlite_schema
 from novelvideo.task_backend.queues import normalize_queue_kind
 from novelvideo.task_identity import (
@@ -977,6 +978,9 @@ class TaskStateManager:
             state.result = self._merge_metadata_into_result(state.result, state.metadata)
         state.updated_at = utc_now_iso()
         self._save(state)
+        # A progress report is proof of life: refresh the task's idle clock so a
+        # long but healthy run is never mistaken for a stalled one.
+        note_task_progress()
 
     def update_progress_for_project(
         self,
@@ -1049,6 +1053,8 @@ class TaskStateManager:
         state.updated_at = utc_now_iso()
         ttl = self.COMPLETED_TTL if status in TERMINAL_TASK_STATUSES else None
         self._save_for_context(ctx, state, ttl=ttl)
+        if status == "running":
+            note_task_progress()
 
     def complete_task(
         self,

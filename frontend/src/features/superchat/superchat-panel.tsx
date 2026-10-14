@@ -120,6 +120,7 @@ import {
 } from "@/features/superchat/task-notification-batch";
 import {
   activateDirectorEpisodeAuto,
+  activateDirectorProjectAuto,
   awaitDirectorEpisodeAutoConfirmation,
   confirmDirectorEpisodeAuto,
   defaultDirectorRunState,
@@ -128,6 +129,8 @@ import {
   directorAutoRunTransportText,
   directorAutoUserMessageTransportText,
   directorAutoVoiceChoiceTransportText,
+  directorPipelineAutoConfirmationTransportText,
+  directorPipelineAutoRunTransportText,
   emphasizeDirectorVoiceChoiceLabels,
   isDirectorEpisodeAutoSession,
   isDirectorEpisodeAutoStartIntent,
@@ -11119,6 +11122,12 @@ const DIRECTOR_RUN_MODE_OPTIONS: ReadonlyArray<{
     label: "本集自动",
     description: "二次确认后自动推进本集，失败或成片完成时停止",
   },
+  {
+    value: "pipeline_auto",
+    icon: Gauge,
+    label: "一键成片",
+    description: "二次确认后自动完成整部剧集制作，仅失败或需人工决策时暂停",
+  },
 ];
 
 type DirectorAutoServerResponse = {
@@ -11129,6 +11138,8 @@ type DirectorAutoServerResponse = {
     run_id: string | null;
     activated_at?: string | null;
     voice_policy?: DirectorVoicePolicy | null;
+    scope?: "episode" | "project";
+    target_episodes?: number;
   };
 };
 
@@ -11181,10 +11192,37 @@ async function startDirectorAutoServer(
   project: string,
   episode: number,
   voicePolicy: DirectorVoicePolicy | null,
+  options: {
+    scope?: "episode" | "project";
+    targetEpisodes?: number;
+    config?: Record<string, unknown>;
+  } = {},
 ): Promise<void> {
   await api.post(p`api/v1/projects/${project}/chat/director-auto/start`, {
-    json: { episode, voice_policy: voicePolicy },
+    json: {
+      episode,
+      voice_policy: voicePolicy,
+      scope: options.scope ?? "episode",
+      target_episodes: options.targetEpisodes ?? 0,
+      config: options.config,
+    },
   }).json<DirectorAutoServerResponse>();
+}
+
+/** Start the project-scope one-click run: global prep + every unfinished episode. */
+async function startProjectAutoServer(
+  project: string,
+  options: {
+    voicePolicy?: DirectorVoicePolicy | null;
+    targetEpisodes?: number;
+    config?: Record<string, unknown>;
+  } = {},
+): Promise<void> {
+  await startDirectorAutoServer(project, 1, options.voicePolicy ?? null, {
+    scope: "project",
+    targetEpisodes: options.targetEpisodes ?? 0,
+    config: options.config,
+  });
 }
 
 async function pauseDirectorAutoServer(project: string): Promise<void> {
@@ -13094,6 +13132,11 @@ export function SuperChatPanel({
       toast.success("已选择本集自动；发送开始指令后，还需再次确认才会执行", {
         duration: 10000,
       });
+    } else if (mode === "pipeline_auto") {
+      updateDirectorRunState(activateDirectorProjectAuto());
+      toast.success("已选择一键成片；发送开始指令后，还需再次确认才会执行", {
+        duration: 10000,
+      });
     } else {
       updateDirectorRunState(defaultDirectorRunState());
       const project = params.project?.trim();
@@ -14868,8 +14911,13 @@ export function SuperChatPanel({
       if (canvasReferenceContext) {
         nextText = appendAttachmentAnalysisContext(nextText, canvasReferenceContext);
       }
-      if (variant !== "freezone" && directorRunStateRef.current.mode === "episode_auto") {
+      if (
+        variant !== "freezone"
+        && (directorRunStateRef.current.mode === "episode_auto"
+          || directorRunStateRef.current.mode === "pipeline_auto")
+      ) {
         const state = directorRunStateRef.current;
+        const isProjectAuto = state.mode === "pipeline_auto";
         const selectedVoicePolicy = resolveDirectorVoicePolicy(text);
         if (
           state.confirmationStage === "awaiting_start"
@@ -14896,7 +14944,9 @@ export function SuperChatPanel({
             voicePrerequisiteErrors: voicePreflight.errors,
           };
           updateDirectorRunState(awaiting);
-          nextText = directorAutoConfirmationTransportText(nextText, {
+          nextText = (isProjectAuto
+            ? directorPipelineAutoConfirmationTransportText
+            : directorAutoConfirmationTransportText)(nextText, {
             voiceChoiceRequired: voicePreflight.choiceRequired,
             voiceErrors: voicePreflight.errors,
           });
@@ -14911,17 +14961,30 @@ export function SuperChatPanel({
           }
           if (!project) return false;
           try {
-            await startDirectorAutoServer(project, state.episode ?? 1, voicePolicy);
+            if (isProjectAuto) {
+              await startProjectAutoServer(project, { voicePolicy });
+            } else {
+              await startDirectorAutoServer(project, state.episode ?? 1, voicePolicy);
+            }
           } catch (error) {
             toast.error(
-              `无法启动本集自动：${error instanceof Error ? error.message : "后端请求失败"}`,
+              `${isProjectAuto ? "无法启动一键成片" : "无法启动本集自动"}：${
+                error instanceof Error ? error.message : "后端请求失败"
+              }`,
             );
             return false;
           }
           const confirmed = confirmDirectorEpisodeAuto({ ...state, voicePolicy });
           updateDirectorRunState(confirmed);
-          toast.success("本集自动已启动，正在检查当前进度", { duration: 10000 });
-          nextText = directorAutoRunTransportText(nextText);
+          toast.success(
+            isProjectAuto
+              ? "一键成片已启动，正在检查当前进度"
+              : "本集自动已启动，正在检查当前进度",
+            { duration: 10000 },
+          );
+          nextText = (isProjectAuto
+            ? directorPipelineAutoRunTransportText
+            : directorAutoRunTransportText)(nextText);
         } else if (state.confirmationStage === "awaiting_intervention") {
           nextText = directorAutoInterventionTransportText(nextText);
         } else if (state.confirmationStage === "confirmed") {

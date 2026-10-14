@@ -31,7 +31,7 @@ DRAMACLAW_LOCAL_AGENT_TRUST=1 novelvideo api --host 127.0.0.1 --port 8780
 
 - 只建议绑定 `127.0.0.1`。
 - 不建议在监听 `0.0.0.0` 或局域网可访问时开启。
-- 画布写操作默认仍交给 Freezone 前端执行，以保持即时同步；外部 Agent 在自己的聊天中完成审批后，前端会自动执行，不再打开虾画内置聊天审批。
+- 画布写操作默认仍交给 Freezone 前端执行，以保持即时同步；外部 Agent 在自己的聊天中完成审批后，前端会自动执行，不再打开捏画内置聊天审批。
 - 覆盖、删除、重摄入等高风险业务操作仍应保留业务确认。
 
 ## MCP Server
@@ -92,7 +92,7 @@ python agent-kit/scripts/launch_mcp.py workflows
 }
 ```
 
-如果要操作虾画画布，建议补充当前画布上下文：
+如果要操作捏画画布，建议补充当前画布上下文：
 
 ```json
 {
@@ -138,9 +138,9 @@ MCP freezone 工具
   -> MCP 工具返回结果
 ```
 
-因此，使用 Codex/Claude 操作虾画时，需要浏览器中打开对应 Freezone 页面。这样可以让 React Flow 状态、选中状态、节点尺寸、autosave 和进度显示保持即时同步。
+因此，使用 Codex/Claude 操作捏画时，需要浏览器中打开对应 Freezone 页面。这样可以让 React Flow 状态、选中状态、节点尺寸、autosave 和进度显示保持即时同步。
 
-`DRAMACLAW_EXTERNAL_MCP=1` 只用于外部 Agent 入口。内置 Hermes 不设置该变量，因此仍使用虾画聊天内的审批卡；外部 Agent 则在 Codex / Claude / OpenClaw 自己的聊天中确认，确认后前端自动执行命令，不弹出虾画聊天审批。
+`DRAMACLAW_EXTERNAL_MCP=1` 只用于外部 Agent 入口。内置 Hermes 不设置该变量，因此仍使用捏画聊天内的审批卡；外部 Agent 则在 Codex / Claude / OpenClaw 自己的聊天中确认，确认后前端自动执行命令，不弹出捏画聊天审批。
 
 当外部 Agent 真正运行图片或视频节点时，授权 MCP 会在审批和画布写入前执行参数预检。
 如果模型、比例、分辨率/质量、时长、声音开关或数量仍有缺项，会返回

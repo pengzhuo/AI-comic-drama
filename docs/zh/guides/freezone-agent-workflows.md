@@ -323,7 +323,7 @@ Agent 不应手写大段 `create_node/create_edge/group_nodes` JSON，除非是�
 Agent 无内容、桥接超时、pending 文件残留等内部问题，应转成用户可理解文案。例如：
 
 - 不显示 `(hermes returned no content)`。
-- 改为“这轮操作没有收到虾导的有效回复，请稍后重试。”
+- 改为“这轮操作没有收到捏导的有效回复，请稍后重试。”
 - 对画布桥接超时，要说明“前端未在限定时间内完成操作”，而不是暴露 pending/result 文件路径。
 
 ## 9. 新增工作流流程

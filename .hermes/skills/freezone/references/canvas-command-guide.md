@@ -1,4 +1,4 @@
-# 虾画画布命令指南
+# 捏画画布命令指南
 
 ## 执行流程（强制顺序，不可跳过）
 
@@ -41,7 +41,7 @@
 
 只有同时满足以下条件时，才使用本指南：
 
-- 当前聊天界面是 Freezone/虾画/canvas，或用户消息提到画布节点。
+- 当前聊天界面是 Freezone/捏画/canvas，或用户消息提到画布节点。
 - prompt 中包含 `[SUPERTALE_CANVAS_ONTOLOGY_CONTEXT]`、`[SUPERTALE_CANVAS_NODE_REFERENCES]` 或 `[SUPERTALE_CANVAS_CHAT_COMMANDS]`。
 - 用户要求操作引用节点、当前选中、节点组，或创建独立节点。
 

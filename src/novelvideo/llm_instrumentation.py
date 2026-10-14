@@ -682,6 +682,37 @@ async def _forward_litellm_success(
     )
 
 
+def _guard_litellm_context_budget(args: tuple, kwargs: dict) -> None:
+    """Fail fast when a LiteLLM text request would exceed the context budget.
+
+    LiteLLM/Cognee calls bypass the PydanticAI wrapper, so they need the same
+    guard. Raises ``MODEL_CONTEXT_BUDGET_EXCEEDED`` (a ``ValueError``) before
+    transport. Skips silently when messages are not plain dicts.
+    """
+
+    messages = kwargs.get("messages")
+    if messages is None and len(args) > 1:
+        messages = args[1]
+    if not isinstance(messages, list) or not messages:
+        return
+    if not all(isinstance(message, dict) for message in messages):
+        return
+    try:
+        from novelvideo.utils.model_context_budget import guard_payload
+    except Exception:  # pragma: no cover - defensive import guard
+        return
+    model = str(kwargs.get("model") or (args[0] if args else "") or "").strip()
+    settings: dict = {"max_tokens": kwargs.get("max_tokens")}
+    completion_cap = kwargs.get("max_completion_tokens")
+    if completion_cap is not None:
+        settings["extra_body"] = {"max_completion_tokens": completion_cap}
+    guard_payload(
+        {"messages": messages, "tools": kwargs.get("tools")},
+        settings,
+        model=model or None,
+    )
+
+
 def _patch_litellm_acompletion(litellm_module: object) -> None:
     global _litellm_acompletion_patched
     if _litellm_acompletion_patched:
@@ -691,6 +722,7 @@ def _patch_litellm_acompletion(litellm_module: object) -> None:
         return
 
     async def _tracked_acompletion(*args, **kwargs):
+        _guard_litellm_context_budget(args, kwargs)
         if _MODEL_CALL_INSTRUMENTATION_ACTIVE.get() or not _USER_CTX.get():
             return await original_acompletion(*args, **kwargs)
         model = str(kwargs.get("model") or (args[0] if args else "") or "").strip()

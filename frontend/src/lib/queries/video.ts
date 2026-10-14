@@ -634,7 +634,7 @@ export function useTrimSeedance2Asset(project: string, episode: number) {
 export function useGenerateSeedance2Prompt(project: string, episode: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({
+    mutationFn: async ({
       beatNum,
       manualPromptReference,
       promptGuidance,
@@ -644,10 +644,15 @@ export function useGenerateSeedance2Prompt(project: string, episode: number) {
       manualPromptReference?: string;
       promptGuidance?: string;
       promptGuidanceTemplateKeys?: string[];
-    }) =>
-      jsonWithBackendError<OkResponse<Seedance2PromptResult> | ErrorResponse>(
+    }): Promise<OkResponse<Seedance2PromptResult> | ErrorResponse> => {
+      // Enqueue the optimization, then poll. The composer's upstream model can
+      // take minutes (and occasionally hang), so a held-open request is fragile;
+      // enqueue-and-poll keeps the UI responsive and the server bounded.
+      const enqueued = await jsonWithBackendError<
+        OkResponse<{ status: string }> | ErrorResponse
+      >(
         api.post(
-          p`api/v1/projects/${project}/episodes/${episode}/beats/${beatNum}/seedance2-prompt/generate`,
+          p`api/v1/projects/${project}/episodes/${episode}/beats/${beatNum}/seedance2-prompt/generate-async`,
           {
             json: {
               manual_prompt_reference: manualPromptReference ?? "",
@@ -655,12 +660,43 @@ export function useGenerateSeedance2Prompt(project: string, episode: number) {
               prompt_guidance_template_keys: promptGuidanceTemplateKeys ?? [],
             },
             throwHttpErrors: false,
-            // The composer runs a multi-step LLM loop (several sequential model
-            // calls) and can take minutes end-to-end, far past the 30s default.
-            timeout: 600_000,
           },
         ),
-      ),
+      );
+      if (!enqueued.ok) return enqueued;
+
+      const deadline = Date.now() + 15 * 60 * 1000;
+      let firstPoll = true;
+      while (Date.now() < deadline) {
+        if (!firstPoll) await new Promise((resolve) => setTimeout(resolve, 3000));
+        firstPoll = false;
+        let status: OkResponse<{ status: string; data?: Seedance2PromptResult; error?: string }> | ErrorResponse;
+        try {
+          status = await api
+            .get(
+              p`api/v1/projects/${project}/episodes/${episode}/beats/${beatNum}/seedance2-prompt/generate-async-status`,
+              { throwHttpErrors: false },
+            )
+            .json<
+              | OkResponse<{ status: string; data?: Seedance2PromptResult; error?: string }>
+              | ErrorResponse
+            >();
+        } catch {
+          continue;
+        }
+        if (!status.ok) return status;
+        const jobStatus = status.data.status;
+        if (jobStatus === "succeeded") {
+          const data = status.data.data;
+          if (!data) return { ok: false, error: "" } as ErrorResponse;
+          return { ok: true, data } as OkResponse<Seedance2PromptResult>;
+        }
+        if (jobStatus === "failed") {
+          return { ok: false, error: status.data.error || "" } as ErrorResponse;
+        }
+      }
+      return { ok: false, error: "timeout" } as ErrorResponse;
+    },
     onSuccess: (res, { beatNum }) => {
       if (!res.ok) return;
       const patched = res.data.beat;

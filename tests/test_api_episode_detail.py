@@ -413,7 +413,7 @@ async def test_list_episodes_reports_zero_for_unsplit_episode(tmp_path, monkeypa
 
 @pytest.mark.asyncio
 async def test_list_episodes_closes_the_store_on_the_normal_path(tmp_path, monkeypatch):
-    """分集列表是进虾镜的必经一跳，漏关连接的代价按访问次数累积。
+    """分集列表是进捏镜的必经一跳，漏关连接的代价按访问次数累积。
 
     这里断言的是 ``close()`` 被调用了一次，不是返回码——裸 factory 的版本返回码
     一样是 200，只是每回都留下一条 aiosqlite 连接和一个后台线程。

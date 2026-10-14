@@ -9,6 +9,7 @@ from typing import Any
 
 from novelvideo.ports import get_cancellation_store
 from novelvideo.ports.tasks import cancel_key
+from novelvideo.task_backend.task_clock import TaskClock, current_task_clock
 
 
 class TaskCancelled(Exception):
@@ -80,6 +81,7 @@ async def await_with_cancel_watch(
     scope: str | None = None,
     deadline_monotonic: float | None = None,
     timeout_seconds: int | None = None,
+    clock: TaskClock | None = None,
     poll_seconds: float = 0.5,
 ):
     """Await a coroutine while polling the project task cancel flag.
@@ -87,18 +89,32 @@ async def await_with_cancel_watch(
     Celery revoke/terminate is process-level and may not interrupt an active
     async HTTP await quickly. Async runners should wrap their long-running
     coroutine with this helper so user cancellation raises TaskCancelled.
+
+    When ``clock`` is supplied its *rolling* deadline is consulted on every
+    poll, so a task that keeps reporting progress is never marked timed out;
+    only an idle (no-progress) window trips the timeout.
     """
-    if not task_id and deadline_monotonic is None:
+    if (
+        not task_id
+        and deadline_monotonic is None
+        and (clock is None or not clock.enabled)
+    ):
         return await coro
 
     main_task = asyncio.create_task(coro)
     stop_reason: str | None = None
 
+    def _deadline() -> float | None:
+        if clock is not None:
+            return clock.deadline_monotonic
+        return deadline_monotonic
+
     async def _watch() -> None:
         nonlocal stop_reason
         try:
             while not main_task.done():
-                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                deadline = _deadline()
+                if deadline is not None and time.monotonic() >= deadline:
                     stop_reason = "timeout"
                     main_task.cancel()
                     return
@@ -122,10 +138,11 @@ async def await_with_cancel_watch(
                     main_task.cancel()
                     return
                 sleep_seconds = poll_seconds
-                if deadline_monotonic is not None:
+                deadline = _deadline()
+                if deadline is not None:
                     sleep_seconds = min(
                         sleep_seconds,
-                        max(deadline_monotonic - time.monotonic(), 0.0),
+                        max(deadline - time.monotonic(), 0.0),
                     )
                 await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:
@@ -136,7 +153,12 @@ async def await_with_cancel_watch(
         return await main_task
     except asyncio.CancelledError:
         if stop_reason == "timeout":
-            raise TaskTimedOut(timeout_seconds=timeout_seconds)
+            effective_seconds = (
+                clock.idle_seconds
+                if clock is not None and clock.enabled
+                else timeout_seconds
+            )
+            raise TaskTimedOut(timeout_seconds=effective_seconds)
         raise TaskCancelled()
     finally:
         watcher.cancel()
@@ -170,6 +192,21 @@ def remaining_timeout_seconds(
     default_seconds: int | None = None,
 ) -> int | None:
     """Return seconds remaining before this task's cooperative deadline."""
+
+    clock = current_task_clock()
+    if clock is not None:
+        if not clock.enabled:
+            return default_seconds
+        remaining = clock.remaining_seconds()
+        if remaining is None:
+            return default_seconds
+        if remaining <= 0:
+            raise TaskTimedOut(timeout_seconds=clock.idle_seconds)
+        deadline_seconds = max(math.ceil(remaining), 1)
+        if default_seconds is None:
+            return deadline_seconds
+        return max(min(int(default_seconds), deadline_seconds), 1)
+
     deadline_monotonic = _optional_float(envelope.get("__deadline_monotonic"))
     timeout_seconds = _optional_int(envelope.get("__timeout_seconds"))
     if deadline_monotonic is None:
@@ -242,6 +279,7 @@ async def await_envelope_with_cancel_watch(
         **fields,
         deadline_monotonic=_optional_float(envelope.get("__deadline_monotonic")),
         timeout_seconds=_optional_int(envelope.get("__timeout_seconds")),
+        clock=current_task_clock(),
     )
 
 
@@ -254,8 +292,16 @@ def raise_if_envelope_cancel_requested(
     scope: str | None = None,
 ) -> None:
     """Synchronous cancellation checkpoint for non-async runner boundaries."""
+    clock = current_task_clock()
+    if clock is not None and clock.is_stalled():
+        raise TaskTimedOut(timeout_seconds=clock.idle_seconds)
+
     deadline_monotonic = _optional_float(envelope.get("__deadline_monotonic"))
-    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+    if (
+        clock is None
+        and deadline_monotonic is not None
+        and time.monotonic() >= deadline_monotonic
+    ):
         raise TaskTimedOut(timeout_seconds=_optional_int(envelope.get("__timeout_seconds")))
 
     fields = _envelope_cancel_fields(

@@ -152,11 +152,11 @@ def test_fresh_create_layout(isolated_workspace, repo_skills, repo_plugins):
     assert _enabled_toolsets(config) == ["hermes-acp", "memory"]
     assert "    - dramaclaw" in config
     assert "    - freezone" not in config
-    assert "你是虾导" in (home / "SOUL.md").read_text()
+    assert "你是捏导" in (home / "SOUL.md").read_text()
     memory = (home / "memories" / "MEMORY.md").read_text()
-    assert "虾导在 DramaClaw 会话中面向用户自称“虾导”" in memory
+    assert "捏导在 DramaClaw 会话中面向用户自称“捏导”" in memory
     assert "不要在普通回复开头自报身份" in memory
-    assert "我是虾导，DramaClaw 的小说转视频创作助手。" not in memory
+    assert "我是捏导，DramaClaw 的小说转视频创作助手。" not in memory
 
 
 def test_project_workspace_keeps_hermes_native_state_under_project(
@@ -377,7 +377,7 @@ def test_freezone_profile_materializes_native_workflow_skills(
         {
             "id": "ecommerce-ad",
             "name": "电商广告",
-            "description": "动态生成电商广告工作流。 适用于：商品广告、带货视频。 选择后使用虾画确定性工具生成动态工作流。",
+            "description": "动态生成电商广告工作流。 适用于：商品广告、带货视频。 选择后使用捏画确定性工具生成动态工作流。",
             "category": "ecommerce",
             "source": "hermes_native_workflow_skill",
             "allowed_recipe_ids": ["ecommerce-ad-image"],
@@ -1230,8 +1230,8 @@ def test_hermes_freezone_tool_limit_message_uses_freezone_context():
         "freezone_put_agent_catalog_recipe"
     )
 
-    assert "虾画" in message
-    assert "虾导" not in message
+    assert "捏画" in message
+    assert "捏导" not in message
     assert "beat" not in message
 
 
@@ -1520,10 +1520,10 @@ def test_legacy_identity_context_is_migrated(
 
     soul = (home / "SOUL.md").read_text(encoding="utf-8")
     memory = (memories / "MEMORY.md").read_text(encoding="utf-8")
-    assert "你是虾导" in soul
+    assert "你是捏导" in soul
     assert "You are Hermes Agent" not in soul
-    assert "我是虾导，DramaClaw 的小说转视频创作助手。" not in memory
-    assert "DramaClaw 管理的虾导会话" in memory
+    assert "我是捏导，DramaClaw 的小说转视频创作助手。" not in memory
+    assert "DramaClaw 管理的捏导会话" in memory
     assert "DramaClaw 管理的 Hermes 会话" not in memory
 
 

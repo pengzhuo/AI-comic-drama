@@ -169,7 +169,7 @@ Hermes Agent + Skill + Recipe + Dynamic Graph
 
 ### 2.1 Hermes 已经是 Agent Runtime
 
-当前实现已经把 Hermes 作为虾导和虾画助手的底层 Agent：
+当前实现已经把 Hermes 作为捏导和捏画助手的底层 Agent：
 
 - `.hermes-version` 固定 Hermes 版本；
 - `src/novelvideo/chat/hermes_pool.py` 管理用户 Worker 和会话恢复；

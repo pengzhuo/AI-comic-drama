@@ -53,6 +53,7 @@ class _FakePipelineStore:
 @pytest.mark.asyncio
 async def test_pipeline_status_uses_sparse_beat_numbers_for_media(monkeypatch, tmp_path):
     from novelvideo.api.routes import pipeline
+    from novelvideo import pipeline_status
     from novelvideo.api.deps import ProjectResolution
 
     async def fake_resolve_project_scope(project, user, *, required_role="viewer"):
@@ -81,14 +82,14 @@ async def test_pipeline_status_uses_sparse_beat_numbers_for_media(monkeypatch, t
     (tmp_path / "grids" / ep_tag).mkdir(parents=True)
     (tmp_path / "grids" / ep_tag / "grid.png").write_bytes(b"x")
 
-    monkeypatch.setattr(pipeline, "_user_has_configured", lambda username, project: True)
+    monkeypatch.setattr(pipeline_status, "_user_has_configured", lambda username, project: True)
     monkeypatch.setattr(
-        pipeline,
+        pipeline_status,
         "compute_portrait_path",
         lambda project_dir, character_name: tmp_path / "portrait.png",
     )
     monkeypatch.setattr(
-        pipeline,
+        pipeline_status,
         "compute_identity_path",
         lambda project_dir, character_name, identity_name: tmp_path / "identity.png",
     )
@@ -109,6 +110,7 @@ async def test_pipeline_status_uses_sparse_beat_numbers_for_media(monkeypatch, t
 async def test_pipeline_status_requires_voice_setup_before_tts(monkeypatch, tmp_path):
     from novelvideo.api.deps import ProjectResolution
     from novelvideo.api.routes import pipeline
+    from novelvideo import pipeline_status
 
     async def fake_resolve_project_scope(project, user, *, required_role="viewer"):
         return ProjectResolution(
@@ -126,15 +128,15 @@ async def test_pipeline_status_requires_voice_setup_before_tts(monkeypatch, tmp_
         return ["Beat 01 解说声线缺失：请上传或录制解说人音频"]
 
     monkeypatch.setattr(pipeline, "resolve_project_scope", fake_resolve_project_scope)
-    monkeypatch.setattr(pipeline, "_collect_voice_prereq_errors", fake_voice_prerequisites)
-    monkeypatch.setattr(pipeline, "_user_has_configured", lambda username, project: True)
+    monkeypatch.setattr(pipeline_status, "_collect_voice_prereq_errors", fake_voice_prerequisites)
+    monkeypatch.setattr(pipeline_status, "_user_has_configured", lambda username, project: True)
     monkeypatch.setattr(
-        pipeline,
+        pipeline_status,
         "compute_portrait_path",
         lambda project_dir, character_name: tmp_path / "portrait.png",
     )
     monkeypatch.setattr(
-        pipeline,
+        pipeline_status,
         "compute_identity_path",
         lambda project_dir, character_name, identity_name: tmp_path / "identity.png",
     )

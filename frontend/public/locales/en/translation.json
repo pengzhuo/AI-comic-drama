@@ -4056,6 +4056,7 @@
         "seedance2PromptGenerated": "Seedance2 prompt optimized",
         "seedance2PromptGeneratedOtherBeat": "Subject prompt optimized and saved back to beat #{{n}}",
         "seedance2PromptGenerateFailed": "Seedance2 prompt generation failed",
+        "seedance2PromptFallback": "AI optimize timed out; filled the rule-based draft, please retry later",
         "videoPrompt": "Video prompt",
         "keyframePrompt": "Single-beat video prompt",
         "generateBeatVideoPrompt": "Generate this beat prompt",

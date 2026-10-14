@@ -48,6 +48,10 @@ from novelvideo.task_backend.registry import (
 )
 from novelvideo.task_backend.projection import PROJECTION_REQUIREMENTS, read_projection
 from novelvideo.task_backend.subprocesses import project_task_subprocess_context
+from novelvideo.task_backend.task_clock import (
+    project_task_clock,
+    resolve_idle_timeout_seconds,
+)
 from novelvideo.task_state import project_task_run_context
 from novelvideo.utils.document_parsers import count_billable_text_chars
 
@@ -579,15 +583,17 @@ async def _emit_project_task_metrics(
 
 
 def _project_task_timeout_seconds() -> int:
-    raw_value = os.environ.get("ST_PROJECT_TASK_TIMEOUT_S")
-    if raw_value:
-        try:
-            return int(raw_value)
-        except ValueError:
-            logger.warning(
-                "Invalid ST_PROJECT_TASK_TIMEOUT_S=%r; using default", raw_value
-            )
-    return 30 * 60
+    """Idle window (seconds) before a silent task is treated as stalled.
+
+    Historically this was a *total* wall-clock budget that abandoned a task once
+    it had run for long enough, regardless of progress.  It is now the
+    no-progress window enforced by
+    :mod:`novelvideo.task_backend.task_clock`: a task that keeps reporting
+    progress may run indefinitely, and only a silent (idle) task is stalled out.
+    ``0`` disables the watchdog.
+    """
+
+    return resolve_idle_timeout_seconds()
 
 
 def _project_task_failure_for_exception(
@@ -618,11 +624,19 @@ def _project_task_failure_for_exception(
     if isinstance(exc, VideoPromptPrerequisiteError):
         return str(exc), {"error_code": exc.error_code}, True
 
+    try:
+        from novelvideo.utils.model_context_budget import ModelContextBudgetExceeded
+
+        if isinstance(exc, ModelContextBudgetExceeded):
+            return str(exc), {"error_code": exc.error_code}, True
+    except Exception:
+        pass
+
     if isinstance(exc, TaskTimedOut):
         timeout_seconds = int(getattr(exc, "timeout_seconds", None) or 30 * 60)
         timeout_minutes = max(round(timeout_seconds / 60), 1)
         return (
-            f"任务超过 {timeout_minutes} 分钟未完成，已自动放弃",
+            f"任务已连续 {timeout_minutes} 分钟无进度更新，判定为卡死并暂停",
             {"error_code": "TASK_TIMEOUT", "timeout_seconds": timeout_seconds},
             True,
         )
@@ -634,7 +648,7 @@ def _project_task_failure_for_exception(
             timeout_seconds = _project_task_timeout_seconds()
             timeout_minutes = max(round(timeout_seconds / 60), 1)
             return (
-                f"任务超过 {timeout_minutes} 分钟未完成，已自动放弃",
+                f"任务已连续 {timeout_minutes} 分钟无进度更新，判定为卡死并暂停",
                 {"error_code": "TASK_TIMEOUT", "timeout_seconds": timeout_seconds},
                 True,
             )
@@ -913,6 +927,7 @@ def run_project_task_core_sync(
     try:
         with (
             project_task_run_context(run_task_id),
+            project_task_clock(timeout_seconds) as clock,
             project_task_subprocess_context(
                 project_id=str(envelope["project_id"]),
                 task_type=task_type,
@@ -982,9 +997,10 @@ def run_project_task_core_sync(
 
             try:
                 envelope["__run_task_id"] = run_task_id
-                if deadline_monotonic is not None:
-                    envelope["__deadline_monotonic"] = deadline_monotonic
-                    envelope["__timeout_seconds"] = timeout_seconds
+                rolling_deadline = clock.deadline_monotonic
+                if rolling_deadline is not None:
+                    envelope["__deadline_monotonic"] = rolling_deadline
+                    envelope["__timeout_seconds"] = clock.idle_seconds
                 # 唯一派发点，绑定本次投递的身份，使闸门总有一个请求作用域的
                 # 身份可读——否则「平台任务，允许」与「调用点漏传参数」都是 None。
                 # 5 个 runner 在自己函数体内另有绑定，嵌套安全（set/reset 成对）。

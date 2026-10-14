@@ -254,6 +254,9 @@ async def ask_openrouter(
             }
         ],
     }
+    from novelvideo.utils.model_context_budget import guard_payload
+
+    guard_payload(payload, {"max_tokens": payload["max_tokens"]}, model=model)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",

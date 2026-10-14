@@ -275,7 +275,7 @@ def _newapi_text_openai_model(
     from pydantic_ai.models.openai import OpenAIChatModel
     from novelvideo.utils.model_context_budget import TextContextBudget
 
-    context_budget = TextContextBudget.from_env()
+    context_budget = TextContextBudget.from_env(model_name)
 
     class _AutoClosingOpenAIChatModel(OpenAIChatModel):
         async def _checked_settings(self, messages, settings, parameters):

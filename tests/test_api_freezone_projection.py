@@ -266,7 +266,7 @@ def test_projection_group_id_is_unique_per_non_ascii_asset() -> None:
 
     组 id 由 projection_key 清洗而来，中文角色名被 ``[^A-Za-z0-9]`` 全部换成 ``_``、
     再 strip 掉，两个角色都塌成 ``projection_group_asset_character``——第二个角色
-    进虾画时组名被换、两个角色的节点挤进同一个组。
+    进捏画时组名被换、两个角色的节点挤进同一个组。
     """
     from novelvideo.api.routes import freezone
 

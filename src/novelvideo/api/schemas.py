@@ -1836,7 +1836,11 @@ FreezoneVideoOmniGenRequest.model_rebuild()
 class FreezoneTextTranslateRequest(BaseModel):
     """Freezone 文本工具：中英文互译请求。"""
 
-    text: str = Field(description="待翻译的原始文本或提示词")
+    text: str = Field(
+        min_length=1,
+        max_length=50_000,
+        description="待翻译的原始文本或提示词（超长请分块）",
+    )
     node_type: Literal["generic", "image", "video", "audio", "text"] = Field(
         default="generic",
         description="使用场景。用于帮助翻译器按节点类型保留合适的提示词语气",
@@ -1975,7 +1979,8 @@ class FreezoneStoryScriptGenerateRequest(BaseModel):
 
     source_text: str = Field(
         default="",
-        description="已上传剧本的文本内容。与 source_url / video_url / character_refs 至少提供一个",
+        max_length=200_000,
+        description="已上传剧本的文本内容（超长请分块）。与 source_url / video_url / character_refs 至少提供一个",
     )
     source_url: Optional[str] = Field(
         default=None,

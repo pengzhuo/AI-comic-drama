@@ -364,12 +364,16 @@ def call_openai_chat(
     else:
         user_content = user_prompt
 
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    from novelvideo.utils.model_context_budget import guard_payload
+
+    guard_payload({"messages": messages}, None, model=model)
     response = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
+        messages=messages,
     )
     message = response.choices[0].message.content
     if not message:
