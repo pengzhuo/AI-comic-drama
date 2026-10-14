@@ -1,0 +1,2082 @@
+"""Celery runners for Image Freezone jobs."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from novelvideo.i18n_message import MessageLike, lmsg
+from novelvideo.egress_context import (
+    TRUSTED_EGRESS_CONTEXT_KEY,
+    TrustedEgressContext,
+    TrustedRunnerEnvelope,
+)
+from novelvideo.ports import get_usage_meter
+from novelvideo.project_context import ProjectContext
+from novelvideo.task_backend.cancel import (
+    TaskCancelled,
+    TaskTimedOut,
+    await_envelope_with_cancel_watch,
+    await_with_cancel_watch as _await_with_cancel_watch,
+)
+from novelvideo.task_backend.registry import register_project_task_runner
+from novelvideo.task_backend.envelope import InvalidTaskEnvelope
+from novelvideo.task_backend.projection import read_projection
+from novelvideo.task_identity import project_task_state_key
+from novelvideo.task_state import get_task_manager
+
+
+logger = logging.getLogger(__name__)
+
+
+async def _run_image_output(envelope: dict[str, Any], ctx: ProjectContext, *, vectorize: bool) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.image_outputs import transcode_gif, vectorize_image
+    from novelvideo.freezone.paths import output_path_for_job
+
+    payload = envelope.get("payload") or {}
+    project_dir = Path(ctx.output_dir).resolve()
+    source = Path(str(payload["source_path" if vectorize else "video_path"])).resolve()
+    if not source.is_relative_to(project_dir):
+        raise ValueError("素材不属于当前项目。")
+    job_id = str(payload["job_id"])
+    if not job_id or Path(job_id).name != job_id or job_id in {".", ".."}:
+        raise ValueError("Invalid job id")
+    task_type = "freezone_image_vectorize" if vectorize else "freezone_image_animate_gif"
+    output = output_path_for_job(project_dir, task_type, job_id).with_suffix(".svg" if vectorize else ".gif")
+    await (vectorize_image(source, output) if vectorize else transcode_gif(source, output))
+    url = make_static_url_for_context(ctx, output.relative_to(project_dir).as_posix(), local_path=output)
+    return {"job_id": job_id, "svg_url" if vectorize else "gif_url": url, "output_url": url, "url": url}
+
+
+async def _run_freezone_image_animate_gif_async(envelope, ctx):
+    return await _run_image_output(envelope, ctx, vectorize=False)
+
+
+def run_freezone_image_animate_gif(envelope, ctx):
+    return _run_cancellable(envelope, _run_freezone_image_animate_gif_async(envelope, ctx))
+
+
+def run_freezone_image_vectorize(envelope, ctx):
+    return _run_cancellable(envelope, _run_image_output(envelope, ctx, vectorize=True))
+
+
+AGENT_PRODUCT_TASK_TYPES = (
+    "freezone_agent_workflow_result",
+    "freezone_agent_recipe_result",
+    "freezone_agent_workflow_generate",
+    "freezone_agent_recipe_generate",
+)
+
+
+async def _run_freezone_agent_product_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    """Wait for a trusted, persisted product result before EE settlement."""
+    from novelvideo.freezone.agent_product_operations import (
+        AgentProductSettlementPending,
+        PENDING_STATUSES,
+        RECIPE_COMPILE_MESSAGES,
+        is_recipe_compile_receipt,
+        is_recipe_direct_audio_receipt,
+        read_agent_product_operation,
+    )
+
+    payload = (
+        envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
+    )
+    operation_id = str(payload.get("operation_id") or "").strip()
+    product_kind = str(payload.get("product_kind") or "").strip()
+    run_task_id = str(envelope.get("__run_task_id") or "").strip()
+    if not operation_id or not product_kind or not run_task_id:
+        raise ValueError("agent product task payload is incomplete")
+    logger.info(
+        "agent_product_waiter.start task_type=%s task_id=%s operation_id=%s product_kind=%s",
+        str(envelope.get("task_type") or ""),
+        run_task_id,
+        operation_id,
+        product_kind,
+    )
+    while True:
+        operation = await asyncio.to_thread(
+            read_agent_product_operation,
+            project_dir=Path(ctx.state_dir),
+            operation_id=operation_id,
+        )
+        if operation is None:
+            raise RuntimeError("agent product operation disappeared")
+        if operation["product_kind"] != product_kind:
+            raise RuntimeError("agent product operation kind changed")
+        bound_task_id = str(operation.get("task_id") or "")
+        if bound_task_id and bound_task_id != run_task_id:
+            raise RuntimeError("agent product operation is bound to another task")
+        status = str(operation.get("status") or "")
+        logger.info(
+            "agent_product_waiter.observed task_id=%s operation_id=%s "
+            "product_kind=%s operation_status=%s bound_task_id=%s "
+            "has_model_evidence=%s has_result_ref=%s",
+            run_task_id,
+            operation_id,
+            product_kind,
+            status,
+            bound_task_id or "none",
+            bool((operation.get("model_evidence") or {}).get("model_call_id")),
+            bool(operation.get("result_ref")),
+        )
+        if status == "delivered":
+            evidence = operation.get("model_evidence") or {}
+            result_ref = operation.get("result_ref") or {}
+            if is_recipe_compile_receipt(product_kind, operation_id, result_ref):
+                reason = result_ref["reason"]
+                return {
+                    "ok": True,
+                    "operation_id": operation_id,
+                    "product_kind": product_kind,
+                    "delivery_status": "delivered",
+                    "compile_mode": reason,
+                    "message": RECIPE_COMPILE_MESSAGES[reason],
+                    "result_ref": result_ref,
+                }
+            direct_audio_delivery = False
+            if not evidence.get("model_call_id"):
+                direct_audio_delivery = await asyncio.to_thread(
+                    is_recipe_direct_audio_receipt,
+                    project_dir=Path(ctx.state_dir),
+                    operation=operation,
+                )
+            if (
+                not evidence.get("model_call_id") and not direct_audio_delivery
+            ) or not result_ref.get("id"):
+                raise RuntimeError(
+                    "agent product result lacks trusted delivery evidence"
+                )
+            return {
+                "ok": True,
+                "operation_id": operation_id,
+                "product_kind": product_kind,
+                "delivery_status": "delivered",
+                "model_evidence": evidence,
+                "result_ref": result_ref,
+            }
+        if status in {"failed", "cancelled"}:
+            raise RuntimeError(
+                f"agent product generation ended without delivery: {status}"
+            )
+        if status not in PENDING_STATUSES:
+            raise RuntimeError(f"invalid agent product operation status: {status}")
+        if product_kind == "recipe_result":
+            metadata = operation.get("metadata") or {}
+            run_id = str(metadata.get("workflow_run_id") or "").strip()
+            canvas_id = str(operation.get("canvas_id") or "").strip()
+            if run_id and canvas_id:
+                from novelvideo.freezone.workflow_runs import read_workflow_run
+
+                run = await asyncio.to_thread(
+                    read_workflow_run,
+                    project_dir=Path(ctx.state_dir),
+                    canvas_id=canvas_id,
+                    run_id=run_id,
+                )
+                run_status = str((run or {}).get("status") or "")
+                if run_status in {"cancelled", "failed", "interrupted", "completed"}:
+                    # Keep the operation and its credit reservation available for
+                    # a late provider result, but do not occupy a worker slot for
+                    # the remainder of the generic 30-minute task timeout.
+                    raise AgentProductSettlementPending(
+                        operation_id=operation_id,
+                        status=f"workflow_{run_status}",
+                    )
+                lease_expires_at = str((run or {}).get("lease_expires_at") or "")
+                if run_status == "running" and lease_expires_at:
+                    try:
+                        expires_at = datetime.fromisoformat(
+                            lease_expires_at.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        expires_at = None
+                    if (
+                        expires_at is not None
+                        and expires_at.tzinfo is not None
+                        and expires_at <= datetime.now(timezone.utc)
+                    ):
+                        raise AgentProductSettlementPending(
+                            operation_id=operation_id,
+                            status="workflow_lease_expired",
+                        )
+            # The media task this waits for runs on the same lane. Polling here
+            # would hold the slot it needs (#700); delivery paths settle late.
+            raise AgentProductSettlementPending(
+                operation_id=operation_id,
+                status="awaiting_delivery",
+            )
+        if product_kind == "workflow_result":
+            # Draft delivery reconciles this operation independently. Waiting
+            # here can occupy every default-lane slot before media work runs.
+            logger.warning(
+                "agent_product_waiter.deferred task_id=%s operation_id=%s "
+                "product_kind=%s operation_status=%s reason=awaiting_delivery "
+                "task_projection=running",
+                run_task_id,
+                operation_id,
+                product_kind,
+                status,
+            )
+            raise AgentProductSettlementPending(
+                operation_id=operation_id,
+                status="awaiting_delivery",
+            )
+        await asyncio.sleep(0.2)
+
+
+def run_freezone_agent_product(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    try:
+        return _run_cancellable(
+            envelope,
+            _run_freezone_agent_product_async(envelope, ctx),
+            task_type=str(envelope.get("task_type") or ""),
+        )
+    except (TaskTimedOut, TaskCancelled) as exc:
+        # A product result can arrive after the local worker deadline. Preserve
+        # the reservation for the authenticated result path to reconcile; an
+        # ordinary timeout must never turn an unknown provider outcome into a
+        # refund.
+        from novelvideo.freezone.agent_product_operations import (
+            AgentProductSettlementPending,
+            PENDING_STATUSES,
+            read_agent_product_operation,
+        )
+
+        payload = (
+            envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
+        )
+        operation_id = str(payload.get("operation_id") or "").strip()
+        operation = (
+            read_agent_product_operation(
+                project_dir=Path(ctx.state_dir), operation_id=operation_id
+            )
+            if operation_id
+            else None
+        )
+        status = str((operation or {}).get("status") or "")
+        preserve_statuses = (
+            PENDING_STATUSES
+            if isinstance(exc, TaskTimedOut)
+            else {"running", "accepted", "submitted"}
+        )
+        if status in preserve_statuses:
+            raise AgentProductSettlementPending(
+                operation_id=operation_id, status=status
+            ) from exc
+        raise
+
+
+async def _run_freezone_workflow_confirm_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    """Wait for the browser's durable canvas outcome before task settlement."""
+    from novelvideo.freezone.workflow_drafts import read_workflow_draft
+
+    payload = (
+        envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
+    )
+    canvas_id = str(payload.get("canvas_id") or "").strip()
+    draft_id = str(payload.get("draft_id") or "").strip()
+    revision = int(payload.get("revision") or 0)
+    plan_digest = str(payload.get("plan_digest") or "").strip()
+    attempt_started_at = payload.get("confirmation_started_at")
+    run_task_id = str(envelope.get("__run_task_id") or "").strip()
+    if (
+        not canvas_id
+        or not draft_id
+        or revision <= 0
+        or not plan_digest
+        or not run_task_id
+    ):
+        raise ValueError("workflow confirmation task payload is incomplete")
+
+    try:
+        while True:
+            draft, error = await asyncio.to_thread(
+                read_workflow_draft,
+                project_dir=Path(ctx.state_dir),
+                canvas_id=canvas_id,
+                draft_id=draft_id,
+            )
+            if draft is None:
+                raise RuntimeError(error or "workflow confirmation draft disappeared")
+            if int(draft.get("revision") or 0) != revision:
+                raise RuntimeError("workflow confirmation draft revision changed")
+            if str(draft.get("plan_digest") or "") != plan_digest:
+                raise RuntimeError("workflow confirmation plan changed")
+            # A same-task rejection resets ready's timestamp. Report the
+            # delivery rejection rather than misclassifying it as a newer run.
+            same_task_rejected = (
+                draft.get("status") == "ready"
+                and str(draft.get("task_id") or "") == run_task_id
+                and draft.get("confirmation_started_at") is None
+            )
+            if attempt_started_at is not None and not same_task_rejected and (
+                draft.get("confirmation_started_at") != attempt_started_at
+            ):
+                raise RuntimeError("workflow confirmation attempt changed")
+            bound_task_id = str(draft.get("task_id") or "")
+            if bound_task_id and bound_task_id != run_task_id:
+                raise RuntimeError(
+                    "workflow confirmation draft is bound to another task"
+                )
+
+            status = str(draft.get("status") or "")
+            if status == "confirmed":
+                return {
+                    "ok": True,
+                    "draft_id": draft_id,
+                    "canvas_id": canvas_id,
+                    "revision": revision,
+                    "plan_digest": plan_digest,
+                    "delivery_status": "canvas_applied",
+                }
+            if status == "ready":
+                raise RuntimeError("workflow canvas operation was not delivered")
+            if status not in {"confirming", "submitted"}:
+                raise RuntimeError(f"invalid workflow confirmation status: {status}")
+            await asyncio.sleep(0.2)
+    except BaseException:
+        from novelvideo.freezone.workflow_drafts import (
+            finish_workflow_draft_confirmation,
+        )
+
+        try:
+            await asyncio.to_thread(
+                finish_workflow_draft_confirmation,
+                project_dir=Path(ctx.state_dir),
+                canvas_id=canvas_id,
+                draft_id=draft_id,
+                outcome="ready",
+                expected_task_id=run_task_id,
+                expected_confirmation_started_at=attempt_started_at,
+            )
+        except ValueError:
+            # A newer confirmation task owns the draft; the old task may fail,
+            # but must not roll back the newer presentation state.
+            pass
+        raise
+
+
+def run_freezone_workflow_confirm(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    return _run_cancellable(
+        envelope,
+        _run_freezone_workflow_confirm_async(envelope, ctx),
+        task_type="freezone_workflow_confirm",
+    )
+
+
+def _run_cancellable(
+    envelope: dict[str, Any],
+    coro,
+    *,
+    task_type: str | None = None,
+) -> dict[str, Any]:
+    return asyncio.run(
+        await_envelope_with_cancel_watch(
+            coro,
+            envelope,
+            task_type=task_type or str(envelope.get("task_type") or ""),
+        )
+    )
+
+
+def _extract_trusted_egress_context(
+    envelope: dict[str, Any],
+) -> TrustedEgressContext | None:
+    if type(envelope) is TrustedRunnerEnvelope:
+        context = envelope.get(TRUSTED_EGRESS_CONTEXT_KEY)
+        if type(context) is not TrustedEgressContext:
+            raise InvalidTaskEnvelope() from None
+        return context
+    if type(envelope) is not dict or TRUSTED_EGRESS_CONTEXT_KEY in envelope:
+        raise InvalidTaskEnvelope() from None
+    return None
+
+
+class LeafEgress(Enum):
+    """leaf 会不会出网。这是分发判据本身，与它的签名长什么样无关。"""
+
+    LOCAL = "local"
+    """纯本地：ffmpeg/subprocess，不出网、不取凭证。组织一律放行。"""
+
+    NETWORK = "network"
+    """出网：必须声明并接收 `egress_context`，由本函数注入。"""
+
+    DENIED = "denied"
+    """已知出网但尚未声明契约：组织下拒。与「未列入表」同待遇，列出来只为留证据。"""
+
+
+@dataclass(frozen=True, slots=True)
+class LeafEgressRule:
+    module: str
+    egress: LeafEgress
+    eg_id: str
+
+
+# 键是**调用点显式给出的名字**，不是函数对象：19 个调用点的 import 都在 runner
+# 函数体内，测试替换掉的是那个局部名，模块级建的对象表必然查不中；`leaf.__name__`
+# 同理（假 leaf 叫别的名字）。名字由调用点提供，替身也就盖不住分类。
+FREEZONE_LEAF_EGRESS: dict[str, LeafEgressRule] = {
+    # EG-20a `tool.local.restricted`（egress-inventory.md:54，`service/local`）
+    "run_freezone_extract_frames": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.LOCAL, "EG-20a"
+    ),
+    "run_freezone_video_compose": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.LOCAL, "EG-20a"
+    ),
+    "run_freezone_video_erase": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.LOCAL, "EG-20a"
+    ),
+    "run_freezone_audio_separate": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.LOCAL, "EG-20a"
+    ),
+    # EG-18b `freezone.image.generate`（:52，`gateway-routed`）
+    # 视频增强也通过媒体模型网关出网；leaf 内部的慢放阶段仍由受限 ffmpeg 执行。
+    "run_freezone_video_upscale": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.NETWORK, "EG-18b"
+    ),
+    "run_freezone_gen": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.NETWORK, "EG-18b"
+    ),
+    "run_freezone_edit": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.NETWORK, "EG-18b"
+    ),
+    "run_freezone_mask_edit": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.NETWORK, "EG-18b"
+    ),
+    "run_freezone_analyze_shots": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.NETWORK, "EG-18b"
+    ),
+    # 逐帧拉片：本地 ffmpeg 抽帧/切片 + 一跳 Vision，出网点与 analyze_shots 相同。
+    "run_freezone_video_breakdown": LeafEgressRule(
+        "novelvideo.freezone.jobs", LeafEgress.NETWORK, "EG-18b"
+    ),
+    "reverse_prompt_from_image": LeafEgressRule(
+        "novelvideo.freezone.image_node", LeafEgress.NETWORK, "EG-18b"
+    ),
+    # EG-18a `freezone.text.generate` / `.structured`（:51，`gateway-routed`）
+    "translate_freezone_text": LeafEgressRule(
+        "novelvideo.freezone.text_node", LeafEgress.NETWORK, "EG-18a"
+    ),
+    "generate_freezone_text": LeafEgressRule(
+        "novelvideo.freezone.text_node", LeafEgress.NETWORK, "EG-18a"
+    ),
+    "generate_freezone_story_script": LeafEgressRule(
+        "novelvideo.freezone.text_node", LeafEgress.NETWORK, "EG-18a"
+    ),
+    "generate_freezone_story_script_with_vision": LeafEgressRule(
+        "novelvideo.freezone.text_node", LeafEgress.NETWORK, "EG-18a"
+    ),
+    # EG-15a `audio.tts.gateway`（:46，`gateway-routed`）
+    "generate_freezone_audio_speech": LeafEgressRule(
+        "novelvideo.freezone.audio_node", LeafEgress.NETWORK, "EG-15a"
+    ),
+    # 音乐与语音是同一个出网点的两个一跳调用方：都经 `_write_newapi_audio_speech`，
+    # claim 的 capability 也都是 `audio.tts.gateway`（`audio_node.py:558`）。
+    "generate_freezone_audio_eleven_music": LeafEgressRule(
+        "novelvideo.freezone.audio_node", LeafEgress.NETWORK, "EG-15a"
+    ),
+    # EG-09a/09b：经 NanoBananaGridGenerator 出图，newapi 走网关，其余 provider 在
+    # `nanobanana_grid.py:141` 对组织抛 ORG_EGRESS_DENIED。
+    "convert_control_frame_to_sketch": LeafEgressRule(
+        "novelvideo.director_world.control_frame_to_sketch",
+        LeafEgress.NETWORK,
+        "EG-09a",
+    ),
+}
+
+
+def _call_freezone_leaf(
+    envelope: dict[str, Any],
+    leaf,
+    leaf_name: str,
+    /,
+    **kwargs: Any,
+):
+    """按 leaf 是否出网分发。`leaf_name` 必填——漏传是 TypeError，不是静默放行。"""
+
+    context = _extract_trusted_egress_context(envelope)
+    rule = FREEZONE_LEAF_EGRESS.get(leaf_name)
+    if rule is not None:
+        if rule.egress is LeafEgress.LOCAL:
+            return leaf(**kwargs)
+        if rule.egress is LeafEgress.NETWORK:
+            # 组织任务必须携带受信任的组织身份以走网关；平台与个人任务
+            # 保持无组织上下文的既有直连语义，不能误触发组织出网闸门。
+            if context is not None and context.is_organization:
+                return leaf(egress_context=context, **kwargs)
+            return leaf(**kwargs)
+    # 未分类与 DENIED 同待遇：默认 fail-closed。
+    if context is not None and context.is_organization:
+        raise InvalidTaskEnvelope() from None
+    return leaf(**kwargs)
+
+
+def _update(
+    ctx: ProjectContext,
+    task_type: str,
+    scope: str,
+    progress: float,
+    current_task: MessageLike,
+    *,
+    episode: int = 0,
+) -> None:
+    get_task_manager().update_progress_for_project(
+        ctx,
+        task_type,
+        int(episode),
+        scope=scope,
+        progress=progress,
+        current_task=current_task,
+        logs=[current_task],
+    )
+
+
+def _append_node_history(
+    *,
+    ctx: ProjectContext,
+    project_dir: Path,
+    payload: dict[str, Any],
+    task_type: str,
+    job_id: str,
+    media_type: str,
+    result: dict[str, Any],
+    error: str | None = None,
+    episode: int = 0,
+    beat_num: int | None = None,
+    scope: str | None = None,
+    **extra: Any,
+) -> dict[str, Any] | None:
+    node_id = str(payload.get("node_id") or "").strip()
+    if not node_id:
+        return None
+    from novelvideo.freezone.history import (
+        append_generation_history,
+        build_node_history_record,
+    )
+
+    # Text/audio nodes carry the user text under "input"; image nodes use "prompt".
+    for key in ("generation_attempt_id", "product_operation_id"):
+        if payload.get(key):
+            extra[key] = str(payload[key])
+    record = build_node_history_record(
+        task_type=task_type,
+        job_id=job_id,
+        task_key=project_task_state_key(
+            task_type,
+            ctx.project_id,
+            int(episode),
+            beat_num=beat_num,
+            scope=scope or job_id,
+        ),
+        status="failed" if error else "completed",
+        media_type=media_type,
+        result=result,
+        error=error,
+        prompt=payload.get("prompt") or payload.get("input"),
+        extra=extra,
+    )
+
+    return append_generation_history(
+        project_dir=project_dir,
+        canvas_id=str(payload.get("canvas_id") or "default"),
+        node_id=node_id,
+        record=record,
+    )
+
+
+def _history_model_mode_extra(payload: dict) -> dict:
+    """记忆包：把生成请求里的注册表 model id / 生成模式映射到历史记录顶层字段。
+
+    仅非空时写入，缺省省略（向后兼容，还原时回退默认）。
+    """
+    extra: dict[str, str] = {}
+    model_id = payload.get("model_id")
+    if model_id:
+        extra["model"] = str(model_id)
+    gen_mode = payload.get("gen_mode")
+    if gen_mode:
+        extra["gen_mode"] = str(gen_mode)
+    return extra
+
+
+async def _run_freezone_gen_async(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import ensure_freezone_dirs, run_freezone_gen
+
+    payload = envelope.get("payload") or {}
+    task_type = str(envelope.get("task_type") or "freezone_gen")
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, task_type, job_id, 0.1, "调用图像生成器...")
+    out_path = await _await_with_cancel_watch(
+        _call_freezone_leaf(
+            envelope,
+            run_freezone_gen,
+            "run_freezone_gen",
+            project_dir=project_dir,
+            job_id=job_id,
+            prompt=str(payload.get("prompt") or ""),
+            aspect_ratio=str(payload.get("aspect_ratio") or "1:1"),
+            image_size=str(payload.get("image_size") or "2K"),
+            reference_paths=payload.get("reference_paths") or None,
+            provider=payload.get("provider"),
+            model=payload.get("model"),
+            quality=payload.get("quality"),
+            model_params=payload.get("model_params") or None,
+            request_schema=payload.get("request_schema") or None,
+            output_task_type=task_type,
+        ),
+        project_id=ctx.project_id,
+        task_type=task_type,
+        episode=0,
+        task_id=str(envelope.get("__run_task_id") or ""),
+        scope=job_id,
+    )
+    rel = out_path.relative_to(project_dir).as_posix()
+    result = {
+        "job_id": job_id,
+        "output_path": str(out_path),
+        "output_url": make_static_url_for_context(ctx, rel),
+    }
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type=task_type,
+        job_id=job_id,
+        media_type="image",
+        result=result,
+        **_history_model_mode_extra(payload),
+    )
+    if history_record:
+        result["generation_history_record"] = history_record
+    return result
+
+
+async def _run_freezone_edit_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import ensure_freezone_dirs, run_freezone_edit
+
+    payload = envelope.get("payload") or {}
+    task_type = str(envelope.get("task_type") or "freezone_edit")
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, task_type, job_id, 0.1, "调用图像编辑器...")
+    out_path = await _await_with_cancel_watch(
+        _call_freezone_leaf(
+            envelope,
+            run_freezone_edit,
+            "run_freezone_edit",
+            project_dir=project_dir,
+            job_id=job_id,
+            prompt=str(payload.get("prompt") or ""),
+            base_path=str(payload["base_path"]),
+            extra_reference_paths=payload.get("extra_reference_paths") or None,
+            aspect_ratio=str(payload.get("aspect_ratio") or "1:1"),
+            image_size=str(payload.get("image_size") or "2K"),
+            provider=payload.get("provider"),
+            model=payload.get("model"),
+            quality=payload.get("quality"),
+            model_params=payload.get("model_params") or None,
+            request_schema=payload.get("request_schema") or None,
+            output_task_type=task_type,
+        ),
+        project_id=ctx.project_id,
+        task_type=task_type,
+        episode=0,
+        task_id=str(envelope.get("__run_task_id") or ""),
+        scope=job_id,
+    )
+    rel = out_path.relative_to(project_dir).as_posix()
+    result = {
+        "job_id": job_id,
+        "output_path": str(out_path),
+        "output_url": make_static_url_for_context(ctx, rel),
+    }
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type=task_type,
+        job_id=job_id,
+        media_type="image",
+        result=result,
+        **_history_model_mode_extra(payload),
+    )
+    if history_record:
+        result["generation_history_record"] = history_record
+    return result
+
+
+async def _run_freezone_mask_edit_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import ensure_freezone_dirs, run_freezone_mask_edit
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    provider = str(payload.get("provider") or "newapi")
+    _update(ctx, "freezone_mask_edit", job_id, 0.1, f"调用 {provider} 图片擦除...")
+    out_path = await _call_freezone_leaf(
+        envelope,
+        run_freezone_mask_edit,
+        "run_freezone_mask_edit",
+        project_dir=project_dir,
+        job_id=job_id,
+        base_path=str(payload["base_path"]),
+        mask_path=str(payload["mask_path"]),
+        prompt=str(payload.get("prompt") or ""),
+        aspect_ratio=str(payload.get("aspect_ratio") or "1:1"),
+        image_size=str(payload.get("image_size") or "2K"),
+        quality=str(payload.get("quality") or "medium"),
+        provider=provider,
+        model=str(payload.get("model") or ""),
+    )
+    rel = out_path.relative_to(project_dir).as_posix()
+    return {
+        "job_id": job_id,
+        "output_path": str(out_path),
+        "output_url": make_static_url_for_context(ctx, rel),
+    }
+
+
+async def _run_freezone_extract_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import (
+        ensure_freezone_dirs,
+        run_freezone_extract_frames,
+    )
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, "freezone_extract", job_id, 0.1, "ffmpeg 抽帧中...")
+    frame_paths = await _call_freezone_leaf(
+        envelope,
+        run_freezone_extract_frames,
+        "run_freezone_extract_frames",
+        project_dir=project_dir,
+        job_id=job_id,
+        video_path=Path(str(payload["video_path"])),
+        max_frames=int(payload.get("max_frames") or 20),
+        scene_threshold=float(payload.get("scene_threshold") or 0.3),
+    )
+    return {
+        "job_id": job_id,
+        "frame_count": len(frame_paths),
+        "frame_urls": [
+            make_static_url_for_context(ctx, path.relative_to(project_dir).as_posix())
+            for path in frame_paths
+        ],
+        "frame_paths": [str(path) for path in frame_paths],
+    }
+
+
+async def _run_freezone_analyze_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import (
+        ensure_freezone_dirs,
+        run_freezone_analyze_shots,
+    )
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    frame_paths = [str(path) for path in payload.get("frame_paths") or []]
+    _update(
+        ctx, "freezone_analyze", job_id, 0.1, f"Vision 分析 {len(frame_paths)} 帧..."
+    )
+    result = await _call_freezone_leaf(
+        envelope,
+        run_freezone_analyze_shots,
+        "run_freezone_analyze_shots",
+        project_dir=project_dir,
+        job_id=job_id,
+        frame_paths=frame_paths,
+        provider=payload.get("provider"),
+        model=payload.get("model"),
+        analysis_mode=str(payload.get("analysis_mode") or "shots"),
+        duration_sec=payload.get("duration_sec"),
+    )
+    output_path = Path(str(result["output_path"]))
+    return {
+        "job_id": job_id,
+        "output_path": str(output_path),
+        "output_url": make_static_url_for_context(
+            ctx,
+            output_path.relative_to(project_dir).as_posix(),
+        ),
+        "model": result.get("model"),
+        "analysis_mode": result.get("analysis_mode"),
+        "frame_count": result.get("frame_count"),
+        "analyses": result.get("analyses"),
+        "video_story": result.get("video_story"),
+    }
+
+
+async def _run_freezone_video_story_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import (
+        ensure_freezone_dirs,
+        run_freezone_analyze_shots,
+        run_freezone_extract_frames,
+    )
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, "freezone_video_story", job_id, 0.1, "ffmpeg 抽取关键帧...")
+    frame_paths = await _call_freezone_leaf(
+        envelope,
+        run_freezone_extract_frames,
+        "run_freezone_extract_frames",
+        project_dir=project_dir,
+        job_id=job_id,
+        video_path=Path(str(payload["video_path"])),
+        max_frames=int(payload.get("max_frames") or 20),
+        scene_threshold=float(payload.get("scene_threshold") or 0.3),
+    )
+    frame_urls = [
+        make_static_url_for_context(ctx, path.relative_to(project_dir).as_posix())
+        for path in frame_paths
+    ]
+    _update(
+        ctx,
+        "freezone_video_story",
+        job_id,
+        0.55,
+        f"Vision 解析 {len(frame_paths)} 帧为视频故事...",
+    )
+    result = await _call_freezone_leaf(
+        envelope,
+        run_freezone_analyze_shots,
+        "run_freezone_analyze_shots",
+        project_dir=project_dir,
+        job_id=job_id,
+        frame_paths=[str(path) for path in frame_paths],
+        provider=payload.get("provider"),
+        model=payload.get("model"),
+        analysis_mode="video_story",
+        duration_sec=payload.get("duration_sec"),
+    )
+    output_path = Path(str(result["output_path"]))
+    return {
+        "job_id": job_id,
+        "output_url": make_static_url_for_context(
+            ctx,
+            output_path.relative_to(project_dir).as_posix(),
+        ),
+        "model": result.get("model"),
+        "analysis_mode": "video_story",
+        "frame_count": len(frame_paths),
+        "frame_urls": frame_urls,
+        "analyses": result.get("analyses"),
+        "video_story": result.get("video_story"),
+    }
+
+
+async def _run_freezone_video_breakdown_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import ensure_freezone_dirs, run_freezone_video_breakdown
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+
+    def report(ratio: float, message: MessageLike) -> None:
+        _update(ctx, "freezone_video_breakdown", job_id, ratio, message)
+
+    report(0.05, lmsg("tasks.progress.videoBreakdown.start", "开始逐帧拉片..."))
+    result = await _call_freezone_leaf(
+        envelope,
+        run_freezone_video_breakdown,
+        "run_freezone_video_breakdown",
+        project_dir=project_dir,
+        job_id=job_id,
+        video_path=Path(str(payload["video_path"])),
+        dimensions=list(payload.get("dimensions") or []) or None,
+        max_frames=int(payload.get("max_frames") or 40),
+        scene_threshold=float(payload.get("scene_threshold") or 0.3),
+        duration_sec=payload.get("duration_sec"),
+        storyboard_group_size=int(payload.get("storyboard_group_size") or 4),
+        max_motion_clips=int(payload.get("max_motion_clips") or 3),
+        motion_clip_max_sec=float(payload.get("motion_clip_max_sec") or 6.0),
+        music_clip_sec=float(payload.get("music_clip_sec") or 15.0),
+        model=payload.get("model"),
+        progress=report,
+    )
+
+    def to_url(path_value: Any) -> str | None:
+        # 作业层只认磁盘路径，前端只认 URL —— 转换集中在这一处，免得每个维度各写
+        # 一遍 relative_to/make_static_url。
+        if not path_value:
+            return None
+        path = Path(str(path_value))
+        if not path.exists():
+            return None
+        try:
+            rel = path.relative_to(project_dir).as_posix()
+        except ValueError:
+            # 落在项目目录外的文件没有 static URL 可给，宁可少一个字段也不能拼一个
+            # 指向别人项目的地址。
+            return None
+        return make_static_url_for_context(ctx, rel, local_path=path)
+
+    storyboard = result.get("storyboard")
+    if isinstance(storyboard, dict):
+        for group in storyboard.get("groups") or []:
+            for shot in group.get("shots") or []:
+                shot["image_url"] = to_url(shot.pop("image_path", None))
+
+    motion = result.get("motion")
+    if isinstance(motion, dict):
+        for clip in motion.get("clips") or []:
+            clip["video_url"] = to_url(clip.pop("video_path", None))
+            clip["preview_image_url"] = to_url(clip.pop("preview_image_path", None))
+
+    music = result.get("music")
+    if isinstance(music, dict) and isinstance(music.get("clip"), dict):
+        music["clip"]["audio_url"] = to_url(music["clip"].pop("audio_path", None))
+
+    response = {
+        "job_id": job_id,
+        "source_video_url": payload.get("video_url"),
+        "duration_sec": result.get("duration_sec"),
+        "model": result.get("model"),
+        "title": result.get("title"),
+        "summary": result.get("summary"),
+        "dimensions": result.get("dimensions"),
+        "storyboard": storyboard,
+        "motion": motion,
+        "music": music,
+        "frame_urls": [to_url(path) for path in result.get("frame_paths") or []],
+        "output_url": to_url(result.get("output_path")),
+    }
+    _update(ctx, "freezone_video_breakdown", job_id, 1.0, "逐帧拉片完成")
+    return response
+
+
+def run_freezone_video_breakdown(envelope: dict[str, Any], ctx: ProjectContext) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_video_breakdown_async(envelope, ctx))
+
+
+def run_freezone_gen(envelope: dict[str, Any], ctx: ProjectContext) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_gen_async(envelope, ctx))
+
+
+def run_freezone_edit(envelope: dict[str, Any], ctx: ProjectContext) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_edit_async(envelope, ctx))
+
+
+def run_mainline_sketch_from_context(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(
+        envelope, _run_mainline_sketch_from_context_async(envelope, ctx)
+    )
+
+
+def run_mainline_frame_from_context(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(
+        envelope, _run_mainline_frame_from_context_async(envelope, ctx)
+    )
+
+
+async def _run_mainline_sketch_from_context_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.task_backend.runners.sketch import _run_sketch_generation_async
+
+    payload = envelope.get("payload") or {}
+    task_type = str(envelope.get("task_type") or "mainline_sketch_from_context")
+    job_id = str(payload["job_id"])
+    episode = int(envelope.get("episode") or payload.get("episode") or 0)
+    beat_num = int(envelope.get("beat_num") or payload.get("beat_num") or 0)
+    scope = str(envelope.get("scope") or job_id)
+    project_dir = Path(
+        str(payload.get("output_dir") or payload.get("project_dir") or ctx.output_dir)
+    )
+
+    result = await _run_sketch_generation_async(envelope, ctx)
+    out_path = Path(str(result.get("sketch_path") or ""))
+    if not out_path.exists():
+        raise FileNotFoundError(f"mainline sketch output missing: {out_path}")
+    rel = out_path.relative_to(project_dir).as_posix()
+    response = {
+        **result,
+        "job_id": job_id,
+        "output_path": str(out_path),
+        "output_url": make_static_url_for_context(ctx, rel, local_path=out_path),
+        "media_type": "image",
+    }
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type=task_type,
+        job_id=job_id,
+        media_type="image",
+        result=response,
+        episode=episode,
+        beat_num=beat_num,
+        scope=scope,
+    )
+    if history_record:
+        response["generation_history_record"] = history_record
+    return response
+
+
+async def _run_mainline_frame_from_context_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.task_backend.runners.render import _run_selected_regen_async
+
+    payload = envelope.get("payload") or {}
+    task_type = str(envelope.get("task_type") or "mainline_frame_from_context")
+    job_id = str(payload["job_id"])
+    episode = int(envelope.get("episode") or payload.get("episode") or 0)
+    beat_num = int(envelope.get("beat_num") or payload.get("beat_num") or 0)
+    scope = str(envelope.get("scope") or job_id)
+    project_dir = Path(
+        str(payload.get("output_dir") or payload.get("project_dir") or ctx.output_dir)
+    )
+
+    result = await _run_selected_regen_async(envelope, ctx, is_sketch=False)
+    # Single-beat skill run (1x1): one grid → one rel path under project_dir.
+    grid_paths = result.get("grid_paths") or {}
+    rel = grid_paths.get(beat_num) or (
+        next(iter(grid_paths.values())) if grid_paths else ""
+    )
+    if not rel:
+        grid_results = result.get("grid_results") or []
+        rel = str(grid_results[0].get("rel_path") or "") if grid_results else ""
+    if not rel:
+        raise FileNotFoundError("mainline frame output missing (no grid path)")
+    out_path = (project_dir / rel).resolve()
+    if not out_path.exists():
+        raise FileNotFoundError(f"mainline frame output missing: {out_path}")
+    rel = out_path.relative_to(project_dir).as_posix()
+    response = {
+        **result,
+        "job_id": job_id,
+        "output_path": str(out_path),
+        "output_url": make_static_url_for_context(ctx, rel, local_path=out_path),
+        "media_type": "image",
+    }
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type=task_type,
+        job_id=job_id,
+        media_type="image",
+        result=response,
+        episode=episode,
+        beat_num=beat_num,
+        scope=scope,
+    )
+    if history_record:
+        response["generation_history_record"] = history_record
+    return response
+
+
+async def _run_mainline_director_control_sketch_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.director_world.control_frame_to_sketch import (
+        convert_control_frame_to_sketch,
+    )
+    from novelvideo.freezone.paths import output_path_for_job
+
+    payload = envelope.get("payload") or {}
+    task_type = str(envelope.get("task_type") or "mainline_director_control_sketch")
+    job_id = str(payload["job_id"])
+    episode = int(envelope.get("episode") or payload.get("episode") or 0)
+    beat_num = int(envelope.get("beat_num") or payload.get("beat_num") or 0)
+    scope = str(envelope.get("scope") or job_id)
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    state_dir = str(payload.get("state_dir") or ctx.state_dir)
+    output_path = output_path_for_job(project_dir, task_type, job_id)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    _update(
+        ctx,
+        task_type,
+        scope,
+        0.05,
+        f"开始 Beat {beat_num} 导演合成图转草图候选...",
+        episode=episode,
+    )
+    result = await _await_with_cancel_watch(
+        _call_freezone_leaf(
+            envelope,
+            convert_control_frame_to_sketch,
+            "convert_control_frame_to_sketch",
+            user=ctx.owner_username,
+            project=ctx.project_name,
+            episode=episode,
+            beat=beat_num,
+            mode_key=str(payload.get("mode_key") or ""),
+            aspect_ratio=str(payload.get("aspect_ratio") or ""),
+            output_dir=project_dir,
+            state_dir=state_dir,
+            control_frame_path=payload.get("control_frame_path") or None,
+            require_control_frame_path=True,
+            candidate_output_path=output_path,
+            promote=False,
+            projection=read_projection(payload),
+        ),
+        project_id=ctx.project_id,
+        task_type=task_type,
+        episode=episode,
+        task_id=str(envelope.get("__run_task_id") or ""),
+        beat_num=beat_num,
+        scope=scope,
+    )
+    out_path = Path(str(result.get("output_path") or output_path))
+    rel = out_path.relative_to(project_dir).as_posix()
+    response = {
+        **result,
+        "job_id": job_id,
+        "output_path": str(out_path),
+        "output_url": make_static_url_for_context(ctx, rel, local_path=out_path),
+        "media_type": "image",
+    }
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type=task_type,
+        job_id=job_id,
+        media_type="image",
+        result=response,
+        episode=episode,
+        beat_num=beat_num,
+        scope=scope,
+    )
+    if history_record:
+        response["generation_history_record"] = history_record
+    _update(ctx, task_type, scope, 1.0, "导演合成图草图候选已生成", episode=episode)
+    return response
+
+
+def run_mainline_director_control_sketch(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(
+        envelope, _run_mainline_director_control_sketch_async(envelope, ctx)
+    )
+
+
+def run_freezone_mask_edit(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_mask_edit_async(envelope, ctx))
+
+
+def run_freezone_extract(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_extract_async(envelope, ctx))
+
+
+def run_freezone_analyze(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_analyze_async(envelope, ctx))
+
+
+def run_freezone_video_story(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_video_story_async(envelope, ctx))
+
+
+async def _run_freezone_video_erase_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import ensure_freezone_dirs, run_freezone_video_erase
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, "freezone_video_erase", job_id, 0.1, "开始视频擦除处理...")
+    output_path, meta = await _call_freezone_leaf(
+        envelope,
+        run_freezone_video_erase,
+        "run_freezone_video_erase",
+        project_dir=project_dir,
+        job_id=job_id,
+        source_path=str(payload["source_path"]),
+        mode=str(payload.get("mode") or "smart_subtitle"),
+        box_x=payload.get("box_x"),
+        box_y=payload.get("box_y"),
+        box_width=payload.get("box_width"),
+        box_height=payload.get("box_height"),
+    )
+    rel = output_path.relative_to(project_dir).as_posix()
+    return {
+        "job_id": job_id,
+        "output_format": "mp4",
+        "output_path": str(output_path),
+        "output_url": make_static_url_for_context(ctx, rel),
+        "meta": meta,
+    }
+
+
+async def _run_freezone_video_upscale_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import (
+        ensure_freezone_dirs,
+        run_freezone_video_upscale,
+    )
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, "freezone_video_upscale", job_id, 0.1, "开始视频高清处理...")
+    output_path, meta = await _call_freezone_leaf(
+        envelope,
+        run_freezone_video_upscale,
+        "run_freezone_video_upscale",
+        project_dir=project_dir,
+        job_id=job_id,
+        source_path=str(payload["source_path"]),
+        resolution=str(payload.get("resolution") or "1080p"),
+        target_fps=payload.get("target_fps"),
+        smart_interpolation=bool(payload.get("smart_interpolation", True)),
+        slowdown=str(payload.get("slowdown") or "auto"),
+        scene=str(payload.get("scene") or "realistic"),
+        face_enhance=bool(payload.get("face_enhance", False)),
+        upscale_backend=payload.get("upscale_backend"),
+        upscale_model_params=payload.get("upscale_model_params"),
+        upscale_request_schema=payload.get("upscale_request_schema"),
+        frame_rate_backend=payload.get("frame_rate_backend"),
+        frame_rate_model_params=payload.get("frame_rate_model_params"),
+        frame_rate_request_schema=payload.get("frame_rate_request_schema"),
+    )
+    rel = output_path.relative_to(project_dir).as_posix()
+    return {
+        "job_id": job_id,
+        "output_format": "mp4",
+        "output_path": str(output_path),
+        "output_url": make_static_url_for_context(ctx, rel),
+        "meta": meta,
+    }
+
+
+async def _run_freezone_audio_separate_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import (
+        ensure_freezone_dirs,
+        run_freezone_audio_separate,
+    )
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, "freezone_audio_separate", job_id, 0.1, "开始音视频分离...")
+    outputs = await _call_freezone_leaf(
+        envelope,
+        run_freezone_audio_separate,
+        "run_freezone_audio_separate",
+        project_dir=project_dir,
+        job_id=job_id,
+        source_path=str(payload["source_path"]),
+    )
+    audio_path = outputs.get("audio_path")
+    mute_video_path = outputs.get("mute_video_path")
+    audio_rel = audio_path.relative_to(project_dir).as_posix() if audio_path else ""
+    mute_rel = (
+        mute_video_path.relative_to(project_dir).as_posix() if mute_video_path else ""
+    )
+    response = {
+        "job_id": job_id,
+        "audio_url": make_static_url_for_context(ctx, audio_rel) if audio_rel else None,
+        "mute_video_url": (
+            make_static_url_for_context(ctx, mute_rel) if mute_rel else None
+        ),
+    }
+    target_episode = payload.get("target_episode")
+    target_beat = payload.get("target_beat")
+    if audio_path and target_episode and target_beat:
+        response["pushable"] = True
+        response["slot_target"] = {
+            "kind": "beat_audio",
+            "episode": int(target_episode),
+            "beat": int(target_beat),
+        }
+    return response
+
+
+async def _run_freezone_video_compose_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import (
+        ensure_freezone_dirs,
+        run_freezone_video_compose,
+    )
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    cover_url = str(payload.get("cover_url") or payload.get("coverUrl") or "").strip()
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, "freezone_video_compose", job_id, 0.1, "开始合成视频时间线...")
+    output_path = await _call_freezone_leaf(
+        envelope,
+        run_freezone_video_compose,
+        "run_freezone_video_compose",
+        project_dir=project_dir,
+        job_id=job_id,
+        title=str(payload.get("title") or ""),
+        canvas_id=str(payload.get("canvas_id") or ""),
+        resolution=str(payload.get("resolution") or "1080p"),
+        fps=int(payload.get("fps") or 30),
+        background_color=str(payload.get("background_color") or "#000000"),
+        keep_original_audio=bool(payload.get("keep_original_audio", True)),
+        tracks=list(payload.get("tracks") or []),
+    )
+    rel = output_path.relative_to(project_dir).as_posix()
+    result = {
+        "job_id": job_id,
+        "output_format": "mp4",
+        "output_path": str(output_path),
+        "output_url": make_static_url_for_context(ctx, rel),
+    }
+    if cover_url:
+        result["cover_url"] = cover_url
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type="freezone_video_compose",
+        job_id=job_id,
+        media_type="video",
+        result=result,
+    )
+    if history_record:
+        result["generation_history_record"] = history_record
+    return result
+
+
+def run_freezone_video_erase(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_video_erase_async(envelope, ctx))
+
+
+def run_freezone_video_upscale(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_video_upscale_async(envelope, ctx))
+
+
+def run_freezone_audio_separate(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_audio_separate_async(envelope, ctx))
+
+
+def run_freezone_video_compose(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_video_compose_async(envelope, ctx))
+
+
+async def _run_freezone_text_translate_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import ensure_freezone_dirs
+    from novelvideo.freezone.paths import outputs_dir
+    from novelvideo.freezone.text_node import translate_freezone_text
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    node_type = str(payload.get("node_type") or "generic")
+    _update(ctx, "freezone_text_translate", job_id, 0.1, "开始翻译文本...")
+    translated_text, source_language, target_language = await _call_freezone_leaf(
+        envelope,
+        translate_freezone_text,
+        "translate_freezone_text",
+        text=str(payload.get("text") or ""),
+        node_type=node_type,
+    )
+    data = {
+        "translated_text": translated_text,
+        "source_language": source_language,
+        "target_language": target_language,
+        "node_type": node_type,
+    }
+    out = outputs_dir(project_dir, "freezone_text_translate") / f"{job_id}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    import json
+
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    rel = out.relative_to(project_dir).as_posix()
+    result = {
+        "job_id": job_id,
+        "output_format": "json",
+        "output_path": str(out),
+        "output_url": make_static_url_for_context(ctx, rel),
+        **data,
+    }
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type="freezone_text_translate",
+        job_id=job_id,
+        media_type="text",
+        node_type=node_type,
+        input_preview=str(payload.get("text") or "")[:240],
+        result=result,
+    )
+    if history_record:
+        result["generation_history_record"] = history_record
+    return result
+
+
+async def _run_freezone_text_generate_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import ensure_freezone_dirs
+    from novelvideo.freezone.paths import outputs_dir
+    from novelvideo.freezone.text_node import generate_freezone_text
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    prompt = str(payload.get("prompt") or "").strip()
+    _update(ctx, "freezone_text_generate", job_id, 0.1, "开始生成文本...")
+    model, generated_text = await _call_freezone_leaf(
+        envelope,
+        generate_freezone_text,
+        "generate_freezone_text",
+        prompt=prompt,
+    )
+    from novelvideo.utils.document_parsers import count_billable_text_chars
+
+    billable_chars = count_billable_text_chars(generated_text)
+    data = {
+        "generated_text": generated_text,
+        "model": model,
+        "billing": {
+            "operation": "text_generate",
+            "billable_chars": billable_chars,
+            "pricing_quantity": billable_chars,
+            "quantity_source": "generated_text",
+        },
+    }
+    billing_metadata = (
+        envelope.get("billing_metadata")
+        if isinstance(envelope.get("billing_metadata"), dict)
+        else {}
+    )
+    feature_key = str(billing_metadata.get("feature_key") or "").strip()
+    run_task_id = str(envelope.get("__run_task_id") or "").strip()
+    result_billing_ack = billing_metadata.get("result_billing_version_ack")
+    existing_reservation_id = str(
+        billing_metadata.get("feature_credit_reservation_id")
+        or billing_metadata.get("feature_credit_charge_id")
+        or ""
+    ).strip()
+    reservation_id = ""
+    # The runner owns the output-priced reservation only after EE explicitly
+    # acknowledges protocol v2.  With old EE, the legacy estimate was already
+    # reserved at enqueue time; reserving again here would double-charge.
+    if (
+        feature_key
+        and run_task_id
+        and type(result_billing_ack) is int
+        and result_billing_ack == 2
+        and not existing_reservation_id
+    ):
+        reservation = await get_usage_meter().reserve_feature_start_credits(
+            user_id=ctx.requester_user_id,
+            feature_key=feature_key,
+            product_surface="freezone",
+            project_id=ctx.project_id,
+            resource_kind="script",
+            task_id=run_task_id,
+            task_type="freezone_text_generate",
+            quantity=billable_chars,
+            idempotency_key=(
+                f"task_result:{ctx.requester_user_id}:{feature_key}:{run_task_id}"
+            ),
+            require_price_rule=True,
+            require_positive_cost=True,
+            params={
+                "operation": "text_generate",
+                "billable_chars": billable_chars,
+                "pricing_quantity": billable_chars,
+                "pricing_metrics": {
+                    "call_count": 1,
+                    "item_count": 1,
+                    "billable_chars": billable_chars,
+                },
+            },
+            metadata={
+                "source": "trusted_task_result",
+                "quantity_source": "generated_text",
+            },
+        )
+        reservation_id = str(reservation.get("id") or "").strip()
+        if not reservation_id:
+            raise RuntimeError("text result billing did not return a reservation ID")
+    # Full text becomes user-readable through both static output and history.
+    # Neither may be published until the output-priced reservation succeeds.
+    try:
+        out = outputs_dir(project_dir, "freezone_text_generate") / f"{job_id}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        import json
+
+        out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        rel = out.relative_to(project_dir).as_posix()
+        result = {
+            "job_id": job_id,
+            "output_format": "json",
+            "output_path": str(out),
+            "output_url": make_static_url_for_context(ctx, rel),
+            **data,
+        }
+        history_record = _append_node_history(
+            ctx=ctx,
+            project_dir=project_dir,
+            payload=payload,
+            task_type="freezone_text_generate",
+            job_id=job_id,
+            media_type="text",
+            input_preview=prompt[:240],
+            prompt=prompt,
+            model=model,
+            result=result,
+        )
+        if history_record:
+            result["generation_history_record"] = history_record
+    except BaseException:
+        if reservation_id:
+            # Publication may have partially succeeded. Preserve the hold for
+            # reconciliation instead of refunding potentially readable output.
+            await get_usage_meter().mark_feature_credit_settlement_for_review(
+                reservation_id,
+                metadata={"source": "text_result_publication_failed"},
+            )
+        raise
+    if reservation_id:
+        result["__feature_credit_reservation_id"] = reservation_id
+    return result
+
+
+async def _run_freezone_story_script_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.jobs import (
+        ensure_freezone_dirs,
+        run_freezone_extract_frames,
+    )
+    from novelvideo.freezone.paths import outputs_dir
+    from novelvideo.freezone.text_node import (
+        bind_story_script_assets,
+        generate_freezone_story_script,
+        generate_freezone_story_script_with_vision,
+    )
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+
+    source_text = str(payload.get("source_text") or "")
+    prompt = str(payload.get("prompt") or "")
+    character_refs = list(payload.get("character_refs") or [])
+    character_image_paths = [
+        str(path) for path in payload.get("character_image_paths") or []
+    ]
+    video_path = str(payload.get("video_path") or "")
+    duration_sec = payload.get("duration_sec")
+
+    frame_paths: list[Path] = []
+    frame_urls: list[str] = []
+    if video_path:
+        _update(ctx, "freezone_story_script", job_id, 0.1, "ffmpeg 抽取关键帧...")
+        frame_paths = await _call_freezone_leaf(
+            envelope,
+            run_freezone_extract_frames,
+            "run_freezone_extract_frames",
+            project_dir=project_dir,
+            job_id=job_id,
+            video_path=Path(video_path),
+            max_frames=int(payload.get("max_frames") or 20),
+            scene_threshold=float(payload.get("scene_threshold") or 0.3),
+        )
+        frame_urls = [
+            make_static_url_for_context(ctx, path.relative_to(project_dir).as_posix())
+            for path in frame_paths
+        ]
+
+    if frame_paths or character_image_paths:
+        _update(
+            ctx,
+            "freezone_story_script",
+            job_id,
+            0.55,
+            (
+                f"视觉模型解析 {len(frame_paths)} 帧为分镜脚本..."
+                if frame_paths
+                else "视觉模型读取角色参考图生成故事脚本..."
+            ),
+        )
+        data = await _call_freezone_leaf(
+            envelope,
+            generate_freezone_story_script_with_vision,
+            "generate_freezone_story_script_with_vision",
+            frame_paths=[str(path) for path in frame_paths],
+            character_image_paths=character_image_paths,
+            source_text=source_text,
+            prompt=prompt,
+            duration_sec=float(duration_sec) if duration_sec else None,
+            character_refs=character_refs,
+        )
+    else:
+        _update(ctx, "freezone_story_script", job_id, 0.1, "开始生成故事脚本...")
+        data = await _call_freezone_leaf(
+            envelope,
+            generate_freezone_story_script,
+            "generate_freezone_story_script",
+            source_text=source_text,
+            prompt=prompt,
+            model=str(payload.get("model") or ""),
+            character_refs=character_refs,
+        )
+
+    bind_story_script_assets(data, frame_urls=frame_urls, character_refs=character_refs)
+    out = outputs_dir(project_dir, "freezone_story_script") / f"{job_id}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    import json
+
+    payload_data = data.model_dump()
+    out.write_text(
+        json.dumps(payload_data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    rel = out.relative_to(project_dir).as_posix()
+    result = {
+        "job_id": job_id,
+        "output_format": "json",
+        "output_path": str(out),
+        "output_url": make_static_url_for_context(ctx, rel),
+        **payload_data,
+    }
+    if frame_urls:
+        result["frame_urls"] = frame_urls
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type="freezone_story_script",
+        job_id=job_id,
+        media_type="text",
+        model=str(payload.get("model") or ""),
+        source_text_preview=str(payload.get("source_text") or "")[:240],
+        row_count=len(payload_data.get("rows") or []),
+        result=result,
+    )
+    if history_record:
+        result["generation_history_record"] = history_record
+    return result
+
+
+async def _run_freezone_image_reverse_prompt_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.image_node import reverse_prompt_from_image
+    from novelvideo.freezone.jobs import ensure_freezone_dirs
+    from novelvideo.freezone.paths import outputs_dir
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    source_path = Path(str(payload["source_path"]))
+    _update(ctx, "freezone_image_reverse_prompt", job_id, 0.1, "开始反推图片提示词...")
+    prompt = await _call_freezone_leaf(
+        envelope,
+        reverse_prompt_from_image,
+        "reverse_prompt_from_image",
+        image_path=source_path,
+        instruction=str(payload.get("instruction") or ""),
+    )
+    out = outputs_dir(project_dir, "freezone_image_reverse_prompt") / f"{job_id}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    import json
+
+    out.write_text(
+        json.dumps({"prompt": prompt}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    rel = out.relative_to(project_dir).as_posix()
+    result = {
+        "job_id": job_id,
+        "output_format": "json",
+        "output_path": str(out),
+        "output_url": make_static_url_for_context(ctx, rel),
+        "prompt": prompt,
+    }
+    history_record = _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type="freezone_image_reverse_prompt",
+        job_id=job_id,
+        media_type="text",
+        source_path=str(source_path),
+        result=result,
+    )
+    if history_record:
+        result["generation_history_record"] = history_record
+    return result
+
+
+def run_freezone_text_translate(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_text_translate_async(envelope, ctx))
+
+
+def run_freezone_text_generate(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_text_generate_async(envelope, ctx))
+
+
+def run_freezone_story_script(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_story_script_async(envelope, ctx))
+
+
+def run_freezone_image_reverse_prompt(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    return _run_cancellable(
+        envelope, _run_freezone_image_reverse_prompt_async(envelope, ctx)
+    )
+
+
+async def _run_freezone_audio_speech_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import (
+        make_sqlite_store_for_context,
+        make_static_url_for_context,
+    )
+    from novelvideo.freezone.audio_node import generate_freezone_audio_speech
+    from novelvideo.freezone.jobs import ensure_freezone_dirs
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, "freezone_audio_speech", job_id, 0.1, "开始文本生成语音...")
+    # 音色所需的项目态已在投递时定型放进 payload 时，这里不再回头开项目 SQLite
+    # —— 那一步经 `api/deps.py` 的 `require_project_home_node` 把本任务钉在
+    # 存放该项目的那台机器上。payload 里没有投射时行为逐字不变。
+    projection = read_projection(payload)
+    store = None if projection is not None else await make_sqlite_store_for_context(ctx)
+    try:
+        result = await _call_freezone_leaf(
+            envelope,
+            generate_freezone_audio_speech,
+            "generate_freezone_audio_speech",
+            store=store,
+            username=ctx.owner_username,
+            project=ctx.project_name,
+            account_voice_username=str(
+                payload.get("account_voice_username")
+                or ctx.requester_username
+                or ctx.owner_username
+            ),
+            project_dir=project_dir,
+            job_id=job_id,
+            text=str(payload.get("text") or ""),
+            emotion_prompt=str(payload.get("emotion_prompt") or ""),
+            voice_ref=payload.get("voice_ref"),
+            speech_mode=str(payload.get("speech_mode") or "clone"),
+            preset_model=str(payload.get("preset_model") or "edge-tts"),
+            preset_voice=str(payload.get("preset_voice") or "Serena"),
+            projection=projection,
+        )
+    finally:
+        close = getattr(store, "close", None)
+        if close:
+            await close()
+    rel = result.audio_path.relative_to(project_dir).as_posix()
+    audio_url = make_static_url_for_context(ctx, rel)
+    response = {
+        "job_id": job_id,
+        "url": audio_url,
+        "audio_url": audio_url,
+        "audio_size": result.audio_path.stat().st_size,
+        "duration_ms": result.duration_ms,
+        "mime_type": result.mime_type,
+        "model": result.model,
+        "voice_source": result.voice_source,
+        "voice_sha256": result.voice_sha256,
+    }
+    target_episode = payload.get("target_episode")
+    target_beat = payload.get("target_beat")
+    if target_episode and target_beat:
+        response["pushable"] = True
+        response["slot_target"] = {
+            "kind": "beat_audio",
+            "episode": int(target_episode),
+            "beat": int(target_beat),
+        }
+    _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type="freezone_audio_speech",
+        job_id=job_id,
+        media_type="audio",
+        result=response,
+    )
+    return response
+
+
+def run_freezone_audio_speech(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return _run_cancellable(envelope, _run_freezone_audio_speech_async(envelope, ctx))
+
+
+async def _run_freezone_audio_eleven_music_async(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.api.deps import make_static_url_for_context
+    from novelvideo.freezone.audio_node import generate_freezone_audio_eleven_music
+    from novelvideo.freezone.jobs import ensure_freezone_dirs
+
+    payload = envelope.get("payload") or {}
+    job_id = str(payload["job_id"])
+    project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
+    ensure_freezone_dirs(project_dir)
+    _update(ctx, "freezone_audio_eleven_music", job_id, 0.1, "开始文本生成音乐...")
+    result = await _call_freezone_leaf(
+        envelope,
+        generate_freezone_audio_eleven_music,
+        "generate_freezone_audio_eleven_music",
+        project_dir=project_dir,
+        job_id=job_id,
+        prompt=str(payload.get("input") or ""),
+        model=str(payload.get("model") or "LingShan-MU-11"),
+        response_format=str(payload.get("response_format") or "mp3"),
+        music_length_ms=int(payload.get("music_length_ms") or 30_000),
+        force_instrumental=bool(payload.get("force_instrumental", True)),
+        respect_sections_durations=bool(
+            payload.get("respect_sections_durations", True)
+        ),
+        output_format=str(payload.get("output_format") or "mp3_44100_128"),
+    )
+    rel = result.audio_path.relative_to(project_dir).as_posix()
+    audio_url = make_static_url_for_context(ctx, rel)
+    response = {
+        "job_id": job_id,
+        "url": audio_url,
+        "audio_url": audio_url,
+        "audio_size": result.audio_path.stat().st_size,
+        "duration_ms": result.duration_ms,
+        "mime_type": result.mime_type,
+        "model": result.model,
+    }
+    _append_node_history(
+        ctx=ctx,
+        project_dir=project_dir,
+        payload=payload,
+        task_type="freezone_audio_eleven_music",
+        job_id=job_id,
+        media_type="audio",
+        result=response,
+    )
+    return response
+
+
+def run_freezone_audio_eleven_music(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    return _run_cancellable(
+        envelope, _run_freezone_audio_eleven_music_async(envelope, ctx)
+    )
+
+
+register_project_task_runner("freezone_gen", run_freezone_gen, requires_home_node=False)
+register_project_task_runner(
+    "freezone_edit", run_freezone_edit, requires_home_node=False
+)
+register_project_task_runner(
+    "mainline_sketch_from_context",
+    run_mainline_sketch_from_context,
+    requires_home_node=False,
+)
+register_project_task_runner(
+    "mainline_frame_from_context",
+    run_mainline_frame_from_context,
+    requires_home_node=False,
+)
+register_project_task_runner(
+    "mainline_director_control_sketch",
+    run_mainline_director_control_sketch,
+    requires_home_node=False,
+)
+register_project_task_runner(
+    "freezone_mask_edit", run_freezone_mask_edit, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_extract", run_freezone_extract, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_analyze", run_freezone_analyze, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_video_story", run_freezone_video_story, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_video_erase", run_freezone_video_erase, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_video_upscale", run_freezone_video_upscale, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_audio_separate", run_freezone_audio_separate, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_video_compose", run_freezone_video_compose, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_text_translate", run_freezone_text_translate, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_text_generate", run_freezone_text_generate, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_story_script", run_freezone_story_script, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_video_breakdown", run_freezone_video_breakdown, requires_home_node=False
+)
+register_project_task_runner(
+    "freezone_image_reverse_prompt",
+    run_freezone_image_reverse_prompt,
+    requires_home_node=False,
+)
+register_project_task_runner(
+    "freezone_image_animate_gif",
+    run_freezone_image_animate_gif,
+    # Reads/writes job-scoped output only; EE output is shared OSS, not home state.
+    requires_home_node=False,
+    lane="ffmpeg",
+)
+register_project_task_runner(
+    "freezone_audio_speech",
+    run_freezone_audio_speech,
+    requires_home_node=False,
+)
+register_project_task_runner(
+    "freezone_audio_eleven_music",
+    run_freezone_audio_eleven_music,
+    requires_home_node=False,
+)
+register_project_task_runner(
+    "freezone_workflow_confirm",
+    run_freezone_workflow_confirm,
+    requires_home_node=True,
+)
+for _agent_product_task_type in AGENT_PRODUCT_TASK_TYPES:
+    register_project_task_runner(
+        _agent_product_task_type,
+        run_freezone_agent_product,
+        requires_home_node=True,
+    )
+
+register_project_task_runner("freezone_image_vectorize", run_freezone_image_vectorize, lane="ffmpeg")

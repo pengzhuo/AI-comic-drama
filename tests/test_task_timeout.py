@@ -1,0 +1,798 @@
+import asyncio
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from novelvideo.task_backend import cancel as cancel_module
+from novelvideo.ports.authz import AdmissionContext, BillingPrincipal
+from novelvideo.ports.model_credentials import CredentialReference
+from novelvideo.task_backend.cancel import TaskTimedOut
+from novelvideo.task_backend.consumer import VerifiedTaskDelivery
+from novelvideo.task_backend.envelope import InvalidTaskEnvelope
+
+
+class _FakeTaskManager:
+    def __init__(self) -> None:
+        self.completed: list[dict] = []
+        self.failed: list[dict] = []
+        self.updates: list[dict] = []
+
+    def update_progress_for_project(self, *_args, **kwargs) -> None:
+        self.updates.append(kwargs)
+
+    def begin_task_execution_for_project(self, *_args, **_kwargs) -> bool:
+        return True
+
+    def complete_task_for_project(self, *_args, **kwargs) -> None:
+        self.completed.append(kwargs)
+
+    def fail_task_for_project(self, *_args, **kwargs) -> None:
+        self.failed.append(kwargs)
+
+
+def _verified_delivery(
+    *,
+    task_type: str = "timeout_probe",
+    project_id: str = "proj_timeout",
+    billing_metadata: dict | None = None,
+) -> VerifiedTaskDelivery:
+    admission = AdmissionContext(
+        requester_user_id="usr_1",
+        billing_principal=BillingPrincipal(kind="local", id="usr_1"),
+        credential=CredentialReference("local", "local-newapi", 1),
+        admission_id="admission-1",
+        root_task_id="task_1",
+        admitted_at="2026-08-03T04:05:00Z",
+        authz_version=1,
+    )
+    return VerifiedTaskDelivery(
+        envelope_id="envelope-1",
+        admission=admission,
+        task_type=task_type,
+        project_id=project_id,
+        requester_user_id="usr_1",
+        episode=0,
+        beat_num=None,
+        scope=None,
+        queue_kind="default",
+        payload={},
+        billing_metadata=billing_metadata,
+    )
+
+
+@pytest.mark.asyncio
+async def test_await_with_cancel_watch_times_out_from_deadline():
+    async def slow_work():
+        await asyncio.sleep(1)
+
+    with pytest.raises(TaskTimedOut) as exc_info:
+        await cancel_module.await_with_cancel_watch(
+            slow_work(),
+            project_id="proj_timeout",
+            task_type="single_video",
+            episode=1,
+            task_id="task_1",
+            deadline_monotonic=0.0,
+        )
+
+    assert exc_info.value.timeout_seconds == 30 * 60
+
+
+def test_raise_if_envelope_cancel_requested_checks_deadline():
+    with pytest.raises(TaskTimedOut):
+        cancel_module.raise_if_envelope_cancel_requested(
+            {
+                "project_id": "proj_timeout",
+                "task_type": "stage_asset",
+                "episode": 0,
+                "__run_task_id": "task_1",
+                "__deadline_monotonic": 0.0,
+                "__timeout_seconds": 30 * 60,
+            },
+            task_type="stage_asset",
+        )
+
+
+def test_remaining_timeout_seconds_uses_envelope_deadline():
+    remaining = cancel_module.remaining_timeout_seconds(
+        {
+            "__deadline_monotonic": time.monotonic() + 20.0,
+            "__timeout_seconds": 30 * 60,
+        },
+        default_seconds=60,
+    )
+
+    assert 1 <= remaining <= 20
+
+
+def test_remaining_timeout_seconds_raises_when_deadline_expired():
+    with pytest.raises(TaskTimedOut):
+        cancel_module.remaining_timeout_seconds(
+            {
+                "__deadline_monotonic": 0.0,
+                "__timeout_seconds": 30 * 60,
+            },
+            default_seconds=60,
+        )
+
+
+def test_project_task_timeout_defaults_to_30_minutes_without_celery(monkeypatch):
+    from novelvideo.task_backend import run_core
+
+    monkeypatch.delenv("ST_PROJECT_TASK_TIMEOUT_S", raising=False)
+
+    assert run_core._project_task_timeout_seconds() == 30 * 60
+
+
+def test_project_task_timeout_reads_ce_neutral_env(monkeypatch):
+    from novelvideo.task_backend import run_core
+
+    monkeypatch.setenv("ST_PROJECT_TASK_TIMEOUT_S", "42")
+
+    assert run_core._project_task_timeout_seconds() == 42
+
+
+def test_run_project_task_core_injects_deadline_for_runner(monkeypatch):
+    from novelvideo.task_backend import run_core
+    from novelvideo.task_backend.registry import register_project_task_runner
+
+    captured: dict[str, object] = {}
+
+    def fake_runner(envelope, _ctx):
+        captured.update(envelope)
+        return {"ok": True}
+
+    async def fake_is_cancel_requested(**_kwargs):
+        return False
+
+    async def fake_emit_project_task_metrics(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(run_core, "_ensure_builtin_runners_registered", lambda: None)
+    monkeypatch.setattr(run_core, "is_cancel_requested", fake_is_cancel_requested)
+    monkeypatch.setattr(
+        run_core, "_emit_project_task_metrics", fake_emit_project_task_metrics
+    )
+    monkeypatch.setattr(
+        run_core,
+        "_set_project_task_metrics_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(run_core, "_clear_project_task_metrics_context", lambda: None)
+    monkeypatch.setattr(run_core, "_project_task_timeout_seconds", lambda: 30 * 60)
+    register_project_task_runner("timeout_probe", fake_runner)
+
+    manager = _FakeTaskManager()
+    result = run_core.run_project_task_core_sync(
+        _verified_delivery(),
+        SimpleNamespace(
+            project_id="proj_timeout", requester_user_id="usr_1", is_home_node=True
+        ),
+        manager,
+        run_task_id="task_1",
+    )
+
+    assert result == {"ok": True}
+    assert captured["__run_task_id"] == "task_1"
+    assert captured["__timeout_seconds"] == 30 * 60
+    assert isinstance(captured["__deadline_monotonic"], float)
+
+
+@pytest.mark.parametrize(
+    ("task_type", "expected_projection"),
+    [
+        ("freezone_agent_recipe_result", "failed"),
+        ("freezone_agent_workflow_result", "running"),
+    ],
+)
+def test_agent_product_pending_timeout_is_reviewed_without_refund(
+    monkeypatch, caplog, task_type, expected_projection
+):
+    caplog.set_level("INFO", logger="novelvideo.task_backend.run_core")
+    from novelvideo.chat import evidence_metrics
+    from novelvideo.freezone.agent_product_operations import (
+        AgentProductSettlementPending,
+    )
+    from novelvideo.task_backend import run_core
+    from novelvideo.task_backend.registry import register_project_task_runner
+
+    events: list[tuple[str, str]] = []
+    observed_metrics: list[str] = []
+    monkeypatch.setattr(evidence_metrics, "observe", observed_metrics.append)
+
+    class UsageMeter:
+        async def resolve_feature_credit_reservation(self, _identity):
+            from novelvideo.ports.usage import FeatureSettlementResolution
+
+            return FeatureSettlementResolution(
+                outcome="resolved",
+                reservation_id="reservation_1",
+                feature_key="freezone.agent.recipe_result",
+                model_call_credit_policy="feature_included",
+            )
+
+        async def mark_feature_credit_settlement_for_review(
+            self, reservation_id, *, metadata=None
+        ):
+            events.append(("review", reservation_id))
+            assert metadata["operation_status"] == "submitted"
+            return {"status": "awaiting"}
+
+        async def settle_cancelled_feature_credit_reservation(self, *_args, **_kwargs):
+            events.append(("refund", "unexpected"))
+
+        async def settle_feature_credit_reservation(self, *_args, **_kwargs):
+            events.append(("confirm", "unexpected"))
+
+    def pending_runner(_envelope, _ctx):
+        raise AgentProductSettlementPending(
+            operation_id="agent_product_test", status="submitted"
+        )
+
+    async def not_cancelled(**_kwargs):
+        return False
+
+    async def no_metrics(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(run_core, "_ensure_builtin_runners_registered", lambda: None)
+    monkeypatch.setattr(run_core, "is_cancel_requested", not_cancelled)
+    monkeypatch.setattr(run_core, "get_usage_meter", lambda: UsageMeter())
+    monkeypatch.setattr(run_core, "_emit_project_task_metrics", no_metrics)
+    monkeypatch.setattr(
+        run_core, "_set_project_task_metrics_context", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(run_core, "_clear_project_task_metrics_context", lambda: None)
+    register_project_task_runner(task_type, pending_runner, requires_home_node=True)
+
+    manager = _FakeTaskManager()
+    result = run_core.run_project_task_core_sync(
+        _verified_delivery(
+            task_type=task_type,
+            billing_metadata={"feature_credit_reservation_id": "reservation_1"},
+        ),
+        SimpleNamespace(
+            project_id="proj_timeout", requester_user_id="usr_1", is_home_node=True
+        ),
+        manager,
+        run_task_id="task_1",
+    )
+
+    assert result["pending"] is True
+    assert result["settlement_status"] == "awaiting_reconciliation"
+    assert events == [("review", "reservation_1")]
+    if expected_projection == "running":
+        assert manager.failed == []
+        assert manager.updates[-1]["status"] == "running"
+        assert manager.updates[-1]["metadata"]["error_code"] == (
+            "AGENT_PRODUCT_SETTLEMENT_PENDING"
+        )
+        assert "agent_product_pending.projecting_task_running" in caplog.text
+    else:
+        assert manager.failed[0]["metadata"]["error_code"] == (
+            "AGENT_PRODUCT_SETTLEMENT_PENDING"
+        )
+        assert "agent_product_pending.projecting_task_failed" in caplog.text
+    assert observed_metrics == ["agent_product_awaiting_reconciliation"]
+    assert "operation_status=submitted" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "compile_mode",
+    ["timeout_fallback", "memory_cache", "persistent_cache", "deterministic", "direct_voice"],
+)
+@pytest.mark.parametrize("confirm_fails", [False, True])
+def test_recipe_delivery_confirms_original_reservation_without_refund(
+    monkeypatch, tmp_path, compile_mode, confirm_fails
+):
+    from novelvideo.freezone.agent_product_operations import (
+        bind_agent_product_task,
+        create_agent_product_operation,
+        finish_agent_product_operation,
+    )
+    from novelvideo.task_backend import run_core
+    from novelvideo.task_backend.registry import register_project_task_runner
+    from novelvideo.task_backend.runners.freezone import (
+        _run_freezone_agent_product_async,
+    )
+
+    from novelvideo.freezone.workflow_runs import (
+        bind_workflow_action_product_operation,
+        claim_workflow_media_action,
+        create_workflow_run,
+    )
+
+    direct_voice = compile_mode == "direct_voice"
+    metadata = {}
+    if direct_voice:
+        run = create_workflow_run(
+            project_dir=tmp_path,
+            project_id="proj_timeout",
+            canvas_id="default",
+            actions=[
+                {
+                    "node_id": "voice-1",
+                    "action": "generate_audio",
+                    "recipe_id": "drama-shot-voice",
+                    "recipe_version": "1.0.0",
+                    "generation_attempt_id": "attempt-voice",
+                }
+            ],
+        )
+        metadata = {
+            "workflow_run_id": run["run_id"],
+            "node_id": "voice-1",
+            "recipe_id": "drama-shot-voice",
+            "recipe_version": "1.0.0",
+            "generation_attempt_id": "attempt-voice",
+        }
+
+    operation = create_agent_product_operation(
+        project_dir=tmp_path,
+        project_id="proj_timeout",
+        product_kind="recipe_result",
+        idempotency_key="recipe-reuse",
+        generation_session_id="recipe-reuse",
+        canvas_id="default",
+        artifact_id="voice-1" if direct_voice else "",
+        metadata=metadata,
+    )
+    operation_id = operation["operation_id"]
+    bind_agent_product_task(
+        project_dir=tmp_path,
+        operation_id=operation_id,
+        task_id="task_1",
+        root_task_id="task_1",
+    )
+    receipt = {
+        "kind": "recipe_compile_result",
+        "id": operation_id,
+        "reason": compile_mode,
+        "content": "usable prompt",
+    }
+    if direct_voice:
+        bind_workflow_action_product_operation(
+            project_dir=tmp_path,
+            canvas_id="default",
+            run_id=run["run_id"],
+            node_id="voice-1",
+            action="generate_audio",
+            operation_id=operation_id,
+        )
+        claim = claim_workflow_media_action(
+            project_dir=tmp_path,
+            project_id="proj_timeout",
+            canvas_id="default",
+            node_id="voice-1",
+            operation_id=operation_id,
+            attempt_id="attempt-voice",
+            task_type="freezone_audio_speech",
+            fingerprint="a" * 64,
+        )
+        receipt = {
+            "kind": "recipe_result",
+            "id": claim["job_id"],
+            "workflow_run_id": run["run_id"],
+            "node_id": "voice-1",
+            "recipe_id": "drama-shot-voice",
+        }
+    finish_agent_product_operation(
+        project_dir=tmp_path,
+        operation_id=operation_id,
+        outcome="delivered",
+        expected_task_id="task_1",
+        result_ref=receipt,
+        server_recipe_compile=not direct_voice,
+        server_recipe_direct_audio=direct_voice,
+    )
+
+    events: list[tuple[str, str]] = []
+
+    class UsageMeter:
+        async def resolve_feature_credit_reservation(self, _identity):
+            from novelvideo.ports.usage import FeatureSettlementResolution
+
+            return FeatureSettlementResolution(
+                outcome="resolved",
+                reservation_id="reservation_1",
+                feature_key="freezone.agent.recipe_result",
+                model_call_credit_policy="feature_included",
+            )
+
+        async def settle_cancelled_feature_credit_reservation(self, *_args, **_kwargs):
+            events.append(("refund", "unexpected"))
+
+        async def settle_feature_credit_reservation(
+            self, reservation_id, *, action, metadata
+        ):
+            assert action == "confirm"
+            assert metadata["business_outcome"] == "delivered"
+            events.append(("confirm", reservation_id))
+            if confirm_fails:
+                raise RuntimeError("ledger temporarily unavailable")
+
+    def delivered_runner(envelope, ctx):
+        envelope["payload"] = {
+            "operation_id": operation_id,
+            "product_kind": "recipe_result",
+        }
+        return asyncio.run(_run_freezone_agent_product_async(envelope, ctx))
+
+    async def not_cancelled(**_kwargs):
+        return False
+
+    async def no_metrics(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(run_core, "_ensure_builtin_runners_registered", lambda: None)
+    monkeypatch.setattr(run_core, "is_cancel_requested", not_cancelled)
+    monkeypatch.setattr(run_core, "get_usage_meter", lambda: UsageMeter())
+    monkeypatch.setattr(run_core, "_emit_project_task_metrics", no_metrics)
+    monkeypatch.setattr(
+        run_core, "_set_project_task_metrics_context", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(run_core, "_clear_project_task_metrics_context", lambda: None)
+    register_project_task_runner(
+        "freezone_agent_recipe_result", delivered_runner, requires_home_node=True
+    )
+
+    manager = _FakeTaskManager()
+    result = run_core.run_project_task_core_sync(
+        _verified_delivery(
+            task_type="freezone_agent_recipe_result",
+            billing_metadata={"feature_credit_reservation_id": "reservation_1"},
+        ),
+        SimpleNamespace(
+            project_id="proj_timeout",
+            requester_user_id="usr_1",
+            is_home_node=True,
+            state_dir=tmp_path,
+        ),
+        manager,
+        run_task_id="task_1",
+    )
+
+    assert result["delivery_status"] == "delivered"
+    assert result["result_ref"] == receipt
+    assert events == [("confirm", "reservation_1")]
+    assert manager.failed == []
+    assert len(manager.completed) == 1
+    if direct_voice:
+        # Replaying delivery must reconfirm the same reservation, never refund it.
+        replay = run_core.run_project_task_core_sync(
+            _verified_delivery(task_type="freezone_agent_recipe_result"),
+            SimpleNamespace(
+                project_id="proj_timeout",
+                requester_user_id="usr_1",
+                is_home_node=True,
+                state_dir=tmp_path,
+            ),
+            manager,
+            run_task_id="task_1",
+        )
+        assert replay == result
+        assert events == [("confirm", "reservation_1")] * 2
+        assert manager.failed == []
+        assert result["model_evidence"] == {}
+    else:
+        assert result["compile_mode"] == compile_mode
+        assert "正常计费" in manager.completed[0]["current_task"]
+
+
+def test_run_project_task_core_rejects_raw_dict_before_side_effects():
+    from novelvideo.task_backend import run_core
+
+    manager = _FakeTaskManager()
+
+    with pytest.raises(InvalidTaskEnvelope):
+        run_core.run_project_task_core_sync(
+            {"task_type": "timeout_probe"},
+            SimpleNamespace(
+                project_id="proj_timeout", requester_user_id="usr_1", is_home_node=True
+            ),
+            manager,
+            run_task_id="task_1",
+        )
+
+    assert manager.updates == []
+    assert manager.completed == []
+    assert manager.failed == []
+
+
+def test_run_project_task_core_persists_result_before_confirming_credit(monkeypatch):
+    from novelvideo.task_backend import run_core
+    from novelvideo.task_backend.registry import register_project_task_runner
+
+    events: list[str] = []
+
+    class OrderedTaskManager(_FakeTaskManager):
+        def complete_task_for_project(self, *_args, **kwargs) -> bool:
+            events.append("persisted")
+            super().complete_task_for_project(*_args, **kwargs)
+            return True
+
+    class UsageMeter:
+        async def resolve_feature_credit_reservation(self, _identity):
+            from novelvideo.ports.usage import FeatureSettlementResolution
+
+            return FeatureSettlementResolution(
+                outcome="resolved",
+                reservation_id="reservation_1",
+                feature_key="mainline.test_feature",
+                model_call_credit_policy="feature_included",
+            )
+
+        async def settle_feature_credit_reservation(
+            self, _reservation_id, *, action, metadata=None
+        ):
+            events.append(action)
+            return {"decision": action, "metadata": metadata or {}}
+
+    def fake_runner(_envelope, _ctx):
+        return {"asset_id": "asset_1"}
+
+    async def fake_is_cancel_requested(**_kwargs):
+        return False
+
+    async def fake_emit_project_task_metrics(*_args, **_kwargs):
+        events.append("metrics")
+
+    monkeypatch.setattr(run_core, "_ensure_builtin_runners_registered", lambda: None)
+    monkeypatch.setattr(run_core, "is_cancel_requested", fake_is_cancel_requested)
+    monkeypatch.setattr(run_core, "get_usage_meter", lambda: UsageMeter())
+    monkeypatch.setattr(
+        run_core, "_emit_project_task_metrics", fake_emit_project_task_metrics
+    )
+    monkeypatch.setattr(
+        run_core,
+        "_set_project_task_metrics_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(run_core, "_clear_project_task_metrics_context", lambda: None)
+    register_project_task_runner("result_settlement_order_probe", fake_runner)
+
+    manager = OrderedTaskManager()
+    result = run_core.run_project_task_core_sync(
+        _verified_delivery(
+            task_type="result_settlement_order_probe",
+            project_id="proj_result",
+            billing_metadata={"feature_credit_reservation_id": "reservation_1"},
+        ),
+        SimpleNamespace(
+            project_id="proj_result", requester_user_id="usr_1", is_home_node=True
+        ),
+        manager,
+        run_task_id="task_1",
+    )
+
+    assert result == {"asset_id": "asset_1"}
+    assert events == ["persisted", "confirm", "metrics"]
+
+
+def test_run_project_task_core_confirms_delivered_result_when_task_state_write_fails(
+    monkeypatch,
+):
+    from novelvideo.task_backend import run_core
+    from novelvideo.task_backend.registry import register_project_task_runner
+
+    events: list[tuple[str, dict]] = []
+
+    class FailingTaskManager(_FakeTaskManager):
+        def complete_task_for_project(self, *_args, **_kwargs) -> None:
+            raise OSError("task state write failed")
+
+    class UsageMeter:
+        async def resolve_feature_credit_reservation(self, _identity):
+            from novelvideo.ports.usage import FeatureSettlementResolution
+
+            return FeatureSettlementResolution(
+                outcome="resolved",
+                reservation_id="reservation_1",
+                feature_key="mainline.test_feature",
+                model_call_credit_policy="feature_included",
+            )
+
+        async def settle_feature_credit_reservation(
+            self, _reservation_id, *, action, metadata=None
+        ):
+            events.append((action, metadata or {}))
+            return {"decision": action}
+
+    def fake_runner(_envelope, _ctx):
+        return {"asset_id": "asset_1"}
+
+    async def fake_is_cancel_requested(**_kwargs):
+        return False
+
+    async def fake_emit_project_task_metrics(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(run_core, "_ensure_builtin_runners_registered", lambda: None)
+    monkeypatch.setattr(run_core, "is_cancel_requested", fake_is_cancel_requested)
+    monkeypatch.setattr(run_core, "get_usage_meter", lambda: UsageMeter())
+    monkeypatch.setattr(
+        run_core,
+        "_set_project_task_metrics_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(run_core, "_clear_project_task_metrics_context", lambda: None)
+    register_project_task_runner("result_persistence_failure_probe", fake_runner)
+
+    with pytest.raises(OSError, match="task state write failed"):
+        run_core.run_project_task_core_sync(
+            _verified_delivery(
+                task_type="result_persistence_failure_probe",
+                project_id="proj_result",
+                billing_metadata={"feature_credit_reservation_id": "reservation_1"},
+            ),
+            SimpleNamespace(
+                project_id="proj_result", requester_user_id="usr_1", is_home_node=True
+            ),
+            FailingTaskManager(),
+            run_task_id="task_1",
+        )
+
+    assert events == [
+        (
+            "confirm",
+            {
+                "source": "task_completed",
+                "business_outcome": "delivered",
+            },
+        )
+    ]
+
+
+def test_text_generation_settlement_uses_actual_delivered_output_chars(monkeypatch):
+    from novelvideo.task_backend import run_core
+    from novelvideo.task_backend.registry import register_project_task_runner
+
+    settlements: list[tuple[str, dict]] = []
+
+    class UsageMeter:
+        async def resolve_feature_credit_reservation(self, _identity):
+            from novelvideo.ports.usage import FeatureSettlementResolution
+
+            return FeatureSettlementResolution(
+                outcome="not_applicable",
+                feature_key="freezone.text_generate",
+                model_call_credit_policy="separate",
+            )
+
+        async def settle_feature_credit_reservation(
+            self, reservation_id, *, action, metadata=None
+        ):
+            assert action == "confirm"
+            settlements.append((reservation_id, metadata or {}))
+            return {"decision": action}
+
+    def fake_runner(_envelope, _ctx):
+        return {
+            "generated_text": " 雨 夜\n重逢 ",
+            "__feature_credit_reservation_id": "reservation_actual_text",
+        }
+
+    async def fake_is_cancel_requested(**_kwargs):
+        return False
+
+    async def fake_emit_project_task_metrics(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(run_core, "_ensure_builtin_runners_registered", lambda: None)
+    monkeypatch.setattr(run_core, "is_cancel_requested", fake_is_cancel_requested)
+    monkeypatch.setattr(run_core, "get_usage_meter", lambda: UsageMeter())
+    monkeypatch.setattr(
+        run_core, "_emit_project_task_metrics", fake_emit_project_task_metrics
+    )
+    monkeypatch.setattr(
+        run_core, "_set_project_task_metrics_context", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(run_core, "_clear_project_task_metrics_context", lambda: None)
+    register_project_task_runner("freezone_text_generate", fake_runner)
+
+    result = run_core.run_project_task_core_sync(
+        _verified_delivery(
+            task_type="freezone_text_generate",
+            project_id="proj_text",
+            billing_metadata=None,
+        ),
+        SimpleNamespace(
+            project_id="proj_text", requester_user_id="usr_1", is_home_node=True
+        ),
+        _FakeTaskManager(),
+        run_task_id="task_1",
+    )
+
+    assert result == {"generated_text": " 雨 夜\n重逢 "}
+    assert settlements == [
+        (
+            "reservation_actual_text",
+            {
+            "source": "task_completed",
+            "business_outcome": "delivered",
+            "actual_billing": {
+                "operation": "text_generate",
+                "billable_chars": 4,
+                "pricing_quantity": 4,
+                "pricing_metrics": {
+                    "call_count": 1,
+                    "item_count": 1,
+                    "billable_chars": 4,
+                },
+                "quantity_source": "trusted_runner_result",
+            },
+            },
+        )
+    ]
+
+
+def test_run_project_task_core_confirms_runner_result_even_when_read_model_ignores_completion(
+    monkeypatch,
+):
+    from novelvideo.task_backend import run_core
+    from novelvideo.task_backend.registry import register_project_task_runner
+
+    events: list[tuple[str, dict]] = []
+
+    class CancelledTaskManager(_FakeTaskManager):
+        def complete_task_for_project(self, *_args, **_kwargs) -> bool:
+            return False
+
+    class UsageMeter:
+        async def resolve_feature_credit_reservation(self, _identity):
+            from novelvideo.ports.usage import FeatureSettlementResolution
+
+            return FeatureSettlementResolution(
+                outcome="resolved",
+                reservation_id="reservation_1",
+                feature_key="mainline.test_feature",
+                model_call_credit_policy="feature_included",
+            )
+
+        async def settle_feature_credit_reservation(
+            self, _reservation_id, *, action, metadata=None
+        ):
+            events.append((action, metadata or {}))
+            return {"decision": action}
+
+    def fake_runner(_envelope, _ctx):
+        return {"asset_id": "asset_1"}
+
+    async def fake_is_cancel_requested(**_kwargs):
+        return False
+
+    monkeypatch.setattr(run_core, "_ensure_builtin_runners_registered", lambda: None)
+    monkeypatch.setattr(run_core, "is_cancel_requested", fake_is_cancel_requested)
+    monkeypatch.setattr(run_core, "get_usage_meter", lambda: UsageMeter())
+    monkeypatch.setattr(
+        run_core,
+        "_set_project_task_metrics_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(run_core, "_clear_project_task_metrics_context", lambda: None)
+    register_project_task_runner("cancel_race_settlement_probe", fake_runner)
+
+    result = run_core.run_project_task_core_sync(
+        _verified_delivery(
+            task_type="cancel_race_settlement_probe",
+            project_id="proj_result",
+            billing_metadata={"feature_credit_reservation_id": "reservation_1"},
+        ),
+        SimpleNamespace(
+            project_id="proj_result", requester_user_id="usr_1", is_home_node=True
+        ),
+        CancelledTaskManager(),
+        run_task_id="task_1",
+    )
+
+    assert result == {"asset_id": "asset_1"}
+    assert events == [
+        (
+            "confirm",
+            {
+                "source": "task_completed",
+                "business_outcome": "delivered",
+            },
+        )
+    ]

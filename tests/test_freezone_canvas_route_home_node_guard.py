@@ -1,0 +1,323 @@
+"""只允许具备共享存储语义的画布路由撤掉 home node 守卫。
+
+方案文档（`B2-canvas-placement-free.md` §6.4 步 11）的原话是「撤掉
+`api/routes/freezone.py:326` 的 home node 守卫」。**照字面删是错的**，
+`TCP-P60` 已把范围收窄成「按调用点逐个撤」，理由本文件用可执行的形式钉住：
+
+- 那一行（集成线上已漂到 `:331`，在 `_resolve_freezone_project` 内）
+  **不是画布路由的守卫，是 freezone 全部路由的守卫** —— 本文件
+  `test_only_canvas_routes_opt_out_of_the_home_node_guard` 现场点数：
+  `@router.` 当前共 99 条，其中 `tags=[TAG_FREEZONE_CANVAS]` 只有 25 条。
+- 删那一行 ＝ 一次性放开另外 74 条读写 `Path(ctx.output_dir)` 本地项目文件、
+  **既没有租约也没有共享存储交代**的路由，与 §6.3 的「逐个撤、不批量撤」直接冲突。
+
+故落地形态是给 `_resolve_freezone_project` 加一个**带默认值 `True` 的关键字参数**
+`require_home_node`（形制照它自己签名里已有的 `*, required_role: str = "editor"`），
+只在明确白名单中的 placement-free 画布路由调用点显式传 `False`。仍写入项目本地
+SQLite 的 workflow draft/run 路由不在白名单中，必须保留默认 Home Node 守卫。
+
+四条用例分工：
+
+1. `test_default_still_rejects_a_non_home_node_project` —— 不传新参数时行为逐字不变
+   （错误体照 `tests/test_project_context.py:35` 的既有断言口径）。
+2. `test_canvas_read_route_passes_the_home_node_guard` /
+   `test_canvas_write_route_passes_the_home_node_guard` —— 白名单里挑读写各一条，
+   在非 home node 上**过得了这道守卫**。只断言这一件：真正落盘还依赖共享存储，
+   那是 `dispatch-and-branching.md` §11 第 4 行的交接项，不在本 EU 内。
+3. `test_non_canvas_freezone_routes_are_still_blocked_on_a_non_home_node` ——
+   另外 76 条挑 3 条，**仍然被拦**且错误体逐字相同。
+4. `test_only_placement_free_canvas_routes_opt_out_of_the_home_node_guard` —— AST 静态护栏
+   （双向）：传 `require_home_node=False` 的调用点必须且只能位于明确白名单。
+   形制照同目录 `tests/test_freezone_canvas_route_to_thread.py:180` 的 AST 不变量。
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+from fastapi import HTTPException
+
+from novelvideo.api.routes import freezone as freezone_routes
+from novelvideo.api.schemas import CanvasPayload
+from novelvideo.project_context import ProjectContext
+
+ROUTES_SOURCE = Path("src/novelvideo/api/routes/freezone.py")
+
+# 守卫的错误体真源：`project_context.py:50-58`。
+HOME_NODE_REJECTION_CODE = "project_not_on_this_node"
+# `_resolve_freezone_project` 传给守卫的字面量，别的用例可能在断言它。
+FREEZONE_OPERATION = "access freezone project files"
+
+USER = {"id": "owner_1", "username": "admin"}
+
+
+def _remote_ctx(tmp_path: Path) -> ProjectContext:
+    """一个「项目不在本节点」的上下文，形状照 `test_freezone_canvas_route_to_thread.py:48`。"""
+
+    return ProjectContext(
+        project_id="proj_freezone",
+        project_name="demo",
+        owner_type="user",
+        owner_id="owner_1",
+        owner_username="admin",
+        requester_user_id="owner_1",
+        requester_username="admin",
+        requester_principals=(("user", "owner_1"),),
+        effective_role="editor",
+        home_node_id="node_a",
+        output_dir=tmp_path / "output" / "admin" / "demo",
+        state_dir=tmp_path / "state" / "admin" / "demo",
+        runtime_dir=tmp_path / "runtime" / "admin" / "demo",
+        is_home_node=False,
+    )
+
+
+def _patch_remote_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ProjectContext:
+    """只打桩控制面解析，**真守卫原样留在链路里**（这正是被测对象）。"""
+
+    ctx = _remote_ctx(tmp_path)
+    ctx.output_dir.mkdir(parents=True, exist_ok=True)
+    ctx.state_dir.mkdir(parents=True, exist_ok=True)
+
+    async def fake_resolve_project_context(**_kwargs) -> ProjectContext:
+        return ctx
+
+    monkeypatch.setattr(freezone_routes, "resolve_project_context", fake_resolve_project_context)
+    return ctx
+
+
+def _assert_home_node_rejection(exc: HTTPException, ctx: ProjectContext) -> None:
+    assert exc.status_code == 409
+    assert exc.detail == {
+        "code": HOME_NODE_REJECTION_CODE,
+        "message": f"{FREEZONE_OPERATION} must run on the project home node",
+        "project_id": ctx.project_id,
+        "home_node_id": ctx.home_node_id,
+    }
+
+
+def _assert_not_a_home_node_rejection(exc: BaseException | None) -> None:
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
+        assert exc.detail.get("code") != HOME_NODE_REJECTION_CODE, (
+            "画布路由仍然被 home node 守卫拦住了"
+        )
+
+
+async def test_default_still_rejects_a_non_home_node_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不传新参数 ＝ 今天的行为，逐字不变（76 条非画布路由靠这个默认值不改一行）。"""
+
+    ctx = _patch_remote_project(monkeypatch, tmp_path)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await freezone_routes._resolve_freezone_project("proj_freezone", USER)
+
+    _assert_home_node_rejection(excinfo.value, ctx)
+
+
+async def test_canvas_read_route_passes_the_home_node_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`get_canvas`（`:11537`）在非 home node 上不再被守卫拦。"""
+
+    _patch_remote_project(monkeypatch, tmp_path)
+
+    try:
+        await freezone_routes.get_canvas(
+            project="proj_freezone",
+            canvas_id="never_written",
+            user=USER,
+        )
+    except HTTPException as exc:  # pragma: no cover - 只在回潮时走到
+        _assert_not_a_home_node_rejection(exc)
+        raise
+
+
+async def test_canvas_write_route_passes_the_home_node_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`put_canvas`（`:11775`）在非 home node 上不再被守卫拦。
+
+    只断言过得了守卫这一件事 —— 落盘本身还依赖共享存储（交接项）。
+    """
+
+    _patch_remote_project(monkeypatch, tmp_path)
+
+    try:
+        await freezone_routes.put_canvas(
+            project="proj_freezone",
+            canvas_id="written_off_home_node",
+            body=CanvasPayload(nodes=[{"id": "n1"}], edges=[], metadata={}),
+            user=USER,
+        )
+    except HTTPException as exc:  # pragma: no cover - 只在回潮时走到
+        _assert_not_a_home_node_rejection(exc)
+        raise
+
+
+async def test_workflow_run_route_remains_home_node_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _patch_remote_project(monkeypatch, tmp_path)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await freezone_routes.get_canvas_workflow_run(
+            project="proj_freezone",
+            canvas_id="default",
+            run_id="run-1",
+            user=USER,
+        )
+
+    _assert_home_node_rejection(excinfo.value, ctx)
+
+
+@pytest.mark.parametrize(
+    "handler_name",
+    [
+        "freezone_image_camera_options",
+        "freezone_image_style_templates",
+        "freezone_video_camera_templates",
+    ],
+)
+async def test_non_canvas_freezone_routes_are_still_blocked_on_a_non_home_node(
+    handler_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """另外 76 条一行不改：仍然被拦，错误体逐字相同。"""
+
+    ctx = _patch_remote_project(monkeypatch, tmp_path)
+    handler = getattr(freezone_routes, handler_name)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await handler(project="proj_freezone", user=USER)
+
+    _assert_home_node_rejection(excinfo.value, ctx)
+
+
+def _is_router_decorator(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "router"
+    )
+
+
+def _is_canvas_decorator(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    for keyword in node.keywords:
+        if keyword.arg != "tags" or not isinstance(keyword.value, ast.List):
+            continue
+        if any(
+            isinstance(element, ast.Name) and element.id == "TAG_FREEZONE_CANVAS"
+            for element in keyword.value.elts
+        ):
+            return True
+    return False
+
+
+def _opts_out_of_the_guard(call: ast.Call) -> bool:
+    return any(
+        keyword.arg == "require_home_node"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is False
+        for keyword in call.keywords
+    )
+
+
+PLACEMENT_FREE_CANVAS_ROUTES = {
+    "create_canvas_from_preset",
+    "build_projection_from_preset",
+    "project_canvas_from_preset",
+    "remove_canvas_projection",
+    "projection_status",
+    "list_canvases",
+    "get_canvas_revision",
+    "get_canvas",
+    "list_canvas_history",
+    "restore_canvas_history",
+    "get_node_generation_history",
+    "delete_node_generation_history_record",
+    "get_canvas_generation_history",
+    "put_canvas",
+    "delete_canvas",
+}
+
+
+def test_only_placement_free_canvas_routes_opt_out_of_the_home_node_guard() -> None:
+    """双向棘轮：opt-out 只许出现在明确的 placement-free 白名单中。"""
+
+    tree = ast.parse(ROUTES_SOURCE.read_text(encoding="utf-8"), filename=str(ROUTES_SOURCE))
+
+    canvas_routes: dict[str, list[ast.Call]] = {}
+    opt_outs_inside_routes: set[ast.Call] = set()
+    router_decorators = 0
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorators = [dec for dec in node.decorator_list if _is_router_decorator(dec)]
+        if not decorators:
+            continue
+        router_decorators += len(decorators)
+        resolver_calls = [
+            call
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_resolve_freezone_project"
+        ]
+        if any(_is_canvas_decorator(dec) for dec in decorators):
+            canvas_routes[node.name] = resolver_calls
+            opt_outs_inside_routes.update(call for call in resolver_calls if _opts_out_of_the_guard(call))
+        else:
+            assert [call.lineno for call in resolver_calls if _opts_out_of_the_guard(call)] == [], (
+                f"非画布路由 {node.name} 传了 require_home_node=False"
+            )
+
+    all_opt_outs = {
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_resolve_freezone_project"
+        and _opts_out_of_the_guard(call)
+    }
+
+    # 合并后新增 video-extend、upscale/quote、upscale/probe 三条非画布路由。
+    # 画布路由数保持 staging 的 31 条，home-node opt-out 白名单仍逐项检查。
+    # 113 → 114：新增 `POST .../freezone/video-breakdown`（逐帧拉片）。
+    # 非画布路由、未传 require_home_node=False，同样过守卫。
+    assert router_decorators == 114
+    assert len(canvas_routes) == 31
+
+    assert set(canvas_routes) >= PLACEMENT_FREE_CANVAS_ROUTES
+    assert "cancel_canvas_workflow_draft" in canvas_routes
+    assert canvas_routes["cancel_canvas_workflow_draft"]
+    assert not any(_opts_out_of_the_guard(call) for call in canvas_routes["cancel_canvas_workflow_draft"])
+
+    # 正向：白名单路由必须全部、且每一处调用都 opt-out。
+    missing = {
+        name: [call.lineno for call in calls if not _opts_out_of_the_guard(call)]
+        for name, calls in canvas_routes.items()
+        if name in PLACEMENT_FREE_CANVAS_ROUTES
+        if not calls or not all(_opts_out_of_the_guard(call) for call in calls)
+    }
+    assert missing == {}
+
+    # 仍落项目本地 SQLite 的画布路由不得 opt-out。
+    unexpected = {
+        name: [call.lineno for call in calls if _opts_out_of_the_guard(call)]
+        for name, calls in canvas_routes.items()
+        if name not in PLACEMENT_FREE_CANVAS_ROUTES
+        if any(_opts_out_of_the_guard(call) for call in calls)
+    }
+    assert unexpected == {}
+
+    # 反向：全文件的 opt-out 一个都不许落在画布路由之外（含模块级 helper）。
+    assert {call.lineno for call in all_opt_outs} == {
+        call.lineno for call in opt_outs_inside_routes
+    }

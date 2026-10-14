@@ -1,0 +1,197 @@
+"""Canvas-level generation-history aggregation.
+
+Deleting a node from the canvas must NOT remove its past generations from the
+history browser. History lives in per-node append-only JSONL files that the
+canvas JSON never touches, so ``read_canvas_generation_history`` reads *every*
+node file under a canvas — including nodes that no longer exist on the canvas.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from novelvideo.freezone.history import (
+    append_generation_history,
+    delete_generation_history_record,
+    generation_history_path,
+    read_canvas_generation_history,
+)
+
+
+def _append(project_dir: Path, node_id: str, job_id: str, recorded_at: str) -> None:
+    append_generation_history(
+        project_dir=project_dir,
+        canvas_id="default",
+        node_id=node_id,
+        record={
+            "id": f"video:{job_id}",
+            "job_id": job_id,
+            "status": "completed",
+            "media_type": "video",
+            "recorded_at": recorded_at,
+            "result": {"output_url": f"/static/{job_id}.mp4"},
+        },
+    )
+
+
+def test_canvas_history_includes_deleted_node(tmp_path: Path) -> None:
+    project_dir = tmp_path / "proj"
+    _append(project_dir, "kept_node", "job_kept", "2026-06-16T00:00:00Z")
+    _append(project_dir, "deleted_node", "job_deleted", "2026-06-15T00:00:00Z")
+
+    # Simulate the node being removed from the canvas: only the canvas JSON would
+    # drop it — the history file stays on disk, which is the whole point.
+    assert generation_history_path(project_dir, "default", "deleted_node").exists()
+
+    records = read_canvas_generation_history(project_dir=project_dir, canvas_id="default")
+    job_ids = {r["job_id"] for r in records}
+    assert job_ids == {"job_kept", "job_deleted"}
+
+
+def test_media_workers_preserve_admitted_workflow_attempt_in_history(tmp_path: Path) -> None:
+    from novelvideo.task_backend.runners.freezone import _append_node_history
+    from novelvideo.task_backend.runners.video import _append_freezone_video_node_history
+
+    ctx = SimpleNamespace(project_id="project-1")
+    payload = {
+        "canvas_id": "default",
+        "node_id": "media-1",
+        "generation_attempt_id": "attempt-1",
+        "product_operation_id": "operation-1",
+    }
+    image = _append_node_history(
+        ctx=ctx,
+        project_dir=tmp_path,
+        payload=payload,
+        task_type="freezone_gen",
+        job_id="image-job",
+        media_type="image",
+        result={"image_url": "/static/image.png"},
+    )
+    video = _append_freezone_video_node_history(
+        ctx=ctx,
+        project_dir=tmp_path,
+        payload=payload,
+        job_id="video-job",
+        result={"output_url": "/static/video.mp4"},
+    )
+    assert image is not None and video is not None
+    for record in (image, video):
+        assert record["generation_attempt_id"] == "attempt-1"
+        assert record["product_operation_id"] == "operation-1"
+
+
+def test_canvas_history_sorted_newest_first(tmp_path: Path) -> None:
+    project_dir = tmp_path / "proj"
+    _append(project_dir, "node_a", "job_old", "2026-06-10T00:00:00Z")
+    _append(project_dir, "node_b", "job_mid", "2026-06-12T00:00:00Z")
+    _append(project_dir, "node_a", "job_new", "2026-06-14T00:00:00Z")
+
+    records = read_canvas_generation_history(project_dir=project_dir, canvas_id="default")
+    assert [r["job_id"] for r in records] == ["job_new", "job_mid", "job_old"]
+
+
+def test_canvas_history_respects_limit(tmp_path: Path) -> None:
+    project_dir = tmp_path / "proj"
+    _append(project_dir, "node_a", "job_old", "2026-06-10T00:00:00Z")
+    _append(project_dir, "node_b", "job_new", "2026-06-14T00:00:00Z")
+
+    records = read_canvas_generation_history(
+        project_dir=project_dir, canvas_id="default", limit=1
+    )
+    assert [r["job_id"] for r in records] == ["job_new"]
+
+
+def test_canvas_history_missing_canvas_dir_is_empty(tmp_path: Path) -> None:
+    records = read_canvas_generation_history(
+        project_dir=tmp_path / "proj", canvas_id="default"
+    )
+    assert records == []
+
+
+def test_canvas_history_rejects_bad_canvas_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        read_canvas_generation_history(
+            project_dir=tmp_path / "proj", canvas_id="../escape"
+        )
+
+
+def test_idempotent_history_append_is_atomic_without_scanning_full_history(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import novelvideo.freezone.history as history
+
+    project_dir = tmp_path / "proj"
+    record = {
+        "id": "html:artifact:v1",
+        "job_id": "artifact:v1",
+        "status": "completed",
+        "media_type": "html",
+    }
+    monkeypatch.setattr(
+        history,
+        "_read_history_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("idempotent append must not scan the whole JSONL file")
+        ),
+    )
+
+    def append_once():
+        return append_generation_history(
+            project_dir=project_dir,
+            canvas_id="default",
+            node_id="html_node",
+            record=record,
+            idempotency_key=record["id"],
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _index: append_once(), range(8)))
+
+    path = generation_history_path(project_dir, "default", "html_node")
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_delete_history_record_hides_only_target_and_keeps_append_only_file(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "proj"
+    _append(project_dir, "node_a", "job_keep", "2026-06-10T00:00:00Z")
+    path = generation_history_path(project_dir, "default", "node_a")
+    append_generation_history(
+        project_dir=project_dir,
+        canvas_id="default",
+        node_id="node_a",
+        record={
+            "id": "video:job_delete",
+            "job_id": "job_delete",
+            "status": "completed",
+            "media_type": "video",
+            "result": {"output_url": "/static/job_delete.mp4"},
+        },
+    )
+    size_before = path.stat().st_size
+
+    assert delete_generation_history_record(
+        project_dir=project_dir,
+        canvas_id="default",
+        node_id="node_a",
+        record_id="video:job_delete",
+    )
+    assert path.stat().st_size > size_before
+    assert [
+        record["job_id"]
+        for record in read_canvas_generation_history(
+            project_dir=project_dir, canvas_id="default"
+        )
+    ] == ["job_keep"]
+    assert not delete_generation_history_record(
+        project_dir=project_dir,
+        canvas_id="default",
+        node_id="node_a",
+        record_id="video:job_delete",
+    )
