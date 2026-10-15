@@ -247,7 +247,7 @@ async def test_gate2_cancel_kills_registered_process_group_and_unregisters_handl
 async def test_gate2_deadline_kills_process_group_and_marks_failed(
     monkeypatch, _task_ports, signed_inline_backend, tmp_path
 ):
-    monkeypatch.setenv("ST_PROJECT_TASK_TIMEOUT_S", "1")
+    monkeypatch.setenv("ST_PROJECT_TASK_MAX_RUNTIME_S", "1")
     ctx = _ctx(tmp_path)
     backend = signed_inline_backend()
     script, pidfile = _spawn_tree_script(tmp_path)
@@ -282,6 +282,12 @@ async def test_gate2_deadline_kills_process_group_and_marks_failed(
 
     assert failed.metadata is not None
     assert failed.metadata["error_code"] == "TASK_TIMEOUT"
+    # The failure payload must explain *what* was running, not just that it died.
+    failure = failed.metadata["failure"]
+    assert failure["exception_type"] == "TaskTimedOut"
+    assert failure["task_type"] == task_type
+    assert failure["task_id"] == queued.task_state.task_id
+    assert "TaskTimedOut" in failure["traceback"]
     assert await _wait_until_dead(child_pid)
     assert active_subprocess_count(queued.task_state.task_id) == 0
     await _wait_lane_idle(backend, "world")

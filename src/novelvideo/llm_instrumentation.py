@@ -536,6 +536,58 @@ async def _forward_agent_usage(
     )
 
 
+_KNOWN_PROVIDER_PREFIXES = (
+    "openai",
+    "anthropic",
+    "google",
+    "gemini",
+    "azure",
+    "custom",
+    "deepseek",
+    "moonshot",
+    "qwen",
+    "zhipu",
+)
+
+
+def _provider_from_model(model: str) -> str:
+    value = (model or "").strip()
+    if "/" in value:
+        prefix = value.split("/", 1)[0].strip().lower()
+        if prefix in _KNOWN_PROVIDER_PREFIXES:
+            return prefix
+    return ""
+
+
+def _note_task_model_call(
+    *,
+    model: str,
+    capability: str = "",
+    request_id: str = "",
+    source: str = "",
+    status: str = "ok",
+    error: object = "",
+) -> None:
+    """Record a model invocation on the active task diagnostics record.
+
+    No-op outside a project-task execution context; never raises.
+    """
+
+    try:
+        from novelvideo.task_diagnostics import note_model_call
+    except Exception:  # pragma: no cover - defensive import guard
+        return
+    note_model_call(
+        model=_normalize_recorded_model_name(model) or model,
+        provider=_provider_from_model(model),
+        capability=capability,
+        request_id=request_id,
+        source=source,
+        status=status,
+        error=error,
+    )
+
+
 def _install_pydantic_ai_openai_trace_patch() -> None:
     global _pydantic_ai_openai_trace_patched
     if _pydantic_ai_openai_trace_patched:
@@ -603,6 +655,7 @@ def _install_agent_run_patch() -> None:
     original_run = Agent.run
 
     async def _tracked_run(self, *args, **kwargs):
+        model_name = _extract_model_name(self)
         reservation_id = await _meter_reserve(
             model=_extract_model_name(self),
             billing_kind="text",
@@ -625,6 +678,13 @@ def _install_agent_run_patch() -> None:
                 reservation_id,
                 metadata=_failure_log_metadata(exc),
             )
+            _note_task_model_call(
+                model=model_name,
+                capability=_RESOURCE_KIND_CTX.get(),
+                source="pydantic_ai",
+                status="error",
+                error=exc,
+            )
             raise
         finally:
             _MODEL_CALL_INSTRUMENTATION_ACTIVE.reset(token)
@@ -632,6 +692,17 @@ def _install_agent_run_patch() -> None:
             await _forward_agent_usage(self, result, credit_reservation_id=reservation_id)
         except Exception:
             pass
+        try:
+            request_id, _task_id, _response_id = _extract_provider_ids(result)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            request_id = ""
+        _note_task_model_call(
+            model=model_name,
+            capability=_RESOURCE_KIND_CTX.get(),
+            request_id=request_id,
+            source="pydantic_ai",
+            status="ok",
+        )
         return result
 
     Agent.run = _tracked_run  # type: ignore[assignment]
@@ -746,6 +817,12 @@ def _patch_litellm_acompletion(litellm_module: object) -> None:
                 reservation_id,
                 metadata=_failure_log_metadata(exc),
             )
+            _note_task_model_call(
+                model=model,
+                source="litellm",
+                status="error",
+                error=exc,
+            )
             raise
         finally:
             _MODEL_CALL_INSTRUMENTATION_ACTIVE.reset(token)
@@ -757,6 +834,16 @@ def _patch_litellm_acompletion(litellm_module: object) -> None:
             )
         except Exception as exc:
             logger.debug("litellm acompletion success emit failed: %s", exc)
+        try:
+            request_id, _task_id, _response_id = _extract_provider_ids(response)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            request_id = ""
+        _note_task_model_call(
+            model=model,
+            request_id=request_id,
+            source="litellm",
+            status="ok",
+        )
         return response
 
     setattr(litellm_module, "acompletion", _tracked_acompletion)
@@ -780,6 +867,19 @@ def _install_litellm_hook() -> None:
         async def _forward_success(self, kwargs, response_obj) -> None:
             if _MODEL_CALL_INSTRUMENTATION_ACTIVE.get():
                 return
+            _in_tok, _out_tok, hook_model = _extract_litellm_usage(kwargs, response_obj)
+            try:
+                hook_request_id, _hook_task_id, _hook_response_id = _extract_provider_ids(
+                    response_obj
+                )
+            except Exception:  # noqa: BLE001 - diagnostics only
+                hook_request_id = ""
+            _note_task_model_call(
+                model=hook_model,
+                request_id=hook_request_id,
+                source="litellm_hook",
+                status="ok",
+            )
             reservation_id = _pop_credit_reservation()
             await _forward_litellm_success(
                 kwargs, response_obj, credit_reservation_id=reservation_id
@@ -813,6 +913,12 @@ def _install_litellm_hook() -> None:
             error = kwargs.get("exception") if isinstance(kwargs, dict) else None
             if not isinstance(error, BaseException):
                 error = RuntimeError(str(error or "model call failed"))
+            _note_task_model_call(
+                model=str((kwargs or {}).get("model") or ""),
+                source="litellm_hook",
+                status="error",
+                error=error,
+            )
             await _meter_refund(
                 reservation_id,
                 metadata=_failure_log_metadata(error, response_obj),
@@ -827,6 +933,12 @@ def _install_litellm_hook() -> None:
             error = kwargs.get("exception") if isinstance(kwargs, dict) else None
             if not isinstance(error, BaseException):
                 error = RuntimeError(str(error or "model call failed"))
+            _note_task_model_call(
+                model=str((kwargs or {}).get("model") or ""),
+                source="litellm_hook",
+                status="error",
+                error=error,
+            )
             coro = _meter_refund(
                 reservation_id,
                 metadata=_failure_log_metadata(error, response_obj),

@@ -16,6 +16,13 @@
 | `NOVELVIDEO_RUNTIME_DIR` | `$DATA_ROOT/runtime` | Runtime temporary directory. |
 | `ST_CONTROL_PLANE_DSN` / `ST_REDIS_URL` / `ST_CELERY_BROKER_URL` / `ST_CELERY_RESULT_BACKEND` | Empty (forced empty in CE) | Used only by EE/distributed; CE runs tasks inline in-process, so leave empty. |
 
+## Task Execution
+
+| Variable | Default | Description |
+|---|---|---|
+| `ST_PROJECT_TASK_IDLE_TIMEOUT_S` | `1800` | Idle notice (seconds) for project tasks. A task that keeps reporting progress is never timed out; after this long with no progress update it only raises a prompt (the task keeps running, it is not terminated automatically) so you can choose "keep waiting" or "terminate the task". Set to `0` to disable the notice. `ST_PROJECT_TASK_TIMEOUT_S` is a backward-compatible alias. |
+| `ST_PROJECT_TASK_MAX_RUNTIME_S` | `0` (unlimited) | Absolute runtime hard cap (seconds) and the only setting that **automatically terminates** a task. Off by default to avoid killing a still-healthy long task; enable it only as an operator safety net. |
+
 ## Model Gateway
 
 In CE, the selected channel, gateway address, and token are written by

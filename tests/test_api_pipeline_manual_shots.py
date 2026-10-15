@@ -146,9 +146,10 @@ async def test_pipeline_status_requires_voice_setup_before_tts(monkeypatch, tmp_
     frames_dir.mkdir(parents=True)
     for beat_num in (1, 2, 5):
         (frames_dir / f"beat_{beat_num:02d}.png").write_bytes(b"x")
-    grids_dir = tmp_path / "grids" / ep_tag
-    grids_dir.mkdir(parents=True)
-    (grids_dir / "grid.png").write_bytes(b"x")
+    sketches_dir = tmp_path / "sketches" / ep_tag
+    sketches_dir.mkdir(parents=True)
+    for beat_num in (1, 2, 5):
+        (sketches_dir / f"beat_{beat_num:02d}.png").write_bytes(b"x")
 
     response = await pipeline.pipeline_status(
         project="demo",
@@ -165,6 +166,81 @@ async def test_pipeline_status_requires_voice_setup_before_tts(monkeypatch, tmp_
         "ready": False,
         "errors": ["Beat 01 解说声线缺失：请上传或录制解说人音频"],
     }
+
+
+@pytest.mark.asyncio
+async def test_pipeline_status_requires_all_beats_sketched(monkeypatch, tmp_path):
+    """Regression: a partial sketch must not mark 草图生成 complete.
+
+    Mirrors the nn1 episode-1 deadlock where only beats 1-75 of 121 had sketches,
+    the pipeline advanced to ``global_optimize_video``, and the step could never
+    complete because the optimizer skips beats without a sketch.
+    """
+
+    from novelvideo.api.deps import ProjectResolution
+    from novelvideo.api.routes import pipeline
+    from novelvideo import pipeline_status
+
+    async def fake_resolve_project_scope(project, user, *, required_role="viewer"):
+        return ProjectResolution(
+            ctx=None,
+            username="alice",
+            project_name="demo",
+            project_dir=tmp_path,
+            output_dir=str(tmp_path),
+            state_dir=str(tmp_path / "state"),
+            runtime_dir=str(tmp_path / "runtime"),
+        )
+
+    monkeypatch.setattr(pipeline, "resolve_project_scope", fake_resolve_project_scope)
+    monkeypatch.setattr(pipeline_status, "_user_has_configured", lambda username, project: True)
+    monkeypatch.setattr(
+        pipeline_status,
+        "compute_portrait_path",
+        lambda project_dir, character_name: tmp_path / "portrait.png",
+    )
+    monkeypatch.setattr(
+        pipeline_status,
+        "compute_identity_path",
+        lambda project_dir, character_name, identity_name: tmp_path / "identity.png",
+    )
+
+    sketches_dir = tmp_path / "sketches" / "ep001"
+    sketches_dir.mkdir(parents=True)
+    # Only beats 1-2 of {1, 2, 5} sketched -> the step must stay incomplete.
+    for beat_num in (1, 2):
+        (sketches_dir / f"beat_{beat_num:02d}.png").write_bytes(b"x")
+
+    response = await pipeline.pipeline_status(
+        project="demo",
+        episode=1,
+        user={"username": "alice"},
+        store=_FakePipelineStore(),
+    )
+    data = response["data"]
+    assert data["episode_status"]["sketches"] is False
+    assert data["next_step"] == "sketch_generation"
+
+    # A single stray grid image must not count either.
+    (tmp_path / "grids" / "ep001").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "grids" / "ep001" / "grid.png").write_bytes(b"x")
+    response = await pipeline.pipeline_status(
+        project="demo",
+        episode=1,
+        user={"username": "alice"},
+        store=_FakePipelineStore(),
+    )
+    assert response["data"]["episode_status"]["sketches"] is False
+
+    for beat_num in (1, 2, 5):
+        (sketches_dir / f"beat_{beat_num:02d}.png").write_bytes(b"x")
+    response = await pipeline.pipeline_status(
+        project="demo",
+        episode=1,
+        user={"username": "alice"},
+        store=_FakePipelineStore(),
+    )
+    assert response["data"]["episode_status"]["sketches"] is True
 
 
 def test_pipeline_script_status_accepts_current_sqlite_beat_fields():

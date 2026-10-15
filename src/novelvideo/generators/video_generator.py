@@ -66,6 +66,31 @@ from novelvideo.task_backend.subprocesses import run_project_subprocess
 
 logger = logging.getLogger(__name__)
 
+
+def _note_model_call(
+    *,
+    model: str,
+    request_id: str = "",
+    status: str = "ok",
+    error: object = "",
+) -> None:
+    """Best-effort diagnostics: remember the last video model call."""
+
+    try:
+        from novelvideo.task_diagnostics import note_model_call
+
+        note_model_call(
+            model=model,
+            provider="newapi",
+            capability="video",
+            request_id=request_id,
+            source="video_generator",
+            status=status,
+            error=error,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics never break generation
+        pass
+
 # 确保加载 .env 环境变量
 load_dotenv()
 
@@ -2072,6 +2097,12 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                 text = await resp.text()
                 if resp.status < 200 or resp.status >= 300:
                     request_id = self._extract_request_id(text, resp.headers)
+                    _note_model_call(
+                        model=self.model,
+                        request_id=request_id,
+                        status="error",
+                        error=f"HTTP {resp.status}: {text[:200]}",
+                    )
                     raise NewApiVideoError(
                         f"DramaClawAPI submit failed: HTTP {resp.status} - {text}",
                         request_id=request_id,
@@ -2079,10 +2110,14 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                     )
                 try:
                     data = json.loads(text)
+                    request_id = self._extract_request_id(text, resp.headers)
                     if isinstance(data, dict):
-                        data["_newapi_request_id"] = self._extract_request_id(
-                            text, resp.headers
-                        )
+                        data["_newapi_request_id"] = request_id
+                    _note_model_call(
+                        model=self.model,
+                        request_id=request_id,
+                        status="ok",
+                    )
                     return data
                 except json.JSONDecodeError as exc:
                     raise RuntimeError(

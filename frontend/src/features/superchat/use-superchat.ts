@@ -2480,6 +2480,11 @@ export function useSuperChat({
             message: frame.message,
             terminalTaskId: frame.terminal_task_id,
             voicePolicy: frame.voice_policy,
+            stalled: frame.stalled,
+            stallTaskType: frame.stall_task_type,
+            stallBeatNum: frame.stall_beat_num,
+            stallScope: frame.stall_scope,
+            diagnostics: frame.diagnostics,
           },
         }));
         break;

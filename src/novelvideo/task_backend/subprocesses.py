@@ -398,12 +398,11 @@ def _deadline_for(scope: dict[str, Any], timeout: int | float | None) -> float |
     deadlines: list[float] = []
     clock = current_task_clock()
     if clock is not None:
-        # Prefer the rolling idle deadline: the frozen envelope deadline is only
-        # a fallback for callers that run without a task clock (e.g. a bare
-        # subprocess worker), and would otherwise kill a healthy task early.
-        clock_deadline = clock.deadline_monotonic
-        if clock_deadline is not None:
-            deadlines.append(clock_deadline)
+        # Only the explicit hard runtime cap bounds a child process: an idle gap
+        # must not kill a subprocess that is still legitimately working.
+        hard_deadline = clock.hard_deadline_monotonic
+        if hard_deadline is not None:
+            deadlines.append(hard_deadline)
     else:
         scope_deadline = _optional_float(scope.get("deadline_monotonic"))
         if scope_deadline is not None:
@@ -413,6 +412,28 @@ def _deadline_for(scope: dict[str, Any], timeout: int | float | None) -> float |
     if not deadlines:
         return None
     return min(deadlines)
+
+
+def _deadline_timeout(scope: dict[str, Any], timeout: int | float | None) -> tuple[int, str]:
+    """Return ``(timeout_seconds, reason)`` for a deadline-triggered timeout.
+
+    The reason lets the failure message distinguish the configured hard runtime
+    cap from a per-call subprocess timeout.
+    """
+
+    clock = current_task_clock()
+    if clock is not None:
+        hard_deadline = clock.hard_deadline_monotonic
+        if hard_deadline is not None:
+            per_call_deadline = (
+                None
+                if timeout is None
+                else time.monotonic() + max(float(timeout), 0.001)
+            )
+            if per_call_deadline is None or hard_deadline <= per_call_deadline:
+                return clock.max_runtime_seconds or 30 * 60, "max_runtime"
+    seconds = _optional_int(scope.get("timeout_seconds")) or int(timeout or 30 * 60)
+    return seconds, "idle"
 
 
 def run_project_subprocess(
@@ -449,7 +470,6 @@ def run_project_subprocess(
     scope = _scope_from_envelope(envelope)
     task_id = str(scope.get("task_id") or "")
     deadline = _deadline_for(scope, timeout)
-    timeout_seconds = _optional_int(scope.get("timeout_seconds"))
 
     stdout = subprocess.PIPE if capture_output else None
     stderr = subprocess.PIPE if capture_output else None
@@ -475,9 +495,8 @@ def run_project_subprocess(
                 _kill_process_group(proc)
                 with contextlib.suppress(Exception):
                     proc.communicate(timeout=1)
-                raise TaskTimedOut(
-                    timeout_seconds=timeout_seconds or int(timeout or 30 * 60)
-                )
+                _seconds, _reason = _deadline_timeout(scope, timeout)
+                raise TaskTimedOut(timeout_seconds=_seconds, reason=_reason)
             if _cancel_requested_sync(scope):
                 _kill_process_group(proc)
                 with contextlib.suppress(Exception):
@@ -496,9 +515,8 @@ def run_project_subprocess(
                 if _consume_cancel_killed(proc):
                     raise TaskCancelled()
                 if deadline is not None and time.monotonic() >= deadline:
-                    raise TaskTimedOut(
-                        timeout_seconds=timeout_seconds or int(timeout or 30 * 60)
-                    )
+                    _seconds, _reason = _deadline_timeout(scope, timeout)
+                    raise TaskTimedOut(timeout_seconds=_seconds, reason=_reason)
                 if check and completed.returncode != 0:
                     if restricted:
                         raise EgressBoundaryError("ORG_SERVICE_EGRESS_DENIED")

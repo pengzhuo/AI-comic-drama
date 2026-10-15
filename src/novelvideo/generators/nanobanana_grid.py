@@ -104,6 +104,31 @@ SINGLE_CELL_RENDER_MODE_BY_ASPECT = {
     "16:9": "1x1_16-9",
 }
 logger = logging.getLogger(__name__)
+
+
+def _note_model_call(
+    *,
+    model: str,
+    request_id: str = "",
+    status: str = "ok",
+    error: object = "",
+) -> None:
+    """Best-effort diagnostics: remember the last image model call."""
+
+    try:
+        from novelvideo.task_diagnostics import note_model_call
+
+        note_model_call(
+            model=model,
+            provider="newapi",
+            capability="image",
+            request_id=request_id,
+            source="nanobanana_grid",
+            status=status,
+            error=error,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics never break generation
+        pass
 NEWAPI_MEDIA_INPUT_MIN_TTL_SECONDS = 2 * 60 * 60
 
 
@@ -3882,6 +3907,11 @@ async def _call_newapi_image_api(
                 or str(result.get("request_id") or result.get("requestId") or "").strip()
             )
             response_id = str(result.get("id") or "").strip()
+            _note_model_call(
+                model=str(model or ""),
+                request_id=provider_request_id,
+                status="ok",
+            )
             _record_trace(provider_request_id=provider_request_id, response_id=response_id)
             await _mark_paid_image_attempt_accepted(
                 provider_request_id=provider_request_id,

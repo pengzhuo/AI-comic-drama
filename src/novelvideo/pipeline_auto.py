@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from novelvideo.pipeline_status import compute_pipeline_status
+from novelvideo.pipeline_status import character_needs_portrait, compute_pipeline_status
 from novelvideo.task_backend.client import enqueue_project_task
 from novelvideo.utils.path_resolver import compute_identity_path, compute_portrait_path
 
@@ -147,7 +147,7 @@ async def _dispatch_portrait(
     attempted: set[str],
 ) -> tuple[str | None, str | None]:
     for char in store.get_all_characters():
-        if not getattr(char, "is_main", False):
+        if not character_needs_portrait(char):
             continue
         if compute_portrait_path(project_dir, char.name):
             continue

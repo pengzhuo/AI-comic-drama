@@ -27,6 +27,32 @@ from novelvideo.generators.tts_generator import (
 )
 from novelvideo.ports.model_credentials import ModelCredentialError
 
+
+def _note_model_call(
+    *,
+    model: str,
+    request_id: str = "",
+    status: str = "ok",
+    error: object = "",
+) -> None:
+    """Best-effort diagnostics: remember the last TTS model call."""
+
+    try:
+        from novelvideo.task_diagnostics import note_model_call
+
+        note_model_call(
+            model=model,
+            provider="newapi",
+            capability="tts",
+            request_id=request_id,
+            source="indextts2_fal",
+            status=status,
+            error=error,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics never break generation
+        pass
+
+
 async def _reserve_tts_model_call(model: str, *, source: str) -> str:
     return await get_usage_meter().reserve_current_model_call_credit(
         model=model,
@@ -426,6 +452,11 @@ class IndexTTS2FalClient:
                     self._last_provider_response_id = str(
                         payload.get("id") or ""
                     ).strip()
+                    _note_model_call(
+                        model=self.model,
+                        request_id=self._last_provider_request_id,
+                        status="ok",
+                    )
                     result_url = _extract_audio_url(payload)
                     if not result_url:
                         return TTSResult(
@@ -456,6 +487,7 @@ class IndexTTS2FalClient:
                 duration_seconds=await _audio_duration_seconds(output_path),
             )
         except Exception as exc:
+            _note_model_call(model=self.model, status="error", error=exc)
             if is_fatal_billing_error(exc):
                 raise
             if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):

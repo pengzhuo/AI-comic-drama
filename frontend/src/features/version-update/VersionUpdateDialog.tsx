@@ -15,6 +15,7 @@ import {
   markCurrentReleaseSeen,
   shouldAutoShowCurrentRelease,
 } from "@/lib/release-notification-state";
+import { releasePopupHidden } from "@/lib/ui-hide-flags";
 
 /** 更新弹窗顶部的头图视频。走 CDN 域名（OSS 默认域名会强制下载，播不了）。 */
 const UPDATE_HERO_VIDEO_URL =
@@ -31,6 +32,9 @@ export function VersionUpdateDialog() {
   const autoOpenedTagRef = useRef<string | null>(null);
 
   useEffect(() => {
+    // Instances can silence the on-entry popup with VITE_HIDE_RELEASE_POPUP.
+    // The notification center's manual entry point is unaffected.
+    if (releasePopupHidden()) return;
     const tag = feed?.current_tag ?? null;
     if (!tag || autoOpenedTagRef.current === tag || !shouldAutoShowCurrentRelease(feed)) {
       return;

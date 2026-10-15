@@ -15,6 +15,7 @@ from pydantic_ai.output import NativeOutput
 from PIL import Image as PILImage
 
 from novelvideo.brainclaw_contract import BrainClawProfile
+from novelvideo.model_gateway_runtime import model_gateway_output_retries
 from novelvideo.utils.source_language import asset_language_instruction
 
 
@@ -759,6 +760,9 @@ def _create_identity_detector_agent() -> Agent:
         system_prompt=AI_IDENTITY_DETECTOR_INSTRUCTIONS,
         model_settings=get_newapi_structured_output_model_settings(),
         output_type=NativeOutput(list[BeatIdentity]),
+        # 一个网格最多 25 个 panel，模型偶尔会漏字段/多字段导致结构化输出校验失败；
+        # 默认 output retries=1 只给一次纠正机会，这里对齐其它复杂结构化 agent。
+        retries={"output": model_gateway_output_retries(3)},
         name="角色颜色识别",
     )
 

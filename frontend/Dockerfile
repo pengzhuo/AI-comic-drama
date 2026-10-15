@@ -14,6 +14,14 @@ ENV VITE_APP_VERSION=${VITE_APP_VERSION}
 ARG VITE_EDITION=ce
 ENV VITE_EDITION=${VITE_EDITION}
 
+# Instance-level UI hides. Empty (the default) keeps the shipped behavior; a
+# self-hosted instance sets a flag to "1" to drop the on-entry release popup or
+# the Piko status-bar entry. See src/lib/ui-hide-flags.ts.
+ARG VITE_HIDE_RELEASE_POPUP=""
+ENV VITE_HIDE_RELEASE_POPUP=${VITE_HIDE_RELEASE_POPUP}
+ARG VITE_HIDE_PIKO_ENTRY=""
+ENV VITE_HIDE_PIKO_ENTRY=${VITE_HIDE_PIKO_ENTRY}
+
 # Use pnpm (matches local dev) instead of npm — a single lockfile as source of
 # truth, which removes the npm/pnpm dual-lockfile drift that made `npm ci` fail.
 # corepack picks the version pinned in package.json's "packageManager" field.

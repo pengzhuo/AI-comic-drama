@@ -44,6 +44,7 @@ vi.mock("@/components/ui/button", () => ({
 
 import { VersionUpdateDialog } from "@/features/version-update/VersionUpdateDialog";
 import { openVersionUpdateDialog } from "@/features/version-update/version-update-events";
+import { queryKeys } from "@/lib/query-keys";
 import { RELEASE_NOTIFICATIONS_MUTED_KEY } from "@/lib/release-notification-state";
 
 const server = setupServer();
@@ -77,13 +78,17 @@ function feed(items = [{ title: "Current highlight", body: "Current body" }]) {
   };
 }
 
-function renderDialog() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <VersionUpdateDialog />
-    </QueryClientProvider>,
-  );
+function renderDialog(
+  qc = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
+  return {
+    qc,
+    ...render(
+      <QueryClientProvider client={qc}>
+        <VersionUpdateDialog />
+      </QueryClientProvider>,
+    ),
+  };
 }
 
 describe("VersionUpdateDialog release feed behavior", () => {
@@ -118,5 +123,24 @@ describe("VersionUpdateDialog release feed behavior", () => {
     openVersionUpdateDialog();
 
     expect(await screen.findByText(/Current highlight/)).toBeInTheDocument();
+  });
+
+  it("stays shut on entry when the instance flag is set, but still opens on demand", async () => {
+    vi.stubEnv("VITE_HIDE_RELEASE_POPUP", "1");
+    try {
+      const { qc } = renderDialog();
+
+      // Let the feed land first, otherwise "no popup" would pass trivially.
+      await waitFor(() =>
+        expect(qc.getQueryState(queryKeys.releaseNotifications("en"))?.status).toBe("success"),
+      );
+      expect(screen.queryByText(/Current highlight/)).not.toBeInTheDocument();
+      expect(localStorage.getItem("dramaclaw:release-seen:v1.0.2")).toBeNull();
+
+      openVersionUpdateDialog();
+      expect(await screen.findByText(/Current highlight/)).toBeInTheDocument();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

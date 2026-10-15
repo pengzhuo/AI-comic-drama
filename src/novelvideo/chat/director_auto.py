@@ -18,6 +18,7 @@ from novelvideo.chat import service as chat_service
 from novelvideo.chat.live_events import broadcast_project_chat_event
 from novelvideo.project_context import ProjectContext, resolve_project_context
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
+from novelvideo.task_diagnostics import summarize_failure
 from novelvideo.task_state import TaskState, get_task_manager
 
 
@@ -67,6 +68,55 @@ HEARTBEAT_SECONDS = 10.0
 _MISSING_CHARACTER_PORTRAIT_RE = re.compile(
     r"请先为角色[「“\"](?P<character>.+?)[」”\"]生成\s*Portrait（面部特写）"
 )
+#: Task error codes that mean "the task went silent" rather than "the task hit a
+#: real error".  A stalled task is paused and offered to the user as a decision
+#: instead of being treated as an unrecoverable failure.
+STALL_ERROR_CODES = frozenset({"TASK_TIMEOUT", "TASK_STALLED"})
+#: Stable marker prepended to a stall pause reason so the pending decision
+#: survives a page reload (the reason is persisted on the durable run).
+STALL_REASON_TAG = "[stall]"
+
+
+def _task_error_code(task) -> str:
+    metadata = getattr(task, "metadata", None)
+    if isinstance(metadata, dict) and metadata.get("error_code"):
+        return str(metadata["error_code"])
+    result = getattr(task, "result", None)
+    if isinstance(result, dict):
+        nested = result.get("task_metadata")
+        if isinstance(nested, dict) and nested.get("error_code"):
+            return str(nested["error_code"])
+    return ""
+
+
+def _task_is_stalled(task) -> bool:
+    return _task_error_code(task) in STALL_ERROR_CODES
+
+
+def _task_failure_payload(task) -> dict | None:
+    """Structured failure diagnostics attached by the task runner, if any."""
+
+    metadata = getattr(task, "metadata", None)
+    if isinstance(metadata, dict) and isinstance(metadata.get("failure"), dict):
+        return metadata["failure"]
+    result = getattr(task, "result", None)
+    if isinstance(result, dict):
+        nested = result.get("task_metadata")
+        if isinstance(nested, dict) and isinstance(nested.get("failure"), dict):
+            return nested["failure"]
+    return None
+
+
+def _failure_reason_with_detail(task, reason: str) -> str:
+    """Append the operation/model summary to a human-facing failure reason."""
+
+    detail = summarize_failure(_task_failure_payload(task))
+    if not detail:
+        return reason
+    base = (reason or "").strip()
+    if detail in base:
+        return base
+    return f"{base}（{detail}）" if base else detail
 
 
 def _utc_now() -> str:
@@ -794,6 +844,46 @@ class DirectorAutoCoordinator:
             worker.cancel()
         return updated
 
+    async def _suspend_owned(
+        self,
+        *,
+        run_id: str,
+        username: str,
+        project_id: str,
+        reason: str = "",
+        terminal_task_id: str | None = None,
+    ) -> DirectorAutoRun | None:
+        """Pause a stalled run for a user decision, keeping it resumable.
+
+        Unlike :meth:`_pause_owned`, the run enters ``awaiting_confirmation`` so
+        the frontend can offer the user a choice (keep waiting / stop) instead of
+        silently abandoning automatic production.
+        """
+
+        run = await asyncio.to_thread(self.store.get, username, project_id)
+        if run is None or run.run_id != run_id:
+            return None
+        updated = DirectorAutoRun(
+            **{
+                **asdict(run),
+                "status": "awaiting_confirmation",
+                "updated_at": _utc_now(),
+                "last_error": reason,
+            }
+        )
+        if not await self._update_owned(updated):
+            return None
+        await asyncio.to_thread(
+            self.store.release_lease,
+            run.run_id,
+            self.owner_token,
+        )
+        await self._broadcast_status(updated, terminal_task_id=terminal_task_id)
+        worker = self._workers.pop(run.run_id, None)
+        if worker is not None and worker is not asyncio.current_task():
+            worker.cancel()
+        return updated
+
     async def _broadcast_status(
         self,
         run: DirectorAutoRun,
@@ -1132,6 +1222,26 @@ class DirectorAutoCoordinator:
                 if failures:
                     failed = failures[0]
                     reason = failed.error or failed.current_task or failed.status
+                    reason = _failure_reason_with_detail(failed, reason)
+                    if _task_is_stalled(failed):
+                        # The task stopped reporting progress (idle watchdog). This
+                        # is not a hard failure: keep the durable run resumable and
+                        # let the user decide whether to keep waiting or stop.
+                        if not await self._owns_run(run_id):
+                            return
+                        await self._suspend_owned(
+                            run_id=run_id,
+                            username=username,
+                            project_id=project_id,
+                            reason=f"{STALL_REASON_TAG} {_task_label(failed)}卡住：{reason}",
+                            terminal_task_id=failed.task_id,
+                        )
+                        await self._notify(
+                            updated,
+                            f"本集自动已暂停：{_task_label(failed)}长时间没有进度更新，"
+                            "判定为卡住。请在弹出的提示中选择重试当前步骤或终止本次自动制作。",
+                        )
+                        return
                     character = _missing_character_portrait(failed)
                     recovery_key = f"missing-character-portrait:{character}" if character else ""
                     if (

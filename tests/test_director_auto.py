@@ -543,3 +543,73 @@ async def test_hard_paused_auto_run_cannot_be_resumed_as_declined_change(tmp_pat
 
     with pytest.raises(ValueError, match="只有等待修改确认"):
         await coordinator.resume_suspended(username="alice", project_id="project-1")
+
+
+def test_task_is_stalled_matches_timeout_error_codes() -> None:
+    stalled = task("stalled", "failed")
+    stalled.metadata = {"error_code": "TASK_TIMEOUT"}
+    assert director_auto._task_is_stalled(stalled) is True
+
+    stalled_with_nested = task("stalled-nested", "failed")
+    stalled_with_nested.result = {"task_metadata": {"error_code": "TASK_STALLED"}}
+    assert director_auto._task_is_stalled(stalled_with_nested) is True
+
+    other = task("other", "failed")
+    other.metadata = {"error_code": "BILLING_RULE_NOT_CONFIGURED"}
+    assert director_auto._task_is_stalled(other) is False
+    assert director_auto._task_is_stalled(task("plain", "failed")) is False
+
+
+@pytest.mark.asyncio
+async def test_stalled_task_suspends_run_for_user_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A task that stopped reporting progress (idle watchdog) must not abandon the
+    # run outright: it is suspended so the user can choose to wait or stop.
+    stalled = task("new-stalled", "failed")
+    stalled.error = "任务已连续 30 分钟无进度更新，判定为卡死并暂停"
+    stalled.metadata = {"error_code": "TASK_TIMEOUT", "timeout_seconds": 30 * 60}
+    notified = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [stalled]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+            self.continuations = 0
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            notified.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            self.continuations += 1
+            return True
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        await asyncio.wait_for(notified.wait(), timeout=5)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None
+        assert saved.status == "awaiting_confirmation"
+        assert saved.last_error.startswith(director_auto.STALL_REASON_TAG)
+        assert "无进度更新" in saved.last_error
+        assert coordinator.continuations == 0
+    finally:
+        await coordinator.shutdown()
+

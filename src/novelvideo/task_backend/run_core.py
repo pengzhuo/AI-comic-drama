@@ -24,7 +24,7 @@ from novelvideo.ports.usage import (
     FeatureSettlementResolutionRejected,
     VerifiedTaskSettlementIdentity,
 )
-from novelvideo.project_context import require_project_home_node
+from novelvideo.project_context import ProjectContext, require_project_home_node
 from novelvideo.shared.billing_errors import (
     INSUFFICIENT_CREDITS_MESSAGE,
     billing_error_payload,
@@ -51,6 +51,11 @@ from novelvideo.task_backend.subprocesses import project_task_subprocess_context
 from novelvideo.task_backend.task_clock import (
     project_task_clock,
     resolve_idle_timeout_seconds,
+    resolve_max_runtime_seconds,
+)
+from novelvideo.task_diagnostics import (
+    build_failure_diagnostics,
+    task_diagnostics_scope,
 )
 from novelvideo.task_state import project_task_run_context
 from novelvideo.utils.document_parsers import count_billable_text_chars
@@ -583,17 +588,145 @@ async def _emit_project_task_metrics(
 
 
 def _project_task_timeout_seconds() -> int:
-    """Idle window (seconds) before a silent task is treated as stalled.
+    """Idle window (seconds) before a silent task raises a stall notice.
 
     Historically this was a *total* wall-clock budget that abandoned a task once
     it had run for long enough, regardless of progress.  It is now the
-    no-progress window enforced by
+    no-progress window monitored by
     :mod:`novelvideo.task_backend.task_clock`: a task that keeps reporting
-    progress may run indefinitely, and only a silent (idle) task is stalled out.
-    ``0`` disables the watchdog.
+    progress may run indefinitely, and a silent (idle) task merely *notifies* the
+    user — it is never terminated automatically, so a genuinely long step is
+    never abandoned by mistake.  ``0`` disables the notice.  The only automatic
+    termination left is ``ST_PROJECT_TASK_MAX_RUNTIME_S``.
     """
 
     return resolve_idle_timeout_seconds()
+
+
+#: Human-facing labels for the long-running task types a stall notice is most
+#: likely to be about. Unknown types fall back to the raw task type.
+_PROJECT_TASK_LABELS = {
+    "global_optimize_video": "全局优化视频",
+    "single_video": "单镜头视频",
+    "compose_episode": "本集合成",
+    "audio_generation": "配音生成",
+    "indextts2_audio_generation": "配音生成",
+    "character_portrait": "角色肖像",
+    "sketch_grid_generation": "草图网格生成",
+    "sketch_generation": "草图生成",
+}
+
+
+def _project_task_display_label(task_type: str) -> str:
+    return _PROJECT_TASK_LABELS.get(task_type, task_type or "当前任务")
+
+
+def _task_stall_notifier(
+    ctx: "ProjectContext",
+    task_type: str,
+    episode: int,
+    *,
+    beat_num: int | None,
+    scope: str | None,
+    diagnostics: Any = None,
+):
+    """Build the async idle-stall callback installed on the task clock.
+
+    The callback only *notifies*: the task keeps running so a legitimately long
+    step is never abandoned. The user chooses whether to cancel it.
+    """
+
+    async def _notify(clock: Any) -> None:
+        idle_seconds = int(getattr(clock, "idle_seconds", 0) or 0)
+        logger.warning(
+            "project_task_idle_stall project=%s task_type=%s episode=%s "
+            "beat=%s scope=%s idle_seconds=%s",
+            getattr(ctx, "project_id", ""),
+            task_type,
+            episode,
+            beat_num,
+            scope,
+            idle_seconds,
+        )
+        await _broadcast_task_stall_notice(
+            ctx=ctx,
+            task_type=task_type,
+            episode=episode,
+            beat_num=beat_num,
+            scope=scope,
+            idle_seconds=idle_seconds,
+            diagnostics=diagnostics,
+        )
+
+    return _notify
+
+
+async def _broadcast_task_stall_notice(
+    *,
+    ctx: "ProjectContext",
+    task_type: str,
+    episode: int,
+    beat_num: int | None,
+    scope: str | None,
+    idle_seconds: int,
+    diagnostics: Any = None,
+) -> None:
+    username = str(
+        getattr(ctx, "requester_username", "")
+        or getattr(ctx, "owner_username", "")
+        or ""
+    ).strip()
+    project_id = str(getattr(ctx, "project_id", ""))
+    if not username or not project_id:
+        return
+    try:
+        from novelvideo.chat.live_events import broadcast_project_chat_event
+    except Exception:  # noqa: BLE001
+        logger.debug("stall notice skipped: chat events unavailable")
+        return
+    try:
+        minutes = max(round(max(idle_seconds, 1) / 60), 1)
+        label = _project_task_display_label(task_type)
+        await broadcast_project_chat_event(
+            username=username,
+            project_id=project_id,
+            payload={
+                "type": "director.auto.status",
+                "scope": {
+                    "kind": "project",
+                    "id": project_id,
+                    "surface": "director",
+                },
+                "status": "running",
+                "episode": episode,
+                "run_id": None,
+                "message": (
+                    f"[stall] {label} 已连续 {minutes} 分钟没有进度更新，"
+                    "但任务仍在运行。你可以继续等待，或终止本次任务。"
+                ),
+                "terminal_task_id": None,
+                "stalled": True,
+                "stall_seconds": int(idle_seconds),
+                "stall_task_type": task_type,
+                "stall_beat_num": beat_num,
+                "stall_scope": scope,
+                "diagnostics": _diagnostics_snapshot(diagnostics),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("project task stall notice broadcast failed", exc_info=True)
+
+
+def _diagnostics_snapshot(diagnostics: Any) -> dict[str, Any] | None:
+    """Best-effort snapshot of a task diagnostics record (never raises)."""
+
+    if diagnostics is None:
+        return None
+    try:
+        snapshot = diagnostics.snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
 
 
 def _project_task_failure_for_exception(
@@ -635,8 +768,12 @@ def _project_task_failure_for_exception(
     if isinstance(exc, TaskTimedOut):
         timeout_seconds = int(getattr(exc, "timeout_seconds", None) or 30 * 60)
         timeout_minutes = max(round(timeout_seconds / 60), 1)
+        if getattr(exc, "reason", "idle") == "max_runtime":
+            message = f"任务运行超过 {timeout_minutes} 分钟，已强制终止"
+        else:
+            message = f"任务已连续 {timeout_minutes} 分钟无进度更新，判定为卡死并暂停"
         return (
-            f"任务已连续 {timeout_minutes} 分钟无进度更新，判定为卡死并暂停",
+            message,
             {"error_code": "TASK_TIMEOUT", "timeout_seconds": timeout_seconds},
             True,
         )
@@ -888,6 +1025,7 @@ def run_project_task_core_sync(
     if trusted_billing_metadata:
         envelope["billing_metadata"] = trusted_billing_metadata
     timeout_seconds = _project_task_timeout_seconds()
+    max_runtime_seconds = resolve_max_runtime_seconds()
     deadline_monotonic = (
         time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     )
@@ -927,7 +1065,10 @@ def run_project_task_core_sync(
     try:
         with (
             project_task_run_context(run_task_id),
-            project_task_clock(timeout_seconds) as clock,
+            project_task_clock(
+                timeout_seconds,
+                max_runtime_seconds=max_runtime_seconds,
+            ) as clock,
             project_task_subprocess_context(
                 project_id=str(envelope["project_id"]),
                 task_type=task_type,
@@ -938,7 +1079,23 @@ def run_project_task_core_sync(
                 deadline_monotonic=deadline_monotonic,
                 timeout_seconds=timeout_seconds,
             ),
+            task_diagnostics_scope(
+                task_type=task_type,
+                episode=episode,
+                beat_num=beat_num,
+                scope=scope,
+                project_id=str(envelope["project_id"]),
+                task_id=run_task_id,
+            ) as task_diagnostics,
         ):
+            clock.on_stall = _task_stall_notifier(
+                ctx,
+                task_type,
+                episode,
+                beat_num=beat_num,
+                scope=scope,
+                diagnostics=task_diagnostics,
+            )
             _set_project_task_metrics_context(
                 ctx,
                 task_type,
@@ -1137,6 +1294,9 @@ def run_project_task_core_sync(
                     failure_payload = {
                         "error_code": exc.code,
                         "failure_kind": exc.failure_kind,
+                        "failure": build_failure_diagnostics(
+                            exc, task_id=run_task_id
+                        ),
                     }
                     logger.info(
                         "task_refund_deferred_to_review",
@@ -1186,6 +1346,13 @@ def run_project_task_core_sync(
                 error, failure_payload, handled = _project_task_failure_for_exception(
                     exc
                 )
+                # Rich diagnostics explain *what* the task was doing; attach them
+                # to the task row only so refund/billing payloads stay compact.
+                task_failure_metadata = {
+                    **run_metadata,
+                    **failure_payload,
+                    "failure": build_failure_diagnostics(exc, task_id=run_task_id),
+                }
                 asyncio.run(
                     _refund_undelivered_feature_credit_reservation(
                         feature_reservation_id,
@@ -1203,7 +1370,7 @@ def run_project_task_core_sync(
                     beat_num=beat_num,
                     scope=scope,
                     error=error,
-                    metadata={**run_metadata, **failure_payload},
+                    metadata=task_failure_metadata,
                     expected_task_id=run_task_id,
                 )
                 asyncio.run(

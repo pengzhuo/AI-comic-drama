@@ -3440,6 +3440,19 @@
       "error": {
         "label": "错误"
       },
+      "failure": {
+        "title": "失败详情",
+        "operation": "执行的操作",
+        "recentOperations": "最近操作",
+        "modelCalls": "调用的模型",
+        "noModelCalls": "无模型调用记录",
+        "requestId": "请求 ID",
+        "requestOk": "成功",
+        "requestFailed": "失败",
+        "exception": "异常类型",
+        "traceback": "错误堆栈",
+        "elapsed": "已运行 {{seconds}} 秒"
+      },
       "logs": {
         "placeholder": "暂无日志输出。"
       }

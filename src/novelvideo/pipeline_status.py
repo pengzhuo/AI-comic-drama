@@ -70,6 +70,32 @@ def _beat_file_series_complete(directory: Path, suffix: str, beats: list[dict]) 
     return all((directory / f"beat_{beat_num:02d}.{suffix}").exists() for beat_num in beat_numbers)
 
 
+def _beat_sketch_series_complete(directory: Path, beats: list[dict]) -> bool:
+    """Every beat has a canonical sketch (``beat_NN.png`` or ``beat_NN.jpg``).
+
+    This mirrors the optimizer/billing eligibility for ``global_optimize_video``
+    (``_global_optimize_billable_beat_numbers``), which only processes beats with a
+    canonical sketch. Declaring "草图生成" complete after the first grid leaves the
+    remaining beats unsketchable, so ``global_optimize`` can never satisfy its
+    all-beats predicate and the pipeline deadlocks on "全局视频优化".
+    """
+
+    beat_numbers = [
+        int(beat.get("beat_number", 0) or 0)
+        for beat in beats
+        if int(beat.get("beat_number", 0) or 0) > 0
+    ]
+    if not beat_numbers:
+        return False
+    return all(
+        any(
+            (directory / f"beat_{beat_num:02d}.{suffix}").exists()
+            for suffix in ("png", "jpg")
+        )
+        for beat_num in beat_numbers
+    )
+
+
 def _beat_requires_audio(beat: dict) -> bool:
     from novelvideo.seedance2_i2v.voice_clone import (
         dialogue_text,
@@ -155,6 +181,22 @@ def incomplete_episodes(store: SQLiteStore, project_dir: Path) -> list[int]:
     return result
 
 
+def character_needs_portrait(character: Any) -> bool:
+    """Whether a character must own a ``portrait.png`` face anchor.
+
+    Main characters always need one. A non-main character needs one too once it
+    owns identities, because an identity image whose age matches the character
+    is rendered from that character portrait. Characters without a face prompt
+    cannot be rendered at all, so they are excluded instead of wedging the
+    pipeline on an unsatisfiable prerequisite.
+    """
+    if not str(getattr(character, "face_prompt", "") or "").strip():
+        return False
+    return bool(getattr(character, "is_main", False)) or bool(
+        getattr(character, "identities", None)
+    )
+
+
 async def compute_pipeline_status(
     *,
     store: SQLiteStore,
@@ -174,7 +216,7 @@ async def compute_pipeline_status(
 
     characters = store.get_all_characters()
     episodes = store.get_all_episodes()
-    main_chars = [c for c in characters if getattr(c, "is_main", False)]
+    portrait_chars = [c for c in characters if character_needs_portrait(c)]
 
     ingest_task = (
         await run_in_threadpool(
@@ -198,8 +240,8 @@ async def compute_pipeline_status(
         or bool(episodes)
     )
     configured = _user_has_configured(username, project_name)
-    portraits_done = bool(main_chars) and all(
-        bool(compute_portrait_path(project_dir, c.name)) for c in main_chars
+    portraits_done = bool(portrait_chars) and all(
+        bool(compute_portrait_path(project_dir, c.name)) for c in portrait_chars
     )
 
     global_status = {
@@ -245,7 +287,7 @@ async def compute_pipeline_status(
     has_identity_plan = bool(identity_ids)
     has_identity_images = has_identity_plan
     if has_identity_plan:
-        for char in main_chars:
+        for char in characters:
             for ident in getattr(char, "identities", []) or []:
                 if ident.identity_id not in identity_ids:
                     continue
@@ -255,9 +297,8 @@ async def compute_pipeline_status(
     beats = await store.get_beats_as_dicts(target_ep)
     has_script = _all_or_empty([_beat_has_script_content(b) for b in beats])
 
-    grids_dir = project_dir / "grids" / f"ep{target_ep:03d}"
     sketches_dir = project_dir / "sketches" / f"ep{target_ep:03d}"
-    has_sketches = bool(list(grids_dir.glob("*.png"))) or bool(list(sketches_dir.glob("*.png")))
+    has_sketches = _beat_sketch_series_complete(sketches_dir, beats)
 
     has_coloring = has_sketches and _all_or_empty(
         [

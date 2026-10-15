@@ -147,6 +147,11 @@ import { calculateTimelineContextDelta } from "@/features/superchat/timeline-scr
 import { useEventBus } from "@/task-center/event-bus-context";
 import { useTaskCenterStore } from "@/task-center/store";
 import {
+  normalizeTaskFailure,
+  type TaskFailureDetail,
+} from "@/task-center/task-failure";
+import { TaskFailureDetails } from "@/components/task-center/task-failure-details";
+import {
   extractStructuredBlocks,
   isUiSpec,
   looksLikeStructuredRenderText,
@@ -11140,7 +11145,22 @@ type DirectorAutoServerResponse = {
     voice_policy?: DirectorVoicePolicy | null;
     scope?: "episode" | "project";
     target_episodes?: number;
+    last_error?: string | null;
   };
+};
+
+/** Marks a durable auto run that paused because a task stopped reporting progress. */
+const DIRECTOR_STALL_TAG = "[stall]";
+
+type DirectorStallNotice = {
+  /** "soft" = task still running; "hard" = run paused by the hard runtime cap. */
+  mode: "soft" | "hard";
+  episode: number | null;
+  taskType?: string | null;
+  beatNum?: number | null;
+  scope?: string | null;
+  /** Last recorded operation + model calls for the stalled task, when known. */
+  diagnostics?: TaskFailureDetail | null;
 };
 
 type DirectorVoicePreflight = {
@@ -11228,6 +11248,35 @@ async function startProjectAutoServer(
 async function pauseDirectorAutoServer(project: string): Promise<void> {
   await api.post(p`api/v1/projects/${project}/chat/director-auto/pause`)
     .json<DirectorAutoServerResponse>();
+}
+
+async function resumeDirectorAutoServer(project: string): Promise<void> {
+  await api.post(p`api/v1/projects/${project}/chat/director-auto/resume`)
+    .json<DirectorAutoServerResponse>();
+}
+
+/** Terminate one stalled project task (running task needs explicit confirmation). */
+async function cancelDirectorTask(
+  project: string,
+  target: {
+    taskType: string;
+    episode: number;
+    beatNum?: number | null;
+    scope?: string | null;
+  },
+): Promise<void> {
+  const search = new URLSearchParams({
+    force: "true",
+    acknowledge_no_refund: "true",
+  });
+  if (target.beatNum !== null && target.beatNum !== undefined) {
+    search.set("beat_num", String(target.beatNum));
+  }
+  if (target.scope) search.set("scope", target.scope);
+  const path =
+    `api/v1/projects/${encodeURIComponent(project)}/tasks/` +
+    `${encodeURIComponent(target.taskType)}/${target.episode}?${search.toString()}`;
+  await api.delete(path).json<unknown>();
 }
 
 async function getDirectorAutoServer(project: string): Promise<DirectorAutoServerResponse["data"]> {
@@ -12655,6 +12704,11 @@ export function SuperChatPanel({
   );
   const directorRunStateRef = useRef(directorRunState);
   const [directorRunModeMenuOpen, setDirectorRunModeMenuOpen] = useState(false);
+  // Set when a task stops reporting progress. `soft` means the task is still
+  // running (keep waiting or terminate it); `hard` means the run paused at the
+  // hard runtime cap (retry the step or stop automatic production).
+  const [directorStallNotice, setDirectorStallNotice] = useState<DirectorStallNotice | null>(null);
+  const [directorStallBusy, setDirectorStallBusy] = useState(false);
   const isChatInitializing = !chat.historyReady && chat.messages.length === 0 && (chat.connecting || chat.connected);
 
   useEffect(() => {
@@ -13052,6 +13106,12 @@ export function SuperChatPanel({
         directorRunStateRef.current = suspended;
         setDirectorRunState(suspended);
         saveDirectorRunState(directorRunProject, suspended);
+        if (server.last_error?.includes(DIRECTOR_STALL_TAG)) {
+          setDirectorStallNotice({
+            mode: "hard",
+            episode: server.episode ?? suspended.episode ?? null,
+          });
+        }
       } else if (server.status === "paused" || server.status === "completed") {
         // A persisted terminal server run is authoritative. In particular,
         // do not leave an old pre-start confirmation in localStorage after a
@@ -13089,9 +13149,27 @@ export function SuperChatPanel({
         message?: string | null;
         terminalTaskId?: string | null;
         voicePolicy?: DirectorVoicePolicy | null;
+        stalled?: boolean;
+        stallTaskType?: string | null;
+        stallBeatNum?: number | null;
+        stallScope?: string | null;
+        diagnostics?: unknown;
       }>).detail;
       if (detail?.terminalTaskId) {
         directorAutoTerminalTaskIdsRef.current.add(detail.terminalTaskId);
+      }
+      if (detail?.stalled) {
+        // The task stopped reporting progress but is still running. Leave the
+        // run state untouched (it has not failed) and ask the user what to do.
+        setDirectorStallNotice({
+          mode: "soft",
+          episode: detail.episode ?? directorRunStateRef.current.episode ?? null,
+          taskType: detail.stallTaskType ?? null,
+          beatNum: detail.stallBeatNum ?? null,
+          scope: detail.stallScope ?? null,
+          diagnostics: normalizeTaskFailure(detail.diagnostics),
+        });
+        return;
       }
       if (detail?.status === "running") {
         const current = directorRunStateRef.current;
@@ -13110,6 +13188,13 @@ export function SuperChatPanel({
           episode: detail.episode ?? current.episode ?? 1,
           voicePolicy: detail.voicePolicy ?? current.voicePolicy,
         });
+        if (detail.message?.includes(DIRECTOR_STALL_TAG)) {
+          setDirectorStallNotice({
+            mode: "hard",
+            episode: detail.episode ?? current.episode ?? null,
+          });
+          return;
+        }
         toast.info("本集自动已暂停后续推进，等待你确认是否修改", { duration: 10000 });
         return;
       }
@@ -13125,6 +13210,52 @@ export function SuperChatPanel({
     window.addEventListener("director-auto-status", onStatus);
     return () => window.removeEventListener("director-auto-status", onStatus);
   }, [updateDirectorRunState, variant]);
+
+  const resolveDirectorStall = useCallback(
+    async (action: "resume" | "pause" | "dismiss") => {
+      const project = params.project?.trim();
+      const notice = directorStallNotice;
+      if (action === "dismiss" || !project) {
+        setDirectorStallNotice(null);
+        return;
+      }
+      setDirectorStallBusy(true);
+      try {
+        if (notice?.mode === "soft" && action === "pause") {
+          // A still-running task: cancel it (the run then pauses itself).
+          if (notice.taskType && notice.episode && notice.episode > 0) {
+            await cancelDirectorTask(project, {
+              taskType: notice.taskType,
+              episode: notice.episode,
+              beatNum: notice.beatNum,
+              scope: notice.scope,
+            });
+          }
+          await pauseDirectorAutoServer(project).catch(() => undefined);
+          updateDirectorRunState(defaultDirectorRunState());
+          toast.info("已终止当前任务");
+        } else if (action === "resume") {
+          await resumeDirectorAutoServer(project);
+          const current = directorRunStateRef.current;
+          updateDirectorRunState({
+            ...confirmDirectorEpisodeAuto(current),
+            episode: notice?.episode ?? current.episode ?? 1,
+          });
+          toast.info("已重试当前步骤，本集自动恢复推进");
+        } else {
+          await pauseDirectorAutoServer(project);
+          updateDirectorRunState(defaultDirectorRunState());
+          toast.info("已终止本次自动制作，可手动处理当前步骤");
+        }
+        setDirectorStallNotice(null);
+      } catch {
+        toast.error("操作失败，请稍后重试");
+      } finally {
+        setDirectorStallBusy(false);
+      }
+    },
+    [directorStallNotice, params.project, updateDirectorRunState],
+  );
 
   const setDirectorExecutionMode = useCallback((mode: DirectorRunMode) => {
     if (mode === "episode_auto") {
@@ -16914,6 +17045,58 @@ export function SuperChatPanel({
             </Button>
             <Button type="button" variant="destructive" disabled={clearingChat || chat.busy} onClick={() => void confirmClearConversation()}>
               {clearingChat ? t("aiAssistant.clearChat.clearing") : t("aiAssistant.clearChat.confirm")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={directorStallNotice !== null}
+        onOpenChange={(open) => {
+          if (!open && !directorStallBusy) setDirectorStallNotice(null);
+        }}
+      >
+        <DialogContent className="w-[calc(100vw-2rem)] border-black/10 bg-background/95 sm:max-w-md">
+          <DialogTitle>
+            {directorStallNotice?.mode === "soft"
+              ? "任务长时间没有进度更新，仍在运行"
+              : "本集自动已暂停：任务长时间没有进度更新"}
+          </DialogTitle>
+          <p className="text-sm leading-6 text-muted-foreground">
+            {directorStallNotice?.mode === "soft"
+              ? "当前任务已连续较长时间没有进度更新，但仍在运行。你可以继续等待，或终止当前任务。"
+              : "当前步骤已连续较长时间没有进度更新，捏导已暂停自动推进。你可以重试当前步骤，或终止本次自动制作后手动处理。"}
+          </p>
+          {directorStallNotice?.diagnostics ? (
+            <div className="max-h-[45vh] overflow-auto">
+              <TaskFailureDetails
+                failure={directorStallNotice.diagnostics}
+                summaryLabel="查看详情：当前操作与调用模型"
+              />
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={directorStallBusy}
+              onClick={() => void resolveDirectorStall("pause")}
+            >
+              {directorStallNotice?.mode === "soft" ? "终止当前任务" : "终止自动制作"}
+            </Button>
+            <Button
+              type="button"
+              disabled={directorStallBusy}
+              onClick={() =>
+                void resolveDirectorStall(
+                  directorStallNotice?.mode === "soft" ? "dismiss" : "resume",
+                )
+              }
+            >
+              {directorStallBusy
+                ? "处理中…"
+                : directorStallNotice?.mode === "soft"
+                  ? "继续等待"
+                  : "重试当前步骤"}
             </Button>
           </div>
         </DialogContent>

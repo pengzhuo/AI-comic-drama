@@ -190,7 +190,7 @@ def test_celery_task_failure_maps_soft_time_limit(monkeypatch) -> None:
     )
 
     assert handled is True
-    assert error == "任务超过 30 分钟未完成，已自动放弃"
+    assert error == "任务已连续 30 分钟无进度更新，判定为卡死并暂停"
     assert metadata == {"error_code": "TASK_TIMEOUT", "timeout_seconds": 30 * 60}
 
 
@@ -209,7 +209,7 @@ def test_celery_task_failure_maps_cooperative_task_timeout(monkeypatch) -> None:
     )
 
     assert handled is True
-    assert error == "任务超过 30 分钟未完成，已自动放弃"
+    assert error == "任务已连续 30 分钟无进度更新，判定为卡死并暂停"
     assert metadata == {"error_code": "TASK_TIMEOUT", "timeout_seconds": 30 * 60}
 
 

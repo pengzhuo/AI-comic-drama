@@ -174,8 +174,8 @@ async def test_dispatch_portrait_picks_first_missing(
     class Store:
         def get_all_characters(self):
             return [
-                SimpleNamespace(name="Done", is_main=True),
-                SimpleNamespace(name="Bob", is_main=True),
+                SimpleNamespace(name="Done", is_main=True, face_prompt="face", identities=[]),
+                SimpleNamespace(name="Bob", is_main=True, face_prompt="face", identities=[]),
             ]
 
     task_type, signature = await pipeline_auto.dispatch_next_stage(
@@ -186,3 +186,44 @@ async def test_dispatch_portrait_picks_first_missing(
     assert signature == "dispatch:character_portrait:Bob"
     assert calls[0]["payload"]["character_name"] == "Bob"
     assert calls[0]["scope"] == "character:Bob:portrait"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_portrait_covers_non_main_characters_with_identities(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Identity images reuse the character portrait, so non-main characters that
+    own identities must also get one; extras without a face prompt are skipped."""
+    patch_status(monkeypatch, "portraits")
+    calls = capture_enqueue(monkeypatch)
+    monkeypatch.setattr(
+        pipeline_auto,
+        "compute_portrait_path",
+        lambda _dir, name: tmp_path / f"{name}.png" if name == "Lead" else None,
+    )
+    monkeypatch.setattr(
+        pipeline_auto,
+        "_character_image_payload_bits",
+        lambda *_a, **_k: ("anime", {"style": "anime", "model": "m", "billing": {}}),
+    )
+
+    class Store:
+        def get_all_characters(self):
+            return [
+                SimpleNamespace(name="Lead", is_main=True, face_prompt="face", identities=[]),
+                SimpleNamespace(name="Extra", is_main=False, face_prompt="", identities=[]),
+                SimpleNamespace(
+                    name="Villager",
+                    is_main=False,
+                    face_prompt="face",
+                    identities=[SimpleNamespace(identity_id="Villager_中年时期")],
+                ),
+            ]
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=Store(), episode=1
+    )
+
+    assert task_type == "character_portrait"
+    assert signature == "dispatch:character_portrait:Villager"
+    assert calls[0]["payload"]["character_name"] == "Villager"

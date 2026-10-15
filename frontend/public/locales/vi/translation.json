@@ -3239,6 +3239,19 @@
       "error": {
         "label": "Lỗi"
       },
+      "failure": {
+        "title": "Chi tiết lỗi",
+        "operation": "Thao tác đang chạy",
+        "recentOperations": "Thao tác gần đây",
+        "modelCalls": "Mô hình đã gọi",
+        "noModelCalls": "Chưa ghi nhận lời gọi mô hình",
+        "requestId": "ID yêu cầu",
+        "requestOk": "thành công",
+        "requestFailed": "thất bại",
+        "exception": "Loại ngoại lệ",
+        "traceback": "Dấu vết lỗi",
+        "elapsed": "Đã chạy {{seconds}} giây"
+      },
       "logs": {
         "placeholder": "Chưa có log nào."
       }

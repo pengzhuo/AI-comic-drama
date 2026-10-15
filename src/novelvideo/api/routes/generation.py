@@ -4569,25 +4569,66 @@ async def detect_sketch_identities(
             resource_kind="sketch",
             billing_metadata=billing_metadata,
         )
-        batch_size = 25
+        # 视觉模型对「一次表格里出 N 条结构化结果」不稳定：实测 12 个 panel 起就会
+        # 出现 500 / 结构化校验失败，9 个（3x3）稳定成功。所以按 9 个一批，并且每个
+        # 网格先重试，仍失败就二分继续拆小后合并，只有最小粒度（单 panel）都失败才
+        # 向上抛错，把「整集识别失败」收窄成极少数单 beat 失败。
+        batch_size = 9
+        detection_attempts = 2
+
+        async def _detect_panels(
+            items: list[tuple[int, str]],
+            *,
+            label: str,
+        ) -> dict[int, list[str]]:
+            rows, cols = _grid_shape(len(items))
+            grid_path = grid_dir / f"_ai_detect_grid_{rows}x{cols}_{label}.png"
+            combine_to_grid([path for _, path in items], grid_path, rows=rows, cols=cols)
+            last_error: Exception | None = None
+            for attempt in range(1, detection_attempts + 1):
+                try:
+                    result = await detect_identities_by_ai(
+                        sketch_image_paths=[str(grid_path)],
+                        color_identity_map=color_identity_map,
+                        total_beats=len(items),
+                    )
+                    return {int(key): list(value or []) for key, value in (result or {}).items()}
+                except Exception as error:  # noqa: BLE001 - 退化为更小批次继续识别
+                    last_error = error
+                    logger.warning(
+                        "AI 出场身份识别失败（grid=%s panels=%s attempt=%s）: %s",
+                        label,
+                        len(items),
+                        attempt,
+                        error,
+                    )
+            if len(items) <= 1:
+                raise last_error if last_error is not None else RuntimeError(
+                    "AI 出场身份识别失败"
+                )
+            half = len(items) // 2
+            left = await _detect_panels(items[:half], label=f"{label}_a")
+            right = await _detect_panels(items[half:], label=f"{label}_b")
+            merged = dict(left)
+            for panel_index, marker_ids in right.items():
+                merged[panel_index + half] = marker_ids
+            return merged
+
         for batch_idx in range(0, len(frame_items), batch_size):
             batch = frame_items[batch_idx : batch_idx + batch_size]
-            rows, cols = _grid_shape(len(batch))
-            grid_path = (
-                grid_dir / f"_ai_detect_grid_{rows}x{cols}_part{batch_idx // batch_size + 1}.png"
-            )
-            combine_to_grid([path for _, path in batch], grid_path, rows=rows, cols=cols)
-            batch_result = await detect_identities_by_ai(
-                sketch_image_paths=[str(grid_path)],
-                color_identity_map=color_identity_map,
-                total_beats=len(batch),
-            )
+            try:
+                batch_result = await _detect_panels(
+                    batch, label=f"part{batch_idx // batch_size + 1}"
+                )
+            except Exception as error:
+                failed_beats = "、".join(
+                    str(beat_number) for beat_number, _ in sorted(batch)
+                )
+                raise RuntimeError(
+                    f"AI 识别失败（beat {failed_beats}）: {error}"
+                ) from error
             ordered_batch = sorted(batch, key=lambda item: item[0])
-            for local_idx, marker_ids in (batch_result or {}).items():
-                try:
-                    panel_index = int(local_idx)
-                except (TypeError, ValueError):
-                    continue
+            for panel_index, marker_ids in (batch_result or {}).items():
                 if 1 <= panel_index <= len(ordered_batch):
                     beat_number = ordered_batch[panel_index - 1][0]
                     detections[beat_number] = list(marker_ids or [])

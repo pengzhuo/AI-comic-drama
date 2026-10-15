@@ -139,6 +139,7 @@ def _client(
     *,
     usage_meter=None,
     ctx=None,
+    detect=None,
 ):
     from novelvideo.agents import global_video_optimizer
     from novelvideo.api.routes import generation
@@ -186,7 +187,7 @@ def _client(
     monkeypatch.setattr(
         global_video_optimizer,
         "detect_identities_by_ai",
-        fake_detect_identities_by_ai,
+        detect if detect is not None else fake_detect_identities_by_ai,
     )
 
     app = FastAPI()
@@ -339,7 +340,7 @@ def test_detect_identities_falls_back_to_script_sketch_colors(monkeypatch, tmp_p
     assert body["data"]["identity_detections"] == {"1": ["Hero_Main"]}
 
 
-def test_detect_identities_batches_more_than_twenty_five_sketches(monkeypatch, tmp_path):
+def test_detect_identities_batches_sketches_by_nine(monkeypatch, tmp_path):
     beats = [
         {"beat_number": beat_num, "visual_description": "{{Hero_Main}}"}
         for beat_num in range(1, 27)
@@ -355,13 +356,17 @@ def test_detect_identities_batches_more_than_twenty_five_sketches(monkeypatch, t
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
-    assert calls == [25, 1]
+    # 视觉模型对 3x3 以上的结构化结果不稳定，按 9 个一批切分。
+    assert calls == [9, 9, 8]
+    # 假模型只认每批第 1 个 panel，因此每批首个 beat 命中 Hero_Main。
     assert body["data"]["identity_detections"]["1"] == ["Hero_Main"]
-    assert body["data"]["identity_detections"]["26"] == ["Hero_Main"]
+    assert body["data"]["identity_detections"]["10"] == ["Hero_Main"]
+    assert body["data"]["identity_detections"]["19"] == ["Hero_Main"]
     assert body["data"]["identity_detections"]["2"] == ["__NO_CHARACTER__"]
     assert len(body["data"]["identity_detections"]) == 26
     assert store.identity_writes[1] == ["Hero_Main"]
-    assert store.identity_writes[26] == ["Hero_Main"]
+    assert store.identity_writes[10] == ["Hero_Main"]
+    assert store.identity_writes[19] == ["Hero_Main"]
     assert store.identity_writes[2] == ["__NO_CHARACTER__"]
 
 
@@ -424,3 +429,84 @@ def test_detect_identities_marks_missing_ai_panel_result_as_no_character_and_no_
     assert body["data"]["prop_detections"] == {"1": ["__NO_PROP__"]}
     assert store.identity_writes == {1: ["__NO_CHARACTER__"]}
     assert store.prop_writes == {1: ["__NO_PROP__"]}
+
+
+def test_detect_identities_splits_grid_when_ai_rejects_large_structured_output(
+    monkeypatch, tmp_path
+):
+    """一个网格结构化输出失败时，二分拆小重试而不是让整集识别失败。"""
+
+    beats = [
+        {"beat_number": beat_num, "visual_description": "{{Hero_Main}}"}
+        for beat_num in (1, 2, 3)
+    ]
+    store = _DetectStore(beats)
+    attempted: list[int] = []
+    for beat_num in (1, 2, 3):
+        _write_sketch(tmp_path, beat_num)
+
+    async def flaky_detect_identities_by_ai(
+        *,
+        sketch_image_paths: list[str],
+        color_identity_map: dict[str, str],
+        total_beats: int,
+    ):
+        assert sketch_image_paths
+        attempted.append(total_beats)
+        if total_beats > 2:
+            raise RuntimeError("Exceeded maximum output retries (1)")
+        return {index: ["Hero_Main"] for index in range(1, total_beats + 1)}
+
+    client = _client(
+        monkeypatch, tmp_path, store, [], detect=flaky_detect_identities_by_ai
+    )
+
+    response = client.post("/api/v1/projects/demo/episodes/1/sketches/detect-identities")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    # 3 panel 的网格失败两次后拆成 1 + 2，各自识别成功。
+    assert attempted == [3, 3, 1, 2]
+    assert body["data"]["identity_detections"] == {
+        "1": ["Hero_Main"],
+        "2": ["Hero_Main"],
+        "3": ["Hero_Main"],
+    }
+    assert store.identity_writes == {
+        1: ["Hero_Main"],
+        2: ["Hero_Main"],
+        3: ["Hero_Main"],
+    }
+
+
+def test_detect_identities_reports_failing_beats_when_even_smallest_grid_fails(
+    monkeypatch, tmp_path
+):
+    beats = [
+        {"beat_number": beat_num, "visual_description": "{{Hero_Main}}"}
+        for beat_num in (1, 2)
+    ]
+    store = _DetectStore(beats)
+    attempted: list[int] = []
+    for beat_num in (1, 2):
+        _write_sketch(tmp_path, beat_num)
+
+    async def always_failing_detect_identities_by_ai(**kwargs):
+        attempted.append(kwargs["total_beats"])
+        raise RuntimeError("vision model failed")
+
+    client = _client(
+        monkeypatch, tmp_path, store, [], detect=always_failing_detect_identities_by_ai
+    )
+
+    response = client.post("/api/v1/projects/demo/episodes/1/sketches/detect-identities")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert "vision model failed" in body["error"]
+    # 明确告知是哪几个 beat 识别失败，便于只重跑受影响的批次。
+    assert "beat 1、2" in body["error"]
+    # 2 panel 网格各重试两次后拆成单 panel，单 panel 再重试两次仍失败才抛错。
+    assert attempted == [2, 2, 1, 1]

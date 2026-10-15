@@ -39,6 +39,7 @@ from novelvideo.config import OUTPUT_DIR, STATE_DIR
 from novelvideo.project_context import ProjectContext, require_project_home_node
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 from novelvideo.task_backend.task_clock import note_task_progress
+from novelvideo.task_diagnostics import note_operation
 from novelvideo.sqlite_schema import ensure_sqlite_schema
 from novelvideo.task_backend.queues import normalize_queue_kind
 from novelvideo.task_identity import (
@@ -1055,6 +1056,7 @@ class TaskStateManager:
         self._save_for_context(ctx, state, ttl=ttl)
         if status == "running":
             note_task_progress()
+            note_operation(state.current_task)
 
     def complete_task(
         self,

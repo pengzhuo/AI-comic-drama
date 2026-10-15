@@ -9,6 +9,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { currentTaskText, displayLabel } from "@/task-center/derivations";
 import { taskErrorMessage } from "@/task-center/task-errors";
+import { extractTaskFailure } from "@/task-center/task-failure";
+import { TaskFailureDetails } from "./task-failure-details";
 import { taskIoLabel } from "@/lib/task-io-label";
 import type { TaskState } from "@/task-center/types";
 
@@ -152,6 +154,7 @@ export function TaskDetail() {
   }
   const providerId = providerTaskId(task);
   const displayResult = task.result ? sanitizeResultForDisplay(task.result) : null;
+  const failureDetail = extractTaskFailure(task);
   // 后端这两个标签是 freezone 写死的中文，英文界面下要按词条渲染（见 lib/task-io-label.ts）。
   const sourceLabel = taskIoLabel(metadataField(task, "source_label"), t);
   const targetLabel = taskIoLabel(metadataField(task, "target_label"), t);
@@ -230,6 +233,7 @@ export function TaskDetail() {
             <div className="mt-3 rounded bg-destructive/10 p-2 text-destructive">
               <div className="font-medium">{t("taskCenter.detail.error.label")}</div>
               <div className="mt-1">{taskErrorMessage(task, t)}</div>
+              <TaskFailureDetails failure={failureDetail} />
             </div>
           )}
           {displayResult ? (

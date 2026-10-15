@@ -16,6 +16,13 @@
 | `NOVELVIDEO_RUNTIME_DIR` | `$DATA_ROOT/runtime` | 运行时临时目录。 |
 | `ST_CONTROL_PLANE_DSN` / `ST_REDIS_URL` / `ST_CELERY_BROKER_URL` / `ST_CELERY_RESULT_BACKEND` | 空(CE 强制清空) | EE/分布式才用;CE 任务进程内 inline 执行,留空。 |
 
+## 任务执行
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ST_PROJECT_TASK_IDLE_TIMEOUT_S` | `1800` | 项目任务的「空闲提醒」(秒)。任务只要持续上报进度就永不超时;连续该时长毫无进度更新时只会弹框提醒(任务继续运行,不会自动终止),由你选择「继续等待」或「终止任务」。设为 `0` 可关闭提醒。`ST_PROJECT_TASK_TIMEOUT_S` 为兼容旧配置的别名。 |
+| `ST_PROJECT_TASK_MAX_RUNTIME_S` | `0`(不限) | 任务总运行时长的硬上限(秒),是唯一会**自动终止**任务的设置。默认关闭,避免误杀仍在正常运行的超长任务;仅在运维需要兜底时才启用。 |
+
 ## 模型网关
 
 CE 的渠道选择、网关地址和 token 由网页「设置 → 模型配置」写入本机

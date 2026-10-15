@@ -14,6 +14,7 @@ import { displayLabel } from "@/task-center/derivations";
 import { RegionBadge } from "@/components/layout/region-badge";
 import { FREEZONE_DOCK_OFFSET_ANIMATED_STYLE } from "@/features/freezone/dockOffset";
 import { APP_VERSION } from "@/lib/app-version";
+import { pikoEntryHidden } from "@/lib/ui-hide-flags";
 import { cn } from "@/lib/utils";
 import type { StreamHealth, TaskState } from "@/task-center/types";
 
@@ -179,7 +180,7 @@ export function TaskStatusBar({ onOpenPikoStation }: TaskStatusBarProps) {
         ) : null}
       </div>
       <div className="flex shrink-0 items-center gap-2 text-muted-foreground">
-        {onOpenPikoStation ? (
+        {onOpenPikoStation && !pikoEntryHidden() ? (
           <button
             type="button"
             className="group inline-flex h-8 items-center px-1 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/55 focus-visible:ring-offset-2 focus-visible:ring-offset-background"

@@ -110,4 +110,19 @@ describe("TaskStatusBar", () => {
     fireEvent.click(launcher);
     expect(onOpenPikoStation).toHaveBeenCalledTimes(1);
   });
+
+  it("hides the Piko launcher when the instance flag is set", () => {
+    vi.stubEnv("VITE_HIDE_PIKO_ENTRY", "1");
+    try {
+      const { container } = renderBar(vi.fn());
+      expect(
+        screen.queryByRole("button", { name: enTranslation.pikoMiniGame.statusTooltip }),
+      ).not.toBeInTheDocument();
+      expect(
+        container.querySelector('img[src="/piko/entry/piko-game-launcher.png"]'),
+      ).toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });

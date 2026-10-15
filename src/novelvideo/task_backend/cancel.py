@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 from typing import Any
@@ -10,6 +11,8 @@ from typing import Any
 from novelvideo.ports import get_cancellation_store
 from novelvideo.ports.tasks import cancel_key
 from novelvideo.task_backend.task_clock import TaskClock, current_task_clock
+
+logger = logging.getLogger(__name__)
 
 
 class TaskCancelled(Exception):
@@ -23,10 +26,21 @@ class TaskCancelled(Exception):
 
 
 class TaskTimedOut(Exception):
-    """Raised when a project task exceeds its cooperative execution deadline."""
+    """Raised when a project task exceeds its cooperative execution deadline.
 
-    def __init__(self, *, timeout_seconds: int | None = None) -> None:
+    ``reason`` distinguishes the configured hard runtime cap (``"max_runtime"``)
+    from the legacy frozen-deadline path (``"idle"``) so the failure message can
+    describe what actually happened.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: int | None = None,
+        reason: str = "idle",
+    ) -> None:
         self.timeout_seconds = timeout_seconds or 30 * 60
+        self.reason = reason
         super().__init__(self.timeout_seconds)
 
 
@@ -104,17 +118,32 @@ async def await_with_cancel_watch(
     main_task = asyncio.create_task(coro)
     stop_reason: str | None = None
 
-    def _deadline() -> float | None:
-        if clock is not None:
-            return clock.deadline_monotonic
-        return deadline_monotonic
-
     async def _watch() -> None:
         nonlocal stop_reason
         try:
             while not main_task.done():
-                deadline = _deadline()
-                if deadline is not None and time.monotonic() >= deadline:
+                if clock is not None:
+                    if clock.hard_cap_reached():
+                        stop_reason = "timeout"
+                        main_task.cancel()
+                        return
+                    if clock.is_stalled():
+                        # An idle gap is not fatal: fire a one-time notice and
+                        # keep the task running, so a genuinely long step is
+                        # never abandoned by mistake. The user decides.
+                        clock.note_progress()
+                        clock.stall_notices += 1
+                        handler = clock.on_stall
+                        if handler is not None:
+                            try:
+                                await handler(clock)
+                            except Exception:  # noqa: BLE001
+                                logger.exception("project task stall handler failed")
+                        continue
+                elif (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
                     stop_reason = "timeout"
                     main_task.cancel()
                     return
@@ -138,11 +167,10 @@ async def await_with_cancel_watch(
                     main_task.cancel()
                     return
                 sleep_seconds = poll_seconds
-                deadline = _deadline()
-                if deadline is not None:
+                if clock is None and deadline_monotonic is not None:
                     sleep_seconds = min(
                         sleep_seconds,
-                        max(deadline - time.monotonic(), 0.0),
+                        max(deadline_monotonic - time.monotonic(), 0.0),
                     )
                 await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:
@@ -153,12 +181,13 @@ async def await_with_cancel_watch(
         return await main_task
     except asyncio.CancelledError:
         if stop_reason == "timeout":
-            effective_seconds = (
-                clock.idle_seconds
-                if clock is not None and clock.enabled
-                else timeout_seconds
-            )
-            raise TaskTimedOut(timeout_seconds=effective_seconds)
+            if clock is not None:
+                capped = clock.max_runtime_seconds > 0
+                raise TaskTimedOut(
+                    timeout_seconds=clock.max_runtime_seconds or timeout_seconds,
+                    reason="max_runtime" if capped else "idle",
+                )
+            raise TaskTimedOut(timeout_seconds=timeout_seconds, reason="idle")
         raise TaskCancelled()
     finally:
         watcher.cancel()
@@ -195,13 +224,16 @@ def remaining_timeout_seconds(
 
     clock = current_task_clock()
     if clock is not None:
-        if not clock.enabled:
-            return default_seconds
+        # Idle gaps are non-fatal and never cap a subprocess; only an explicitly
+        # configured hard runtime cap can bound a child process.
         remaining = clock.remaining_seconds()
         if remaining is None:
             return default_seconds
         if remaining <= 0:
-            raise TaskTimedOut(timeout_seconds=clock.idle_seconds)
+            raise TaskTimedOut(
+                timeout_seconds=clock.max_runtime_seconds,
+                reason="max_runtime",
+            )
         deadline_seconds = max(math.ceil(remaining), 1)
         if default_seconds is None:
             return deadline_seconds
@@ -293,16 +325,23 @@ def raise_if_envelope_cancel_requested(
 ) -> None:
     """Synchronous cancellation checkpoint for non-async runner boundaries."""
     clock = current_task_clock()
-    if clock is not None and clock.is_stalled():
-        raise TaskTimedOut(timeout_seconds=clock.idle_seconds)
-
-    deadline_monotonic = _optional_float(envelope.get("__deadline_monotonic"))
-    if (
-        clock is None
-        and deadline_monotonic is not None
-        and time.monotonic() >= deadline_monotonic
-    ):
-        raise TaskTimedOut(timeout_seconds=_optional_int(envelope.get("__timeout_seconds")))
+    if clock is not None:
+        # Idle gaps are non-fatal at synchronous checkpoints too: only the
+        # explicitly configured hard runtime cap can terminate the task here.
+        if clock.hard_cap_reached():
+            raise TaskTimedOut(
+                timeout_seconds=clock.max_runtime_seconds,
+                reason="max_runtime",
+            )
+    else:
+        deadline_monotonic = _optional_float(envelope.get("__deadline_monotonic"))
+        if (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+        ):
+            raise TaskTimedOut(
+                timeout_seconds=_optional_int(envelope.get("__timeout_seconds"))
+            )
 
     fields = _envelope_cancel_fields(
         envelope,

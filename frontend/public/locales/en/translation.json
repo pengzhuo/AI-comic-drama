@@ -3440,6 +3440,19 @@
       "error": {
         "label": "Error"
       },
+      "failure": {
+        "title": "Failure details",
+        "operation": "Current operation",
+        "recentOperations": "Recent operations",
+        "modelCalls": "Model calls",
+        "noModelCalls": "No model calls recorded",
+        "requestId": "Request ID",
+        "requestOk": "ok",
+        "requestFailed": "failed",
+        "exception": "Exception",
+        "traceback": "Stack trace",
+        "elapsed": "Ran for {{seconds}}s"
+      },
       "logs": {
         "placeholder": "No log output yet."
       }

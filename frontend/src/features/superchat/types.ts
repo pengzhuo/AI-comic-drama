@@ -336,6 +336,13 @@ export type ServerFrame =
       message?: string | null;
       terminal_task_id?: string | null;
       voice_policy?: "system" | "custom" | null;
+      /** Set when a task stopped reporting progress but is still running. */
+      stalled?: boolean;
+      stall_task_type?: string | null;
+      stall_beat_num?: number | null;
+      stall_scope?: string | null;
+      /** Operation / model-call diagnostics for a stalled task. */
+      diagnostics?: unknown;
     }
   | { type: "project.created"; project: string }
   | { type: "error"; message: string; turn_id?: string }
