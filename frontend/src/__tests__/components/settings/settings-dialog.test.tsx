@@ -136,8 +136,11 @@ vi.mock("react-i18next", () => ({
         "settings.statusNotConfigured": `${options?.page ?? ""}未配置`,
         "settings.modelConfig.title": "模型配置",
         "settings.modelConfig.description": "选择模型网关渠道",
+        "settings.modelConfig.descriptionLocalOnly": "仅使用本地 NewAPI",
         "settings.modelConfig.gatewayWarningIconLabel": "模型网关未配置",
-        "settings.modelConfig.gatewayNotConfiguredImpact": "模型网关未配置",
+        "settings.modelConfig.gatewayNotConfiguredImpact": "请配置官方渠道或初始化本地 NewAPI",
+        "settings.modelConfig.gatewayNotConfiguredImpactLocalOnly": "请初始化本地 NewAPI",
+        "settings.modelConfig.guide": "配置手册",
         "settings.modelConfig.modes.official": "官方渠道",
         "settings.modelConfig.modes.custom": "自定义 NewAPI",
         "settings.modelConfig.official.description": "官方渠道说明",
@@ -393,6 +396,72 @@ describe("SettingsDialog pages", () => {
     );
     expect(screen.getByText("选择模型网关渠道")).toBeInTheDocument();
     expect(screen.getByText("Agent 模型")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "配置手册" })).toBeInTheDocument();
+  });
+
+  it("hides the model configuration guide when the instance flag is set", () => {
+    vi.stubEnv("VITE_HIDE_MODEL_GUIDE", "1");
+    try {
+      renderSettingsDialog();
+
+      expect(screen.getByText("选择模型网关渠道")).toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: "配置手册" })).not.toBeInTheDocument();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("drops the official-channel wording from the missing-gateway warning on instance builds", () => {
+    vi.stubEnv("VITE_HIDE_OFFICIAL_CHANNELS", "1");
+    modelGatewayMocks.config = {
+      mode: "custom",
+      effective: { source: "custom", baseUrl: "", apiKeyPreview: "", configured: false },
+      llmEffective: { mode: "custom", source: "custom", baseUrl: "", apiKeyPreview: "", configured: false, model: "", brainclaw: false },
+      agent: { mode: "inherit", baseUrl: "", apiKeyPreview: "", configured: false, model: "" },
+      official: { source: "database", baseUrl: "https://relay.example/v1", apiKeyPreview: "", configured: false, environment: { baseUrl: "https://relay.example/v1", apiKeyPreview: "", configured: false } },
+      custom: { llmMode: "relayclaw_brainclaw", baseUrl: "http://local-newapi:3000/v1", apiKeyPreview: "", configured: false, adminBaseUrl: "http://local-newapi:3000", tokenName: "dramaclaw", tokenId: "1" },
+    };
+
+    try {
+      renderSettingsDialog();
+
+      expect(screen.getByText("请初始化本地 NewAPI")).toBeInTheDocument();
+      expect(
+        screen.queryByText("请配置官方渠道或初始化本地 NewAPI"),
+      ).not.toBeInTheDocument();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("keeps only the local gateway channel when the instance flag is set", () => {
+    vi.stubEnv("VITE_HIDE_OFFICIAL_CHANNELS", "1");
+    modelGatewayMocks.config = {
+      mode: "official",
+      effective: { source: "official", baseUrl: "https://relay.example/v1", apiKeyPreview: "", configured: true },
+      llmEffective: { mode: "official", source: "official", baseUrl: "https://relay.example/v1", apiKeyPreview: "", configured: true, model: "brainclaw", brainclaw: true },
+      agent: { mode: "inherit", baseUrl: "", apiKeyPreview: "", configured: false, model: "" },
+      official: { source: "database", baseUrl: "https://relay.example/v1", apiKeyPreview: "", configured: true, environment: { baseUrl: "https://relay.example/v1", apiKeyPreview: "", configured: false } },
+      custom: { llmMode: "relayclaw_brainclaw", baseUrl: "http://local-newapi:3000/v1", apiKeyPreview: "sk-c...cret", configured: true, adminBaseUrl: "http://local-newapi:3000", tokenName: "dramaclaw", tokenId: "1" },
+    };
+
+    try {
+      renderSettingsDialog();
+
+      expect(screen.getByRole("tab", { name: "自定义 NewAPI" })).toBeInTheDocument();
+      expect(screen.queryByRole("tab", { name: "官方渠道" })).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("tab", { name: "settings.modelConfig.modes.hybrid" }),
+      ).not.toBeInTheDocument();
+      // The official channel form (its API key field and save button) is gone,
+      // and the server's official mode falls back to the local panel.
+      expect(screen.queryByText("保存并启用")).not.toBeInTheDocument();
+      expect(screen.getByText("捏驿 BrainClaw（推荐）")).toBeInTheDocument();
+      expect(screen.getByText("仅使用本地 NewAPI")).toBeInTheDocument();
+      expect(screen.queryByText("选择模型网关渠道")).not.toBeInTheDocument();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("saves an independent third-party Agent model", async () => {

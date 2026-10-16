@@ -6,6 +6,8 @@ source module still takes effect; the source re-imports these names.
 
 from __future__ import annotations
 
+import os
+
 import novelvideo.chat.service as _svc
 
 
@@ -502,14 +504,16 @@ def _codex_model() -> str:
     # EE/SaaS is deployment-configured. The gateway address and logical model
     # come from env, while an organization channel's key is authorized and
     # injected separately for each turn.
+    # ``os.environ`` is read directly here so the CE env-config ratchet can see
+    # the keys (a ``_svc.os`` alias is invisible to its AST scan).
     return (
-        _svc.os.environ.get("CODEX_MODEL", _svc._DEFAULT_CODEX_MODEL).strip()
+        os.environ.get("CODEX_MODEL", _svc._DEFAULT_CODEX_MODEL).strip()
         or _svc._DEFAULT_CODEX_MODEL
     )
 
 def _codex_reasoning_effort() -> str:
     value = (
-        _svc.os.environ.get(
+        os.environ.get(
             "CODEX_REASONING_EFFORT", _svc._DEFAULT_CODEX_REASONING_EFFORT
         ).strip()
         or _svc._DEFAULT_CODEX_REASONING_EFFORT

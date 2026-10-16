@@ -53,6 +53,7 @@ import {
   markUpgradeSeen,
   shouldShowUpgradeNudge,
 } from "@/lib/release-notification-state";
+import { notificationCenterHidden } from "@/lib/ui-hide-flags";
 import { FREEZONE_DOCK_OFFSET_ANIMATED_STYLE } from "@/features/freezone/dockOffset";
 import {
   ProjectHeaderNavigation,
@@ -132,7 +133,8 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
     useAnnouncementReadState();
   void releaseNotificationStateVersion;
   const hasUnreadNotification =
-    shouldShowUpgradeNudge(releaseFeed) || announcementUnreadCount(announcementIds) > 0;
+    !notificationCenterHidden() &&
+    (shouldShowUpgradeNudge(releaseFeed) || announcementUnreadCount(announcementIds) > 0);
   const gatewayConfig = modelGatewayConfig.data?.data;
   const hasSettingsWarning = Boolean(
     ceRuntime &&
@@ -478,12 +480,14 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
         currentAccessory={pikoAccessory}
         onConfirm={handleCompanionConfirm}
       />
-      <NotificationDrawer
-        open={notificationOpen}
-        onOpenChange={setNotificationOpen}
-        onUpgradeStateChange={handleUpgradeStateChange}
-        announcements={announcements}
-      />
+      {notificationCenterHidden() ? null : (
+        <NotificationDrawer
+          open={notificationOpen}
+          onOpenChange={setNotificationOpen}
+          onUpgradeStateChange={handleUpgradeStateChange}
+          announcements={announcements}
+        />
+      )}
       <AvatarUploadDialog
         avatarInitial={avatarInitial}
         displayName={displayName}
@@ -658,12 +662,12 @@ function AccountPanel({
             label={t("header.account.phoneBinding.title")}
             onClick={onBindPhone}
           /> : null}
-          <AccountMenuRow
+          {notificationCenterHidden() ? null : <AccountMenuRow
             icon={<Bell className="size-3.5" />}
             label={t("header.notifications")}
             unread={hasUnreadNotification}
             onClick={onNotifications}
-          />
+          />}
           <AccountMenuRow
             icon={<Camera className="size-3.5" />}
             label={t("header.account.changeAvatar")}

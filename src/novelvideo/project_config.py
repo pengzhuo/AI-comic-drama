@@ -372,6 +372,22 @@ def load_project_config(username: str, project: str) -> dict:
     return result
 
 
+def effective_video_backend(username: str, project: str) -> str:
+    """The video backend a project actually renders with.
+
+    Project config wins; when it never set one, the instance default
+    (``VIDEO_BACKEND``) applies. Anything that has to know "is this project on
+    the Seedance 2.0 family" (the pipeline's 2.0 prompt step, the auto
+    dispatcher) reads this instead of a frozen model name, so a project and the
+    gateway it talks to cannot disagree silently.
+    """
+
+    from novelvideo.config import VIDEO_BACKEND
+
+    configured = str(load_project_config(username, project).get("video_backend") or "").strip()
+    return configured or str(VIDEO_BACKEND or "").strip()
+
+
 def ensure_project_uuid_in_state_dir(state_dir: str | Path) -> str:
     """Ensure a stable UUID without resolving legacy username/project paths."""
 

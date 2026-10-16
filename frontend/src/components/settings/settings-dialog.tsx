@@ -47,6 +47,7 @@ import {
 } from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { safeLocalStorageSet } from "@/lib/localStorageQuota";
+import { modelGuideHidden, officialChannelsHidden } from "@/lib/ui-hide-flags";
 import { cn } from "@/lib/utils";
 import {
   FEATURE_MODEL_GROUPS,
@@ -267,6 +268,16 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 }
 
 const GATEWAY_MODES: GatewayMode[] = ["official", "custom", "hybrid"];
+const LOCAL_ONLY_GATEWAY_MODES: GatewayMode[] = ["custom"];
+
+/**
+ * Channels offered as tabs. Instance builds can hide the official ones
+ * (VITE_HIDE_OFFICIAL_CHANNELS) so the local NewAPI channel is the only offer —
+ * the official config forms become unreachable instead of merely unpicked.
+ */
+function visibleGatewayModes(): GatewayMode[] {
+  return officialChannelsHidden() ? LOCAL_ONLY_GATEWAY_MODES : GATEWAY_MODES;
+}
 
 const DEFAULT_CUSTOM_NEWAPI_URL = "http://127.0.0.1:3000";
 
@@ -356,17 +367,20 @@ function ModelConfigSection({ open }: { open: boolean }) {
     ? !config.effective.configured || !config.llmEffective.configured
     : false;
 
-  const [mode, setMode] = useState<GatewayMode>("official");
+  const [mode, setMode] = useState<GatewayMode>(() =>
+    officialChannelsHidden() ? "custom" : "official",
+  );
+  const gatewayModes = visibleGatewayModes();
   const modeChosenByUser = useRef(false);
   const [customLlmMode, setCustomLlmMode] =
     useState<CustomLlmMode>("relayclaw_brainclaw");
   const updateCustomLlmMode = useSetCustomLlmMode();
-  // 配置加载后，把激活的 tab 同步到服务端当前 mode。
+  // 配置加载后，把激活的 tab 同步到服务端当前 mode（被屏蔽的渠道回落到本地）。
   const serverMode = config?.mode;
   useEffect(() => {
-    if (serverMode && !modeChosenByUser.current) {
-      setMode((current) => (current === serverMode ? current : serverMode));
-    }
+    if (!serverMode || modeChosenByUser.current) return;
+    const next: GatewayMode = gatewayModes.includes(serverMode) ? serverMode : "custom";
+    setMode((current) => (current === next ? current : next));
   }, [serverMode]);
   useEffect(() => {
     if (config?.custom.llmMode) {
@@ -485,19 +499,25 @@ function ModelConfigSection({ open }: { open: boolean }) {
             })}
           </span>
         ) : null}
-        <a
-          href={MODEL_CONFIGURATION_GUIDE_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="ml-auto inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
-        >
-          {t("settings.modelConfig.guide")}
-          <ExternalLink className="size-3" aria-hidden />
-        </a>
+        {modelGuideHidden() ? null : (
+          <a
+            href={MODEL_CONFIGURATION_GUIDE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="ml-auto inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+          >
+            {t("settings.modelConfig.guide")}
+            <ExternalLink className="size-3" aria-hidden />
+          </a>
+        )}
       </div>
 
       <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-        {t("settings.modelConfig.description")}
+        {t(
+          officialChannelsHidden()
+            ? "settings.modelConfig.descriptionLocalOnly"
+            : "settings.modelConfig.description",
+        )}
       </p>
       {modelGatewayMissing ? (
         <div className="mt-3 flex gap-2 rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-100">
@@ -505,7 +525,13 @@ function ModelConfigSection({ open }: { open: boolean }) {
             className="mt-0.5 size-3.5 shrink-0 text-amber-300"
             aria-hidden
           />
-          <p>{t("settings.modelConfig.gatewayNotConfiguredImpact")}</p>
+          <p>
+            {t(
+              officialChannelsHidden()
+                ? "settings.modelConfig.gatewayNotConfiguredImpactLocalOnly"
+                : "settings.modelConfig.gatewayNotConfiguredImpact",
+            )}
+          </p>
         </div>
       ) : null}
 
@@ -522,7 +548,7 @@ function ModelConfigSection({ open }: { open: boolean }) {
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <TabsList>
-            {GATEWAY_MODES.map((m) => (
+            {gatewayModes.map((m) => (
               <TabsTrigger key={m} value={m}>
                 {t(`settings.modelConfig.modes.${m}`)}
               </TabsTrigger>

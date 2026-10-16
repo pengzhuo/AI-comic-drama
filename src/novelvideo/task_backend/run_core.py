@@ -79,6 +79,7 @@ _PROJECT_TASK_RESOURCE_KINDS = {
     "build_episodes": "script",
     "script_writer": "script",
     "beat_video_prompt": "script",
+    "seedance2_prompt": "script",
     "identity_planner": "portrait",
     "episode_scene_planner": "script",
     "episode_prop_planner": "script",

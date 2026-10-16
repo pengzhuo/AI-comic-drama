@@ -16,12 +16,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from novelvideo.pipeline_status import character_needs_portrait, compute_pipeline_status
+from novelvideo.pipeline_status import (
+    beat_seedance2_prompt_ready,
+    character_needs_portrait,
+    compute_pipeline_status,
+)
 from novelvideo.task_backend.client import enqueue_project_task
 from novelvideo.utils.path_resolver import compute_identity_path, compute_portrait_path
 
 DEFAULT_EPISODE_TARGET = 10
 DEFAULT_COMPOSE_RESOLUTION = "720x1280"
+# ``SingleVideoRequest`` validates ``batch_size <= 9``; the deterministic path
+# ships the same chunk size so a 40-beat episode goes out in the same batches the
+# workbench tool would send.
+MAX_SINGLE_VIDEO_BATCH = 9
 
 
 async def dispatch_next_stage(
@@ -94,6 +102,10 @@ async def dispatch_next_stage(
         )
     if next_step == "identity_images":
         return await _dispatch_identity_image(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "seedance2_prompt":
+        return await _dispatch_seedance2_prompt(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "single_video":
+        return await _dispatch_single_videos(ctx, store, current_episode, project_dir, attempted)
     if next_step == "compose_episode":
         return await _dispatch_compose(ctx, store, current_episode, attempted)
     return None, None
@@ -109,6 +121,7 @@ async def _enqueue_once(
     signature: str,
     payload: dict[str, Any],
     scope: str | None = None,
+    beat_num: int | None = None,
 ) -> tuple[str | None, str]:
     if signature in attempted:
         return None, signature
@@ -118,6 +131,7 @@ async def _enqueue_once(
         product_surface="mainline",
         queue_kind=queue_kind,
         episode=episode,
+        beat_num=beat_num,
         scope=scope,
         payload=payload,
     )
@@ -216,6 +230,95 @@ async def _dispatch_identity_image(
                 },
             )
     return None, None
+
+
+async def _dispatch_seedance2_prompt(
+    ctx: Any,
+    store: Any,
+    episode: int,
+    project_dir: Path,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """Write the next beat's Seedance 2.0 final prompt.
+
+    Seedance 2.0 will not render a beat whose 2.0 prompt was never composed, and
+    composing it is an LLM round-trip per beat. Dispatching one beat at a time as
+    a real task keeps the coordinator's task bookkeeping intact (a taskless
+    continuation would drift into the "no new task" pause).
+    """
+
+    beats = await store.get_beats_as_dicts(episode)
+    for beat in sorted(beats, key=lambda item: int(item.get("beat_number") or 0)):
+        beat_num = int(beat.get("beat_number") or 0)
+        if beat_num <= 0 or beat_seedance2_prompt_ready(beat):
+            continue
+        return await _enqueue_once(
+            ctx,
+            attempted,
+            task_type="seedance2_prompt",
+            queue_kind="default",
+            episode=episode,
+            beat_num=beat_num,
+            signature=f"dispatch:seedance2_prompt:{episode}:{beat_num}",
+            payload={
+                "output_dir": str(project_dir),
+                "episode": episode,
+                "beat_num": beat_num,
+            },
+        )
+    return None, None
+
+
+async def _dispatch_single_videos(
+    ctx: Any,
+    store: Any,
+    episode: int,
+    project_dir: Path,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """Enqueue the ready beats' videos in the same payload the REST route uses.
+
+    "Ready" means the promoted first frame exists and the beat still has no
+    video; beats whose frame never materialised are left to the agent (it can
+    explain what is missing) instead of being dispatched into a guaranteed
+    failure. The chunk is capped at the runtime's own ``batch_size <= 9`` limit,
+    and the signature carries the chunk so the next call (after this chunk
+    completes) is recognised as progress rather than a retry.
+    """
+
+    from novelvideo.api.schemas import SingleVideoRequest
+    from novelvideo.api.routes.generation import enqueue_single_video_task
+    from novelvideo.utils.path_resolver import PathResolver
+
+    beats = await store.get_beats_as_dicts(episode)
+    if not beats:
+        return None, None
+    paths = PathResolver(str(project_dir), episode)
+    ready = sorted(
+        beat_num
+        for beat_num in (int(beat.get("beat_number") or 0) for beat in beats)
+        if beat_num > 0
+        and paths.first_frame_for_video(beat_num).exists()
+        and not paths.video(beat_num).exists()
+    )
+    if not ready:
+        return None, None
+    batch = ready[:MAX_SINGLE_VIDEO_BATCH]
+    signature = f"dispatch:single_video:{episode}:{batch[0]}-{batch[-1]}"
+    if signature in attempted:
+        return None, signature
+    for beat_num in batch:
+        await enqueue_single_video_task(
+            ctx=ctx,
+            store=store,
+            username=ctx.requester_username,
+            project_name=ctx.project_name,
+            output_dir=str(project_dir),
+            episode_num=episode,
+            beat_num=beat_num,
+            body=SingleVideoRequest(),
+        )
+    return "single_video", signature
 
 
 async def _dispatch_compose(

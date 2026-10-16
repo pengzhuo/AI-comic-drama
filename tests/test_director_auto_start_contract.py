@@ -3,6 +3,7 @@ from __future__ import annotations
 from novelvideo.api.routes.chat import (
     _AUTO_CONFIG_KEYS,
     _auto_config_updates,
+    _auto_run_driver,
     _director_auto_payload,
     DirectorAutoStartIn,
 )
@@ -16,6 +17,24 @@ def test_start_payload_defaults_to_episode_scope() -> None:
     assert payload.voice_policy is None
     assert payload.target_episodes == 0
     assert payload.config is None
+    assert payload.driver is None
+
+
+def test_one_click_project_run_defaults_to_the_deterministic_fast_path() -> None:
+    """一键成片 must not spend one agent turn per stage."""
+
+    assert _auto_run_driver(DirectorAutoStartIn(scope="project")) == "deterministic"
+
+
+def test_episode_scope_run_keeps_the_agent_driver() -> None:
+    assert _auto_run_driver(DirectorAutoStartIn(scope="episode")) == "agent"
+
+
+def test_explicit_driver_wins() -> None:
+    assert _auto_run_driver(DirectorAutoStartIn(scope="project", driver="agent")) == "agent"
+    assert _auto_run_driver(DirectorAutoStartIn(scope="episode", driver="deterministic")) == (
+        "deterministic"
+    )
 
 
 def test_start_payload_accepts_project_scope_with_config() -> None:

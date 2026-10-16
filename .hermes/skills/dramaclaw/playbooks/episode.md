@@ -3,7 +3,7 @@
 > 本文件是逐集流程顺序的唯一事实源。API 请求细节不确定时，读取
 > `references/step-api-reference.md`；技术参考不得改变本文件的顺序。
 > 变量：`$EP` = 当前集数。
-> **首步**：`GET /projects/{project}` 读取项目配置（rhythm, tts_provider, video_resolution），用于 `{项目...}` 占位符；视频后端默认统一使用 `huimeng_seedance-1.0-pro-fast`。
+> **首步**：`GET /projects/{project}` 读取项目配置（rhythm, tts_provider, video_resolution），用于 `{项目...}` 占位符；视频后端不要写死：不传 `video_backend`，由后端按项目配置的默认视频模型（本实例为 `newapi_seedance-2.0-fast`）决定。
 
 ## 流水线
 
@@ -36,6 +36,7 @@ CP2 判定：脚本、场景/道具上下文足够推进草图；当前后端没
 
 **Step 9（服装一致性关键）**：
 1. 先读取核心+重要角色的 identity 状态，选择第一个缺失身份图的 identity；本轮最多只生成这一个 identity 图
+   - 缺哪个 identity 优先从 `dramaclaw_pipeline_status` 的 `episode_status.identities_missing` 读（每项含 `character` + `identity_id`），不要猜 `/episodes/{ep}/identities` 之类的按集路由
    - `CHAR_NAME` 只能来自已读到的角色名列表或当前返回结果中的明确角色字段，且必须非空
    - 如果当前拿不到角色名，就跳过该角色的 identity 补读，不要探测 `/characters//identities` 或任何空名路径
    - 不要在同一轮遍历并生成多个角色/多个 identity；剩余 identity 等用户下次“继续”再处理
@@ -102,7 +103,7 @@ CP2 判定：脚本、场景/道具上下文足够推进草图；当前后端没
   必须等该 beat 的音频重做请求已经发出并返回成功后，才允许进入 `compose`。
 - 不要在该 beat 的音频重做之前先发起 `compose`
 
-**Step 15 视频模型**：当前后端没有整集 `/videos/generate` 路由。默认用 `POST /episodes/{ep}/beats/{beat}/video` 单 beat 生成；如需整集片段，优先调用一次 `dramaclaw_start_video_batch`，工具默认从缺少视频且已有首帧的 beat 中自动补足并按顺序提交最多 9 个独立任务；实际视频并发仍由共享队列限制为 3，其余任务排队。只有用户明确指定单个 beat 时调用 `dramaclaw_start_single_video`；明确指定少量 beat 时才为批量工具设置 `auto_fill=false`。默认 `huimeng_seedance-1.0-pro-fast`。
+**Step 15 视频模型**：当前后端没有整集 `/videos/generate` 路由。默认用 `POST /episodes/{ep}/beats/{beat}/video` 单 beat 生成；如需整集片段，优先调用一次 `dramaclaw_start_video_batch`，工具默认从缺少视频且已有首帧的 beat 中自动补足并按顺序提交最多 9 个独立任务；实际视频并发仍由共享队列限制为 3，其余任务排队。只有用户明确指定单个 beat 时调用 `dramaclaw_start_single_video`；明确指定少量 beat 时才为批量工具设置 `auto_fill=false`。不要传 `video_backend`（后端按项目配置的默认视频模型，本实例为 `newapi_seedance-2.0-fast`）；只有用户明确点名某个模型时才传 `newapi_<model>`，不要传旧的 `huimeng_*` 值。
 
 **Step 15-16**：所有 `single_video` 完成后才能启动 `compose_episode`；当
 `pipeline/status.next_step == "compose_episode"` 且没有运行中的合成任务时，直接调用一次

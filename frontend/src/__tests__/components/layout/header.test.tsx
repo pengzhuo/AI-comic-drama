@@ -254,6 +254,25 @@ describe("Header runtime gating", () => {
     ).toBeInTheDocument();
   });
 
+  it("drops the notification center entirely when the instance flag is set", async () => {
+    vi.stubEnv("VITE_HIDE_NOTIFICATION_CENTER", "1");
+    try {
+      renderHeader();
+
+      fireEvent.mouseEnter(screen.getByLabelText("Open account").parentElement!);
+
+      // The panel still opens (a sibling row proves it) but 公告中心 is gone.
+      expect(
+        await screen.findByRole("button", { name: "Change avatar" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Announcement Center" }),
+      ).not.toBeInTheDocument();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   // 回归用例：独立公告按钮被删掉后，账号头像成了公告中心的唯一入口。它当时只绑了
   // onMouseEnter —— 触屏没有 hover、键盘也激活不了，公告中心等于对这两类用户消失。
   it("opens the account panel on click so the announcement entry survives without hover", async () => {

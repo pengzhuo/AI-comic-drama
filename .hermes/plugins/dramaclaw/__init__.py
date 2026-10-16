@@ -3174,7 +3174,13 @@ TOOLS = (
         "dramaclaw_pipeline_status",
         _schema(
             "dramaclaw_pipeline_status",
-            "Get the current DramaClaw project pipeline status.",
+            "Get the current DramaClaw project pipeline status. Returns global preparation "
+            "(ingested/configured/characters/episodes/portraits_done) and, for the current "
+            "episode, every step in episode_status — including identity-image progress: "
+            "identity_images_planned / identity_images_done and identities_missing "
+            "(each entry has character + identity_id). Read identity progress from here "
+            "instead of guessing a per-episode identity route, and start a missing one with "
+            "dramaclaw_generate_identity_image(name=<character>, identity_id=<identity_id>).",
             {
                 "project_id": {"type": "string", "description": "Project id. Defaults to DRAMACLAW_PROJECT_ID."},
                 "episode": {"type": "integer", "description": "Optional episode number."},

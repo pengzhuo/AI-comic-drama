@@ -2995,12 +2995,50 @@ async def generate_single_video(
     ctx = resolved.ctx
     username = resolved.username
     project_name = resolved.project_name
-    output_dir = resolved.output_dir
     store = (
         await make_sqlite_store_for_context(ctx)
         if ctx
         else await make_sqlite_store(username, project_name)
     )
+    return await enqueue_single_video_task(
+        ctx=ctx,
+        store=store,
+        username=username,
+        project_name=project_name,
+        output_dir=resolved.output_dir,
+        episode_num=episode_num,
+        beat_num=beat_num,
+        body=body,
+    )
+
+
+async def enqueue_single_video_task(
+    *,
+    ctx: Any,
+    store: Any,
+    username: str,
+    project_name: str,
+    output_dir: str,
+    episode_num: int,
+    beat_num: int,
+    body: SingleVideoRequest,
+) -> dict[str, Any]:
+    """Enqueue one beat's video task with the exact payload the REST route uses.
+
+    Extracted so the deterministic auto pipeline can start beat videos without an
+    agent turn; both callers therefore build the same payload the ``single_video``
+    runner expects, and the fast path cannot drift from the product surface.
+    """
+
+    # 未显式指定视频后端时，跟随项目配置的默认视频模型（其本身回落到实例的
+    # VIDEO_BACKEND）。请求模型写死会让单镜/批量工具落到与实例网关不匹配的模型。
+    # 走模块级 ``load_project_config``，既有测试用它注入项目配置。
+    if "video_backend" not in body.model_fields_set:
+        default_video_backend = str(
+            load_project_config(username, project_name).get("video_backend") or ""
+        ).strip()
+        if default_video_backend:
+            body.video_backend = default_video_backend
 
     # 加载 beat 数据
     beats = await store.get_beats_as_dicts(episode_num)

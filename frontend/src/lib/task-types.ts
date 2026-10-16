@@ -44,6 +44,8 @@ export const TASK_TYPES = {
   SINGLE_VIDEO: "single_video",
   GLOBAL_OPTIMIZE_VIDEO: "global_optimize_video",
   SELECTED_REGEN: "selected_regen",
+  /** Seedance 2.0 compose-one-beat's-final-prompt step that gates its video. */
+  SEEDANCE2_PROMPT: "seedance2_prompt",
   // Compose — BE emits `compose_episode` (task_identity.py); FE used
   // `video_compose` which caused the same infinite-spinner class of bug
   // we hit with script_writer / staging.
@@ -60,6 +62,7 @@ export type TaskType = (typeof TASK_TYPES)[keyof typeof TASK_TYPES];
 export const SCOPED_TASK_TYPES = new Set<TaskType>([
   TASK_TYPES.SINGLE_VIDEO,
   TASK_TYPES.BEAT_VIDEO_PROMPT,
+  TASK_TYPES.SEEDANCE2_PROMPT,
   TASK_TYPES.GRID_REGENERATE,
   TASK_TYPES.SKETCH_REGEN,
   TASK_TYPES.DIRECTOR_CONTROL_TO_SKETCH,

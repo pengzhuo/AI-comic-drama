@@ -1437,6 +1437,56 @@ def test_metered_workflow_run_admits_each_model_recipe_before_run_creation(
     assert not deterministic_action["product_operation_id"]
 
 
+def test_metered_workflow_run_fails_unbound_operation_when_admission_is_rejected(
+    workflow_run_client: TestClient, monkeypatch
+) -> None:
+    from novelvideo.api.routes import freezone
+    from novelvideo.freezone.agent_product_operations import (
+        read_agent_product_operation,
+    )
+    from novelvideo.shared.billing_errors import BillingRuleNotConfiguredError
+
+    class RejectingTaskBackend:
+        async def enqueue_project_task(self, _ctx, **_kwargs):
+            raise BillingRuleNotConfiguredError(
+                kind="feature", key="freezone.agent.recipe_result"
+            )
+
+    monkeypatch.setattr(freezone, "get_usage_meter", lambda: object())
+    monkeypatch.setattr(freezone, "get_task_backend", lambda: RejectingTaskBackend())
+    base = "/api/v1/projects/proj_demo/freezone/canvases/default/workflow-runs"
+    request = {
+        "idempotency_key": "missing-recipe-price",
+        "actions": [
+            {
+                "node_id": "text-1",
+                "action": "generate_text",
+                "recipe_id": "general-text",
+                "recipe_version": "1.0.0",
+                "generation_attempt_id": "attempt-text",
+            }
+        ],
+    }
+
+    with pytest.raises(BillingRuleNotConfiguredError):
+        workflow_run_client.post(base, json=request)
+
+    with sqlite3.connect(workflow_run_client.state_dir / "data.db") as conn:
+        run_rows = conn.execute("SELECT status FROM workflow_runs").fetchall()
+        rows = conn.execute(
+            "SELECT operation_id FROM freezone_agent_product_operations"
+        ).fetchall()
+    assert run_rows == [("failed",)]
+    assert len(rows) == 1
+    operation = read_agent_product_operation(
+        project_dir=workflow_run_client.state_dir,
+        operation_id=rows[0][0],
+    )
+    assert operation is not None
+    assert operation["status"] == "failed"
+    assert operation["task_id"] == ""
+
+
 def test_metered_html_recipe_workflow_admits_and_binds_operation(
     workflow_run_client: TestClient, monkeypatch
 ) -> None:
@@ -3846,6 +3896,46 @@ def test_client_cannot_forge_server_recipe_receipt(
     assert stored["result_ref"] == {}
 
 
+def test_cancelled_agent_product_operation_terminalizes_its_task(
+    workflow_run_client, monkeypatch
+):
+    from novelvideo.api.routes import freezone
+
+    response = workflow_run_client.post(
+        "/api/v1/projects/proj_demo/freezone/agent-product-operations",
+        json={
+            "product_kind": "workflow_result",
+            "generation_session_id": "awaiting-user",
+            "canvas_id": "default",
+            "artifact_id": "video-ad@1.0.0",
+            "normalized_inputs_hash": "awaiting-user",
+        },
+    )
+    assert response.status_code == 200
+    operation = response.json()["data"]
+    settled = []
+
+    async def terminalize(*, ctx, operation):
+        settled.append((ctx.project_id, operation["operation_id"], operation["status"]))
+
+    monkeypatch.setattr(
+        freezone,
+        "terminalize_undelivered_agent_product_task",
+        terminalize,
+        raising=False,
+    )
+
+    finished = workflow_run_client.post(
+        "/api/v1/projects/proj_demo/freezone/agent-product-operations/"
+        f"{operation['operation_id']}/finish",
+        json={"task_id": operation["task_id"], "outcome": "cancelled"},
+    )
+
+    assert finished.status_code == 200, finished.text
+    assert finished.json()["data"]["status"] == "cancelled"
+    assert settled == [("proj_demo", operation["operation_id"], "cancelled")]
+
+
 def test_server_workflow_prepare_revise_and_compact_query(workflow_run_client):
     base = "/api/v1/projects/proj_demo/freezone/canvases/canvas_demo/workflow-drafts"
     response = workflow_run_client.post(
@@ -4034,6 +4124,205 @@ def test_backend_returns_standard_clarification_for_missing_generation_choices(m
     assert detail["retryable"] is True
     assert detail["next_action"] == "request_user_clarification"
     assert detail["preflight"]["status"] == "blocked"
+
+
+def test_backend_asks_which_constraint_to_change_when_no_video_model_is_compatible(
+    monkeypatch,
+):
+    """Issue #742: the server-owned drafts entry must ask a fixed question
+    before draft persistence instead of leaving the agent to invent a topology."""
+    import asyncio
+
+    from novelvideo.api.routes import freezone, tasks
+
+    async def video_models(project, user):
+        return {
+            "ok": True,
+            "data": [
+                {
+                    "id": "selected",
+                    "supportedModes": ["all_reference"],
+                    "minDuration": 4,
+                    "maxDuration": 15,
+                },
+                {
+                    "id": "duration-only",
+                    "supportedModes": ["image_reference"],
+                    "minDuration": 2,
+                    "maxDuration": 15,
+                },
+            ],
+        }
+
+    async def limits(project, user):
+        return {"ok": True, "data": {"video": {"limit": 2, "remaining": 2}}}
+
+    monkeypatch.setattr(freezone, "freezone_video_models", video_models)
+    monkeypatch.setattr(tasks, "get_project_task_limits", limits)
+    compiled = {
+        "ok": True,
+        "skill_id": "video-ad",
+        "plan": {
+            "nodes": [
+                {
+                    "id": "reference",
+                    "node_type": "imageNode",
+                    "data": {"mediaId": "asset-reference"},
+                },
+                {
+                    "id": "shot-1",
+                    "node_type": "videoNode",
+                    "data": {
+                        "model": "selected",
+                        "genMode": "allReference",
+                        "durationSec": 3,
+                        "referenceMediaIds": ["asset-reference"],
+                    },
+                },
+            ],
+            "edges": [
+                {
+                    "id": "reference-to-shot",
+                    "source": "reference",
+                    "target": "shot-1",
+                    "link_type": "media_input_for",
+                }
+            ],
+        },
+        "preflight": {"status": "ready", "blockers": [], "warnings": []},
+    }
+    original = deepcopy(compiled)
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(
+            freezone._check_workflow_runtime(
+                compiled, project="proj_demo", user={"username": "alice"}
+            )
+        )
+
+    detail = excinfo.value.detail
+    assert excinfo.value.status_code == 400
+    assert detail["ok"] is True
+    assert detail["status"] == "video_model_clarification_required"
+    assert detail["code"] == "no_compatible_video_model"
+    assert detail["draft_created"] is False
+    assert detail["retryable"] is False
+    assert detail["required_choice"] == "video_model_constraint_adjustment"
+    assert detail["next_action"] == "request_user_clarification"
+    assert "agent_instruction" not in detail
+    assert detail["question"]["options"] == [
+        {
+            "id": "keep_requirements",
+            "label": "保持当前要求并停止",
+            "description": "不修改当前 Plan，也不继续创建 Draft。",
+        },
+        {
+            "id": "adjust_reference_mode",
+            "label": "调整参考模式",
+            "description": "仅确认调整方向；提供具体新值前不修改参考边或媒体锚点。",
+        },
+        {
+            "id": "adjust_shot_duration",
+            "label": "调整镜头时长",
+            "description": "仅确认调整方向；提供具体新时长前不修改 Plan。",
+        },
+        {
+            "id": "specify_video_model",
+            "label": "重新指定模型",
+            "description": "由用户提供具体模型，再使用原约束重新执行 preflight。",
+        },
+    ]
+    assert compiled == original
+
+
+def test_backend_offers_only_models_compatible_with_every_video_constraint(monkeypatch):
+    """Issue #742: the unified drafts entry reuses the verified candidate list."""
+    import asyncio
+
+    from novelvideo.api.routes import freezone, tasks
+
+    async def video_models(project, user):
+        return {
+            "ok": True,
+            "data": [
+                {
+                    "id": "selected",
+                    "label": "Selected",
+                    "supportedModes": ["first_frame"],
+                    "minDuration": 2,
+                    "maxDuration": 10,
+                },
+                {
+                    "id": "mode-only",
+                    "label": "Mode Only",
+                    "supportedModes": ["image_reference"],
+                    "minDuration": 4,
+                    "maxDuration": 10,
+                },
+                {
+                    "id": "compatible",
+                    "label": "Compatible Model",
+                    "supportedModes": ["image_reference"],
+                    "minDuration": 2,
+                    "maxDuration": 10,
+                },
+            ],
+        }
+
+    async def limits(project, user):
+        return {"ok": True, "data": {"video": {"limit": 2, "remaining": 2}}}
+
+    monkeypatch.setattr(freezone, "freezone_video_models", video_models)
+    monkeypatch.setattr(tasks, "get_project_task_limits", limits)
+    compiled = {
+        "ok": True,
+        "skill_id": "video-ad",
+        "plan": {
+            "nodes": [
+                {
+                    "id": "shot-1",
+                    "node_type": "videoNode",
+                    "data": {
+                        "model": "selected",
+                        "genMode": "imageReference",
+                        "durationSec": 3,
+                    },
+                },
+                {
+                    "id": "shot-2",
+                    "node_type": "videoNode",
+                    "data": {
+                        "model": "selected",
+                        "genMode": "imageReference",
+                        "durationSec": 4,
+                    },
+                },
+            ],
+            "edges": [],
+        },
+        "preflight": {"status": "ready", "blockers": [], "warnings": []},
+    }
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(
+            freezone._check_workflow_runtime(
+                compiled, project="proj_demo", user={"username": "alice"}
+            )
+        )
+
+    detail = excinfo.value.detail
+    assert excinfo.value.status_code == 400
+    assert detail["ok"] is True
+    assert detail["code"] == "video_model_incompatible"
+    assert detail["draft_created"] is False
+    assert detail["affected_node_ids"] == ["shot-1", "shot-2"]
+    assert detail["question"]["options"] == [
+        {
+            "id": "compatible",
+            "label": "Compatible Model",
+            "description": "支持当前镜头的参考模式、时长及已确认生成参数。",
+        }
+    ]
 
 
 def test_backend_reports_missing_skill_stage_before_missing_generation_choices(monkeypatch):

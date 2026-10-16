@@ -36,7 +36,7 @@ describe("video backend options alignment", () => {
     const videoQueries = read("src/lib/queries/video.ts");
 
     expect(beatsRoute).toContain("DEFAULT_VIDEO_BACKEND");
-    expect(videoQueries).toContain("huimeng_seedance-1.0-pro-fast");
+    expect(videoQueries).toContain("newapi_seedance-2.0-fast");
     expect(videoQueries).not.toContain('videoBackend ?? "comfyui"');
   });
 });

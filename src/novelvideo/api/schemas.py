@@ -19,6 +19,19 @@ CANVAS_MAX_NODES = 50_000
 CANVAS_MAX_EDGES = 200_000
 
 
+def _default_video_backend() -> str:
+    """Instance-configured default video backend (env ``VIDEO_BACKEND``).
+
+    Callers that omit ``video_backend`` must follow the instance/project
+    configuration instead of a frozen model name, otherwise they can request a
+    model the configured gateway does not serve.
+    """
+
+    from novelvideo.config import VIDEO_BACKEND
+
+    return VIDEO_BACKEND
+
+
 # ── 通用响应 ──────────────────────────────────────────────────────────────────
 
 
@@ -229,7 +242,7 @@ class GlobalOptimizeRequest(BaseModel):
 
 class VideoGenerateRequest(BaseModel):
     resolution: str = "720x1280"
-    video_backend: str = "newapi_seedance-1.0-pro-fast"
+    video_backend: str = Field(default_factory=_default_video_backend)
     use_director_render: bool = False
 
 
@@ -353,7 +366,7 @@ class InsertManualShotRequest(BaseModel):
 
 class SingleVideoRequest(BaseModel):
     resolution: str = "720x1280"
-    video_backend: str = "newapi_seedance-1.0-pro-fast"
+    video_backend: str = Field(default_factory=_default_video_backend)
     use_director_render: bool = False
     seedance2_config_json: Optional[str] = None
     mode: Optional[str] = None

@@ -443,7 +443,7 @@ class DirectorAutoStartIn(BaseModel):
     voice_policy: str | None = Field(default=None, pattern="^(system|custom)$")
     scope: str = Field(default="episode", pattern="^(episode|project)$")
     target_episodes: int = Field(default=0, ge=0)
-    driver: str = Field(default="agent", pattern="^(agent|deterministic)$")
+    driver: str | None = Field(default=None, pattern="^(agent|deterministic)$")
     config: dict[str, Any] | None = None
 
 
@@ -473,6 +473,22 @@ _AUTO_CONFIG_KEYS = frozenset(
 
 def _auto_config_updates(config: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in config.items() if key in _AUTO_CONFIG_KEYS}
+
+
+def _auto_run_driver(payload: DirectorAutoStartIn) -> str:
+    """Resolve the run driver, defaulting the one-click project run to the fast path.
+
+    A project-scope run is the user-facing "一键成片". Its mainline stages all
+    have a payload derivable from project state, so the coordinator can enqueue
+    them directly instead of spending one agent turn per step — which is what
+    made the run hard-pause whenever a single turn did not start a write task.
+    Episode-scope runs keep the agent driver, and the fast path still falls back
+    to the agent for any stage it cannot derive on its own.
+    """
+
+    if payload.driver in {"agent", "deterministic"}:
+        return str(payload.driver)
+    return "deterministic" if payload.scope == "project" else "agent"
 
 
 def _director_auto_payload(run: Any | None) -> dict[str, Any]:
@@ -531,7 +547,7 @@ async def start_director_auto_run(
         scope=payload.scope,
         target_episodes=payload.target_episodes,
         config=payload.config or {},
-        driver=payload.driver,
+        driver=_auto_run_driver(payload),
     )
     return {"ok": True, "data": _director_auto_payload(run)}
 
@@ -3716,6 +3732,7 @@ async def _stream_project_turn(
                 route_prompt=display_text,
                 backend=runtime_backend,
                 execution_context=execution_context,
+                project_context=project_ctx,
             )
     finally:
         heartbeat_task.cancel()

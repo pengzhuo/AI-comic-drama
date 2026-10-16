@@ -927,9 +927,10 @@ NEWAPI_VIDEO_MODELS = _csv_env(
     "NEWAPI_VIDEO_MODELS",
     "seedance-1.0-pro-fast,seedance-1.5-pro,seedance-2.0,seedance-2.0-fast,seedance-2.0-value,seedance-2.0-fast-value,happyhorse-1.0,seedance-2.0-mini",
 )
+# 默认视频模型固定为 2.0 系列，不再回落到列表首项（历史上是 seedance-1.0-pro-fast）。
 DEFAULT_VIDEO_MODEL = os.environ.get(
     "DEFAULT_VIDEO_MODEL",
-    os.environ.get("NEWAPI_VIDEO_MODEL", NEWAPI_VIDEO_MODELS[0]),
+    os.environ.get("NEWAPI_VIDEO_MODEL", "seedance-2.0-fast"),
 ).strip()
 NEWAPI_VIDEO_MODEL = os.environ.get("NEWAPI_VIDEO_MODEL", DEFAULT_VIDEO_MODEL).strip()
 NEWAPI_VIDEO_RESOLUTION = os.environ.get("NEWAPI_VIDEO_RESOLUTION", "720p")
@@ -942,7 +943,7 @@ NEWAPI_VIDEO_DURATION_BOUNDS = os.environ.get(
     "seedance-1.0-pro-fast:2-12,seedance-1.5-pro:4-12,seedance-2.0:4-15,seedance-2.0-fast:4-15,seedance-2.0-value:4-15,seedance-2.0-fast-value:4-15,happyhorse-1.0:3-15,seedance-2.0-mini:4-15",
 ).strip()
 
-# 视频生成后端: newapi_seedance-1.0-pro-fast (默认), newapi_seedance-2.0-fast,
+# 视频生成后端: newapi_seedance-2.0-fast (默认), newapi_seedance-2.0-mini,
 # comfyui, seedance_fast, seedance_pro, seedance_pro_silent, grok_720
 VIDEO_BACKEND = os.environ.get("VIDEO_BACKEND", f"newapi_{DEFAULT_VIDEO_MODEL}")
 

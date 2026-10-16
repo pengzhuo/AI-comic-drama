@@ -28,3 +28,27 @@ export function releasePopupHidden(): boolean {
 export function pikoEntryHidden(): boolean {
   return envFlag(import.meta.env.VITE_HIDE_PIKO_ENTRY);
 }
+
+/**
+ * Hide the official gateway channels ("官方" / "本地 + 官方混合") in Settings →
+ * 模型与渠道, leaving the local NewAPI channel ("自定义") as the only offer.
+ */
+export function officialChannelsHidden(): boolean {
+  return envFlag(import.meta.env.VITE_HIDE_OFFICIAL_CHANNELS);
+}
+
+/**
+ * Hide the notification center ("公告中心"): the account-panel entry, the unread
+ * dot it drives, and the drawer behind it.
+ */
+export function notificationCenterHidden(): boolean {
+  return envFlag(import.meta.env.VITE_HIDE_NOTIFICATION_CENTER);
+}
+
+/**
+ * Hide the "配置手册" link in Settings → 模型与渠道, which points at the upstream
+ * model-configuration guide.
+ */
+export function modelGuideHidden(): boolean {
+  return envFlag(import.meta.env.VITE_HIDE_MODEL_GUIDE);
+}

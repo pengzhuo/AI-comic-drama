@@ -15,6 +15,12 @@ interface ImportMetaEnv {
   readonly VITE_HIDE_RELEASE_POPUP?: string;
   /** Set to "1" on instance builds to drop the Piko status-bar entry. */
   readonly VITE_HIDE_PIKO_ENTRY?: string;
+  /** Set to "1" on instance builds to drop the official gateway channels. */
+  readonly VITE_HIDE_OFFICIAL_CHANNELS?: string;
+  /** Set to "1" on instance builds to drop the notification center. */
+  readonly VITE_HIDE_NOTIFICATION_CENTER?: string;
+  /** Set to "1" on instance builds to drop the model configuration guide link. */
+  readonly VITE_HIDE_MODEL_GUIDE?: string;
 }
 
 interface ImportMeta {

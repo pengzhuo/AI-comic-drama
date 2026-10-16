@@ -3127,11 +3127,14 @@
       "script": {
         "start": "Đang tạo kịch bản...",
         "beatVideoPromptStart": "Đang tạo prompt video cho beat {{beatNum}}",
-        "beatVideoPromptSaved": "Đã lưu prompt video cho beat {{beatNum}}"
+        "beatVideoPromptSaved": "Đã lưu prompt video cho beat {{beatNum}}",
+        "seedance2PromptStart": "Đang tạo prompt Seedance 2.0 cho beat {{beatNum}}",
+        "seedance2PromptSaved": "Đã lưu prompt Seedance 2.0 cho beat {{beatNum}}"
       },
       "submitting": "Đang gửi tác vụ…",
       "queued": "Tác vụ đã vào hàng đợi",
       "workflowDraftDeliveryFailed": "Agent không thể bàn giao bản nháp quy trình",
+      "agentProductDeliveryFailed": "Agent không thể bàn giao sản phẩm",
       "characters": {
         "chunking": "Đang cắt văn bản gốc…",
         "nothingToAnalyze": "Không có gì để phân tích",
@@ -3751,7 +3754,9 @@
         "selectionHint": "Chọn các beat để tạo lại phác thảo và render hàng loạt",
         "batchRegenSketch": "Tạo lại phác thảo",
         "batchRegenRender": "Render lại",
-        "dragToResize": "Kéo để chỉnh tỉ lệ bề ngang trái/phải"
+        "dragToResize": "Kéo để chỉnh tỉ lệ bề ngang trái/phải",
+        "selectAll": "Chọn tất cả",
+        "deselectAll": "Bỏ chọn tất cả"
       },
       "text": {
         "narration": "Lời thoại",
@@ -3959,6 +3964,7 @@
         "seedance2PromptGenerated": "Đã tối ưu prompt Seedance2",
         "seedance2PromptGeneratedOtherBeat": "Đã tối ưu prompt chủ thể và lưu ngược về beat #{{n}}",
         "seedance2PromptGenerateFailed": "Tạo prompt Seedance2 thất bại",
+        "seedance2PromptFallback": "AI tối ưu quá thời gian; đã điền bản nháp theo quy tắc, vui lòng thử lại sau",
         "videoPrompt": "Prompt video",
         "keyframePrompt": "Prompt video của riêng beat",
         "generateBeatVideoPrompt": "Tạo prompt cho beat này",
@@ -7263,6 +7269,7 @@
     "modelConfig": {
       "title": "Cấu hình model",
       "description": "Chọn gateway chính thức, tự cấu hình NewAPI, hoặc kết hợp dịch vụ cục bộ với dịch vụ chính thức.",
+      "descriptionLocalOnly": "Chỉ dùng NewAPI cục bộ: các lời gọi model chạy qua gateway cục bộ do runtime CE quản lý.",
       "baseUrlHint": "Runtime CE tự động cấu hình URL của Local NewAPI.",
       "effectiveBadge": "Đang dùng: {{channel}}",
       "guide": "Hướng dẫn cấu hình",
@@ -7276,6 +7283,7 @@
       "statusActive": "Đang dùng",
       "gatewayWarningIconLabel": "Chưa cấu hình model gateway",
       "gatewayNotConfiguredImpact": "Model gateway đang dùng chưa được cấu hình. Mọi lệnh gọi model văn bản, ảnh, video và âm thanh đều sẽ thất bại; hãy cấu hình kênh chính thức hoặc khởi tạo Local NewAPI trước khi tạo nội dung.",
+      "gatewayNotConfiguredImpactLocalOnly": "Model gateway đang dùng chưa được cấu hình. Mọi lệnh gọi model văn bản, ảnh, video và âm thanh đều sẽ thất bại; hãy khởi tạo Local NewAPI trước khi tạo nội dung.",
       "modes": {
         "official": "Chính thức",
         "custom": "Tuỳ chỉnh",
@@ -8572,5 +8580,18 @@
     "confirm": "Xác nhận",
     "saving": "Đang lưu...",
     "resultTitle": "Kết quả cắt ảnh"
+  },
+  "resizeEditor": {
+    "title": "Điều chỉnh kích thước",
+    "original": "Kích thước gốc: {{width}} × {{height}} pixel",
+    "loading": "Đang đọc kích thước ảnh gốc…",
+    "width": "Chiều rộng (px)",
+    "height": "Chiều cao (px)",
+    "lockRatio": "Khóa tỷ lệ khung hình",
+    "submit": "Điều chỉnh",
+    "resultTitle": "Ảnh đã đổi kích thước",
+    "loadFailed": "Không thể đọc ảnh gốc. Vui lòng thử lại.",
+    "saveFailed": "Không thể tạo kết quả. Hãy kiểm tra ảnh và dự án hiện tại.",
+    "invalidSize": "Nhập số nguyên dương. Mỗi cạnh tối đa 16384 pixel; tổng tối đa 40 triệu pixel."
   }
 }

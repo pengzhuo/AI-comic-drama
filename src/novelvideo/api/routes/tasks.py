@@ -48,6 +48,7 @@ _TASK_TYPE_LABELS = {
     "identity_planner": "规划身份",
     "script_writer": "生成剧本",
     "beat_video_prompt": "生成提示词",
+    "seedance2_prompt": "生成 2.0 提示词",
     "literal_script_writer": "生成解说稿",
     "director_notes": "导演说明",
     "episode_scene_planner": "规划场景",

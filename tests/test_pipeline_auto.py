@@ -121,6 +121,188 @@ async def test_dispatch_compose_without_beats_falls_back(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_seedance2_prompt_picks_the_first_beat_without_a_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from novelvideo.seedance2_i2v.models import dump_seedance2_config
+
+    patch_status(monkeypatch, "seedance2_prompt", episode=1)
+    calls = capture_enqueue(monkeypatch)
+
+    class Store:
+        async def get_beats_as_dicts(self, episode: int):
+            assert episode == 1
+            return [
+                {
+                    "beat_number": 1,
+                    "seedance2_config_json": dump_seedance2_config(
+                        {"final_prompt": "已有"}
+                    ),
+                },
+                {"beat_number": 2, "seedance2_config_json": ""},
+                {
+                    "beat_number": 3,
+                    "seedance2_config_json": dump_seedance2_config(
+                        {"final_prompt": "也有"}
+                    ),
+                },
+            ]
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=Store(), episode=1
+    )
+
+    assert task_type == "seedance2_prompt"
+    assert signature == "dispatch:seedance2_prompt:1:2"
+    assert calls[0]["queue_kind"] == "default"
+    assert calls[0]["beat_num"] == 2
+    assert calls[0]["payload"]["beat_num"] == 2
+    assert calls[0]["payload"]["episode"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_seedance2_prompt_is_complete_when_all_beats_have_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from novelvideo.seedance2_i2v.models import dump_seedance2_config
+
+    patch_status(monkeypatch, "seedance2_prompt", episode=1)
+    calls = capture_enqueue(monkeypatch)
+    beats = [
+        {
+            "beat_number": number,
+            "seedance2_config_json": dump_seedance2_config({"final_prompt": "有"}),
+        }
+        for number in (1, 2)
+    ]
+
+    class Store:
+        async def get_beats_as_dicts(self, _episode: int):
+            return beats
+
+    result = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=Store(), episode=1
+    )
+
+    assert result == (None, None)
+    assert calls == []
+
+
+def _write_video_inputs(tmp_path: Path, beat_numbers: tuple[int, ...]) -> None:
+    frames = tmp_path / "frames" / "ep001"
+    frames.mkdir(parents=True, exist_ok=True)
+    for beat_num in beat_numbers:
+        (frames / f"beat_{beat_num:02d}.png").write_bytes(b"x")
+
+
+def _video_store(beat_numbers: tuple[int, ...]):
+    class Store:
+        async def get_beats_as_dicts(self, _episode: int):
+            return [{"beat_number": number} for number in beat_numbers]
+
+    return Store()
+
+
+def _capture_single_video_enqueues(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    from novelvideo.api.routes import generation
+
+    calls: list[dict] = []
+
+    async def fake_enqueue_single_video_task(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "task_type": "single_video"}
+
+    monkeypatch.setattr(generation, "enqueue_single_video_task", fake_enqueue_single_video_task)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_dispatch_single_videos_only_sends_ready_beats(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A beat without a first frame cannot render, so the agent gets that step."""
+
+    patch_status(monkeypatch, "single_video", episode=1)
+    calls = _capture_single_video_enqueues(monkeypatch)
+    _write_video_inputs(tmp_path, (1, 2, 3))
+    videos = tmp_path / "videos" / "beats" / "ep001"
+    videos.mkdir(parents=True)
+    (videos / "beat_02.mp4").write_bytes(b"x")
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2, 3, 4)),
+        episode=1,
+    )
+
+    assert task_type == "single_video"
+    assert signature == "dispatch:single_video:1:1-3"
+    assert [call["beat_num"] for call in calls] == [1, 3]
+    assert {call["episode_num"] for call in calls} == {1}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_single_videos_caps_the_chunk_at_the_runtime_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_status(monkeypatch, "single_video", episode=1)
+    calls = _capture_single_video_enqueues(monkeypatch)
+    beat_numbers = tuple(range(1, 13))
+    _write_video_inputs(tmp_path, beat_numbers)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store(beat_numbers),
+        episode=1,
+    )
+
+    assert task_type == "single_video"
+    assert signature == "dispatch:single_video:1:1-9"
+    assert [call["beat_num"] for call in calls] == list(range(1, 10))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_single_videos_does_not_repeat_a_chunk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_status(monkeypatch, "single_video", episode=1)
+    calls = _capture_single_video_enqueues(monkeypatch)
+    _write_video_inputs(tmp_path, (1, 2))
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+        attempted={"dispatch:single_video:1:1-2"},
+    )
+
+    assert task_type is None
+    assert signature == "dispatch:single_video:1:1-2"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_single_videos_without_ready_beats_falls_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_status(monkeypatch, "single_video", episode=1)
+    calls = _capture_single_video_enqueues(monkeypatch)
+
+    result = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+    )
+
+    assert result == (None, None)
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_unsupported_step_falls_back_to_agent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -38,6 +38,98 @@ def run_beat_video_prompt(
     )
 
 
+def run_seedance2_prompt(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    return asyncio.run(
+        await_envelope_with_cancel_watch(
+            _run_seedance2_prompt(envelope, ctx),
+            envelope,
+            task_type="seedance2_prompt",
+        )
+    )
+
+
+async def _run_seedance2_prompt(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    """Generate + persist one beat's Seedance 2.0 final prompt.
+
+    Seedance 2.0 refuses to render a beat that never had its 2.0 prompt written
+    (the workbench panel does that by hand), so the deterministic auto pipeline
+    dispatches this task instead of relying on an agent turn.
+    """
+
+    from novelvideo.api.deps import make_sqlite_store_for_context
+    from novelvideo.api.routes.scripts import (
+        _generate_and_save_seedance2_prompt,
+        _resolve_seedance2_prompt_target,
+    )
+
+    payload = envelope.get("payload") or {}
+    episode = int(envelope.get("episode") or payload.get("episode") or 0)
+    beat_num = int(envelope.get("beat_num") or payload.get("beat_num") or 0)
+    output_dir = str(payload.get("output_dir") or ctx.output_dir)
+    manager = get_task_manager()
+
+    def update_progress(progress: float, task: MessageLike) -> None:
+        manager.update_progress_for_project(
+            ctx,
+            "seedance2_prompt",
+            episode,
+            beat_num=beat_num,
+            progress=progress,
+            current_task=task,
+            logs=[task],
+        )
+
+    update_progress(
+        0.05,
+        lmsg(
+            "tasks.progress.script.seedance2PromptStart",
+            f"开始生成 Beat {beat_num} Seedance 2.0 提示词",
+            beatNum=beat_num,
+        ),
+    )
+    store = await make_sqlite_store_for_context(ctx)
+    try:
+        target, next_beat, language, mode = await _resolve_seedance2_prompt_target(
+            store=store,
+            episode_num=episode,
+            beat_num=beat_num,
+        )
+        saved_json = await _generate_and_save_seedance2_prompt(
+            store=store,
+            state_dir=ctx.state_dir,
+            project_dir=output_dir,
+            episode_num=episode,
+            beat_num=beat_num,
+            target=target,
+            next_beat=next_beat,
+            language=language,
+        )
+        update_progress(
+            0.95,
+            lmsg(
+                "tasks.progress.script.seedance2PromptSaved",
+                f"已保存 Beat {beat_num} Seedance 2.0 提示词",
+                beatNum=beat_num,
+            ),
+        )
+        from novelvideo.seedance2_i2v.models import parse_seedance2_config
+
+        config = parse_seedance2_config(saved_json)
+        return {
+            "episode": episode,
+            "beat_num": beat_num,
+            "mode": mode,
+            "final_prompt": config.final_prompt,
+            "prompt_source": config.prompt_source,
+        }
+    finally:
+        await store.close()
+
+
 async def _run_beat_video_prompt(
     envelope: dict[str, Any], ctx: ProjectContext
 ) -> dict[str, Any]:
@@ -218,3 +310,4 @@ async def _run_script_writer_scoped(
 
 register_project_task_runner("script_writer", run_script_writer)
 register_project_task_runner("beat_video_prompt", run_beat_video_prompt)
+register_project_task_runner("seedance2_prompt", run_seedance2_prompt)

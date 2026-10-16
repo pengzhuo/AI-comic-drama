@@ -3241,11 +3241,14 @@
       "script": {
         "start": "开始生成脚本...",
         "beatVideoPromptStart": "开始生成 Beat {{beatNum}} 视频提示词",
-        "beatVideoPromptSaved": "已保存 Beat {{beatNum}} 视频提示词"
+        "beatVideoPromptSaved": "已保存 Beat {{beatNum}} 视频提示词",
+        "seedance2PromptStart": "开始生成 Beat {{beatNum}} Seedance 2.0 提示词",
+        "seedance2PromptSaved": "已保存 Beat {{beatNum}} Seedance 2.0 提示词"
       },
       "submitting": "任务正在投递",
       "queued": "任务已进入队列",
       "workflowDraftDeliveryFailed": "Agent 交付工作流草稿失败",
+      "agentProductDeliveryFailed": "Agent 产品交付失败",
       "characters": {
         "chunking": "切分原文...",
         "nothingToAnalyze": "无可分析内容",
@@ -7612,6 +7615,7 @@
     "modelConfig": {
       "title": "模型配置",
       "description": "选择模型网关渠道：使用平台官方网关、自定义 NewAPI，或组合使用本地与官方服务。",
+      "descriptionLocalOnly": "仅使用本地 NewAPI：模型调用由 CE 运行环境提供的本地网关承担。",
       "baseUrlHint": "本地 NewAPI 地址由 CE 运行环境自动配置。",
       "effectiveBadge": "当前生效：{{channel}}",
       "guide": "配置手册",
@@ -7625,6 +7629,7 @@
       "statusActive": "当前生效",
       "gatewayWarningIconLabel": "模型网关未配置",
       "gatewayNotConfiguredImpact": "当前生效的模型网关未配置。文本、图片、视频、音频等模型调用会失败；请配置官方渠道或初始化本地 NewAPI 后再生成内容。",
+      "gatewayNotConfiguredImpactLocalOnly": "当前生效的模型网关未配置。文本、图片、视频、音频等模型调用会失败；请初始化本地 NewAPI 后再生成内容。",
       "modes": {
         "official": "官方",
         "custom": "自定义",
@@ -8576,5 +8581,18 @@
     "aligncenter": "居中",
     "alignright": "右对齐",
     "selectLeaf": "请选择最内层文字元素修改内容，避免覆盖内部排版。"
+  },
+  "resizeEditor": {
+    "title": "调整像素",
+    "original": "原像素：{{width}} × {{height}} 像素",
+    "loading": "正在读取原图尺寸…",
+    "width": "宽度（px）",
+    "height": "高度（px）",
+    "lockRatio": "锁定宽高比",
+    "submit": "调整",
+    "resultTitle": "已调整像素",
+    "loadFailed": "无法读取原图，请重试。",
+    "saveFailed": "无法创建结果，请确认图片和当前项目可用。",
+    "invalidSize": "请输入正整数，单边不超过 16384 像素，总像素不超过 4000 万。"
   }
 }

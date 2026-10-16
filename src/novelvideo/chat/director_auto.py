@@ -42,6 +42,7 @@ AUTO_TASK_TYPES = frozenset({
     "scene_reference_asset",
     "prop_reference_asset",
     "beat_video_prompt",
+    "seedance2_prompt",
     "sketch_grid_generation",
     "sketch_generation",
     "sketch_regen",
@@ -75,6 +76,114 @@ STALL_ERROR_CODES = frozenset({"TASK_TIMEOUT", "TASK_STALLED"})
 #: Stable marker prepended to a stall pause reason so the pending decision
 #: survives a page reload (the reason is persisted on the durable run).
 STALL_REASON_TAG = "[stall]"
+#: Meta/bridge tools the agent uses to inspect its tool surface instead of
+#: operating on the project. Introspection must never count as a write: the
+#: bridge echoes the *described* tool name, so a turn that only described a
+#: generator used to look like it had already started the task.
+_META_TOOL_NAMES = frozenset(
+    {
+        "tool_call",
+        "tool_describe",
+        "tool_search",
+        "skills_list",
+        "skill_view",
+        "dramaclaw_tool_call",
+        "dramaclaw_tool_describe",
+        "dramaclaw_tool_search",
+    }
+)
+#: DramaClaw tools that only read state; they never enqueue a generation task.
+_READ_TOOL_PREFIXES = (
+    "dramaclaw_get",
+    "dramaclaw_list",
+    "dramaclaw_pipeline_status",
+)
+#: Consecutive continuations without a new task that are tolerated before the
+#: durable run pauses and hands the decision back to the user.
+MAX_TASKLESS_CONTINUATIONS = 3
+
+
+def _event_tool_name(event: dict[str, Any]) -> str:
+    """Effective tool name of a lifecycle event (``server.tool`` collapsed)."""
+
+    return str(event.get("name") or "").rsplit(".", 1)[-1].strip()
+
+
+def _event_inner_tool_name(event: dict[str, Any]) -> str:
+    """Inner tool name carried by a ``tool_call`` bridge invocation."""
+
+    payload = event.get("input")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("name") or "").strip()
+
+
+def _event_is_write_tool(event: dict[str, Any]) -> bool:
+    """Whether a lifecycle event is a real DramaClaw write/generation call.
+
+    ``tool_describe``/``tool_search`` only inspect the tool surface, while
+    ``tool_call`` is the bridge wrapper around a real invocation — only the
+    latter is unwrapped to its inner tool name. Everything else keeps the
+    original rule: a ``dramaclaw_`` tool that is not a read-only lookup.
+    """
+
+    name = _event_tool_name(event)
+    if not name:
+        return False
+    if name in _META_TOOL_NAMES:
+        if not name.endswith("tool_call"):
+            return False
+        name = _event_inner_tool_name(event)
+    if not name.startswith("dramaclaw_"):
+        return False
+    return not name.startswith(_READ_TOOL_PREFIXES)
+
+
+def _event_failure_detail(event: dict[str, Any]) -> str:
+    """Best-effort ``status_code``/error text from a tool event payload."""
+
+    def scan(value: Any, depth: int = 0) -> str:
+        if depth > 4:
+            return ""
+        if isinstance(value, dict):
+            if value.get("ok") is False or value.get("error"):
+                code = value.get("status_code") or value.get("code")
+                message = (
+                    value.get("error") or value.get("detail") or value.get("message")
+                )
+                if isinstance(message, dict):
+                    message = message.get("detail") or message.get("message")
+                parts = [str(part) for part in (code, message) if part]
+                if parts:
+                    return " ".join(parts)
+            for nested in value.values():
+                found = scan(nested, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                found = scan(nested, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, str) and value.strip()[:1] in {"{", "["}:
+            try:
+                return scan(json.loads(value), depth + 1)
+            except (TypeError, ValueError):
+                return ""
+        return ""
+
+    return scan(
+        {
+            "error": event.get("error"),
+            "structured": event.get("structured"),
+            "output": event.get("output"),
+        }
+    )
 
 
 def _task_error_code(task) -> str:
@@ -535,6 +644,8 @@ def _task_label(task: TaskState) -> str:
         return f"{character or identity or '角色'}身份图"
     if task.task_type == "single_video" and task.beat_num:
         return f"第 {task.episode} 集 Beat {task.beat_num} 视频"
+    if task.task_type == "seedance2_prompt" and task.beat_num:
+        return f"第 {task.episode} 集 Beat {task.beat_num} 提示词"
     labels = {
         "ingest_fast": "项目摄入",
         "build_characters": "角色构建",
@@ -567,6 +678,7 @@ def _task_label(task: TaskState) -> str:
         "indextts2_audio_generation": "音频生成",
         "audio_generation": "音频生成",
         "single_video": "视频生成",
+        "seedance2_prompt": "2.0 提示词",
         "compose_episode": "成片合成",
     }
     return labels.get(task.task_type, task.task_type)
@@ -590,6 +702,21 @@ class DirectorAutoCoordinator:
         self.owner_token = uuid.uuid4().hex
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._stopping = False
+        #: Last continuation breadcrumb per run: ``(saw_write, last_tool_note)``.
+        #: Used to tell "the agent only did reads" apart from "the agent wrote
+        #: but produced no task" when the durable run has to pause.
+        self._continue_notes: dict[str, tuple[bool, str]] = {}
+
+    def _remember_continuation(self, run_id: str, *, wrote: bool, note: str) -> None:
+        self._continue_notes[run_id] = (bool(wrote), str(note or ""))
+
+    def _last_continuation(self, run_id: str) -> tuple[bool, str]:
+        info = self._continue_notes.pop(run_id, None)
+        if info is None:
+            # No agent turn was recorded (e.g. the deterministic fast path
+            # dispatched a stage): do not blame the agent for the pause.
+            return True, ""
+        return info
 
     async def start(
         self,
@@ -990,6 +1117,9 @@ class DirectorAutoCoordinator:
                 "Pause only for: a task failure or cancellation, a missing required configuration, a "
                 "missing voice policy when voice prerequisites block audio, destructive actions, or a "
                 "genuinely ambiguous choice. Do not ask the user to confirm each step.\n"
+                "In the same turn: read whatever state you need at most once, then start the "
+                "single write task before ending the turn. Never describe a tool instead of "
+                "calling it, and never end a turn on a read-only check.\n"
                 "[/DRAMACLAW_RUN_MODE]"
             )
         else:
@@ -1008,7 +1138,9 @@ class DirectorAutoCoordinator:
                 "for per-step confirmation. Missing output with satisfied prerequisites should be generated. "
                 "Pause for a current-step failure, destructive action, ambiguity, missing voice choice, or "
                 "unmet prerequisite, except for one exact Portrait repair explicitly authorized in the "
-                "instruction above.\n[/DRAMACLAW_RUN_MODE]"
+                "instruction above. In the same turn: read whatever state you need at most once, then "
+                "start the single write task before ending the turn. Never describe a tool instead of "
+                "calling it, and never end a turn on a read-only check.\n[/DRAMACLAW_RUN_MODE]"
             )
         prompt = instruction or base_prompt
         prompt += run_mode_block
@@ -1033,12 +1165,16 @@ class DirectorAutoCoordinator:
             )
         turn_id = f"director-auto-{run.run_id}-{uuid.uuid4().hex[:10]}"
         saw_write = False
+        last_tool_note = ""
 
         async def on_event(event: dict[str, Any]) -> None:
-            nonlocal saw_write
+            nonlocal saw_write, last_tool_note
             if event.get("type") in {"tool_started", "tool_updated", "tool_update"}:
-                name = str(event.get("name") or "")
-                if name.startswith("dramaclaw_") and not name.startswith("dramaclaw_get"):
+                name = _event_tool_name(event)
+                if name:
+                    detail = _event_failure_detail(event)
+                    last_tool_note = f"{name}（{detail}）" if detail else name
+                if _event_is_write_tool(event):
                     saw_write = True
             if event.get("type") == "assistant_message" and isinstance(event.get("message"), dict):
                 await broadcast_project_chat_event(
@@ -1063,6 +1199,9 @@ class DirectorAutoCoordinator:
                 surface="director",
                 turn_id=turn_id,
                 route_prompt="自动继续下一步",
+            )
+            self._remember_continuation(
+                run.run_id, wrote=saw_write, note=last_tool_note
             )
             return saw_write
         except Exception as exc:  # noqa: BLE001
@@ -1375,31 +1514,35 @@ class DirectorAutoCoordinator:
                 if chat_service.chat_run_lock_is_active(username, project_id):
                     await asyncio.sleep(POLL_SECONDS)
                     continue
-                if taskless_continuations >= 3:
+                # A taskless continuation is often transient: the agent may have
+                # spent the turn on reads (or on a route that 404s) before it
+                # could start the step. Retry within a bounded budget and only
+                # then pause the durable run for the user's decision.
+                if taskless_continuations >= MAX_TASKLESS_CONTINUATIONS:
+                    wrote, note = self._last_continuation(run_id)
+                    reason = (
+                        "自动续跑未产生新的任务"
+                        if wrote
+                        else "自动续跑未产生写任务"
+                    )
+                    if note:
+                        reason = f"{reason}（最后一次工具调用：{note}）"
                     await self._pause_owned(
                         run_id=run_id,
                         username=username,
                         project_id=project_id,
-                        reason="自动续跑未产生新的任务",
+                        reason=reason,
                     )
-                    await self._notify(run, "本集自动已暂停：当前步骤没有产生新的生成任务，请检查前置条件。")
+                    await self._notify(
+                        run,
+                        "本集自动已暂停：捏导连续几轮没有产生新的生成任务，"
+                        "请检查当前前置条件后重试。",
+                    )
                     return
                 taskless_continuations += 1
                 if not await self._owns_run(run_id):
                     return
-                wrote = await self._continue_owned(run)
-                if not wrote:
-                    latest = await asyncio.to_thread(self.store.get, username, project_id)
-                    if latest is None or latest.status != "running":
-                        return
-                    await self._pause_owned(
-                        run_id=run_id,
-                        username=username,
-                        project_id=project_id,
-                        reason="自动续跑未产生写任务",
-                    )
-                    await self._notify(run, "本集自动已暂停：捏导没有启动新的生成步骤，请检查当前前置条件。")
-                    return
+                await self._continue_owned(run)
                 await asyncio.sleep(POLL_SECONDS)
                 continue
             await asyncio.sleep(POLL_SECONDS)

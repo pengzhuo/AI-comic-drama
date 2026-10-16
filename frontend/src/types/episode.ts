@@ -116,12 +116,21 @@ export interface PipelineProjectStatus {
 export interface PipelineStepStatus {
   identity_plan?: boolean;
   identity_images?: boolean;
+  /** How many identities this episode planned, has images for, and still lacks. */
+  identity_images_planned?: number;
+  identity_images_done?: number;
+  identities_missing?: Array<{
+    character: string;
+    identity_id: string;
+    identity_name: string;
+  }>;
   script?: boolean;
   sketches?: boolean;
   coloring?: boolean;
   global_optimize?: boolean;
   first_frames?: boolean;
   tts?: boolean;
+  seedance2_prompt?: boolean;
   video?: boolean;
 }
 

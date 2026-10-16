@@ -9,6 +9,8 @@
 读取响应：
 - `global` 段：全局准备是否完成（ingested, configured, characters, episodes, portraits_done）
 - `episode_status` 段：当前集各步骤（identity_plan, identity_images, script, sketches, coloring, global_optimize, first_frames, tts, video）
+  - 身份图明细直接从 `episode_status.identity_images_planned` / `identity_images_done` / `identities_missing` 读取；`identities_missing` 每项含 `character` + `identity_id`，可直接作为生成参数
+  - 没有“按集列身份图”的读接口，不要猜 `/episodes/{ep}/identities` 之类的路径；身份图完成情况只从 `pipeline/status` 或 `GET /characters/{name}/identities` 读
   - 辅助任务 type：`content_rewriter`（解说改写）、`script_writer`（剧本生成）。这些辅助步骤通过 `GET /projects/{P}/tasks/{task_type}/{N}` 主动查
   - 当前后端没有场景锚图 `anchor-image/*` 和 `scene_anchor` task
 - `next_step` + `next_step_name`：从断点继续

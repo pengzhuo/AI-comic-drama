@@ -68,6 +68,7 @@ export const EPISODE_STAGE_REGISTRY: readonly StageDef[] = [
     icon: Video,
     taskTypes: [
       TASK_TYPES.SINGLE_VIDEO,
+      TASK_TYPES.SEEDANCE2_PROMPT,
       TASK_TYPES.GLOBAL_OPTIMIZE_VIDEO,
       TASK_TYPES.SELECTED_REGEN,
     ],

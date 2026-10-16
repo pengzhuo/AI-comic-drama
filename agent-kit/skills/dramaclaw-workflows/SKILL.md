@@ -59,6 +59,10 @@ Build one coherent workflow transaction, not a sequence of standalone canvas edi
   bypassing WorkflowPlan validation. A user selection cannot authorize that bypass. When a Skill's
   required stage conflicts with an exact node-only constraint, report the conflict or ask whether
   the required stage may be added; do not offer an invalid direct-write alternative.
+- During exact-Plan recovery, preserve the user's explicit media/result cardinality and existing
+  external-input edges. If the planning contract says a stage `accepts_external_media`, a connected
+  input of that kind fills the stage; never add a generated replacement anchor for it. Add only the
+  genuinely missing stage named by preflight (for example a required planning text node).
 - Never resubmit an unchanged workflow payload. After one correction, if the same validation path
   fails again in the same turn, stop retrying and report that blocker instead of increasing the
   failure counter.
@@ -125,7 +129,8 @@ The image/video choices are:
 Do not include audio voice-source selection in this preliminary clarification. Never ask the user
 to choose system voice versus custom voice. A speech node uses an already selected custom
 `voiceRef`; if none is selected, its generation is skipped as defined under Execution and
-completion.
+completion. A plan that requires that speech as voice-over or composition input must not be ready
+until a valid `voiceRef` is bound.
 
 Offer a recommended/default option so the user does not need to understand provider-specific
 fields. In either execution mode, do not draft, commit, approve, or run until the required
@@ -170,8 +175,10 @@ Use only the image or video keys relevant to the selected plan. For an exact cus
 shared confirmed choices may remain in `plan.inputs`; preparation applies each image/video choice
 to every matching generated node that leaves the field unset. Node `data` may instead pin the
 equivalent canvas or portable field for a step, and an explicit node value always takes
-precedence over the shared choice (the same rule the standard planner follows); only two aliases
-of the same setting with different values on one node are rejected. If a write returns
+precedence over the shared choice (the same rule the standard planner follows), except that the
+user-confirmed `video_generate_audio` choice is authoritative and replaces conflicting
+`generateAudio` values on every video node. Only two aliases of the same setting with different
+values on one node are rejected. If a write returns
 `code="generation_parameters_required"`, do not retry unchanged. Call
 `freezone_request_user_clarification` once for all returned missing choices, passing already
 confirmed choices (at least the model) in `answers` so the recommendation comes from the same
@@ -247,6 +254,11 @@ Route between the normal draft flow and the exact topology path in this priority
    planner: set `planner.item_count=N` and `planner.video_dependency="sequential"`. Do not author
    `items`, nodes, or edges for that pattern. The compiler adds execution-only `dependency_for`
    edges between consecutive clips, so earlier clips are not sent as media references.
+   For `ecommerce-ad`, when the user names one of the Skill's allowed images-stage Recipes, set
+   `planner.image_recipe_id` to that Recipe. If selected canvas images are supplied as
+   `external_inputs`, do not add `items` merely to bind them or to preserve the Recipe: the
+   standard planner uses those images as the asset stage, creates the planning text, and emits
+   `prompt_for` from planning plus `media_input_for` from each external image to every result.
 2. Otherwise, when the user explicitly requires an exact canvas node count or node set, or names
    required nodes and a dependency order that deviates from the matching Skill's template, use the
    exact topology path in
@@ -311,8 +323,10 @@ and `freezone_patch_workflow_draft`; do not fall back to another write after an 
   directly without reading node detail first; never downgrade it to `freezone_run_node_action`.
 - Freezone speech uses custom/reference voices only; never select or generate with a preset/system
   voice. Preserve an existing valid `voiceRef`. If no valid custom voice is selected, skip that
-  audio node without submitting TTS and continue the remaining workflow. Never select the first
-  available voice automatically or open `open_voice_picker` unless the user explicitly requests it.
+  audio node without submitting TTS and continue the remaining workflow. Required voice-over or
+  composition speech is blocked during draft preflight instead of being admitted and skipped.
+  Never select the first available voice automatically or open `open_voice_picker` unless the user
+  explicitly requests it.
 - Treat `awaiting_approval`, `accepted`, and `running` as non-final states. Do not claim that canvas
   creation or generation completed until the corresponding result says it did.
 - Use `operation_id`, `draft_id`, `revision`, and returned idempotency identifiers unchanged on

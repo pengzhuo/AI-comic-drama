@@ -36,6 +36,7 @@ STEP_MAP: dict[str, tuple[str | None, str]] = {
     "first_frames": ("selected_regen", "首帧生成"),
     "voice_setup": (None, "准备配音声线"),
     "tts": (None, "TTS 配音"),
+    "seedance2_prompt": ("seedance2_prompt", "Seedance 2.0 提示词"),
     "video": ("single_video", "视频生成"),
     "compose": ("compose_episode", "合成导出"),
     "done": (None, "全部完成"),
@@ -126,6 +127,32 @@ def _beat_has_script_content(beat: dict) -> bool:
         or str(beat.get("narration") or "").strip()
         or str(beat.get("visual_description") or "").strip()
     )
+
+
+def beat_seedance2_prompt_ready(beat: dict) -> bool:
+    """Whether the beat carries the Seedance 2.0 final prompt its render needs."""
+
+    from novelvideo.seedance2_i2v.models import parse_seedance2_config
+
+    try:
+        config = parse_seedance2_config(beat.get("seedance2_config_json"))
+    except Exception:  # noqa: BLE001 - a broken row must not break the whole status
+        return False
+    return bool(str(config.final_prompt or "").strip())
+
+
+def seedance2_prompt_required(username: str, project: str) -> bool:
+    """Whether this project renders with a Seedance 2.0-family backend.
+
+    Only those backends refuse to render a beat whose 2.0 final prompt is empty
+    (``beat_seedance2_final_prompt_missing``), so every other backend treats the
+    step as vacuously complete and its ordering is unchanged.
+    """
+
+    from novelvideo.project_config import effective_video_backend
+    from novelvideo.seedance2_i2v.pipeline import is_huimeng_seedance2_backend
+
+    return is_huimeng_seedance2_backend(effective_video_backend(username, project))
 
 
 async def _collect_voice_prereq_errors(
@@ -285,14 +312,24 @@ async def compute_pipeline_status(
     target_episode = store.get_episode(target_ep)
     identity_ids = set(getattr(target_episode, "identity_ids", []) or [])
     has_identity_plan = bool(identity_ids)
-    has_identity_images = has_identity_plan
-    if has_identity_plan:
-        for char in characters:
-            for ident in getattr(char, "identities", []) or []:
-                if ident.identity_id not in identity_ids:
-                    continue
-                if not compute_identity_path(project_dir, char.name, ident.identity_name):
-                    has_identity_images = False
+    # Which planned identities still need an image. Reported so the agent never
+    # has to guess a per-episode identity route to find out what is missing.
+    planned_identities = [
+        (char, ident)
+        for char in characters
+        for ident in (getattr(char, "identities", []) or [])
+        if ident.identity_id in identity_ids
+    ]
+    missing_identities = [
+        {
+            "character": char.name,
+            "identity_id": ident.identity_id,
+            "identity_name": ident.identity_name,
+        }
+        for char, ident in planned_identities
+        if not compute_identity_path(project_dir, char.name, ident.identity_name)
+    ]
+    has_identity_images = has_identity_plan and not missing_identities
 
     beats = await store.get_beats_as_dicts(target_ep)
     has_script = _all_or_empty([_beat_has_script_content(b) for b in beats])
@@ -310,9 +347,17 @@ async def compute_pipeline_status(
         [bool(b.get("video_mode")) and bool(b.get("video_prompt")) for b in beats]
     )
 
+    has_seedance2_prompt = (
+        not seedance2_prompt_required(username, project_name)
+        or _all_or_empty([beat_seedance2_prompt_ready(b) for b in beats])
+    )
+
     episode_status = {
         "identity_plan": has_identity_plan,
         "identity_images": has_identity_images,
+        "identity_images_planned": len(planned_identities),
+        "identity_images_done": len(planned_identities) - len(missing_identities),
+        "identities_missing": missing_identities,
         "script": has_script,
         "sketches": has_sketches,
         "coloring": has_coloring,
@@ -323,6 +368,7 @@ async def compute_pipeline_status(
         "tts": _beat_audio_series_complete(
             project_dir / "audio" / f"ep{target_ep:03d}", beats
         ),
+        "seedance2_prompt": has_seedance2_prompt,
         "video": _beat_file_series_complete(
             project_dir / "videos" / "beats" / f"ep{target_ep:03d}", "mp4", beats
         ),
@@ -338,6 +384,7 @@ async def compute_pipeline_status(
         "global_optimize",
         "first_frames",
         "tts",
+        "seedance2_prompt",
         "video",
     ):
         if not episode_status[key]:

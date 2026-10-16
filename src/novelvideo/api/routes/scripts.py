@@ -565,32 +565,28 @@ async def generate_beat_video_prompt(
     }
 
 
-@router.post("/projects/{project}/episodes/{episode_num}/beats/{beat_num}/seedance2-prompt/generate")
-async def generate_seedance2_prompt(
-    project: str,
+async def _resolve_seedance2_prompt_target(
+    *,
+    store: Any,
     episode_num: int,
     beat_num: int,
-    body: Seedance2PromptGenerateRequest | None = None,
-    user: dict = Depends(get_api_user),
-):
-    """AI 生成单个 Beat 的 Seedance2 final_prompt 并保存回配置 JSON。"""
-    resolved = await resolve_project_scope(project, user, required_role="editor")
-    project_dir = resolved.project_dir
-    body = body or Seedance2PromptGenerateRequest()
+) -> tuple[dict[str, Any], dict[str, Any] | None, str, str]:
+    """The beat a Seedance 2.0 prompt belongs to, plus its language and mode.
 
-    store = (
-        await make_sqlite_store_for_context(resolved.ctx)
-        if resolved.ctx
-        else await make_sqlite_store(resolved.username, resolved.project_name)
-    )
+    Raises ``LookupError`` for a missing script/beat and ``ValueError`` when the
+    beat's mode cannot be satisfied (last beat in first/last-frame mode).
+    """
+
     script_data = await store.get_script_as_dict(episode_num)
     if not script_data:
-        raise HTTPException(status_code=404, detail="Script not found")
+        raise LookupError("Script not found")
 
     beats = list(script_data.get("beats") or [])
-    target = next((beat for beat in beats if int(beat.get("beat_number") or 0) == beat_num), None)
+    target = next(
+        (beat for beat in beats if int(beat.get("beat_number") or 0) == beat_num), None
+    )
     if target is None:
-        raise HTTPException(status_code=404, detail=f"Beat {beat_num} not found")
+        raise LookupError(f"Beat {beat_num} not found")
 
     next_beat = next(
         (beat for beat in beats if int(beat.get("beat_number") or 0) == beat_num + 1),
@@ -610,7 +606,79 @@ async def generate_seedance2_prompt(
     config = parse_seedance2_config(target.get("seedance2_config_json"))
     mode = getattr(config.mode, "value", str(config.mode))
     if mode == "first_last_frame" and next_beat is None:
-        return {"ok": False, "error": "这是最后一个 Beat，无法使用首尾帧模式"}
+        raise ValueError("这是最后一个 Beat，无法使用首尾帧模式")
+    return target, next_beat, language, mode
+
+
+async def _generate_and_save_seedance2_prompt(
+    *,
+    store: Any,
+    state_dir: str | Path,
+    project_dir: str | Path,
+    episode_num: int,
+    beat_num: int,
+    target: dict[str, Any],
+    next_beat: dict[str, Any] | None,
+    language: str,
+    manual_prompt_reference: str = "",
+    prompt_guidance: str = "",
+    prompt_guidance_template_keys: list[str] | None = None,
+) -> str:
+    """Generate one beat's Seedance 2.0 final prompt and persist it.
+
+    Shared by the REST endpoint and the ``seedance2_prompt`` task runner, so the
+    auto pipeline produces the same prompt the workbench button does. Returns the
+    saved ``seedance2_config_json``.
+    """
+
+    from novelvideo.seedance2_i2v.panel_service import generate_seedance2_prompt_for_panel
+
+    script_data = await store.get_script_as_dict(episode_num)
+    return await generate_seedance2_prompt_for_panel(
+        store=store,
+        state_dir=Path(state_dir),
+        episode=episode_num,
+        beat=target,
+        project_dir=Path(project_dir),
+        next_beat=next_beat,
+        manual_prompt_reference=manual_prompt_reference,
+        prompt_guidance=prompt_guidance,
+        prompt_guidance_template_keys=prompt_guidance_template_keys,
+        language=language,
+        prop_menu=list((script_data or {}).get("prop_menu") or []),
+    )
+
+
+@router.post("/projects/{project}/episodes/{episode_num}/beats/{beat_num}/seedance2-prompt/generate")
+async def generate_seedance2_prompt(
+    project: str,
+    episode_num: int,
+    beat_num: int,
+    body: Seedance2PromptGenerateRequest | None = None,
+    user: dict = Depends(get_api_user),
+):
+    """AI 生成单个 Beat 的 Seedance2 final_prompt 并保存回配置 JSON。"""
+    resolved = await resolve_project_scope(project, user, required_role="editor")
+    project_dir = resolved.project_dir
+    body = body or Seedance2PromptGenerateRequest()
+
+    store = (
+        await make_sqlite_store_for_context(resolved.ctx)
+        if resolved.ctx
+        else await make_sqlite_store(resolved.username, resolved.project_name)
+    )
+    try:
+        target, next_beat, language, mode = await _resolve_seedance2_prompt_target(
+            store=store,
+            episode_num=episode_num,
+            beat_num=beat_num,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    from novelvideo.seedance2_i2v.models import parse_seedance2_config
 
     usage_meter = get_usage_meter()
     ctx = getattr(resolved, "ctx", None)
@@ -654,20 +722,18 @@ async def generate_seedance2_prompt(
             resource_kind="script",
             billing_metadata=billing_metadata,
         )
-        from novelvideo.seedance2_i2v.panel_service import generate_seedance2_prompt_for_panel
-
-        saved_json = await generate_seedance2_prompt_for_panel(
+        saved_json = await _generate_and_save_seedance2_prompt(
             store=store,
-            state_dir=Path(resolved.state_dir),
-            episode=episode_num,
-            beat=target,
+            state_dir=resolved.state_dir,
             project_dir=project_dir,
+            episode_num=episode_num,
+            beat_num=beat_num,
+            target=target,
             next_beat=next_beat,
+            language=language,
             manual_prompt_reference=body.manual_prompt_reference,
             prompt_guidance=body.prompt_guidance,
             prompt_guidance_template_keys=body.prompt_guidance_template_keys,
-            language=language,
-            prop_menu=list(script_data.get("prop_menu") or []),
         )
     except ValueError as exc:
         if reservation_id:

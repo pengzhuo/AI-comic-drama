@@ -279,7 +279,7 @@ POST /projects/$PID/episodes/$EP/beats/$BEAT/audio
 
 ```
 POST /projects/$PID/episodes/$EP/beats/$BEAT/video
-Body: {"resolution": "720x1280", "video_backend": "huimeng_seedance-1.0-pro-fast"}
+Body: {"resolution": "720x1280"}   # 不传 video_backend → 后端按项目默认视频模型（本实例 newapi_seedance-2.0-fast）
 
 GET /projects/$PID/tasks/single_video/$EP?beat_num=$BEAT
 SSE /projects/$PID/tasks/single_video/$EP/stream?beat_num=$BEAT

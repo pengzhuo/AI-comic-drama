@@ -11144,6 +11144,7 @@ type DirectorAutoServerResponse = {
     activated_at?: string | null;
     voice_policy?: DirectorVoicePolicy | null;
     scope?: "episode" | "project";
+    driver?: "agent" | "deterministic" | null;
     target_episodes?: number;
     last_error?: string | null;
   };
@@ -11216,6 +11217,7 @@ async function startDirectorAutoServer(
     scope?: "episode" | "project";
     targetEpisodes?: number;
     config?: Record<string, unknown>;
+    driver?: "agent" | "deterministic";
   } = {},
 ): Promise<void> {
   await api.post(p`api/v1/projects/${project}/chat/director-auto/start`, {
@@ -11224,6 +11226,7 @@ async function startDirectorAutoServer(
       voice_policy: voicePolicy,
       scope: options.scope ?? "episode",
       target_episodes: options.targetEpisodes ?? 0,
+      driver: options.driver,
       config: options.config,
     },
   }).json<DirectorAutoServerResponse>();
@@ -11238,8 +11241,13 @@ async function startProjectAutoServer(
     config?: Record<string, unknown>;
   } = {},
 ): Promise<void> {
+  // 一键成片 runs on the deterministic fast path: every mainline stage of a
+  // project-scope run has a payload derivable from project state, so the server
+  // enqueues the next task directly instead of spending one agent turn per step
+  // (a single read-only turn used to hard-pause the whole run).
   await startDirectorAutoServer(project, 1, options.voicePolicy ?? null, {
     scope: "project",
+    driver: "deterministic",
     targetEpisodes: options.targetEpisodes ?? 0,
     config: options.config,
   });

@@ -3241,11 +3241,14 @@
       "script": {
         "start": "Generating script...",
         "beatVideoPromptStart": "Generating video prompt for beat {{beatNum}}",
-        "beatVideoPromptSaved": "Saved video prompt for beat {{beatNum}}"
+        "beatVideoPromptSaved": "Saved video prompt for beat {{beatNum}}",
+        "seedance2PromptStart": "Generating Seedance 2.0 prompt for beat {{beatNum}}",
+        "seedance2PromptSaved": "Saved Seedance 2.0 prompt for beat {{beatNum}}"
       },
       "submitting": "Submitting task…",
       "queued": "Task queued",
       "workflowDraftDeliveryFailed": "Agent workflow draft delivery failed",
+      "agentProductDeliveryFailed": "Agent product delivery failed",
       "characters": {
         "chunking": "Splitting the source text…",
         "nothingToAnalyze": "Nothing to analyze",
@@ -7612,6 +7615,7 @@
     "modelConfig": {
       "title": "Model Config",
       "description": "Choose the official gateway, configure your own NewAPI, or combine local and official services.",
+      "descriptionLocalOnly": "Local NewAPI only: model calls run through the gateway the CE runtime manages.",
       "baseUrlHint": "The CE runtime configures the Local NewAPI URL automatically.",
       "effectiveBadge": "Active: {{channel}}",
       "guide": "Configuration guide",
@@ -7625,6 +7629,7 @@
       "statusActive": "Active",
       "gatewayWarningIconLabel": "Model gateway is not configured",
       "gatewayNotConfiguredImpact": "The active model gateway is not configured. Text, image, video, and audio model calls will fail; configure the official channel or initialize Local NewAPI before generating content.",
+      "gatewayNotConfiguredImpactLocalOnly": "The active model gateway is not configured. Text, image, video, and audio model calls will fail; initialize Local NewAPI before generating content.",
       "modes": {
         "official": "Official",
         "custom": "Custom",
@@ -8576,5 +8581,18 @@
     "aligncenter": "Center",
     "alignright": "Align right",
     "selectLeaf": "Select the innermost text element to preserve nested formatting."
+  },
+  "resizeEditor": {
+    "title": "Resize image",
+    "original": "Original: {{width}} × {{height}} pixels",
+    "loading": "Loading original dimensions…",
+    "width": "Width (px)",
+    "height": "Height (px)",
+    "lockRatio": "Lock aspect ratio",
+    "submit": "Resize",
+    "resultTitle": "Resized image",
+    "loadFailed": "Unable to load the original image. Please retry.",
+    "saveFailed": "Unable to create the result. Check the image and current project.",
+    "invalidSize": "Enter positive integers. Maximum edge: 16384 pixels; maximum total: 40 million pixels."
   }
 }
