@@ -172,6 +172,9 @@ async def test_read_only_continuation_retries_then_pauses_with_diagnostic(
 
     monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
     monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    # The taskless diagnostic is what this covers; the stage retry would
+    # otherwise add its own budget on top of MAX_TASKLESS_CONTINUATIONS.
+    monkeypatch.setenv(director_auto.STAGE_RETRY_ENV, "0")
 
     store = DirectorAutoStore(tmp_path / "director-auto.db")
     store.upsert(
@@ -235,6 +238,8 @@ async def test_write_turn_that_creates_no_task_uses_the_other_reason(
 
     monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
     monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    # Same as above: assert the write-vs-read wording, not the retry policy.
+    monkeypatch.setenv(director_auto.STAGE_RETRY_ENV, "0")
 
     store = DirectorAutoStore(tmp_path / "director-auto.db")
     store.upsert(

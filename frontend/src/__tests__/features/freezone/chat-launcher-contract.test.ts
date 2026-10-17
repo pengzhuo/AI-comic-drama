@@ -3,17 +3,18 @@ import { describe, expect, it } from "vitest";
 
 const source = readFileSync("src/features/freezone/FreezoneShell.tsx", "utf8");
 
-describe("freezone xia-dao launcher contract", () => {
+describe("freezone nie-dao launcher contract", () => {
   it("uses one video source for both the idle first frame and hover motion", () => {
-    expect(source).toContain('src="/images/xia-dao-launcher.mp4"');
-    expect(source).not.toContain("xia-dao-launcher-poster.png");
+    expect(source).toContain('src="/images/nie-dao-launcher.mp4"');
+    expect(source).not.toContain("nie-dao-launcher-poster.png");
+    expect(source).not.toContain("xia-dao");
     expect(source).not.toContain('src="/images/avatar-claw.png"');
     expect(source).not.toContain('src="/images/avatar-motion.mp4"');
     expect(source).toContain("const CHAT_LAUNCHER_VISUAL_WIDTH = 96");
     expect(source).toContain("const CHAT_LAUNCHER_VISUAL_HEIGHT = 35");
     expect(source).toContain("const CHAT_LAUNCHER_HIT_HEIGHT = 44");
     expect(source).toContain("brightness-[1.08]");
-    expect(source).toContain("group-hover/xia-dao:brightness-[1.16]");
+    expect(source).toContain("group-hover/nie-dao:brightness-[1.16]");
   });
 
   it("plays from frame zero on hover or focus and resets on exit", () => {

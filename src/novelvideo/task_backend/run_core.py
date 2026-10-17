@@ -73,6 +73,7 @@ class SettlementIntentResult:
 
 _PROJECT_TASK_RESOURCE_KINDS = {
     "ingest_fast": "ingest",
+    "script_process": "script",
     "build_characters": "script",
     "build_scenes": "script",
     "build_props": "script",

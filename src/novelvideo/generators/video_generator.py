@@ -55,6 +55,7 @@ from novelvideo.shared.billing_errors import (
     is_insufficient_credits_error,
 )
 from novelvideo.shared.provider_costs import is_definite_no_cost_http_rejection
+from novelvideo.shared.transient_retry import call_with_transient_retry
 from novelvideo.storage.media_relay import (
     IMAGE_TRANSFORM_AI_REFERENCE_JPEG,
     media_relay_ttl_seconds,
@@ -95,6 +96,21 @@ def _note_model_call(
 load_dotenv()
 
 NEWAPI_VIDEO_HTTP_TIMEOUT_SECONDS = 1800.0
+# Transient upstream failures (5xx / 429 / a connection that never went out) used
+# to fail the beat, and with it the whole one-click run. ``_post_json`` and
+# ``_get_json`` now repeat those in place; the credit reservation is created once
+# per logical request, so a successful retry still bills a single generation.
+# ``NEWAPI_VIDEO_RETRY_ATTEMPTS=1`` restores the old never-retry behaviour.
+NEWAPI_VIDEO_RETRY_ATTEMPTS = max(
+    int(os.environ.get("NEWAPI_VIDEO_RETRY_ATTEMPTS", "3") or 1), 1
+)
+NEWAPI_VIDEO_RETRY_BACKOFF_SECONDS = (5.0, 20.0)
+# Media delivery (the provider's own content URL or the gateway's file route) is
+# idempotent — it is fetched into a temp file and atomically published — so a
+# dropped transfer is always worth repeating.
+NEWAPI_VIDEO_DOWNLOAD_ATTEMPTS = max(
+    int(os.environ.get("NEWAPI_VIDEO_DOWNLOAD_ATTEMPTS", "3") or 1), 1
+)
 NEWAPI_MEDIA_INPUT_MIN_TTL_SECONDS = 2 * 60 * 60
 _POST_ACCEPT_AUTHZ_MAX_RETRIES = 5
 _POST_ACCEPT_AUTHZ_RETRY_BASE_SECONDS = 2.0
@@ -2090,39 +2106,47 @@ class NewApiVideoGenerator(VideoGeneratorBase):
         *,
         headers: dict[str, str] | None = None,
     ) -> dict:
-        async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
-            async with session.post(
-                url, json=payload, headers=headers or self.headers
-            ) as resp:
-                text = await resp.text()
-                if resp.status < 200 or resp.status >= 300:
-                    request_id = self._extract_request_id(text, resp.headers)
-                    _note_model_call(
-                        model=self.model,
-                        request_id=request_id,
-                        status="error",
-                        error=f"HTTP {resp.status}: {text[:200]}",
-                    )
-                    raise NewApiVideoError(
-                        f"DramaClawAPI submit failed: HTTP {resp.status} - {text}",
-                        request_id=request_id,
-                        status_code=resp.status,
-                    )
-                try:
-                    data = json.loads(text)
-                    request_id = self._extract_request_id(text, resp.headers)
-                    if isinstance(data, dict):
-                        data["_newapi_request_id"] = request_id
-                    _note_model_call(
-                        model=self.model,
-                        request_id=request_id,
-                        status="ok",
-                    )
-                    return data
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(
-                        f"DramaClawAPI submit returned invalid JSON: {text}"
-                    ) from exc
+        async def _send() -> dict:
+            async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
+                async with session.post(
+                    url, json=payload, headers=headers or self.headers
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status < 200 or resp.status >= 300:
+                        request_id = self._extract_request_id(text, resp.headers)
+                        _note_model_call(
+                            model=self.model,
+                            request_id=request_id,
+                            status="error",
+                            error=f"HTTP {resp.status}: {text[:200]}",
+                        )
+                        raise NewApiVideoError(
+                            f"DramaClawAPI submit failed: HTTP {resp.status} - {text}",
+                            request_id=request_id,
+                            status_code=resp.status,
+                        )
+                    try:
+                        data = json.loads(text)
+                        request_id = self._extract_request_id(text, resp.headers)
+                        if isinstance(data, dict):
+                            data["_newapi_request_id"] = request_id
+                        _note_model_call(
+                            model=self.model,
+                            request_id=request_id,
+                            status="ok",
+                        )
+                        return data
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            f"DramaClawAPI submit returned invalid JSON: {text}"
+                        ) from exc
+
+        return await call_with_transient_retry(
+            _send,
+            attempts=NEWAPI_VIDEO_RETRY_ATTEMPTS,
+            backoff=NEWAPI_VIDEO_RETRY_BACKOFF_SECONDS,
+            label="newapi video submit",
+        )
 
     async def _get_json(
         self,
@@ -2130,22 +2154,30 @@ class NewApiVideoGenerator(VideoGeneratorBase):
         *,
         headers: dict[str, str] | None = None,
     ) -> dict:
-        async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
-            async with session.get(url, headers=headers or self.headers) as resp:
-                text = await resp.text()
-                if resp.status < 200 or resp.status >= 300:
-                    request_id = self._extract_request_id(text, resp.headers)
-                    raise NewApiVideoError(
-                        f"DramaClawAPI task query failed: HTTP {resp.status} - {text}",
-                        request_id=request_id,
-                        status_code=resp.status,
-                    )
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(
-                        f"DramaClawAPI task query returned invalid JSON: {text}"
-                    ) from exc
+        async def _send() -> dict:
+            async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
+                async with session.get(url, headers=headers or self.headers) as resp:
+                    text = await resp.text()
+                    if resp.status < 200 or resp.status >= 300:
+                        request_id = self._extract_request_id(text, resp.headers)
+                        raise NewApiVideoError(
+                            f"DramaClawAPI task query failed: HTTP {resp.status} - {text}",
+                            request_id=request_id,
+                            status_code=resp.status,
+                        )
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            f"DramaClawAPI task query returned invalid JSON: {text}"
+                        ) from exc
+
+        return await call_with_transient_retry(
+            _send,
+            attempts=NEWAPI_VIDEO_RETRY_ATTEMPTS,
+            backoff=NEWAPI_VIDEO_RETRY_BACKOFF_SECONDS,
+            label="newapi video poll",
+        )
 
     async def _download_video(self, url: str, output_path: str) -> VideoDeliveryReceipt:
         from novelvideo.utils.media_download import download_to_path
@@ -2163,7 +2195,22 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             target_host = urllib.parse.urlsplit(url).hostname
             if gateway_host and target_host == gateway_host:
                 headers = {"Authorization": f"Bearer {self.api_key}"}
-        return await download_to_path(url, output_path, headers=headers)
+
+        async def _fetch() -> VideoDeliveryReceipt:
+            return await download_to_path(url, output_path, headers=headers)
+
+        def _is_retryable(exc: BaseException) -> bool:
+            # ``download_to_path`` already classifies its own failures; honour
+            # that judgement instead of re-deriving it from the exception class.
+            return bool(getattr(exc, "retryable", False))
+
+        return await call_with_transient_retry(
+            _fetch,
+            attempts=NEWAPI_VIDEO_DOWNLOAD_ATTEMPTS,
+            backoff=NEWAPI_VIDEO_RETRY_BACKOFF_SECONDS,
+            is_retryable=_is_retryable,
+            label="newapi video download",
+        )
 
     @staticmethod
     def _archive_state(task: dict) -> tuple[str, bool] | None:

@@ -348,6 +348,14 @@ vi.mock("@/lib/queries/ingest", () => ({
     mutateAsync: mocks.startIngest,
     isPending: false,
   }),
+  // 剧本处理卡片（导入后自动跑的流程包阶段）
+  isScriptProcessRunning: () => false,
+  useScriptProcess: () => ({ data: undefined, isLoading: false, isError: false }),
+  useStartScriptProcess: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+    error: null,
+  }),
 }));
 
 vi.mock("@/lib/queries/characters", () => ({

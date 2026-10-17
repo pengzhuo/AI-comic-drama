@@ -26,6 +26,14 @@ from novelvideo.generators.tts_generator import (
     resolve_audio_gateway_credential,
 )
 from novelvideo.ports.model_credentials import ModelCredentialError
+from novelvideo.shared.transient_retry import call_with_transient_retry
+
+# Transient gateway failures on the billed speech POST used to fail the beat and,
+# with it, the whole one-click run. The credit reservation is created once per
+# logical request in ``generate``, so a successful retry still bills one call.
+# ``INDEXTTS2_RETRY_ATTEMPTS=1`` restores the old never-retry behaviour.
+INDEXTTS2_RETRY_ATTEMPTS = max(int(os.environ.get("INDEXTTS2_RETRY_ATTEMPTS", "3") or 1), 1)
+INDEXTTS2_RETRY_BACKOFF_SECONDS = (5.0, 20.0)
 
 
 def _note_model_call(
@@ -357,15 +365,25 @@ class IndexTTS2FalClient:
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.post(
-                    self.endpoint,
-                    headers={
-                        "Authorization": f"Key {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
+
+                async def _submit() -> httpx.Response:
+                    response = await client.post(
+                        self.endpoint,
+                        headers={
+                            "Authorization": f"Key {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=body,
+                    )
+                    response.raise_for_status()
+                    return response
+
+                response = await call_with_transient_retry(
+                    _submit,
+                    attempts=INDEXTTS2_RETRY_ATTEMPTS,
+                    backoff=INDEXTTS2_RETRY_BACKOFF_SECONDS,
+                    label="indextts2 fal",
                 )
-                response.raise_for_status()
                 result_url = _extract_audio_url(response.json())
                 if not result_url:
                     return TTSResult(
@@ -424,21 +442,31 @@ class IndexTTS2FalClient:
             async with httpx.AsyncClient(
                 timeout=self.timeout_seconds, follow_redirects=True
             ) as client:
-                response = await client.post(
-                    request_endpoint,
-                    headers={
-                        "Authorization": f"Bearer {request_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
+
+                async def _submit() -> httpx.Response:
+                    response = await client.post(
+                        request_endpoint,
+                        headers={
+                            "Authorization": f"Bearer {request_api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=body,
+                    )
+                    self._last_provider_request_id = (
+                        response.headers.get("x-request-id")
+                        or response.headers.get("x-newapi-request-id")
+                        or response.headers.get("x-oneapi-request-id")
+                        or ""
+                    )
+                    response.raise_for_status()
+                    return response
+
+                response = await call_with_transient_retry(
+                    _submit,
+                    attempts=INDEXTTS2_RETRY_ATTEMPTS,
+                    backoff=INDEXTTS2_RETRY_BACKOFF_SECONDS,
+                    label="indextts2 newapi",
                 )
-                self._last_provider_request_id = (
-                    response.headers.get("x-request-id")
-                    or response.headers.get("x-newapi-request-id")
-                    or response.headers.get("x-oneapi-request-id")
-                    or ""
-                )
-                response.raise_for_status()
                 content_type = response.headers.get("content-type", "")
                 if "application/json" in content_type.lower():
                     payload = response.json()

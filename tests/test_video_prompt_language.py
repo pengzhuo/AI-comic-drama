@@ -142,3 +142,69 @@ def test_keyframe_prompt_builder_applies_language_to_task_and_fallback(
     assert result == "generated"
     assert required in seen["prompt"][0]
     assert expected_fallback in builder._fallback_build(language)
+
+
+def test_global_optimizer_retries_an_empty_completion(monkeypatch, tmp_path):
+    """An empty completion used to drop the beat, which then failed the stage."""
+
+    import novelvideo.agents.global_video_optimizer as module
+
+    outputs = ["", "   ", "开花般的运动提示词"]
+    calls: list[str] = []
+
+    class FlakyAgent:
+        async def run(self, prompt):
+            calls.append(prompt[0])
+            output = outputs[min(len(calls) - 1, len(outputs) - 1)]
+            return SimpleNamespace(output=output)
+
+    sketch_path = tmp_path / "beat_07.png"
+    sketch_path.write_bytes(b"fake-image")
+    optimizer = module.GlobalVideoPromptOptimizer()
+    monkeypatch.setattr(optimizer, "_get_agent", lambda _language: FlakyAgent())
+    monkeypatch.setattr(optimizer, "_compress_image", lambda _path: b"compressed")
+    monkeypatch.setattr(module, "GLOBAL_OPTIMIZE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    result = asyncio.run(
+        optimizer.optimize_single_beat(
+            beat={"beat_number": 7, "visual_description": "A door opens."},
+            sketch_image_path=str(sketch_path),
+            character_color_map={},
+            language="zh",
+        )
+    )
+
+    assert result["prompt"] == "开花般的运动提示词"
+    assert len(calls) == 3
+
+
+def test_global_optimizer_stops_after_the_retry_budget(monkeypatch, tmp_path):
+    import novelvideo.agents.global_video_optimizer as module
+
+    calls: list[str] = []
+
+    class EmptyAgent:
+        async def run(self, prompt):
+            calls.append(prompt[0])
+            return SimpleNamespace(output="")
+
+    sketch_path = tmp_path / "beat_09.png"
+    sketch_path.write_bytes(b"fake-image")
+    optimizer = module.GlobalVideoPromptOptimizer()
+    monkeypatch.setattr(optimizer, "_get_agent", lambda _language: EmptyAgent())
+    monkeypatch.setattr(optimizer, "_compress_image", lambda _path: b"compressed")
+    monkeypatch.setattr(module, "GLOBAL_OPTIMIZE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    with pytest.raises(module.EmptyOptimizerResponse) as excinfo:
+        asyncio.run(
+            optimizer.optimize_single_beat(
+                beat={"beat_number": 9, "visual_description": "A door opens."},
+                sketch_image_path=str(sketch_path),
+                character_color_map={},
+                language="zh",
+            )
+        )
+
+    assert len(calls) == module.GLOBAL_OPTIMIZE_RETRY_ATTEMPTS
+    # The surfaced text keeps the wording the pipeline already reported.
+    assert "AI 返回空内容" in str(excinfo.value)

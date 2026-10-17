@@ -43,13 +43,13 @@ with iterative `tsc -b` rather than a blind cut.
 | `task_backend/registry.py` | Task runner registry |
 | `task_backend/client.py` | `enqueue_project_task` / `cancel_project_task` facade |
 | `task_backend/runners/__init__.py` | Registers all built-in runners |
-| `task_backend/runners/*.py` | Per-stage runners (`ingest`, `graph_build`, `identity`, `script`, `sketch`, `render`, `video`, `audio`, `character_image`, `episode_assets`, `freezone`) |
+| `task_backend/runners/*.py` | Per-stage runners (`ingest`, `graph_build`, `identity`, `script_process`, `script`, `sketch`, `render`, `video`, `audio`, `character_image`, `episode_assets`, `freezone`) |
 | `ports/local/tasks.py` | CE in-process task backend (`InlineTaskBackend`) |
 | `chat/service.py` | Chat/agent orchestration + streaming |
 | `chat/director_auto.py` | Durable server-side auto coordinator (episode / project scope) |
 | `chat/dramaclaw_mcp.py` | MCP server (see `.mcp.json`) |
 | `agents/*.py` | LLM agents: `episode_planner`, `identity_planner`, `content_rewriter`, `asset_compiler`, `global_video_optimizer` |
-| `workflows/*.py` | Script-writing workflows (`script_writing`, `literal_script_writing`) |
+| `workflows/*.py` | Script-writing workflows (`script_writing`, `literal_script_writing`, `script_processing`) |
 | `structured_ingest.py`, `structured_extraction.py`, `structured_builders.py` | Structured (`structured_v1`) ingest + extraction |
 | `cognee/` | Legacy knowledge-graph pipeline (`store`, `pipeline`, `event_extractor`, `screenplay_normalizer`) |
 | `generators/` | Media generation (`video_composer`, `prompt_builder`, `nanobanana_grid`, image/video generators) |

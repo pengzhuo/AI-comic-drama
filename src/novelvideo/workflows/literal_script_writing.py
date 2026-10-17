@@ -424,6 +424,7 @@ class LiteralScriptWritingWorkflow:
                 ),
                 system_prompt=(
                     f"{LITERAL_SCRIPT_PROMPT}\n"
+                    f"{self._script_process_digest_section()}"
                     f"{asset_language_instruction(self._output_language)}"
                 ),
                 model_settings=get_newapi_structured_output_model_settings(),
@@ -437,6 +438,33 @@ class LiteralScriptWritingWorkflow:
                 name="逐行剧本分镜标注师",
             )
         return self._agent
+
+    def _script_process_digest_section(self) -> str:
+        """Inject the film-process-pack understanding when it exists.
+
+        The one-click flow processes the imported script with the bundled
+        process pack before the script stage. Feeding the resulting
+        understanding back in keeps per-line labelling aligned with the locked
+        character/reveal boundary without changing what a line may contain.
+        """
+
+        output_dir = str(getattr(self, "output_dir", "") or "")
+        if not output_dir:
+            return ""
+        try:
+            from novelvideo.script_process import build_downstream_digest
+
+            digest = build_downstream_digest(output_dir)
+        except Exception:  # noqa: BLE001 - enrichment must never block script generation
+            return ""
+        if not digest:
+            return ""
+        return (
+            "\n## 剧本处理理解账（来自内置制作流程包）\n"
+            "以下内容只用于保持角色、场景与揭示边界的一致性；"
+            "你仍然只标注当前这一行，不得据此补出原文没有的人、事、物。\n"
+            f"{digest}\n"
+        )
 
     async def run(
         self,

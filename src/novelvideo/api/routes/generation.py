@@ -792,18 +792,53 @@ async def generate_sketches(
     """生成草图。"""
     resolved = await _resolve_generation_project(project, user, required_role="editor")
     ctx = resolved.ctx
-    username = resolved.username
-    project_name = resolved.project_name
-    output_dir = resolved.output_dir
+    store = (
+        await make_sqlite_store_for_context(ctx)
+        if ctx
+        else await make_sqlite_store(resolved.username, resolved.project_name)
+    )
+    return await enqueue_sketch_grid_tasks(
+        ctx=ctx,
+        store=store,
+        username=resolved.username,
+        project_name=resolved.project_name,
+        output_dir=resolved.output_dir,
+        episode_num=episode_num,
+        body=body,
+    )
+
+
+async def enqueue_sketch_grid_tasks(
+    *,
+    ctx: Any,
+    store: Any,
+    username: str,
+    project_name: str,
+    output_dir: str,
+    episode_num: int,
+    body: SketchGenerateRequest,
+    ensure_colors: bool = False,
+) -> dict[str, Any]:
+    """Enqueue this episode's sketch grids with the REST payload.
+
+    Extracted so the deterministic auto pipeline can start the stage without an
+    agent turn — an agent once mis-read this stage as a single-image render and
+    paused the whole run. ``ensure_colors`` (auto path only) runs the same
+    colour assignment the ``assign-colors`` route performs, because sketch
+    generation refuses to start without it; the product surface keeps its
+    "call assign-colors first" contract and leaves it off.
+    """
+
+    if ensure_colors:
+        await ensure_sketch_colors(
+            store=store,
+            output_dir=output_dir,
+            episode_num=episode_num,
+        )
 
     proj_config = load_project_config(username, project_name)
     style = body.style or proj_config.get("visual_style", "chinese_period_drama")
 
-    store = (
-        await make_sqlite_store_for_context(ctx)
-        if ctx
-        else await make_sqlite_store(username, project_name)
-    )
     beats = await store.get_beats_as_dicts(episode_num)
 
     if not beats:
@@ -1124,28 +1159,58 @@ async def generate_audio(
     """批量生成语音（IndexTTS2）。"""
     resolved = await _resolve_generation_project(project, user, required_role="editor")
     ctx = resolved.ctx
-    username = resolved.username
-    project_name = resolved.project_name
-    output_dir = resolved.output_dir
-    state_dir = str(ctx.state_dir) if ctx else get_state_dir(username, project_name)
+    state_dir = (
+        str(ctx.state_dir) if ctx else get_state_dir(resolved.username, resolved.project_name)
+    )
     store = (
         await make_sqlite_store_for_context(ctx)
         if ctx
-        else await make_sqlite_store(username, project_name)
+        else await make_sqlite_store(resolved.username, resolved.project_name)
     )
+    return await enqueue_audio_generation_task(
+        ctx=ctx,
+        store=store,
+        username=resolved.username,
+        project_name=resolved.project_name,
+        output_dir=resolved.output_dir,
+        state_dir=state_dir,
+        episode_num=episode_num,
+        mode=body.mode,
+        beat_numbers=body.beat_numbers,
+    )
+
+
+async def enqueue_audio_generation_task(
+    *,
+    ctx: Any,
+    store: Any,
+    username: str,
+    project_name: str,
+    output_dir: str,
+    state_dir: str,
+    episode_num: int,
+    mode: str | None = None,
+    beat_numbers: list[int] | None = None,
+) -> dict[str, Any]:
+    """Enqueue the episode's speech batch with the REST payload.
+
+    Extracted so the deterministic auto pipeline can start the TTS stage without
+    an agent turn.
+    """
+
     beats = await store.get_beats_as_dicts(episode_num)
 
     if not beats:
         return {"ok": False, "error": f"No beats found for episode {episode_num}"}
 
-    mode = body.mode or "sync_changed"
+    resolved_mode = mode or "sync_changed"
     billable_beat_numbers, missing_voice, billable_chars = await _audio_generation_plan(
         store=store,
         username=username,
         project=project_name,
         episode=episode_num,
-        beat_numbers=body.beat_numbers,
-        mode=mode,
+        beat_numbers=beat_numbers,
+        mode=resolved_mode,
     )
     if missing_voice:
         return _voice_prereq_error_response(missing_voice)
@@ -1156,40 +1221,40 @@ async def generate_audio(
             "error": "没有需要生成的音频",
         }
 
-    if ctx is not None:
-        queued = await get_task_backend().enqueue_project_task(
-            ctx,
-            product_surface="mainline",
-            task_type="audio_generation_indextts2",
-            queue_kind="default",
-            episode=episode_num,
-            payload={
-                "episode": episode_num,
-                "mode": mode,
-                "beat_numbers": billable_beat_numbers,
-                "output_dir": output_dir,
-                "state_dir": state_dir,
-                "billing": _audio_billing_payload(
-                    billable_beat_numbers,
-                    billable_chars=billable_chars,
-                ),
-            },
-        )
+    if ctx is None:
         return {
-            "ok": True,
-            "task_type": "audio_generation_indextts2",
-            "task_id": queued.task_state.task_id,
-            "task_key": project_task_state_key(
-                "audio_generation_indextts2", ctx.project_id, episode_num
-            ),
-            "backend": queued.backend,
-            "queue": queued.queue,
-            "message": f"第 {episode_num} 集语音批量生成已进入队列",
+            "ok": False,
+            "error": "音频生成需要 project context",
         }
 
+    queued = await get_task_backend().enqueue_project_task(
+        ctx,
+        product_surface="mainline",
+        task_type="audio_generation_indextts2",
+        queue_kind="default",
+        episode=episode_num,
+        payload={
+            "episode": episode_num,
+            "mode": resolved_mode,
+            "beat_numbers": billable_beat_numbers,
+            "output_dir": output_dir,
+            "state_dir": state_dir,
+            "billing": _audio_billing_payload(
+                billable_beat_numbers,
+                billable_chars=billable_chars,
+            ),
+        },
+    )
     return {
-        "ok": False,
-        "error": "音频生成需要 project context",
+        "ok": True,
+        "task_type": "audio_generation_indextts2",
+        "task_id": queued.task_state.task_id,
+        "task_key": project_task_state_key(
+            "audio_generation_indextts2", ctx.project_id, episode_num
+        ),
+        "backend": queued.backend,
+        "queue": queued.queue,
+        "message": f"第 {episode_num} 集语音批量生成已进入队列",
     }
 
 
@@ -1279,15 +1344,33 @@ async def global_optimize_video(
     """
     resolved = await _resolve_generation_project(project, user, required_role="editor")
     ctx = resolved.ctx
-    username = resolved.username
-    project_name = resolved.project_name
-    output_dir = resolved.output_dir
-
     store = (
         await make_sqlite_store_for_context(ctx)
         if ctx
-        else await make_sqlite_store(username, project_name)
+        else await make_sqlite_store(resolved.username, resolved.project_name)
     )
+    return await enqueue_global_optimize_video_task(
+        ctx=ctx,
+        store=store,
+        output_dir=resolved.output_dir,
+        episode_num=episode_num,
+    )
+
+
+async def enqueue_global_optimize_video_task(
+    *,
+    ctx: Any,
+    store: Any,
+    output_dir: str,
+    episode_num: int,
+) -> dict[str, Any]:
+    """Enqueue the episode's global video optimization with the REST payload.
+
+    Extracted so the deterministic auto pipeline can start the stage without an
+    agent turn; both callers build the payload the ``global_optimize_video``
+    runner expects, so the fast path cannot drift from the product surface.
+    """
+
     beats = await store.get_beats_as_dicts(episode_num)
 
     if not beats:
@@ -1326,43 +1409,43 @@ async def global_optimize_video(
         for c in characters
     ]
 
-    if ctx is not None:
-        queued = await get_task_backend().enqueue_project_task(
-            ctx,
-            product_surface="mainline",
-            task_type="global_optimize_video",
-            queue_kind="default",
-            episode=episode_num,
-            payload={
-                "episode": episode_num,
-                "beats": beats,
-                "characters": char_list,
-                "output_dir": output_dir,
-                "language": language,
-                "billing": {
-                    "items": billable_beat_count,
-                    "beat_numbers": billable_beat_numbers,
-                    "pricing_metrics": {
-                        "call_count": billable_beat_count,
-                        "item_count": billable_beat_count,
-                    },
-                },
-                "beat_numbers": billable_beat_numbers,
-            },
-        )
-        return {
-            "ok": True,
-            "task_type": "global_optimize_video",
-            "task_id": queued.task_state.task_id,
-            "task_key": project_task_state_key(
-                "global_optimize_video", ctx.project_id, episode_num
-            ),
-            "backend": queued.backend,
-            "queue": queued.queue,
-            "message": f"第 {episode_num} 集全局视频优化已进入队列",
-        }
+    if ctx is None:
+        return {"ok": False, "error": "全局视频优化需要 project context"}
 
-    return {"ok": False, "error": "全局视频优化需要 project context"}
+    queued = await get_task_backend().enqueue_project_task(
+        ctx,
+        product_surface="mainline",
+        task_type="global_optimize_video",
+        queue_kind="default",
+        episode=episode_num,
+        payload={
+            "episode": episode_num,
+            "beats": beats,
+            "characters": char_list,
+            "output_dir": output_dir,
+            "language": language,
+            "billing": {
+                "items": billable_beat_count,
+                "beat_numbers": billable_beat_numbers,
+                "pricing_metrics": {
+                    "call_count": billable_beat_count,
+                    "item_count": billable_beat_count,
+                },
+            },
+            "beat_numbers": billable_beat_numbers,
+        },
+    )
+    return {
+        "ok": True,
+        "task_type": "global_optimize_video",
+        "task_id": queued.task_state.task_id,
+        "task_key": project_task_state_key(
+            "global_optimize_video", ctx.project_id, episode_num
+        ),
+        "backend": queued.backend,
+        "queue": queued.queue,
+        "message": f"第 {episode_num} 集全局视频优化已进入队列",
+    }
 
 
 # ── 再生 ──────────────────────────────────────────────────────────────────────
@@ -1882,48 +1965,83 @@ async def regenerate_beats(
 ):
     """选中 Beats 再生画面。"""
     resolved = await _resolve_generation_project(project, user, required_role="editor")
-    ctx = resolved.ctx
-    username = resolved.username
-    project_name = resolved.project_name
-    output_dir = resolved.output_dir
-    proj_config = load_project_config(username, project_name)
-    style = body.style or proj_config.get("visual_style", "chinese_period_drama")
-    render_image_selection = _resolve_render_image_selection(
-        proj_config,
-        body.image_generation_selection,
+    store = (
+        await make_sqlite_store_for_context(resolved.ctx)
+        if resolved.ctx
+        else await make_sqlite_store(resolved.username, resolved.project_name)
+    )
+    return await enqueue_selected_regen_task(
+        ctx=resolved.ctx,
+        store=store,
+        username=resolved.username,
+        project_name=resolved.project_name,
+        output_dir=resolved.output_dir,
+        episode_num=episode_num,
+        beat_indices=body.beat_indices,
+        model=body.model,
+        mode_key=body.mode_key,
+        style=body.style,
+        image_generation_selection=body.image_generation_selection,
+        sketch_aspect_padding=body.sketch_aspect_padding,
+        batch_id=body.batch_id,
+        batch_size=body.batch_size,
     )
 
-    store = (
-        await make_sqlite_store_for_context(ctx)
-        if ctx
-        else await make_sqlite_store(username, project_name)
+
+async def enqueue_selected_regen_task(
+    *,
+    ctx: Any,
+    store: Any,
+    username: str,
+    project_name: str,
+    output_dir: str,
+    episode_num: int,
+    beat_indices: list[int],
+    model: str | None = None,
+    mode_key: str | None = None,
+    style: str | None = None,
+    image_generation_selection: str | None = None,
+    sketch_aspect_padding: bool | None = None,
+    batch_id: str | None = None,
+    batch_size: int | None = None,
+) -> dict[str, Any]:
+    """Enqueue first-frame (Render) generation for selected beats.
+
+    Extracted so the deterministic auto pipeline can render first frames without
+    an agent turn.
+    """
+
+    proj_config = load_project_config(username, project_name)
+    resolved_style = style or proj_config.get("visual_style", "chinese_period_drama")
+    render_image_selection = _resolve_render_image_selection(
+        proj_config,
+        image_generation_selection,
     )
+
     beats = await store.get_beats_as_dicts(episode_num)
 
     if not beats:
         return {"ok": False, "error": f"No beats found for episode {episode_num}"}
 
     # 验证 beat_indices
-    if not body.beat_indices:
+    if not beat_indices:
         return {"ok": False, "error": "beat_indices 不能为空"}
     total_beats = len(beats)
-    invalid = [i for i in body.beat_indices if i < 1 or i > total_beats]
+    invalid = [i for i in beat_indices if i < 1 or i > total_beats]
     if invalid:
         return {
             "ok": False,
             "error": f"beat_indices {invalid} 超出范围（共 {total_beats} 个 beats，有效: 1~{total_beats}）",
         }
 
-    selected_beats = pick_beats_by_number(beats, body.beat_indices)
+    selected_beats = pick_beats_by_number(beats, beat_indices)
     detection_error = render_ai_detection_error(selected_beats)
     if detection_error:
         return {"ok": False, "error": detection_error}
 
     sketch_paths = PathResolver(output_dir, episode_num)
     missing_sketches = [
-        beat_num
-        for beat_num in body.beat_indices
-        if not sketch_paths.sketch(beat_num).is_file()
+        beat_num for beat_num in beat_indices if not sketch_paths.sketch(beat_num).is_file()
     ]
     if missing_sketches:
         missing_labels = ", ".join(f"#{beat_num}" for beat_num in missing_sketches)
@@ -1943,66 +2061,65 @@ async def regenerate_beats(
 
     # The selected sketch is the source of truth for a single Render. The
     # client mode remains a compatibility fallback for missing legacy assets.
-    mode_key = (
-        _single_render_mode_from_sketch(output_dir, episode_num, body.beat_indices)
-        or body.mode_key
+    resolved_mode_key = _single_render_mode_from_sketch(output_dir, episode_num, beat_indices) or (
+        mode_key or "1x1_2-3"
     )
     episode_obj = _episode_from_store_or_none(store, episode_num)
     prop_menu = await _runtime_prop_menu_with_global_props(store, episode_obj, beats)
-    billing = _render_regen_billing_metadata(render_image_selection, mode_key)
+    billing = _render_regen_billing_metadata(render_image_selection, resolved_mode_key)
     config = {
         "beats": beats,
         "character_map": character_map,
-        "style": style,
-        "model": body.model,
+        "style": resolved_style,
+        "model": model,
         "image_generation_selection": render_image_selection,
-        "selected_beat_numbers": body.beat_indices,
+        "selected_beat_numbers": beat_indices,
         "sketch_colors": store.get_sketch_colors(episode_num) or {},
         "prop_menu": prop_menu,
         "sketch_aspect_padding": _resolve_render_bool_setting(
             proj_config,
             "sketch_aspect_padding",
-            body.sketch_aspect_padding,
+            sketch_aspect_padding,
             True,
         ),
     }
 
     from novelvideo.task_identity import selection_scope
 
-    scope = selection_scope(mode_key, body.beat_indices)
+    scope = selection_scope(resolved_mode_key, beat_indices)
 
-    if ctx is not None:
-        queued = await get_task_backend().enqueue_project_task(
-            ctx,
-            product_surface="mainline",
-            task_type="selected_regen",
-            queue_kind="default",
-            episode=episode_num,
-            scope=scope,
-            payload={
-                "episode": episode_num,
-                "mode_key": mode_key,
-                "output_dir": output_dir,
-                "config": {**config, "mode_key": mode_key},
-                "billing": billing,
-                **({"batch_id": body.batch_id} if body.batch_id else {}),
-                **({"batch_size": body.batch_size} if body.batch_size else {}),
-            },
-        )
-        return {
-            "ok": True,
-            "task_type": "selected_regen",
-            "scope": scope,
-            "task_id": queued.task_state.task_id,
-            "task_key": project_task_state_key(
-                "selected_regen", ctx.project_id, episode_num, scope=scope
-            ),
-            "backend": queued.backend,
-            "queue": queued.queue,
-            "message": f"第 {episode_num} 集选中 Beats 画面再生已进入队列",
-        }
+    if ctx is None:
+        return {"ok": False, "error": "选中 Beats 画面再生需要 project context"}
 
-    return {"ok": False, "error": "选中 Beats 画面再生需要 project context"}
+    queued = await get_task_backend().enqueue_project_task(
+        ctx,
+        product_surface="mainline",
+        task_type="selected_regen",
+        queue_kind="default",
+        episode=episode_num,
+        scope=scope,
+        payload={
+            "episode": episode_num,
+            "mode_key": resolved_mode_key,
+            "output_dir": output_dir,
+            "config": {**config, "mode_key": resolved_mode_key},
+            "billing": billing,
+            **({"batch_id": batch_id} if batch_id else {}),
+            **({"batch_size": batch_size} if batch_size else {}),
+        },
+    )
+    return {
+        "ok": True,
+        "task_type": "selected_regen",
+        "scope": scope,
+        "task_id": queued.task_state.task_id,
+        "task_key": project_task_state_key(
+            "selected_regen", ctx.project_id, episode_num, scope=scope
+        ),
+        "backend": queued.backend,
+        "queue": queued.queue,
+        "message": f"第 {episode_num} 集选中 Beats 画面再生已进入队列",
+    }
 
 
 @router.post("/projects/{project}/episodes/{episode_num}/sketches/regenerate")
@@ -4368,18 +4485,34 @@ async def assign_sketch_colors(
     user: dict = Depends(get_api_user),
 ):
     """为本集出场身份和全局道具分配共享颜色。"""
-    from novelvideo.generators.episode_optimizer import EpisodeOptimizer
-    from novelvideo.generators.nanobanana_grid import _global_prop_marker_colors
-
     resolved = await _resolve_generation_project(project, user, required_role="editor")
-    username = resolved.username
-    project_name = resolved.project_name
-
     store = (
         await make_sqlite_store_for_context(resolved.ctx)
         if resolved.ctx
-        else await make_sqlite_store(username, project_name)
+        else await make_sqlite_store(resolved.username, resolved.project_name)
     )
+    return await ensure_sketch_colors(
+        store=store,
+        output_dir=resolved.output_dir,
+        episode_num=episode_num,
+    )
+
+
+async def ensure_sketch_colors(
+    *,
+    store: Any,
+    output_dir: str,
+    episode_num: int,
+) -> dict[str, Any]:
+    """Assign + persist this episode's identity/prop sketch colours (idempotent).
+
+    Extracted from the ``assign-colors`` route so sketch generation can satisfy
+    its own colour prerequisite on both the product surface and the
+    deterministic auto pipeline.
+    """
+
+    from novelvideo.generators.episode_optimizer import EpisodeOptimizer
+    from novelvideo.generators.nanobanana_grid import _global_prop_marker_colors
 
     beats = await store.get_beats_as_dicts(episode_num)
     if not beats:
@@ -4452,7 +4585,6 @@ async def assign_sketch_colors(
     if should_clean_sketches:
         from novelvideo.utils.path_resolver import PathResolver
 
-        output_dir = resolved.output_dir
         PathResolver(output_dir, episode_num).clean_sketches()
 
     return {

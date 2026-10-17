@@ -36,6 +36,24 @@ def capture_enqueue(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_script_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_status(monkeypatch, "script_process")
+    calls = capture_enqueue(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=object(), episode=0
+    )
+
+    assert task_type == "script_process"
+    assert signature == "dispatch:script_process"
+    assert calls[0]["task_type"] == "script_process"
+    assert calls[0]["episode"] == 0
+    assert calls[0]["payload"] == {"output_dir": str(tmp_path)}
+
+
+@pytest.mark.asyncio
 async def test_dispatch_build_characters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     patch_status(monkeypatch, "build_characters")
     calls = capture_enqueue(monkeypatch)
@@ -306,7 +324,9 @@ async def test_dispatch_single_videos_without_ready_beats_falls_back(
 async def test_unsupported_step_falls_back_to_agent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    patch_status(monkeypatch, "script_writer")
+    # ``coloring`` (sketch identity/prop detection) is the deliberate remaining
+    # agent-driven stage: it is a synchronous vision call with no task type.
+    patch_status(monkeypatch, "coloring")
     capture_enqueue(monkeypatch)
 
     result = await pipeline_auto.dispatch_next_stage(
@@ -314,6 +334,259 @@ async def test_unsupported_step_falls_back_to_agent(
     )
 
     assert result == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_script_writer_uses_the_route_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from novelvideo.api.routes import scripts as scripts_module
+
+    patch_status(monkeypatch, "script_writer", episode=2)
+    calls: list[dict] = []
+
+    async def fake_enqueue_script_writer_task(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "task_type": "script_writer"}
+
+    monkeypatch.setattr(scripts_module, "enqueue_script_writer_task", fake_enqueue_script_writer_task)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=object(), episode=2
+    )
+
+    assert task_type == "script_writer"
+    assert signature == "dispatch:script_writer:2"
+    assert calls[0]["episode_num"] == 2
+    assert calls[0]["output_dir"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_script_writer_prerequisite_failure_falls_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing identity plan must not be recorded as a dispatched stage."""
+
+    from novelvideo.api.routes import scripts as scripts_module
+
+    patch_status(monkeypatch, "script_writer", episode=2)
+
+    async def fake_enqueue_script_writer_task(**_kwargs):
+        return {"ok": False, "code": "identity_plan_required"}
+
+    monkeypatch.setattr(scripts_module, "enqueue_script_writer_task", fake_enqueue_script_writer_task)
+
+    result = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=object(), episode=2
+    )
+
+    assert result == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_sketches_requests_every_grid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from novelvideo.api.routes import generation
+
+    patch_status(monkeypatch, "sketch_generation", episode=1)
+    calls: list[dict] = []
+
+    async def fake_enqueue_sketch_grid_tasks(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "task_type": "sketch_grid_generation"}
+
+    monkeypatch.setattr(generation, "enqueue_sketch_grid_tasks", fake_enqueue_sketch_grid_tasks)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=object(), episode=1
+    )
+
+    assert task_type == "sketch_grid_generation"
+    assert signature == "dispatch:sketch_generation:1"
+    # grid_index=-1 is "all grids"; the schema default (0) would silently build
+    # only the first grid.
+    assert calls[0]["body"].grid_index == -1
+    # The auto path must assign colours itself: sketch generation refuses to
+    # start when none are assigned, which is exactly what once sent an agent
+    # down the wrong (Render) path.
+    assert calls[0]["ensure_colors"] is True
+    assert calls[0]["username"] == "alice"
+    assert calls[0]["output_dir"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_global_optimize_uses_the_route_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from novelvideo.api.routes import generation
+
+    patch_status(monkeypatch, "global_optimize_video", episode=4)
+    calls: list[dict] = []
+
+    async def fake_enqueue_global_optimize_video_task(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "task_type": "global_optimize_video"}
+
+    monkeypatch.setattr(
+        generation, "enqueue_global_optimize_video_task", fake_enqueue_global_optimize_video_task
+    )
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=object(), episode=4
+    )
+
+    assert task_type == "global_optimize_video"
+    assert signature == "dispatch:global_optimize_video:4"
+    assert calls[0]["episode_num"] == 4
+    assert calls[0]["output_dir"] == str(tmp_path)
+
+
+def _write_sketches(tmp_path: Path, beat_numbers: tuple[int, ...]) -> None:
+    sketches = tmp_path / "sketches" / "ep001"
+    sketches.mkdir(parents=True, exist_ok=True)
+    for beat_num in beat_numbers:
+        (sketches / f"beat_{beat_num:02d}.png").write_bytes(b"x")
+
+
+def _capture_selected_regen_enqueues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[dict], list[dict]]:
+    from novelvideo.api.routes import generation
+
+    calls: list[dict] = []
+    mode_calls: list[dict] = []
+
+    async def fake_enqueue_selected_regen_task(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "task_type": "selected_regen"}
+
+    def fake_single_render_mode(output_dir, episode, beat_indices):
+        mode_calls.append(
+            {
+                "output_dir": output_dir,
+                "episode": episode,
+                "beat_indices": list(beat_indices),
+            }
+        )
+        return "1x1_16-9"
+
+    monkeypatch.setattr(generation, "enqueue_selected_regen_task", fake_enqueue_selected_regen_task)
+    monkeypatch.setattr(generation, "_single_render_mode_from_sketch", fake_single_render_mode)
+    return calls, mode_calls
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_only_sends_sketched_beats_without_a_frame(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    _write_sketches(tmp_path, (1, 2, 3))
+    _write_video_inputs(tmp_path, (2,))
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2, 3)),
+        episode=1,
+    )
+
+    assert task_type == "selected_regen"
+    assert signature == "dispatch:selected_regen:1:1-3"
+    assert calls[0]["beat_indices"] == [1, 3]
+    assert calls[0]["episode_num"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_uses_the_sketch_aspect_for_the_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A 16:9 sketch must not be rendered with the 2:3 client default."""
+
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, mode_calls = _capture_selected_regen_enqueues(monkeypatch)
+    _write_sketches(tmp_path, (2, 3))
+
+    await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=_video_store((2, 3)), episode=1
+    )
+
+    assert calls[0]["mode_key"] == "1x1_16-9"
+    # The mode is derived from the batch's own first beat, not from the client.
+    assert mode_calls == [
+        {"output_dir": str(tmp_path), "episode": 1, "beat_indices": [2]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_caps_the_chunk_below_the_runtime_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    beat_numbers = tuple(range(1, 13))
+    _write_sketches(tmp_path, beat_numbers)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store(beat_numbers),
+        episode=1,
+    )
+
+    assert pipeline_auto.AUTO_FIRST_FRAME_CHUNK < pipeline_auto.MAX_SINGLE_VIDEO_BATCH
+    assert task_type == "selected_regen"
+    assert signature == "dispatch:selected_regen:1:1-3"
+    assert calls[0]["beat_indices"] == list(range(1, 4))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_does_not_repeat_a_chunk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    _write_sketches(tmp_path, (1, 2))
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+        attempted={"dispatch:selected_regen:1:1-2"},
+    )
+
+    assert task_type is None
+    assert signature == "dispatch:selected_regen:1:1-2"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tts_uses_the_route_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from novelvideo.api.routes import generation
+
+    patch_status(monkeypatch, "tts", episode=3)
+    calls: list[dict] = []
+
+    async def fake_enqueue_audio_generation_task(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "task_type": "audio_generation_indextts2"}
+
+    monkeypatch.setattr(
+        generation, "enqueue_audio_generation_task", fake_enqueue_audio_generation_task
+    )
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=object(), episode=3
+    )
+
+    assert task_type == "audio_generation_indextts2"
+    assert signature == "dispatch:audio_generation:3"
+    assert calls[0]["episode_num"] == 3
+    assert calls[0]["state_dir"] == str(tmp_path / "state")
 
 
 @pytest.mark.asyncio

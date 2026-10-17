@@ -3427,7 +3427,7 @@ function FreezoneChatToggleButton({
       size="icon-lg"
       variant="secondary"
       className={cn(
-        "group/xia-dao absolute z-50 cursor-grab touch-none overflow-visible border-0 bg-transparent p-0 transition-opacity duration-200 ease-out hover:bg-transparent active:cursor-grabbing",
+        "group/nie-dao absolute z-50 cursor-grab touch-none overflow-visible border-0 bg-transparent p-0 transition-opacity duration-200 ease-out hover:bg-transparent active:cursor-grabbing",
         entered ? "opacity-100" : "opacity-0",
       )}
       style={{
@@ -3447,12 +3447,12 @@ function FreezoneChatToggleButton({
     >
       <video
         ref={videoRef}
-        src="/images/xia-dao-launcher.mp4"
+        src="/images/nie-dao-launcher.mp4"
         muted
         loop
         playsInline
         preload="auto"
-        className="pointer-events-none absolute left-0 top-1/2 w-full -translate-y-1/2 rounded-[6px] object-cover brightness-[1.08] saturate-[1.02] shadow-[0_4px_10px_rgba(0,0,0,0.2)] transition-[filter] duration-200 ease-out group-hover/xia-dao:brightness-[1.16] group-focus-visible/xia-dao:brightness-[1.16]"
+        className="pointer-events-none absolute left-0 top-1/2 w-full -translate-y-1/2 rounded-[6px] object-cover brightness-[1.08] saturate-[1.02] shadow-[0_4px_10px_rgba(0,0,0,0.2)] transition-[filter] duration-200 ease-out group-hover/nie-dao:brightness-[1.16] group-focus-visible/nie-dao:brightness-[1.16]"
         style={{ height: CHAT_LAUNCHER_VISUAL_HEIGHT }}
         aria-hidden="true"
       />

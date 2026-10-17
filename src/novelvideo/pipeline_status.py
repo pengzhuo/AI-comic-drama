@@ -14,6 +14,7 @@ from typing import Any
 from starlette.concurrency import run_in_threadpool
 
 from novelvideo.project_context import ProjectContext
+from novelvideo.script_process import has_script_process_result
 from novelvideo.sqlite_store import SQLiteStore
 from novelvideo.task_state import get_task_manager
 from novelvideo.utils.path_resolver import compute_identity_path, compute_portrait_path
@@ -23,6 +24,7 @@ _log = logging.getLogger(__name__)
 
 STEP_MAP: dict[str, tuple[str | None, str]] = {
     "ingest": ("ingest_fast", "小说摄入"),
+    "script_process": ("script_process", "剧本处理"),
     "configure": (None, "配置项目"),
     "characters": ("build_characters", "角色提取"),
     "episodes": ("build_episodes", "分集规划"),
@@ -270,9 +272,18 @@ async def compute_pipeline_status(
     portraits_done = bool(portrait_chars) and all(
         bool(compute_portrait_path(project_dir, c.name)) for c in portrait_chars
     )
+    # 导入后先按内置流程包处理剧本，再进入角色/分集等后续阶段。产物存在即视为
+    # 本阶段完成。为不打断存量项目（角色/分集已在推进、甚至视频已在渲染），
+    # 只要分集已经建立就不再回灌这个新阶段；存量项目仍可用手动端点重跑。
+    script_processed = has_script_process_result(project_dir)
+    script_process_pending = (
+        ingested and not script_processed and not episodes
+    )
 
     global_status = {
         "ingested": ingested,
+        "script_processed": script_processed,
+        "script_process_pending": script_process_pending,
         "configured": configured,
         "characters": len(characters),
         "episodes": len(episodes),
@@ -282,6 +293,8 @@ async def compute_pipeline_status(
     if not (ingested and configured and characters and episodes and portraits_done):
         if not ingested:
             next_step = "ingest"
+        elif script_process_pending:
+            next_step = "script_process"
         elif not configured:
             next_step = "configure"
         elif not characters:

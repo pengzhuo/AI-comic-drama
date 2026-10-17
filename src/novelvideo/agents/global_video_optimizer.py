@@ -16,7 +16,25 @@ from PIL import Image as PILImage
 
 from novelvideo.brainclaw_contract import BrainClawProfile
 from novelvideo.model_gateway_runtime import model_gateway_output_retries
+from novelvideo.shared.transient_retry import (
+    call_with_transient_retry,
+    is_retryable_transient,
+)
 from novelvideo.utils.source_language import asset_language_instruction
+
+# An empty completion from the text model used to drop the beat's motion prompt
+# (the surrounding loop logs it and moves on), which then failed the whole
+# optimize stage — and with it the one-click run. Repeating the same request is
+# cheap (an empty answer bills no output tokens) and usually clears the flake.
+# ``GLOBAL_OPTIMIZE_RETRY_ATTEMPTS=1`` restores the old behaviour.
+GLOBAL_OPTIMIZE_RETRY_ATTEMPTS = max(
+    int(os.environ.get("GLOBAL_OPTIMIZE_RETRY_ATTEMPTS", "3") or 1), 1
+)
+GLOBAL_OPTIMIZE_RETRY_BACKOFF_SECONDS = (5.0, 20.0)
+
+
+class EmptyOptimizerResponse(RuntimeError):
+    """The model answered with no text for a beat's motion prompt."""
 
 
 class ReviewResult(BaseModel):
@@ -383,14 +401,29 @@ Output the {output_label} motion prompt directly. No JSON, explanation, or markd
         print(f"\n[GlobalVideoOptimizer] Beat {bn}: sending sketch frame + context")
         print(f"[GlobalVideoOptimizer] Beat {bn}: task length={len(task)} chars")
 
-        response = await agent.run(user_prompt)
+        # Organization egress must not repeat a submit (that is the same rule the
+        # gateway applies to platform-level retries), so it stays single-shot.
+        attempts = GLOBAL_OPTIMIZE_RETRY_ATTEMPTS if model_gateway_output_retries(1) else 1
 
-        if not response.output:
-            raise RuntimeError(f"Beat {bn}: AI 返回空内容")
+        async def _generate() -> str:
+            response = await agent.run(user_prompt)
+            text = str(response.output or "").strip()
+            if not text:
+                raise EmptyOptimizerResponse(f"Beat {bn}: AI 返回空内容")
+            return text
 
-        prompt = response.output.strip()
-        if not prompt:
-            raise RuntimeError(f"Beat {bn}: AI 返回空内容")
+        def _retryable(exc: BaseException) -> bool:
+            if isinstance(exc, EmptyOptimizerResponse):
+                return True
+            return is_retryable_transient(exc)
+
+        prompt = await call_with_transient_retry(
+            _generate,
+            attempts=attempts,
+            backoff=GLOBAL_OPTIMIZE_RETRY_BACKOFF_SECONDS,
+            is_retryable=_retryable,
+            label=f"global optimize beat {bn}",
+        )
 
         result = {
             "beat_number": bn,

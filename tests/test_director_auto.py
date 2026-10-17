@@ -81,6 +81,9 @@ def test_store_round_trips_durable_run(tmp_path: Path) -> None:
         baseline_task_ids=("old",),
         handled_task_ids=("done",),
         voice_policy="system",
+        stage_key="single_video",
+        stage_attempts=2,
+        next_attempt_at=1755000000.5,
     )
     store.upsert(run)
 
@@ -88,8 +91,58 @@ def test_store_round_trips_durable_run(tmp_path: Path) -> None:
 
     assert loaded == run
     assert loaded is not None
+    assert loaded.stage_key == "single_video"
+    assert loaded.stage_attempts == 2
+    assert loaded.next_attempt_at == 1755000000.5
     assert loaded.context.output_dir == context(tmp_path).output_dir
     assert store.active() == [run]
+
+
+def test_store_migrates_a_run_table_without_retry_columns(tmp_path: Path) -> None:
+    """A running deployment's DB predates the stage retry columns."""
+
+    import sqlite3
+
+    db_path = tmp_path / "director-auto.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(db_path)
+    legacy.execute(
+        """
+        CREATE TABLE director_auto_runs (
+          run_id TEXT PRIMARY KEY,
+          username TEXT NOT NULL,
+          project_id TEXT NOT NULL,
+          episode INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          activated_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          context_json TEXT NOT NULL,
+          baseline_task_ids_json TEXT NOT NULL,
+          handled_task_ids_json TEXT NOT NULL,
+          recovery_keys_json TEXT NOT NULL DEFAULT '[]',
+          voice_policy TEXT NOT NULL DEFAULT '',
+          last_error TEXT NOT NULL DEFAULT '',
+          scope TEXT NOT NULL DEFAULT 'episode',
+          target_episodes INTEGER NOT NULL DEFAULT 0,
+          config_json TEXT NOT NULL DEFAULT '{}',
+          driver TEXT NOT NULL DEFAULT 'agent',
+          owner_token TEXT NOT NULL DEFAULT '',
+          lease_expires_at REAL NOT NULL DEFAULT 0,
+          UNIQUE(username, project_id)
+        )
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = DirectorAutoStore(db_path)
+    store.upsert(run_record(tmp_path))
+    loaded = store.get("alice", "project-1")
+
+    assert loaded is not None
+    assert loaded.stage_key == ""
+    assert loaded.stage_attempts == 0
+    assert loaded.next_attempt_at == 0.0
 
 
 def test_store_lease_claim_is_atomic_and_expired_lease_can_be_reclaimed(tmp_path: Path) -> None:
@@ -305,8 +358,74 @@ async def test_completed_task_notifies_and_triggers_one_server_continuation(
 
 
 @pytest.mark.asyncio
+async def test_completed_task_that_does_not_advance_the_stage_still_stops(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A completed task that leaves the same stage pending must not spin forever.
+
+    The realistic shape: one task for the stage finishes, the stage is still the
+    next step, and the dispatcher refuses to enqueue it again (its dedupe
+    signature is already recorded). The coordinator must spend a bounded budget
+    and then pause, both because a retry can fix a written-but-unseen output and
+    because an unbounded loop would burn LLM turns and provider credits.
+    """
+
+    completed_task = task(
+        "tts-1", "completed", task_type="audio_generation_indextts2"
+    )
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [completed_task]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+            self.continuations = 0
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _continue_owned(self, run):
+            # Never writes a task: the coordinator has to stop on its own.
+            self.continuations += 1
+            self._remember_continuation(run.run_id, wrote=False, note="")
+            return False
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    # ``run_record`` activates the run in the distant past, so the taskless branch
+    # is reachable immediately; the retry budget is what keeps this bounded.
+    monkeypatch.setattr(director_auto, "STAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        for _ in range(600):
+            saved = store.get("alice", "project-1")
+            if saved is not None and saved.status == "paused":
+                break
+            await asyncio.sleep(0.01)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "paused"
+        assert saved.stage_attempts == director_auto.MAX_STAGE_ATTEMPTS
+        assert saved.stage_key == "audio_generation_indextts2"
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("store_read_delay", [0, 0.1])
-async def test_failure_pauses_without_starting_downstream_turn(
+async def test_failure_retries_before_pausing_without_agent_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     store_read_delay: float,
@@ -339,6 +458,8 @@ async def test_failure_pauses_without_starting_downstream_turn(
 
     monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
     monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    # Backoff is a production concern; the retry contract is what this asserts.
+    monkeypatch.setattr(director_auto, "STAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
     store = DirectorAutoStore(tmp_path / "director-auto.db")
     store.upsert(run_record(tmp_path))
     original_get = store.get
@@ -353,15 +474,126 @@ async def test_failure_pauses_without_starting_downstream_turn(
 
     try:
         coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
-        # Failure notification is emitted only after the paused state is persisted.
+        await asyncio.wait_for(notified.wait(), timeout=5)
+
+        saved = store.get("alice", "project-1")
+        # The first failure must not abandon the run: the stage is retried.
+        assert saved is not None and saved.status == "running"
+        assert saved.stage_key == "identity_image"
+        assert saved.stage_attempts >= 1
+        assert "正在自动重试" in coordinator.notifications[0]
+
+        for _ in range(600):
+            saved = store.get("alice", "project-1")
+            if saved is not None and saved.status == "paused":
+                break
+            await asyncio.sleep(0.01)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "paused"
+        # The pause still carries the failure that started the retry chain.
+        assert "upstream rejected" in saved.last_error
+        assert saved.stage_attempts == director_auto.MAX_STAGE_ATTEMPTS
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stage_retry_can_be_disabled_for_immediate_pause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``DIRECTOR_AUTO_STAGE_RETRY=0`` restores pause-on-first-failure."""
+
+    failed = task("new-failed", "failed")
+    failed.error = "upstream rejected"
+    notified = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [failed]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+            self.continuations = 0
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            notified.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            self.continuations += 1
+            return True
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    monkeypatch.setenv(director_auto.STAGE_RETRY_ENV, "0")
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
         await asyncio.wait_for(notified.wait(), timeout=5)
 
         saved = store.get("alice", "project-1")
         assert saved is not None and saved.status == "paused"
         assert coordinator.continuations == 0
         assert "upstream rejected" in coordinator.notifications[0]
+        # The kill switch means no attempt was spent, and the message must not
+        # claim otherwise.
+        assert "已自动重试 0 次" in coordinator.notifications[0]
     finally:
         await coordinator.shutdown()
+
+
+def test_is_fatal_failure_never_spends_the_retry_budget() -> None:
+    credits = task("billing", "failed", error="insufficient credits for user u: required 3, available 0")
+    credits.metadata = {"error_code": "INSUFFICIENT_CREDITS"}
+    egress = task("egress", "failed", error="organization egress is denied")
+    egress.metadata = {"error_code": "ORG_EGRESS_DENIED"}
+    cancelled = task("cancelled", "cancelled")
+    transient = task("flaky", "failed", error="HTTP 502 Bad Gateway")
+    overflow = task("script_process", "failed", error="第 3/12 段输出超窗：请核实真实上下文窗口")
+    overflow.metadata = {"error_code": "MODEL_CONTEXT_BUDGET_EXCEEDED"}
+
+    assert director_auto._is_fatal_failure(credits) == "积分不足，请联系管理员充值（insufficient credits for user u: required 3, available 0）"
+    assert director_auto._is_fatal_failure(egress)
+    assert director_auto._is_fatal_failure(cancelled) == "任务已取消"
+    assert director_auto._is_fatal_failure(transient) is None
+    # 上下文超窗是确定性失败：重试整个阶段只会重复同样的失败，因此直接暂停。
+    assert "上下文预算不足" in (director_auto._is_fatal_failure(overflow) or "")
+
+
+def test_stage_retry_delay_walks_the_backoff_and_saturates() -> None:
+    assert director_auto._stage_retry_delay(1) == 10.0
+    assert director_auto._stage_retry_delay(2) == 30.0
+    assert director_auto._stage_retry_delay(3) == 60.0
+    assert director_auto._stage_retry_delay(9) == 60.0
+
+
+def test_fatal_failure_pauses_immediately_without_retrying(
+    tmp_path: Path,
+) -> None:
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            stage_key="single_video",
+            stage_attempts=1,
+            recovery_keys=("dispatch:single_video:1:1-3", "missing-character-portrait:锦绣"),
+        )
+    )
+    coordinator = DirectorAutoCoordinator(store)
+    saved = store.get("alice", "project-1")
+
+    assert coordinator._clear_stage_signatures(saved) == ("missing-character-portrait:锦绣",)
 
 
 def test_missing_portrait_recovery_only_matches_exact_identity_failure() -> None:
@@ -475,19 +707,28 @@ async def test_repeated_missing_portrait_failure_pauses_instead_of_looping(
 
     monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
     monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(director_auto, "STAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
     store = DirectorAutoStore(tmp_path / "director-auto.db")
     store.upsert(
         run_record(tmp_path, recovery_keys=("missing-character-portrait:锦绣",))
     )
     coordinator = RecordingCoordinator(store)
 
-    coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
-    await asyncio.sleep(0.08)
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        for _ in range(600):
+            saved = store.get("alice", "project-1")
+            if saved is not None and saved.status == "paused":
+                break
+            await asyncio.sleep(0.01)
 
-    saved = store.get("alice", "project-1")
-    assert saved is not None and saved.status == "paused"
-    assert coordinator.continuations == 0
-    await coordinator.shutdown()
+        saved = store.get("alice", "project-1")
+        # The one-shot portrait repair is already spent, so this failure gets the
+        # bounded stage retry instead of an unbounded repair loop — and it does
+        # stop on its own once the budget is exhausted.
+        assert saved is not None and saved.status == "paused"
+    finally:
+        await coordinator.shutdown()
 
 
 @pytest.mark.asyncio
@@ -596,6 +837,9 @@ async def test_stalled_task_suspends_run_for_user_decision(
 
     monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
     monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    # The stall decision prompt is what this covers; the retry-first path is
+    # exercised in test_stalled_task_is_retried_before_suspending.
+    monkeypatch.setenv(director_auto.STAGE_RETRY_ENV, "0")
     store = DirectorAutoStore(tmp_path / "director-auto.db")
     store.upsert(run_record(tmp_path))
     coordinator = RecordingCoordinator(store)
@@ -610,6 +854,54 @@ async def test_stalled_task_suspends_run_for_user_decision(
         assert saved.last_error.startswith(director_auto.STALL_REASON_TAG)
         assert "无进度更新" in saved.last_error
         assert coordinator.continuations == 0
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stalled_task_is_retried_before_suspending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    stalled = task("new-stalled", "failed")
+    stalled.error = "任务已连续 30 分钟无进度更新，判定为卡死并暂停"
+    stalled.metadata = {"error_code": "TASK_TIMEOUT", "timeout_seconds": 30 * 60}
+    notified = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [stalled]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            notified.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            return True
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(director_auto, "STAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        await asyncio.wait_for(notified.wait(), timeout=5)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "running"
+        assert "正在自动重试" in coordinator.notifications[0]
     finally:
         await coordinator.shutdown()
 

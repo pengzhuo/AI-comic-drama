@@ -142,6 +142,13 @@ class IngestStart(BaseModel):
     spine_template: Optional[Literal["drama", "narrated"]] = None
 
 
+class ScriptProcessStart(BaseModel):
+    """导入后按内置制作流程包处理剧本。"""
+
+    force: bool = False
+    spine_template: Optional[Literal["drama", "narrated"]] = None
+
+
 # ── 角色 ──────────────────────────────────────────────────────────────────────
 
 

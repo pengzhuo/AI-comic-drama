@@ -2948,7 +2948,17 @@
           "fix": "Nếu đây là văn xuôi tiểu thuyết, hãy đổi loại dự án sang Có lời dẫn. Nếu là kịch bản, hãy bổ sung các dòng đầu cảnh."
         }
       }
-    }
+    },
+    "scriptProcessTitle": "Xử lý kịch bản",
+    "scriptProcessDesc": "Đọc toàn bộ kịch bản đã nhập theo gói quy trình làm phim AI tích hợp và tạo kịch bản sản xuất có cấu trúc. Tự động chạy sau khi nhập.",
+    "scriptProcessIdle": "Đang chờ",
+    "scriptProcessRunning": "Đang xử lý…",
+    "scriptProcessDone": "Hoàn tất",
+    "scriptProcessFailed": "Thất bại",
+    "scriptProcessStart": "Bắt đầu xử lý kịch bản",
+    "scriptProcessRerun": "Chạy lại",
+    "scriptProcessSummary": "{{characters}} nhân vật · {{scenes}} bối cảnh · {{gaps}} điểm chưa rõ",
+    "scriptProcessDegraded": "{{count}} đoạn bị chặn bởi kiểm duyệt nội dung, cần xem thủ công"
   },
   "video": {
     "voiceSelect": "Giọng đọc",
@@ -3010,6 +3020,7 @@
     "types": {
       "build_characters": "Dựng nhân vật",
       "ingest_fast": "Nhập truyện nhanh",
+      "script_process": "Xử lý kịch bản",
       "build_episodes": "Lên kế hoạch tập phim",
       "character_portrait": "Chân dung nhân vật",
       "identity_image": "Ảnh tạo hình",
@@ -3130,6 +3141,9 @@
         "beatVideoPromptSaved": "Đã lưu prompt video cho beat {{beatNum}}",
         "seedance2PromptStart": "Đang tạo prompt Seedance 2.0 cho beat {{beatNum}}",
         "seedance2PromptSaved": "Đã lưu prompt Seedance 2.0 cho beat {{beatNum}}"
+      },
+      "scriptProcess": {
+        "start": "Bắt đầu xử lý kịch bản theo gói quy trình làm phim…"
       },
       "submitting": "Đang gửi tác vụ…",
       "queued": "Tác vụ đã vào hàng đợi",

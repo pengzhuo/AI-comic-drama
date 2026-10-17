@@ -3062,7 +3062,17 @@
           "fix": "If this is novel prose, switch the project type to Narrated. If it is a script, add the scene headings."
         }
       }
-    }
+    },
+    "scriptProcessTitle": "Script processing",
+    "scriptProcessDesc": "Reads the imported script end to end with the built-in AI filmmaking process pack and writes a structured production script. Runs automatically after import.",
+    "scriptProcessIdle": "Waiting",
+    "scriptProcessRunning": "Processing…",
+    "scriptProcessDone": "Completed",
+    "scriptProcessFailed": "Failed",
+    "scriptProcessStart": "Start script processing",
+    "scriptProcessRerun": "Re-run",
+    "scriptProcessSummary": "{{characters}} characters · {{scenes}} scenes · {{gaps}} open questions",
+    "scriptProcessDegraded": "{{count}} segment(s) were blocked by content review and need a manual look"
   },
   "video": {
     "voiceSelect": "Voice",
@@ -3124,6 +3134,7 @@
     "types": {
       "build_characters": "Build characters",
       "ingest_fast": "Quick ingest",
+      "script_process": "Script processing",
       "build_episodes": "Plan episodes",
       "character_portrait": "Character portrait",
       "identity_image": "Identity image",
@@ -3244,6 +3255,9 @@
         "beatVideoPromptSaved": "Saved video prompt for beat {{beatNum}}",
         "seedance2PromptStart": "Generating Seedance 2.0 prompt for beat {{beatNum}}",
         "seedance2PromptSaved": "Saved Seedance 2.0 prompt for beat {{beatNum}}"
+      },
+      "scriptProcess": {
+        "start": "Processing the script with the filmmaking process pack…"
       },
       "submitting": "Submitting task…",
       "queued": "Task queued",

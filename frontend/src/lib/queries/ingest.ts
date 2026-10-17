@@ -177,3 +177,95 @@ export function useStartIngest(project: string) {
     },
   });
 }
+
+export interface ScriptProcessCharacter {
+  name?: string;
+  aliases?: string[];
+  role?: string;
+  first_appearance?: string;
+  notes?: string;
+}
+
+export interface ScriptProcessScene {
+  name?: string;
+  time_of_day?: string;
+  description?: string;
+}
+
+/** Structured result of the film-process-pack script processing stage. */
+export interface ScriptProcessResult {
+  understanding?: string;
+  characters?: ScriptProcessCharacter[];
+  scenes?: ScriptProcessScene[];
+  gaps?: string[];
+  chunks?: number;
+  degraded_chunks?: number;
+  source_chars?: number;
+  pack_version?: string;
+  spine_template?: string;
+  created_at?: string;
+}
+
+export interface ScriptProcessTaskSummary {
+  status: string;
+  task_id: string;
+  progress: number;
+  current_task: string;
+}
+
+export interface ScriptProcessStatus {
+  ok: true;
+  has_result: boolean;
+  task: ScriptProcessTaskSummary;
+  result: ScriptProcessResult | null;
+  production_script?: string;
+}
+
+const _SCRIPT_PROCESS_LIVE_STATUSES = new Set([
+  "submitting",
+  "queued",
+  "pending",
+  "starting",
+  "running",
+]);
+
+export function isScriptProcessRunning(status: string | undefined): boolean {
+  return !!status && _SCRIPT_PROCESS_LIVE_STATUSES.has(status);
+}
+
+export function useScriptProcess(project: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.scriptProcess(project),
+    queryFn: ({ signal }) =>
+      api
+        .get(p`api/v1/projects/${project}/script-process`, { signal })
+        .json<ScriptProcessStatus>(),
+    enabled: !!project && enabled,
+    // The stage is short-lived: poll only while a task is actually live.
+    refetchInterval: (query) =>
+      isScriptProcessRunning(query.state.data?.task?.status) ? 2000 : false,
+  });
+}
+
+export function useStartScriptProcess(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { force?: boolean } = {}) => {
+      const response = await jsonWithBackendError<TaskResponse | ErrorResponse>(
+        api.post(p`api/v1/projects/${project}/script-process/start`, {
+          json: params,
+          throwHttpErrors: false,
+        }),
+      );
+      if (!response.ok) {
+        throw new Error(response.error);
+      }
+      return response;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.scriptProcess(project),
+      });
+    },
+  });
+}

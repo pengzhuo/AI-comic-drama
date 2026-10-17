@@ -17,6 +17,14 @@ from typing import Any, Iterable
 from novelvideo.chat import service as chat_service
 from novelvideo.chat.live_events import broadcast_project_chat_event
 from novelvideo.project_context import ProjectContext, resolve_project_context
+from novelvideo.shared.billing_errors import (
+    BILLING_RULE_NOT_CONFIGURED_CODE,
+    BILLING_RULE_NOT_CONFIGURED_MESSAGE,
+    FEATURE_BILLING_IDENTITY_INVALID_CODE,
+    FEATURE_BILLING_IDENTITY_INVALID_MESSAGE,
+    INSUFFICIENT_CREDITS_CODE,
+    INSUFFICIENT_CREDITS_MESSAGE,
+)
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 from novelvideo.task_diagnostics import summarize_failure
 from novelvideo.task_state import TaskState, get_task_manager
@@ -26,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 AUTO_TASK_TYPES = frozenset({
     "ingest_fast",
+    "script_process",
     "build_characters",
     "build_scenes",
     "build_props",
@@ -76,6 +85,10 @@ STALL_ERROR_CODES = frozenset({"TASK_TIMEOUT", "TASK_STALLED"})
 #: Stable marker prepended to a stall pause reason so the pending decision
 #: survives a page reload (the reason is persisted on the durable run).
 STALL_REASON_TAG = "[stall]"
+#: Marker for the failure a granted retry is chasing. It keeps ``last_error``
+#: pointing at the *cause* while the run is retrying, so a later pause on a
+#: different path (e.g. no task in several turns) can still report it.
+RETRY_REASON_PREFIX = "[retry "
 #: Meta/bridge tools the agent uses to inspect its tool surface instead of
 #: operating on the project. Introspection must never count as a write: the
 #: bridge echoes the *described* tool name, so a turn that only described a
@@ -101,6 +114,105 @@ _READ_TOOL_PREFIXES = (
 #: Consecutive continuations without a new task that are tolerated before the
 #: durable run pauses and hands the decision back to the user.
 MAX_TASKLESS_CONTINUATIONS = 3
+#: Bounded auto-retry budget for one mainline stage. A transient task failure no
+#: longer pauses the whole run: the coordinator re-drives the same stage up to
+#: this many times and only then hands the decision back to the user. The budget
+#: is per stage (keyed on the task type the run is driving) and resets as soon as
+#: that stage makes progress, so unrelated later stages keep their own budget.
+MAX_STAGE_ATTEMPTS = 3
+#: Backoff before retry N (1-based). Indexing beyond the tuple repeats the last
+#: value, so a smaller budget than the tuple length stays cheap to reason about.
+STAGE_RETRY_BACKOFF_SECONDS = (10.0, 30.0, 60.0)
+#: ``DIRECTOR_AUTO_STAGE_RETRY=0`` restores the previous pause-on-first-failure
+#: behaviour for an operator without a code change.
+STAGE_RETRY_ENV = "DIRECTOR_AUTO_STAGE_RETRY"
+#: Error codes where an automatic retry is pointless or unsafe: retrying cannot
+#: create credits, grant a missing permission, or cross a denied egress.
+_FATAL_ERROR_CODES = frozenset(
+    {
+        INSUFFICIENT_CREDITS_CODE,
+        BILLING_RULE_NOT_CONFIGURED_CODE,
+        FEATURE_BILLING_IDENTITY_INVALID_CODE,
+        "FEATURE_SETTLEMENT_RESOLUTION_FAILED",
+        "ORG_EGRESS_DENIED",
+        "ORG_SERVICE_EGRESS_DENIED",
+        "EGRESS_OPERATION_REPLAYED",
+        # The request is rebuilt deterministically on every attempt, so a
+        # configured-window overflow cannot resolve itself by retrying; the
+        # per-stage workflow already spent its own split/retry budget first.
+        "MODEL_CONTEXT_BUDGET_EXCEEDED",
+    }
+)
+_FATAL_ERROR_LABELS = {
+    INSUFFICIENT_CREDITS_CODE: INSUFFICIENT_CREDITS_MESSAGE,
+    BILLING_RULE_NOT_CONFIGURED_CODE: BILLING_RULE_NOT_CONFIGURED_MESSAGE,
+    FEATURE_BILLING_IDENTITY_INVALID_CODE: FEATURE_BILLING_IDENTITY_INVALID_MESSAGE,
+    "MODEL_CONTEXT_BUDGET_EXCEEDED": "模型上下文预算不足（自动拆分与重试已用尽）",
+}
+#: Free-text fallback for failures that carry no structured code. Kept narrow on
+#: purpose: a false positive only costs the retry we would not have spent, but a
+#: false negative retries a doomed request three times.
+_FATAL_ERROR_TEXT_RE = re.compile(
+    r"insufficient credits|unauthorized|forbidden|积分不足|计费规则未配置|"
+    r"无权限|未授权|egress is denied|EGRESS_DENIED",
+    re.IGNORECASE,
+)
+
+
+def _stage_retry_enabled() -> bool:
+    """Whether the bounded auto-retry is active (operator kill switch)."""
+
+    raw = os.environ.get(STAGE_RETRY_ENV, "1").strip().lower()
+    return raw not in {"0", "off", "false", "no"}
+
+
+def _stage_retry_delay(attempt: int) -> float:
+    """Seconds to wait before retry ``attempt`` (1-based)."""
+
+    if not STAGE_RETRY_BACKOFF_SECONDS:
+        return 0.0
+    index = min(max(int(attempt), 1), len(STAGE_RETRY_BACKOFF_SECONDS)) - 1
+    return float(STAGE_RETRY_BACKOFF_SECONDS[index])
+
+
+def _is_fatal_failure(task: TaskState) -> str | None:
+    """Return a human-facing reason when retrying this failure cannot help.
+
+    Billing, egress and user cancellation are terminal by construction: the same
+    request will fail again, so spending the retry budget only delays the
+    decision the user has to make.
+    """
+
+    code = _task_error_code(task)
+    if code in _FATAL_ERROR_CODES:
+        label = _FATAL_ERROR_LABELS.get(code, code)
+        detail = str(task.error or "").strip()
+        if detail and label not in detail:
+            return f"{label}（{detail[:160]}）"
+        return label
+    if task.status == "cancelled":
+        return "任务已取消"
+    text = f"{task.error or ''} {task.current_task or ''}"[:600]
+    if _FATAL_ERROR_TEXT_RE.search(text):
+        return "上游拒绝且重试无法解决，请检查账号额度或权限"
+    return None
+
+
+def _stage_key_for(task: TaskState | None, run: DirectorAutoRun) -> str:
+    """Budget key of the stage the run is currently driving."""
+
+    task_type = str(getattr(task, "task_type", "") or "")
+    if task_type:
+        return task_type
+    return run.stage_key or "unknown"
+
+
+def _retry_pause_detail(run: DirectorAutoRun) -> str:
+    """The failure that armed the retry, for a pause reached on another path."""
+
+    if not run.last_error.startswith(RETRY_REASON_PREFIX):
+        return ""
+    return run.last_error.split("] ", 1)[-1].strip()
 
 
 def _event_tool_name(event: dict[str, Any]) -> str:
@@ -281,6 +393,12 @@ class DirectorAutoRun:
     target_episodes: int = 0
     config_json: str = "{}"
     driver: str = "agent"
+    #: Stage the coordinator is currently driving and how many automatic retries
+    #: it has already spent on it. ``next_attempt_at`` is the epoch gate that
+    #: keeps a retry from hammering a provider that just failed.
+    stage_key: str = ""
+    stage_attempts: int = 0
+    next_attempt_at: float = 0.0
 
     @property
     def context(self) -> ProjectContext:
@@ -324,6 +442,9 @@ class DirectorAutoStore:
               target_episodes INTEGER NOT NULL DEFAULT 0,
               config_json TEXT NOT NULL DEFAULT '{}',
               driver TEXT NOT NULL DEFAULT 'agent',
+              stage_key TEXT NOT NULL DEFAULT '',
+              stage_attempts INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at REAL NOT NULL DEFAULT 0,
               owner_token TEXT NOT NULL DEFAULT '',
               lease_expires_at REAL NOT NULL DEFAULT 0,
               UNIQUE(username, project_id)
@@ -374,6 +495,21 @@ class DirectorAutoStore:
                 "ALTER TABLE director_auto_runs "
                 "ADD COLUMN driver TEXT NOT NULL DEFAULT 'agent'"
             )
+        if "stage_key" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN stage_key TEXT NOT NULL DEFAULT ''"
+            )
+        if "stage_attempts" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN stage_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "next_attempt_at" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
+            )
         conn.commit()
         return conn
 
@@ -399,6 +535,9 @@ class DirectorAutoStore:
             target_episodes=int(row["target_episodes"] or 0),
             config_json=str(row["config_json"] or "{}"),
             driver=str(row["driver"] or "agent"),
+            stage_key=str(row["stage_key"] or ""),
+            stage_attempts=int(row["stage_attempts"] or 0),
+            next_attempt_at=float(row["next_attempt_at"] or 0.0),
         )
 
     def upsert(self, run: DirectorAutoRun) -> None:
@@ -409,8 +548,9 @@ class DirectorAutoStore:
                   run_id, username, project_id, episode, status, activated_at,
                   updated_at, context_json, baseline_task_ids_json,
                   handled_task_ids_json, recovery_keys_json, voice_policy, last_error,
-                  scope, target_episodes, config_json, driver
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  scope, target_episodes, config_json, driver,
+                  stage_key, stage_attempts, next_attempt_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username, project_id) DO UPDATE SET
                   run_id=excluded.run_id,
                   episode=excluded.episode,
@@ -427,6 +567,9 @@ class DirectorAutoStore:
                   target_episodes=excluded.target_episodes,
                   config_json=excluded.config_json,
                   driver=excluded.driver,
+                  stage_key=excluded.stage_key,
+                  stage_attempts=excluded.stage_attempts,
+                  next_attempt_at=excluded.next_attempt_at,
                   owner_token=CASE
                     WHEN director_auto_runs.run_id != excluded.run_id THEN ''
                     ELSE director_auto_runs.owner_token
@@ -454,6 +597,9 @@ class DirectorAutoStore:
                     int(run.target_episodes or 0),
                     run.config_json or "{}",
                     run.driver,
+                    run.stage_key,
+                    int(run.stage_attempts or 0),
+                    float(run.next_attempt_at or 0.0),
                 ),
             )
 
@@ -554,7 +700,8 @@ class DirectorAutoStore:
                 SET episode=?, status=?, activated_at=?, updated_at=?, context_json=?,
                     baseline_task_ids_json=?, handled_task_ids_json=?,
                     recovery_keys_json=?, voice_policy=?, last_error=?,
-                    scope=?, target_episodes=?, config_json=?, driver=?
+                    scope=?, target_episodes=?, config_json=?, driver=?,
+                    stage_key=?, stage_attempts=?, next_attempt_at=?
                 WHERE run_id=? AND status='running' AND owner_token=?
                   AND lease_expires_at>?
                 """,
@@ -573,6 +720,9 @@ class DirectorAutoStore:
                     int(run.target_episodes or 0),
                     run.config_json or "{}",
                     run.driver,
+                    run.stage_key,
+                    int(run.stage_attempts or 0),
+                    float(run.next_attempt_at or 0.0),
                     run.run_id,
                     owner_token,
                     current,
@@ -648,6 +798,7 @@ def _task_label(task: TaskState) -> str:
         return f"第 {task.episode} 集 Beat {task.beat_num} 提示词"
     labels = {
         "ingest_fast": "项目摄入",
+        "script_process": "剧本处理",
         "build_characters": "角色构建",
         "build_props": "道具构建",
         "build_episodes": "剧集规划",
@@ -839,6 +990,11 @@ class DirectorAutoCoordinator:
                 "status": "running",
                 "updated_at": _utc_now(),
                 "last_error": "",
+                # A user decision is a fresh start: do not hold the attempts
+                # spent before the pause against the next failure.
+                "stage_key": "",
+                "stage_attempts": 0,
+                "next_attempt_at": 0.0,
             }
         )
         await asyncio.to_thread(self.store.upsert, updated)
@@ -1010,6 +1166,56 @@ class DirectorAutoCoordinator:
         if worker is not None and worker is not asyncio.current_task():
             worker.cancel()
         return updated
+
+    def _clear_stage_signatures(self, run: DirectorAutoRun) -> tuple[str, ...]:
+        """Drop the dispatcher's per-stage dedupe keys so a retry can re-enqueue.
+
+        ``recovery_keys`` mixes two families: ``missing-character-portrait:*``
+        repairs, which must survive, and ``dispatch:*`` stage signatures, which
+        must not, or the deterministic fast path would refuse to re-enqueue the
+        very stage being retried. Every dispatch signature is dropped rather than
+        only the failing stage's prefix, because the task type a stage executes
+        as does not always match its signature segment (sketches run as
+        ``sketch_grid_generation`` but sign as ``sketch_generation``).
+        """
+
+        return tuple(key for key in run.recovery_keys if not key.startswith("dispatch:"))
+
+    async def _grant_stage_retry(
+        self,
+        *,
+        run: DirectorAutoRun,
+        task: TaskState | None,
+        reason: str,
+    ) -> tuple[bool, int]:
+        """Spend one bounded retry on the stage the durable run is driving.
+
+        Returns ``(granted, attempt)``. When granted, the run is updated with the
+        new budget, the stage dedupe signatures are cleared and a backoff gate is
+        armed; the caller only has to notify and keep the loop going.
+        """
+
+        if not _stage_retry_enabled():
+            return False, 0
+        key = _stage_key_for(task, run)
+        attempt = run.stage_attempts + 1 if run.stage_key == key else 1
+        if attempt > MAX_STAGE_ATTEMPTS:
+            return False, attempt
+        now = datetime.now(timezone.utc).timestamp()
+        granted = DirectorAutoRun(
+            **{
+                **asdict(run),
+                "updated_at": _utc_now(),
+                "recovery_keys": self._clear_stage_signatures(run),
+                "stage_key": key,
+                "stage_attempts": attempt,
+                "next_attempt_at": now + _stage_retry_delay(attempt),
+                "last_error": f"{RETRY_REASON_PREFIX}{attempt}/{MAX_STAGE_ATTEMPTS}] {reason}",
+            }
+        )
+        if not await self._update_owned(granted):
+            return False, attempt
+        return True, attempt
 
     async def _broadcast_status(
         self,
@@ -1327,6 +1533,11 @@ class DirectorAutoCoordinator:
             run = await asyncio.to_thread(self.store.get, username, project_id)
             if run is None or run.run_id != run_id or run.status != "running":
                 return
+            if run.next_attempt_at > datetime.now(timezone.utc).timestamp():
+                # A retry is armed but its backoff has not elapsed yet: give the
+                # upstream a moment instead of hammering it with the same request.
+                await asyncio.sleep(POLL_SECONDS)
+                continue
             tasks = await asyncio.to_thread(get_task_manager().list_tasks_for_project, run.context)
             relevant = _relevant_tasks(run, tasks)
             baseline = set(run.baseline_task_ids)
@@ -1348,26 +1559,59 @@ class DirectorAutoCoordinator:
                 if not await self._owns_run(run_id):
                     return
                 handled.update(task.task_id for task in terminal)
+                failures = [task for task in terminal if task.status != "completed"]
+                completed = [task for task in terminal if task.status == "completed"]
+                # The retry budget belongs to the stage the run is driving and is
+                # cleared only when the run actually moves on to another stage.
+                # A completion *inside* the same stage must not clear it: for a
+                # single-task stage whose completion does not satisfy the status
+                # probe the dispatcher reads (something wrote less than the probe
+                # looks for), clearing here would let the coordinator re-enqueue
+                # the same stage forever instead of stopping after the budget.
+                observed_key = str((completed or terminal)[-1].task_type or run.stage_key)
+                stage_reset: dict[str, Any] = {}
+                if observed_key != run.stage_key:
+                    stage_reset = {
+                        "stage_key": observed_key,
+                        "stage_attempts": 0,
+                        "next_attempt_at": 0.0,
+                        "last_error": "",
+                    }
                 updated = DirectorAutoRun(
                     **{
                         **asdict(run),
                         "updated_at": _utc_now(),
                         "handled_task_ids": tuple(sorted(handled)),
+                        **stage_reset,
                     }
                 )
                 if not await self._update_owned(updated):
                     return
-                failures = [task for task in terminal if task.status != "completed"]
                 if failures:
                     failed = failures[0]
                     reason = failed.error or failed.current_task or failed.status
                     reason = _failure_reason_with_detail(failed, reason)
                     if _task_is_stalled(failed):
-                        # The task stopped reporting progress (idle watchdog). This
-                        # is not a hard failure: keep the durable run resumable and
-                        # let the user decide whether to keep waiting or stop.
+                        # The task stopped reporting progress (idle watchdog).
+                        # Treat it as an ordinary transient failure while the
+                        # stage still has retry budget, and only offer the user a
+                        # decision once that budget is spent.
                         if not await self._owns_run(run_id):
                             return
+                        granted, attempt = await self._grant_stage_retry(
+                            run=updated,
+                            task=failed,
+                            reason=f"卡住：{reason}",
+                        )
+                        if granted:
+                            await self._notify(
+                                updated,
+                                f"{_task_label(failed)}长时间没有进度更新，正在自动重试"
+                                f"（第 {attempt}/{MAX_STAGE_ATTEMPTS} 次）。",
+                            )
+                            taskless_continuations = 0
+                            await asyncio.sleep(POLL_SECONDS)
+                            continue
                         await self._suspend_owned(
                             run_id=run_id,
                             username=username,
@@ -1434,6 +1678,36 @@ class DirectorAutoCoordinator:
                             f"本集自动已暂停：未能启动「{character}」肖像生成，请检查角色肖像配置。",
                         )
                         return
+                    fatal = _is_fatal_failure(failed)
+                    if fatal:
+                        # Billing/permission/cancellation: a retry cannot change
+                        # the outcome, so stop instead of burning the budget.
+                        await self._pause_owned(
+                            run_id=run_id,
+                            username=username,
+                            project_id=project_id,
+                            reason=_failure_reason_with_detail(failed, fatal),
+                            terminal_task_id=failed.task_id,
+                        )
+                        await self._notify(
+                            updated,
+                            f"本集自动已暂停：{_task_label(failed)}失败，{fatal}，无需自动重试。",
+                        )
+                        return
+                    granted, attempt = await self._grant_stage_retry(
+                        run=updated,
+                        task=failed,
+                        reason=reason,
+                    )
+                    if granted:
+                        await self._notify(
+                            updated,
+                            f"{_task_label(failed)}执行失败，正在自动重试"
+                            f"（第 {attempt}/{MAX_STAGE_ATTEMPTS} 次）。",
+                        )
+                        taskless_continuations = 0
+                        await asyncio.sleep(POLL_SECONDS)
+                        continue
                     await self._pause_owned(
                         run_id=run_id,
                         username=username,
@@ -1443,7 +1717,8 @@ class DirectorAutoCoordinator:
                     )
                     await self._notify(
                         updated,
-                        f"本集自动已暂停：{_task_label(failed)}{('已取消' if failed.status == 'cancelled' else '失败')}，{reason}。",
+                        f"本集自动已暂停：{_task_label(failed)}{('已取消' if failed.status == 'cancelled' else '失败')}，{reason}。"
+                        f"（已自动重试 {max(0, min(attempt - 1, MAX_STAGE_ATTEMPTS))} 次仍未成功）",
                     )
                     return
                 compose = next((task for task in terminal if task.task_type == "compose_episode"), None)
@@ -1505,7 +1780,13 @@ class DirectorAutoCoordinator:
                 if not await self._owns_run(run_id):
                     return
                 await self._continue_owned(updated)
-                taskless_continuations = 0
+                # Deliberately *not* resetting ``taskless_continuations`` here: a
+                # task can complete without moving the stage along (its output did
+                # not satisfy the status probe the dispatcher reads). Keeping the
+                # counter makes the taskless budget below the backstop for that,
+                # so the run pauses after the retry budget instead of re-enqueuing
+                # the same stage forever. It is cleared as soon as any task is
+                # actually running (see the ``active`` branch above).
                 await asyncio.sleep(POLL_SECONDS)
                 continue
 
@@ -1527,6 +1808,23 @@ class DirectorAutoCoordinator:
                     )
                     if note:
                         reason = f"{reason}（最后一次工具调用：{note}）"
+                    retried_from = _retry_pause_detail(run)
+                    if retried_from:
+                        reason = f"{reason}；最后失败原因：{retried_from}"
+                    granted, attempt = await self._grant_stage_retry(
+                        run=run,
+                        task=None,
+                        reason=reason,
+                    )
+                    if granted:
+                        await self._notify(
+                            run,
+                            f"自动续跑连续几轮没有产生新任务，正在重新驱动"
+                            f"（第 {attempt}/{MAX_STAGE_ATTEMPTS} 次）。",
+                        )
+                        taskless_continuations = 0
+                        await asyncio.sleep(POLL_SECONDS)
+                        continue
                     await self._pause_owned(
                         run_id=run_id,
                         username=username,

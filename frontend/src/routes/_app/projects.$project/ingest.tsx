@@ -42,6 +42,7 @@ import {
 import { FormatCheckDetailsDialog } from "@/components/ingest/FormatCheckDetailsDialog";
 import { NovelFormatDialog } from "@/components/ingest/NovelFormatDialog";
 import { KnowledgeGraphVisualization } from "@/components/ingest/KnowledgeGraphVisualization";
+import { ScriptProcessCard } from "@/components/ingest/ScriptProcessCard";
 import { IngestElapsedTime } from "@/components/ingest/IngestElapsedTime";
 import { useStyles } from "@/lib/queries/styles";
 import { useCancelTask, useTasks } from "@/lib/queries/tasks";
@@ -2156,6 +2157,13 @@ export function IngestPageContent({ project }: { project: string }) {
                       })}
                     </div>
                   </div>
+
+                  {/* Film-process-pack script processing (auto after import, re-runnable) */}
+                  <ScriptProcessCard
+                    project={project}
+                    enabled={Boolean(project)}
+                    className={INGEST_SURFACE_SUBTLE_CLASS}
+                  />
 
                   {/* Chapter table */}
                   <div className={cn("overflow-hidden rounded-lg border", INGEST_SURFACE_SUBTLE_CLASS)}>

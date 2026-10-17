@@ -342,14 +342,32 @@ async def generate_script(
     logger.info("[%s] EP%d generate_script", project, episode_num)
     resolved = await resolve_project_scope(project, user, required_role="editor")
     ctx = resolved.ctx
-    username = resolved.username
-    project_name = resolved.project_name
-    output_dir = resolved.output_dir
     store = (
         await make_sqlite_store_for_context(ctx)
         if ctx
-        else await make_sqlite_store(username, project_name)
+        else await make_sqlite_store(resolved.username, resolved.project_name)
     )
+    return await enqueue_script_writer_task(
+        ctx=ctx,
+        store=store,
+        episode_num=episode_num,
+        output_dir=resolved.output_dir,
+    )
+
+
+async def enqueue_script_writer_task(
+    *,
+    ctx: Any,
+    store: Any,
+    episode_num: int,
+    output_dir: str,
+) -> dict[str, Any]:
+    """Enqueue this episode's script generation with the REST payload.
+
+    Extracted so the deterministic auto pipeline can start the script stage
+    without an agent turn.
+    """
+
     episode = store.get_episode(episode_num)
     if not getattr(episode, "identity_ids", None):
         return {
@@ -366,26 +384,26 @@ async def generate_script(
     paths = PathResolver(output_dir, episode_num)
     paths.clean_sketches()
 
-    if ctx is not None:
-        queued = await get_task_backend().enqueue_project_task(
-            ctx,
-            product_surface="mainline",
-            task_type="script_writer",
-            queue_kind="default",
-            episode=episode_num,
-            payload={"episode": episode_num, "config": config, "output_dir": output_dir},
-        )
-        return {
-            "ok": True,
-            "task_type": "script_writer",
-            "task_id": queued.task_state.task_id,
-            "task_key": project_task_state_key("script_writer", ctx.project_id, episode_num),
-            "backend": queued.backend,
-            "queue": queued.queue,
-            "message": f"第 {episode_num} 集剧本生成任务已进入队列",
-        }
+    if ctx is None:
+        return {"ok": False, "error": "剧本生成需要 project context"}
 
-    return {"ok": False, "error": "剧本生成需要 project context"}
+    queued = await get_task_backend().enqueue_project_task(
+        ctx,
+        product_surface="mainline",
+        task_type="script_writer",
+        queue_kind="default",
+        episode=episode_num,
+        payload={"episode": episode_num, "config": config, "output_dir": output_dir},
+    )
+    return {
+        "ok": True,
+        "task_type": "script_writer",
+        "task_id": queued.task_state.task_id,
+        "task_key": project_task_state_key("script_writer", ctx.project_id, episode_num),
+        "backend": queued.backend,
+        "queue": queued.queue,
+        "message": f"第 {episode_num} 集剧本生成任务已进入队列",
+    }
 
 
 @router.patch("/projects/{project}/episodes/{episode_num}/beats/{beat_num}")

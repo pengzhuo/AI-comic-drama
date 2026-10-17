@@ -311,6 +311,66 @@ def _newapi_request_id_from_headers(headers: Any) -> str:
 
 NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS = 1800.0
 
+# A transient gateway blip (upstream 5xx, rate limiting, a connection that never
+# went out) used to fail the whole beat — and, in the one-click pipeline, pause
+# the entire episode for an error the provider had already recovered from.
+#
+# The credit reservation is created once per logical request, so a retry
+# re-uses it: a successful retry bills the operator once, and only the final
+# failure is charged/refunded under the usual provider-cost rules. Note the
+# deliberate asymmetry with ``is_definite_no_cost_http_rejection``: a 5xx may
+# already have been accepted and paid upstream, so retrying risks one extra
+# upstream generation on that (rare) path. Set
+# ``NEWAPI_IMAGE_RETRY_ATTEMPTS=1`` to restore the old never-retry behaviour.
+NEWAPI_IMAGE_RETRY_ATTEMPTS = max(int(os.environ.get("NEWAPI_IMAGE_RETRY_ATTEMPTS", "3") or 1), 1)
+NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS = (5.0, 20.0)
+_NEWAPI_IMAGE_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+# Only transport failures raised *before* the request body is on the wire are
+# safe to repeat; a read timeout or protocol error may already have paid work.
+_NEWAPI_IMAGE_RETRYABLE_TRANSPORT = (
+    "ConnectError",
+    "ConnectTimeout",
+    "PoolTimeout",
+)
+# A content-policy 400 is a *definite no-cost* rejection (see
+# ``is_definite_no_cost_http_rejection``), and the provider's own message asks the
+# caller to retry. Repeating the identical prompt is therefore billing-safe and
+# occasionally succeeds on a moderator hiccup; it is a separate, smaller budget
+# than the transient one because a deterministic rejection cannot be talked out
+# of. ``NEWAPI_IMAGE_CONTENT_POLICY_RETRY_ATTEMPTS=0`` disables it.
+NEWAPI_IMAGE_CONTENT_POLICY_RETRY_ATTEMPTS = max(
+    int(os.environ.get("NEWAPI_IMAGE_CONTENT_POLICY_RETRY_ATTEMPTS", "1") or 0), 0
+)
+_NEWAPI_IMAGE_CONTENT_POLICY_MARKERS = (
+    "content_policy_violation",
+    "content policy",
+    "内容政策",
+    "content_policy",
+)
+
+
+def _newapi_image_retry_delay(attempt: int) -> float:
+    """Backoff before the next attempt (``attempt`` is the just-failed 1-based try)."""
+
+    backoff = NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS
+    return backoff[min(max(attempt, 1) - 1, len(backoff) - 1)]
+
+
+def _newapi_image_retryable_transport_error(exc: BaseException) -> bool:
+    return type(exc).__name__ in _NEWAPI_IMAGE_RETRYABLE_TRANSPORT
+
+
+def _newapi_image_response_is_content_policy(response: Any) -> bool:
+    """Whether a 4xx response is the provider's content-moderation rejection."""
+
+    text = getattr(response, "text", "")
+    if isinstance(text, (bytes, bytearray)):
+        text = text.decode("utf-8", "replace")
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.casefold()
+    return any(marker.casefold() in lowered for marker in _NEWAPI_IMAGE_CONTENT_POLICY_MARKERS)
+
 
 def _newapi_safe_header_summary(headers: Any) -> dict[str, str]:
     if not headers:
@@ -3879,18 +3939,70 @@ async def _call_newapi_image_api(
             timeout=NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS,
             follow_redirects=True,
         ) as client:
-            logger.info("DramaClawAPI image POST start: %s", request_context.get("endpoint"))
-            response = await client.post(
-                f"{endpoint}{request_path}",
-                headers=headers,
-                json=payload,
-            )
-            logger.info(
-                "DramaClawAPI image POST response: status=%s bytes=%s",
-                getattr(response, "status_code", "?"),
-                (getattr(response, "headers", None) or {}).get("content-length", "?"),
-            )
-            response.raise_for_status()
+            response: httpx.Response | None = None
+            content_policy_retries = 0
+            total_attempts = NEWAPI_IMAGE_RETRY_ATTEMPTS + NEWAPI_IMAGE_CONTENT_POLICY_RETRY_ATTEMPTS
+            for attempt in range(1, total_attempts + 1):
+                logger.info(
+                    "DramaClawAPI image POST start: %s (attempt %d/%d)",
+                    request_context.get("endpoint"),
+                    attempt,
+                    total_attempts,
+                )
+                try:
+                    response = await client.post(
+                        f"{endpoint}{request_path}",
+                        headers=headers,
+                        json=payload,
+                    )
+                except httpx.HTTPError as exc:
+                    if (
+                        attempt >= NEWAPI_IMAGE_RETRY_ATTEMPTS
+                        or not _newapi_image_retryable_transport_error(exc)
+                    ):
+                        raise
+                    delay = _newapi_image_retry_delay(attempt)
+                    logger.warning(
+                        "DramaClawAPI image POST transport error, retrying in %.0fs: %s",
+                        delay,
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.info(
+                    "DramaClawAPI image POST response: status=%s bytes=%s",
+                    getattr(response, "status_code", "?"),
+                    (getattr(response, "headers", None) or {}).get("content-length", "?"),
+                )
+                if (
+                    getattr(response, "status_code", None) in _NEWAPI_IMAGE_RETRYABLE_STATUS
+                    and attempt < NEWAPI_IMAGE_RETRY_ATTEMPTS
+                ):
+                    delay = _newapi_image_retry_delay(attempt)
+                    logger.warning(
+                        "DramaClawAPI image POST transient status=%s, retrying in %.0fs",
+                        response.status_code,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                if (
+                    getattr(response, "status_code", None) == 400
+                    and content_policy_retries < NEWAPI_IMAGE_CONTENT_POLICY_RETRY_ATTEMPTS
+                    and _newapi_image_response_is_content_policy(response)
+                ):
+                    content_policy_retries += 1
+                    delay = _newapi_image_retry_delay(content_policy_retries)
+                    logger.warning(
+                        "DramaClawAPI image POST content-policy rejection, retrying in %.0fs",
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                response.raise_for_status()
+                break
+            if response is None:  # pragma: no cover - loop sets a response or raises
+                raise httpx.HTTPError("DramaClawAPI image POST produced no response")
             response_headers = getattr(response, "headers", {}) or {}
             provider_request_id = _newapi_request_id_from_headers(response_headers)
             result = response.json()

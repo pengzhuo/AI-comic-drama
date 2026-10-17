@@ -3062,7 +3062,17 @@
           "fix": "如果这是小说原文，请把项目类型切换为“旁白解说”；如果是剧本，请补齐分场头。"
         }
       }
-    }
+    },
+    "scriptProcessTitle": "剧本处理",
+    "scriptProcessDesc": "按内置的「通用AI影视制作流程包」对导入的剧本做全文读审，并生成结构化制作剧本。导入后会自动执行。",
+    "scriptProcessIdle": "等待处理",
+    "scriptProcessRunning": "处理中…",
+    "scriptProcessDone": "已完成",
+    "scriptProcessFailed": "处理失败",
+    "scriptProcessStart": "开始剧本处理",
+    "scriptProcessRerun": "重新处理",
+    "scriptProcessSummary": "{{characters}} 个角色 · {{scenes}} 个场景 · {{gaps}} 项未决",
+    "scriptProcessDegraded": "{{count}} 段未通过内容审核，需人工复核"
   },
   "video": {
     "voiceSelect": "语音选择",
@@ -3124,6 +3134,7 @@
     "types": {
       "build_characters": "构建角色",
       "ingest_fast": "快速导入",
+      "script_process": "剧本处理",
       "build_episodes": "规划剧集",
       "character_portrait": "角色肖像",
       "identity_image": "身份图",
@@ -3244,6 +3255,9 @@
         "beatVideoPromptSaved": "已保存 Beat {{beatNum}} 视频提示词",
         "seedance2PromptStart": "开始生成 Beat {{beatNum}} Seedance 2.0 提示词",
         "seedance2PromptSaved": "已保存 Beat {{beatNum}} Seedance 2.0 提示词"
+      },
+      "scriptProcess": {
+        "start": "开始按制作流程包处理剧本..."
       },
       "submitting": "任务正在投递",
       "queued": "任务已进入队列",

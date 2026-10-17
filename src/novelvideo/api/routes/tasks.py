@@ -88,6 +88,7 @@ _TASK_TYPE_LABELS = {
     "freezone_text_translate": "字幕翻译",
     "freezone_text_generate": "AI 文本生成",
     "freezone_skill_import": "外部 Skill 转换",
+    "script_process": "剧本处理",
     "freezone_story_script": "生成故事脚本",
     "freezone_script_to_video_plan": "脚本转视频计划",
     "freezone_audio_speech": "生成语音",

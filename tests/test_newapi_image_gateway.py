@@ -1080,7 +1080,14 @@ def test_newapi_image_http_error_logs_redacted_request_context(monkeypatch, capl
     ]
 
 
-def test_newapi_image_http_5xx_does_not_retry_in_app(monkeypatch):
+def test_newapi_image_http_5xx_retries_then_reports_failure(monkeypatch):
+    """A transient gateway 5xx is retried in place before the beat fails.
+
+    Previously a single 502 failed the beat (and paused the whole one-click
+    episode) even though the upstream had already recovered. The retry reuses
+    the same reservation, so billing still happens once per logical request.
+    """
+
     import httpx
     from novelvideo.generators import nanobanana_grid
 
@@ -1114,6 +1121,7 @@ def test_newapi_image_http_5xx_does_not_retry_in_app(monkeypatch):
             return FailingResponse()
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
 
     image_bytes, _text, error = run_async(
         nanobanana_grid._call_newapi_image_api(
@@ -1128,7 +1136,352 @@ def test_newapi_image_http_5xx_does_not_retry_in_app(monkeypatch):
     assert image_bytes is None
     assert "HTTP 502" in error
     assert "request_id=req-fail" in error
+    assert attempts == nanobanana_grid.NEWAPI_IMAGE_RETRY_ATTEMPTS == 3
+
+
+def test_newapi_image_http_5xx_recovers_on_a_later_attempt(monkeypatch):
+    """The recovery path: one 502 then success returns the image, no error."""
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+
+    attempts = 0
+    payloads: list[dict] = []
+
+    class FailingResponse:
+        status_code = 502
+        text = "bad gateway"
+        headers = {"x-oneapi-request-id": "req-fail"}
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=httpx.Request("POST", "http://newapi.test/v1/images/generations"),
+                response=self,
+            )
+
+    class OkResponse:
+        status_code = 200
+        headers = {"x-newapi-request-id": "req-ok"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": "resp-ok",
+                "data": [{"b64_json": base64.b64encode(b"recovered").decode()}],
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            payloads.append(json)
+            return FailingResponse() if attempts == 1 else OkResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="retry prompt",
+            image_config={"aspect_ratio": "2:1", "image_size": "2K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes == b"recovered"
+    assert error == ""
+    assert attempts == 2
+    # The retry re-issues the same logical request against the same reservation.
+    assert payloads[0] == payloads[1]
+
+
+def test_newapi_image_http_400_still_does_not_retry(monkeypatch):
+    """Client errors are not transient: exactly one attempt reaches the wire."""
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+
+    attempts = 0
+
+    class BadRequestResponse:
+        status_code = 400
+        text = '{"error":{"message":"bad request"}}'
+        headers = {}
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "bad request",
+                request=httpx.Request("POST", "http://newapi.test/v1/images/generations"),
+                response=self,
+            )
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            return BadRequestResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="bad prompt",
+            image_config={"aspect_ratio": "2:1", "image_size": "2K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes is None
+    assert "HTTP 400" in error
     assert attempts == 1
+
+
+def test_newapi_image_content_policy_400_is_retried_once(monkeypatch):
+    """A moderation 400 is no-cost and retried once before the beat fails.
+
+    The production failure this covers is a benign beat prompt rejected by the
+    upstream moderator; the provider's own message asks the caller to retry. One
+    extra attempt is enough to ride out a moderator hiccup, and the budget stays
+    separate from (and smaller than) the transient 5xx one.
+    """
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+
+    attempts = 0
+
+    class ContentPolicyResponse:
+        status_code = 400
+        text = (
+            '{"error":{"message":"非常抱歉，生成的图片可能违反了我们的内容政策。'
+            '如果你认为此判断有误，请重试或修改提示语。","code":"content_policy_violation"}}'
+        )
+        headers = {"x-oneapi-request-id": "req-policy"}
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "bad request",
+                request=httpx.Request("POST", "http://newapi.test/v1/images/edits"),
+                response=self,
+            )
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            return ContentPolicyResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="benign prompt",
+            image_config={"aspect_ratio": "2:3", "image_size": "1K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes is None
+    assert "HTTP 400" in error
+    assert attempts == 1 + nanobanana_grid.NEWAPI_IMAGE_CONTENT_POLICY_RETRY_ATTEMPTS == 2
+
+
+def test_newapi_image_content_policy_retry_can_recover(monkeypatch):
+    """The retry is worth spending: a momentary moderation rejection can clear."""
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+
+    attempts = 0
+
+    class ContentPolicyResponse:
+        status_code = 400
+        text = '{"error":{"code":"content_policy_violation"}}'
+        headers = {"x-oneapi-request-id": "req-policy"}
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "bad request",
+                request=httpx.Request("POST", "http://newapi.test/v1/images/edits"),
+                response=self,
+            )
+
+    class OkResponse:
+        status_code = 200
+        headers = {"x-newapi-request-id": "req-ok"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": "resp-ok",
+                "data": [{"b64_json": base64.b64encode(b"rendered").decode()}],
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            return ContentPolicyResponse() if attempts == 1 else OkResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="benign prompt",
+            image_config={"aspect_ratio": "2:3", "image_size": "1K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes == b"rendered"
+    assert error == ""
+    assert attempts == 2
+
+
+def test_newapi_image_read_timeout_is_not_retried(monkeypatch):
+    """A read timeout may already have paid work, so it must not be repeated."""
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+
+    attempts = 0
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ReadTimeout("slow upstream")
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="slow prompt",
+            image_config={"aspect_ratio": "2:1", "image_size": "2K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes is None
+    assert error
+    assert attempts == 1
+
+
+def test_newapi_image_connect_error_is_retried(monkeypatch):
+    """A connection that never went out is safe to repeat."""
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+
+    attempts = 0
+
+    class OkResponse:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"b64_json": base64.b64encode(b"connected").decode()}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectError("connection refused")
+            return OkResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="connect prompt",
+            image_config={"aspect_ratio": "2:1", "image_size": "2K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes == b"connected"
+    assert error == ""
+    assert attempts == 2
 
 
 def test_newapi_identity_image_sends_portrait_then_costume_references(

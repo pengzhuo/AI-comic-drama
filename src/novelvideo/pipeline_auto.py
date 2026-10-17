@@ -9,6 +9,15 @@ Only stages whose payload is fully derivable from project state are handled.
 Anything else returns ``None``; the coordinator then falls back to the
 agent-driven continuation for that single step. This keeps the fast path
 strictly additive — an unknown stage never blocks production.
+
+Handled mainline stages: film-process-pack script processing, character/episode
+building, portraits, identity plan/images, script, sketches, global video
+optimization, first frames (Render), TTS, Seedance 2.0 prompts, per-beat video
+and episode compose.
+
+The one deliberate exception is ``coloring`` (sketch identity/prop detection):
+it is a synchronous, credit-billed vision call with no task type, so it does not
+fit the coordinator's task bookkeeping and is still driven by the agent.
 """
 
 from __future__ import annotations
@@ -30,6 +39,11 @@ DEFAULT_COMPOSE_RESOLUTION = "720x1280"
 # ships the same chunk size so a 40-beat episode goes out in the same batches the
 # workbench tool would send.
 MAX_SINGLE_VIDEO_BATCH = 9
+#: First frames are dispatched in smaller chunks on purpose. One beat can be
+#: rejected by upstream content moderation while its neighbours render fine, and
+#: a smaller chunk keeps that failure from discarding a whole batch's renders
+#: when the coordinator has to retry the stage.
+AUTO_FIRST_FRAME_CHUNK = 3
 
 
 async def dispatch_next_stage(
@@ -63,6 +77,16 @@ async def dispatch_next_stage(
     next_step = str(data.get("next_step") or "")
     current_episode = int(data.get("current_episode") or episode or 1)
 
+    if next_step == "script_process":
+        return await _enqueue_once(
+            ctx,
+            attempted,
+            task_type="script_process",
+            queue_kind="default",
+            episode=0,
+            signature="dispatch:script_process",
+            payload={"output_dir": str(project_dir)},
+        )
     if next_step == "build_characters":
         return await _enqueue_once(
             ctx,
@@ -102,6 +126,16 @@ async def dispatch_next_stage(
         )
     if next_step == "identity_images":
         return await _dispatch_identity_image(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "script_writer":
+        return await _dispatch_script_writer(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "sketch_generation":
+        return await _dispatch_sketches(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "global_optimize_video":
+        return await _dispatch_global_optimize(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "selected_regen":
+        return await _dispatch_first_frames(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "tts":
+        return await _dispatch_tts(ctx, store, current_episode, project_dir, attempted)
     if next_step == "seedance2_prompt":
         return await _dispatch_seedance2_prompt(ctx, store, current_episode, project_dir, attempted)
     if next_step == "single_video":
@@ -267,6 +301,179 @@ async def _dispatch_seedance2_prompt(
             },
         )
     return None, None
+
+
+async def _dispatch_script_writer(
+    ctx: Any,
+    store: Any,
+    episode: int,
+    project_dir: Path,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """Enqueue the episode's script through the REST payload builder."""
+
+    from novelvideo.api.routes.scripts import enqueue_script_writer_task
+
+    signature = f"dispatch:script_writer:{episode}"
+    if signature in attempted:
+        return None, signature
+    result = await enqueue_script_writer_task(
+        ctx=ctx,
+        store=store,
+        episode_num=episode,
+        output_dir=str(project_dir),
+    )
+    if not result.get("ok"):
+        return None, None
+    return "script_writer", signature
+
+
+async def _dispatch_sketches(
+    ctx: Any,
+    store: Any,
+    episode: int,
+    project_dir: Path,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """Enqueue every sketch grid for the episode.
+
+    Sketch generation is the stage an agent mis-read as a single-image render
+    (and paused the run on), so it is dispatched straight from project state.
+    The auto path also runs the colour assignment this stage requires
+    (``ensure_colors``), because generation refuses to start without it.
+    """
+
+    from novelvideo.api.routes.generation import enqueue_sketch_grid_tasks
+    from novelvideo.api.schemas import SketchGenerateRequest
+
+    signature = f"dispatch:sketch_generation:{episode}"
+    if signature in attempted:
+        return None, signature
+    result = await enqueue_sketch_grid_tasks(
+        ctx=ctx,
+        store=store,
+        username=ctx.requester_username,
+        project_name=ctx.project_name,
+        output_dir=str(project_dir),
+        episode_num=episode,
+        body=SketchGenerateRequest(grid_index=-1),
+        # The auto path assigns the colours the stage requires; the REST route
+        # deliberately keeps its "call assign-colors first" contract.
+        ensure_colors=True,
+    )
+    if not result.get("ok"):
+        return None, None
+    return "sketch_grid_generation", signature
+
+
+async def _dispatch_global_optimize(
+    ctx: Any,
+    store: Any,
+    episode: int,
+    project_dir: Path,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """Enqueue the episode's global video optimization."""
+
+    from novelvideo.api.routes.generation import enqueue_global_optimize_video_task
+
+    signature = f"dispatch:global_optimize_video:{episode}"
+    if signature in attempted:
+        return None, signature
+    result = await enqueue_global_optimize_video_task(
+        ctx=ctx,
+        store=store,
+        output_dir=str(project_dir),
+        episode_num=episode,
+    )
+    if not result.get("ok"):
+        return None, None
+    return "global_optimize_video", signature
+
+
+async def _dispatch_first_frames(
+    ctx: Any,
+    store: Any,
+    episode: int,
+    project_dir: Path,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """Enqueue the ready beats' first frames (Render) via the REST payload.
+
+    "Ready" means the beat has a sketch and still no first frame — mirroring
+    ``_dispatch_single_videos``. The chunk is capped at
+    ``AUTO_FIRST_FRAME_CHUNK`` (well below the runtime's ``batch_size <= 9``
+    limit) so a beat rejected by upstream moderation only costs the retry of a
+    few renders, and the signature carries the chunk, so the next call after
+    this chunk completes reads as progress rather than a retry.
+    """
+
+    from novelvideo.api.routes.generation import (
+        _single_render_mode_from_sketch,
+        enqueue_selected_regen_task,
+    )
+    from novelvideo.utils.path_resolver import PathResolver
+
+    beats = await store.get_beats_as_dicts(episode)
+    if not beats:
+        return None, None
+    paths = PathResolver(str(project_dir), episode)
+    ready = sorted(
+        beat_num
+        for beat_num in (int(beat.get("beat_number") or 0) for beat in beats)
+        if beat_num > 0
+        and paths.sketch(beat_num).is_file()
+        and not paths.first_frame_for_video(beat_num).exists()
+    )
+    if not ready:
+        return None, None
+    batch = ready[:AUTO_FIRST_FRAME_CHUNK]
+    signature = f"dispatch:selected_regen:{episode}:{batch[0]}-{batch[-1]}"
+    if signature in attempted:
+        return None, signature
+    result = await enqueue_selected_regen_task(
+        ctx=ctx,
+        store=store,
+        username=ctx.requester_username,
+        project_name=ctx.project_name,
+        output_dir=str(project_dir),
+        episode_num=episode,
+        beat_indices=batch,
+        # The batch's own sketch aspect decides the render mode; the client
+        # default would silently letterbox a 16:9 sketch as 2:3.
+        mode_key=_single_render_mode_from_sketch(str(project_dir), episode, [batch[0]]),
+    )
+    if not result.get("ok"):
+        return None, None
+    return "selected_regen", signature
+
+
+async def _dispatch_tts(
+    ctx: Any,
+    store: Any,
+    episode: int,
+    project_dir: Path,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """Enqueue the episode's speech batch through the REST payload builder."""
+
+    from novelvideo.api.routes.generation import enqueue_audio_generation_task
+
+    signature = f"dispatch:audio_generation:{episode}"
+    if signature in attempted:
+        return None, signature
+    result = await enqueue_audio_generation_task(
+        ctx=ctx,
+        store=store,
+        username=ctx.requester_username,
+        project_name=ctx.project_name,
+        output_dir=str(project_dir),
+        state_dir=str(getattr(ctx, "state_dir", "") or ""),
+        episode_num=episode,
+    )
+    if not result.get("ok"):
+        return None, None
+    return "audio_generation_indextts2", signature
 
 
 async def _dispatch_single_videos(

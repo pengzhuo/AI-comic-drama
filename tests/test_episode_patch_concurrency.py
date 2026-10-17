@@ -359,6 +359,14 @@ def test_the_marker_colour_write_is_column_atomic():
 
     from novelvideo.api.routes import generation
 
-    source = inspect.getsource(generation.assign_sketch_colors)
+    # The atomic column write lives in the helper the route and the
+    # deterministic auto pipeline both call.
+    source = inspect.getsource(generation.ensure_sketch_colors)
     assert "patch_episode(episode_num, prop_menu=" in source
     assert "update_episode" not in source
+
+    # ...and the route must not grow a competing whole-row write of its own.
+    route_source = inspect.getsource(generation.assign_sketch_colors)
+    assert "ensure_sketch_colors(" in route_source
+    assert "patch_episode(" not in route_source
+    assert "update_episode" not in route_source
