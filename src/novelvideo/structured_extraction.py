@@ -41,6 +41,7 @@ from novelvideo.utils.source_language import (
     asset_language_instruction,
     detect_asset_language,
 )
+from novelvideo.skills.ai_film_process import append_pack
 
 # Titles and kinship terms refer to whoever is on stage at the time. The same
 # word in two chapters is routinely two different people, so they never merge
@@ -190,7 +191,11 @@ def _create_character_extraction_agent(agent: Any = None):
             "gemini-3-flash-preview",
             capability="text.generate.agent",
         ),
-        system_prompt=CHARACTER_EXTRACTION_SYSTEM_PROMPT,
+        system_prompt=append_pack(
+            "build_characters",
+            CHARACTER_EXTRACTION_SYSTEM_PROMPT,
+            model_env="CHARACTER_BUILD_MODEL",
+        ),
         model_settings=get_newapi_structured_output_model_settings(),
         output_type=ChunkCharacterOutput,
         retries={"output": model_gateway_output_retries(2)},
@@ -821,7 +826,9 @@ def _create_adjudication_agent(agent: Any = None):
             "gemini-3-flash-preview",
             capability="text.generate.agent",
         ),
-        system_prompt=ADJUDICATION_SYSTEM_PROMPT,
+        system_prompt=append_pack(
+            "build_characters", ADJUDICATION_SYSTEM_PROMPT, model_env="CHARACTER_BUILD_MODEL"
+        ),
         model_settings=get_newapi_structured_output_model_settings(),
         output_type=CharacterAdjudication,
         name="Structured Character Adjudicator",
@@ -1052,7 +1059,11 @@ def _create_character_appearance_agent(agent: Any = None):
             "gemini-3-flash-preview",
             capability="text.generate.agent",
         ),
-        system_prompt=CHARACTER_APPEARANCE_SYSTEM_PROMPT,
+        system_prompt=append_pack(
+            "build_characters",
+            CHARACTER_APPEARANCE_SYSTEM_PROMPT,
+            model_env="CHARACTER_BUILD_MODEL",
+        ),
         model_settings=get_newapi_structured_output_model_settings(),
         output_type=CharacterAppearanceList,
         name="Structured Character Appearance",
@@ -1590,7 +1601,11 @@ def _create_scene_adjudication_agent(agent: Any = None):
             "gemini-3-flash-preview",
             capability="text.generate.agent",
         ),
-        system_prompt=SCENE_ADJUDICATION_SYSTEM_PROMPT,
+        system_prompt=append_pack(
+            "build_scenes",
+            SCENE_ADJUDICATION_SYSTEM_PROMPT,
+            model_env="SCENE_BUILD_MODEL",
+        ),
         model_settings=get_newapi_structured_output_model_settings(),
         output_type=SceneAdjudication,
         name="Structured Scene Adjudicator",

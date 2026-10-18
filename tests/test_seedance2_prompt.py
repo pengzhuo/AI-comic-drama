@@ -1097,3 +1097,65 @@ def test_seedance2_panel_state_uses_authoritative_language_for_freshness(
 
     assert state.current_prompt_inputs_hash == "current-hash"
     assert seen == {"fallback_language": "en", "hash_language": "en"}
+
+
+def test_seedance2_prompt_hash_tracks_clip_duration():
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.prompt import compute_seedance2_prompt_inputs_hash
+
+    common = {
+        "mode": Seedance2I2VMode.MULTIMODAL_REFERENCE,
+        "beat": {"visual_description": "江辰在雨里抬头。"},
+        "assets": [],
+        "text_overlay": {},
+    }
+
+    five = compute_seedance2_prompt_inputs_hash(**common, duration=5)
+    nine = compute_seedance2_prompt_inputs_hash(**common, duration=9)
+    unset = compute_seedance2_prompt_inputs_hash(**common)
+
+    # 时长决定内部节拍时钟，所以它属于提示词输入：时长变化必须让旧提示词过期。
+    assert len({five, nine, unset}) == 3
+
+
+def test_seedance2_composer_task_writes_the_real_beat_clock():
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.prompt import build_seedance2_prompt_composer_task
+
+    task = build_seedance2_prompt_composer_task(
+        mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+        beat={"narration_segment": "今天是我的生日。"},
+        assets=[],
+        text_overlay={},
+        prompt_guidance="",
+        draft_prompt="",
+        request_params={"duration": 9, "resolution": "720p", "ratio": "9:16"},
+    )
+
+    assert '"clip_duration_seconds": 9' in task
+    assert "0:00–0:09" in task
+    assert "禁止照搬其它档位的时间轴" in task
+    assert "固定 15 秒档" not in task
+
+    english = build_seedance2_prompt_composer_task(
+        mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+        beat={"narration_segment": "今天是我的生日。"},
+        assets=[],
+        text_overlay={},
+        prompt_guidance="",
+        draft_prompt="",
+        request_params={"duration": 5},
+        language="en",
+    )
+    assert "0:00–0:05" in english
+    assert "Never reuse another tier" in english
+
+    without_duration = build_seedance2_prompt_composer_task(
+        mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+        beat={"narration_segment": "今天是我的生日。"},
+        assets=[],
+        text_overlay={},
+        prompt_guidance="",
+        draft_prompt="",
+    )
+    assert "本镜成片时长" not in without_duration

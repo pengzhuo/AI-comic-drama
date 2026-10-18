@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from novelvideo.seedance2_i2v.duration import SEEDANCE2_BASE_DURATION_SECONDS
+
 
 SEEDANCE2_PROMPT_GUIDANCE_TEMPLATE_KEYS = frozenset(
     {"subject", "scene", "lighting", "camera", "style", "no_subtitle"}
@@ -25,13 +27,16 @@ class Seedance2VideoConfig(BaseModel):
     """Per-beat Seedance 2.0 settings persisted in beats.seedance2_config_json."""
 
     mode: Seedance2I2VMode = Seedance2I2VMode.MULTIMODAL_REFERENCE
+    # 严格首帧：视频第 0 帧必须等于 render 首帧（构图/景别/服装/脸型/场景不漂移）。
+    # 默认开启；用户在 Prompt 面板显式选择其它模式时会被置为 False。
+    strict_first_frame: bool = True
     final_prompt: str = ""
     prompt_guidance: str = ""
     prompt_guidance_template_keys: list[str] = Field(default_factory=list)
     prompt_source: str = ""
     prompt_inputs_hash: str = ""
     prompt_updated_at: str = ""
-    duration: int = 4
+    duration: int = SEEDANCE2_BASE_DURATION_SECONDS
     resolution: str = "720p"
     ratio: str = "9:16"
     generate_audio: bool = True
@@ -64,9 +69,9 @@ class Seedance2VideoConfig(BaseModel):
     @classmethod
     def _coerce_duration(cls, value: Any) -> int:
         try:
-            duration = int(float(value or 4))
+            duration = int(float(value or SEEDANCE2_BASE_DURATION_SECONDS))
         except (TypeError, ValueError):
-            duration = 4
+            duration = SEEDANCE2_BASE_DURATION_SECONDS
         return max(1, duration)
 
     @field_validator("prompt_guidance_template_keys", mode="before")
@@ -100,6 +105,18 @@ def parse_seedance2_config(value: Any) -> Seedance2VideoConfig:
             value["generate_audio"] = True
         if value.get("human_review") is False and not value.get("human_review_user_set"):
             value["human_review"] = True
+        if value.get("strict_first_frame") is not False:
+            # 默认强锁严格首帧：视频阶段以 render 图作为硬首帧输入，
+            # 避免模型在多参考模式下换装/换脸/把全身镜头裁成特写。
+            stored_mode = (
+                str(value.get("mode") or "").strip()
+                or Seedance2I2VMode.MULTIMODAL_REFERENCE.value
+            )
+            if stored_mode in {
+                Seedance2I2VMode.MULTIMODAL_REFERENCE.value,
+                Seedance2I2VMode.FIRST_FRAME.value,
+            }:
+                value["mode"] = Seedance2I2VMode.FIRST_FRAME.value
         return Seedance2VideoConfig.model_validate(value)
     return Seedance2VideoConfig()
 

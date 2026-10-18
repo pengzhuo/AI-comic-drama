@@ -578,6 +578,17 @@ def build_freezone_keyframe_video_prompt(
     return "\n".join(part for part in parts if part)
 
 
+def _film_pack_directive() -> str:
+    """画布视频提示词前置的精简规范块（与主线共用同一套技能包，保持同步）。"""
+
+    from novelvideo.skills.ai_film_process import pack_directive
+
+    try:
+        return pack_directive("beat_video_prompt")
+    except Exception:  # noqa: BLE001 - 注入只是增强，不能影响生成链路
+        return ""
+
+
 def build_freezone_omni_video_prompt(
     *,
     user_prompt: str,
@@ -591,6 +602,10 @@ def build_freezone_omni_video_prompt(
     （其中「这是视频参考生成新的视频」与续写正相反）。"""
 
     parts = [str(user_prompt or "").strip()]
+
+    pack = _film_pack_directive()
+    if pack:
+        parts.append(pack)
 
     if theme and theme.strip():
         parts.append(f"主题要求：{theme.strip()}")

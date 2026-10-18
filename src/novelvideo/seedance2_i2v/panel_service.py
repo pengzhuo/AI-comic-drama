@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,7 +11,6 @@ from typing import Any
 import anyio
 from anyio.lowlevel import RunVar
 
-from novelvideo.manual_shots import resolve_target_video_duration
 from novelvideo.project_config import set_narrator_reference_audio_in_state_dir
 from novelvideo.seedance2_i2v.assets import (
     Seedance2ResolvedAsset,
@@ -30,6 +28,10 @@ from novelvideo.seedance2_i2v.character_voice_storage import (
     voice_resource_lock,
     voice_content_sha256,
 )
+from novelvideo.seedance2_i2v.duration import (
+    seedance2_duration_floor,
+    resolve_seedance2_target_duration,
+)
 from novelvideo.seedance2_i2v.models import (
     SEEDANCE2_PROMPT_GUIDANCE_TEMPLATE_KEYS,
     Seedance2I2VMode,
@@ -46,7 +48,6 @@ from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
 from novelvideo.utils.async_ops import metadata_io_limiter
 from novelvideo.utils.media_io import (
     crop_image_to_path_sync as _crop_image_to_path_sync,
-    get_audio_duration,
 )
 from novelvideo.utils.path_resolver import PathResolver
 from novelvideo.utils.source_language import AssetLanguage
@@ -182,6 +183,8 @@ def _prepare_seedance2_video_panel_config(
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
     if mode is not None:
         config.mode = Seedance2I2VMode(mode)
+        # 用户显式选择模式时按选择执行；默认（不选择）仍强锁严格首帧。
+        config.strict_first_frame = config.mode == Seedance2I2VMode.FIRST_FRAME
     if duration is not None:
         config.duration = int(duration)
     if resolution is not None:
@@ -324,11 +327,15 @@ async def generate_seedance2_prompt_for_panel(
     ).strip()
     prompt_beat = _beat_with_seedance2_initial_prompt(beat, initial_prompt)
     output_language = language or detect_seedance2_prompt_language(prompt_beat)
+    effective_duration = resolve_seedance2_target_duration(
+        config_duration=config.duration,
+    )
     inputs_hash = _seedance2_prompt_inputs_hash(
         config=config,
         beat=prompt_beat,
         assets=assets,
         language=output_language,
+        duration=effective_duration,
     )
     if (
         str(config.final_prompt or "").strip()
@@ -349,7 +356,7 @@ async def generate_seedance2_prompt_for_panel(
         prompt_guidance=config.prompt_guidance,
         prompt_guidance_template_keys=config.prompt_guidance_template_keys,
         request_params={
-            "duration": int(config.duration),
+            "duration": int(effective_duration),
             "resolution": config.resolution,
             "ratio": config.ratio,
         },
@@ -863,7 +870,9 @@ def build_seedance2_video_panel_state(
         episode=episode,
         beat=beat,
     )
-    duration = max(int(config.duration or 4), duration_floor)
+    duration = resolve_seedance2_target_duration(
+        config_duration=config.duration,
+    )
     assets = build_seedance2_project_assets(
         project_output=project_dir,
         episode=episode,
@@ -894,6 +903,7 @@ def build_seedance2_video_panel_state(
         beat=beat,
         assets=assets,
         language=output_language,
+        duration=duration,
     )
     return Seedance2VideoPanelState(
         mode=config.mode.value,
@@ -1133,6 +1143,7 @@ def _seedance2_prompt_inputs_hash(
     beat: dict[str, Any],
     assets: list[Seedance2ResolvedAsset],
     language: str = "zh",
+    duration: int | None = None,
 ) -> str:
     return compute_seedance2_prompt_inputs_hash(
         mode=config.mode,
@@ -1142,6 +1153,7 @@ def _seedance2_prompt_inputs_hash(
         prompt_guidance=config.prompt_guidance,
         prompt_guidance_template_keys=config.prompt_guidance_template_keys,
         language=language,
+        duration=duration,
     )
 
 
@@ -1180,19 +1192,13 @@ def _seedance2_storyboard_context(beat: dict[str, Any]) -> list[tuple[str, str]]
 
 
 def _seedance2_duration_floor(*, project_dir: Path, episode: int, beat: dict[str, Any]) -> int:
-    beat_num = int(beat.get("beat_number") or 0)
-    audio_duration = None
-    audio_path = project_dir / "audio" / f"ep{episode:03d}" / f"beat_{beat_num:02d}.mp3"
-    if normalize_seedance2_audio_type(beat) in {"narration", "dialogue"} and audio_path.exists():
-        try:
-            audio_duration = get_audio_duration(str(audio_path))
-        except Exception:
-            audio_duration = None
-    floor = resolve_target_video_duration(beat, audio_duration)
-    try:
-        return max(4, int(math.ceil(float(floor))))
-    except (TypeError, ValueError):
-        return 4
+    """Minimum clip length: product basis plus the beat's spoken line."""
+
+    return seedance2_duration_floor(
+        project_dir=project_dir,
+        episode=episode,
+        beat=beat,
+    )
 
 
 __all__ = [

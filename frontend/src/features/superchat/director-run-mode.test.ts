@@ -15,13 +15,18 @@ import {
   directorAutoVoiceChoiceTransportText,
   directorPipelineAutoConfirmationTransportText,
   directorPipelineAutoRunTransportText,
+  directorKeywordSegments,
+  directorKeywordTone,
+  emphasizeDirectorCommandKeywords,
   emphasizeDirectorVoiceChoiceLabels,
+  initialDirectorRunState,
   isDirectorEpisodeAutoSession,
   isDirectorEpisodeAutoStartIntent,
   loadDirectorRunState,
   markDirectorAutoHandled,
   resolveDirectorVoicePolicy,
   saveDirectorRunState,
+  settledDirectorRunState,
 } from "./director-run-mode";
 
 function task(overrides: Partial<TaskState> = {}): TaskState {
@@ -53,7 +58,7 @@ describe("director episode auto mode", () => {
     vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-08-13T10:01:00Z"));
   });
 
-  it("persists auto mode per project and removes manual mode", () => {
+  it("persists auto mode per project and stores an explicit manual choice", () => {
     const active = activateDirectorEpisodeAuto();
     saveDirectorRunState("project-a", active);
     expect(loadDirectorRunState("project-a").mode).toBe("episode_auto");
@@ -61,6 +66,23 @@ describe("director episode auto mode", () => {
 
     saveDirectorRunState("project-a", defaultDirectorRunState());
     expect(loadDirectorRunState("project-a").mode).toBe("manual_confirm");
+  });
+
+  it("opens a project on 一键成片 until the user chooses otherwise", () => {
+    expect(initialDirectorRunState("project-a").mode).toBe("pipeline_auto");
+    // A stored choice always wins — an explicit 手动模式 is never overridden.
+    saveDirectorRunState("project-a", defaultDirectorRunState());
+    expect(initialDirectorRunState("project-a").mode).toBe("manual_confirm");
+    saveDirectorRunState("project-b", activateDirectorEpisodeAuto());
+    expect(initialDirectorRunState("project-b").mode).toBe("episode_auto");
+  });
+
+  it("keeps the selected mode when a run ends", () => {
+    const settled = settledDirectorRunState("pipeline_auto");
+    expect(settled.mode).toBe("pipeline_auto");
+    // The next start still needs its explicit second confirmation.
+    expect(settled.confirmationStage).toBe("awaiting_start");
+    expect(settledDirectorRunState("manual_confirm").mode).toBe("manual_confirm");
   });
 
   it("continues a completed mainline task and binds its episode", () => {
@@ -274,5 +296,66 @@ describe("director episode auto mode", () => {
     );
     expect(emphasizeDirectorVoiceChoiceLabels("当前使用系统声线。"))
       .toBe("当前使用系统声线。");
+  });
+
+  it("classifies bracketed keywords by risk level", () => {
+    expect(directorKeywordTone("[终止]", { bracketed: true })).toBe("destructive");
+    expect(directorKeywordTone("强制终止", { bracketed: true })).toBe("destructive");
+    expect(directorKeywordTone("[暂停]", { bracketed: true })).toBe("warning");
+    expect(directorKeywordTone("[重试]", { bracketed: true })).toBe("warning");
+    expect(directorKeywordTone("[开始]", { bracketed: true })).toBe("primary");
+    expect(directorKeywordTone("[生成首帧草图]", { bracketed: true })).toBe("primary");
+    expect(directorKeywordTone("[系统声线]", { bracketed: true })).toBe("step");
+    // 非方括号场景不做裸词染色，避免自然语句被误伤。
+    expect(directorKeywordTone("终止", { bracketed: false })).toBe("destructive");
+    expect(directorKeywordTone("今天天气不错", { bracketed: false })).toBeNull();
+  });
+
+  it("wraps bracketed keywords in markdown bold and keeps the brackets", () => {
+    expect(emphasizeDirectorCommandKeywords("请回复 [继续] 或 [终止]。")).toBe(
+      "请回复 **[继续]** 或 **[终止]**。",
+    );
+    expect(emphasizeDirectorCommandKeywords("【暂停】本集自动已暂停")).toBe(
+      "**【暂停】**本集自动已暂停",
+    );
+    // 幂等：已加粗的不重复加粗。
+    expect(emphasizeDirectorCommandKeywords("请回复 **[继续]**。")).toBe("请回复 **[继续]**。");
+    // 不破坏 markdown 链接、任务列表与数字引用。
+    expect(emphasizeDirectorCommandKeywords("见 [文档](https://example.com/a)。")).toBe(
+      "见 [文档](https://example.com/a)。",
+    );
+    expect(emphasizeDirectorCommandKeywords("- [x] 已完成")).toBe("- [x] 已完成");
+    expect(emphasizeDirectorCommandKeywords("引用 [1] 与 [2]。")).toBe("引用 [1] 与 [2]。");
+  });
+
+  it("splits controlled copy into colored keyword segments", () => {
+    const segments = directorKeywordSegments("已终止当前任务", { bare: true });
+    expect(segments).toEqual([
+      { text: "已", tone: null },
+      { text: "终止", tone: "destructive" },
+      { text: "当前任务", tone: null },
+    ]);
+    expect(directorKeywordSegments("已选择本集自动；发送 [开始] 指令", { bare: true })).toEqual([
+      { text: "已选择本集自动；发送 ", tone: null },
+      { text: "[开始]", tone: "primary" },
+      { text: " 指令", tone: null },
+    ]);
+    expect(directorKeywordSegments("没有任何关键字", { bare: true })).toEqual([
+      { text: "没有任何关键字", tone: null },
+    ]);
+    expect(directorKeywordSegments("强制终止", { bare: true })).toEqual([
+      { text: "强制终止", tone: "destructive" },
+    ]);
+  });
+
+  it("tells the model to write keywords in brackets", () => {
+    for (const text of [
+      directorAutoRunTransportText("开始"),
+      directorPipelineAutoRunTransportText("开始"),
+      directorAutoUserMessageTransportText("怎么样了"),
+    ]) {
+      expect(text).toContain("[DRAMACLAW_KEYWORD_FORMAT]");
+      expect(text).toContain("[终止]");
+    }
   });
 });

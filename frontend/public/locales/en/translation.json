@@ -2847,6 +2847,7 @@
     },
     "pastePlaceholder": "Paste novel text here, up to 1000 characters",
     "startIngest": "Start Import",
+    "startOneClickFilm": "One-click Film",
     "saveSettings": "Save Settings",
     "settingsSaved": "Project settings saved",
     "settingsSaveFailed": "Failed to save project settings",
@@ -3222,6 +3223,8 @@
         "fallback": "scene reference",
         "named": "{{scene}} — {{kind}}"
       },
+      "scenePano": "Scene 360 panorama",
+      "scenePanoNamed": "{{scene}} — 360 panorama",
       "beatRange": "Beat {{ranges}}",
       "sketchGrid": "Sketch grid {{index}}/{{total}}",
       "sketch": "Sketch",

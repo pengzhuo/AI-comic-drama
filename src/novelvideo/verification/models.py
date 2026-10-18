@@ -154,6 +154,20 @@ class ContinuityTransition(BaseModel):
     issues: list[str] = Field(default_factory=list, description="具体问题")
 
 
+class VideoConsistencyIssues(BaseModel):
+    """视频生成后置校验的结构化结果（D 环节）。"""
+
+    costume_changed: bool = Field(default=False, description="服装/配饰是否相对首帧变化")
+    face_changed: bool = Field(default=False, description="脸型/身份是否相对首帧变化")
+    framing_changed: bool = Field(default=False, description="景别/取景是否相对首帧被重构")
+    physical_defect: bool = Field(
+        default=False,
+        description="肢体缺失/融接/悬空/贴地/支撑面不符等物理穿帮",
+    )
+    issues: list[str] = Field(default_factory=list, description="逐条一句话的具体问题")
+    summary: str = Field(default="", description="一句话总结")
+
+
 class ContinuityResult(BaseModel):
     """T6 连贯性评估结果（LLM 输出结构）。"""
 

@@ -32,4 +32,16 @@ describe("freezone nie-dao launcher contract", () => {
     expect(source).toContain("onClick={handleClick}");
     expect(source).toContain("onClick();");
   });
+
+  it("renders the 捏导 wordmark as real text over the video", () => {
+    // 视频只留角色动画：烤进去的字形在 96×35 下会丢笔画（土/寸底横只有
+    // 6px/13px），所以字样改由浏览器排版，字重和字体跟随 UI 字体栈。
+    expect(source).not.toContain("xia-dao");
+    expect(source).toContain("const CHAT_LAUNCHER_LABEL_LEFT = 40");
+    expect(source).toContain("const CHAT_LAUNCHER_LABEL_TOP = 12");
+    expect(source).toContain("const CHAT_LAUNCHER_LABEL_WIDTH = 43");
+    expect(source).toContain("const CHAT_LAUNCHER_LABEL_FONT_SIZE = 20");
+    expect(source).toContain('var(--font-family-ui-default)');
+    expect(source).toMatch(/aria-hidden="true"[\s\S]{0,1200}?>\s*捏导\s*<\/span>/);
+  });
 });

@@ -38,6 +38,7 @@ from novelvideo.seedance2_i2v.voice_clone import (
     resolve_character_voice,
     resolve_narrator_source,
 )
+from novelvideo.skills.ai_film_process import append_audio_directive
 from novelvideo.freezone.paths import outputs_dir
 
 USER_VOICE_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".webm"}
@@ -668,8 +669,10 @@ async def generate_freezone_audio_speech(
         prompt=clean_text,
         audio_url=build_reference_audio_url(selected_voice.audio_path),
         output_path=output_path,
-        emotion_prompt=str(emotion_prompt or "").strip()
-        or narration_style_prompt(narration_style),
+        emotion_prompt=append_audio_directive(
+            "freezone_audio_speech",
+            str(emotion_prompt or "").strip() or narration_style_prompt(narration_style),
+        ),
     )
     if not result.success:
         raise RuntimeError(result.error or "IndexTTS2 generation failed")

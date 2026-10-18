@@ -11,6 +11,7 @@ from novelvideo.config import (
     get_newapi_text_pydantic_model,
 )
 from novelvideo.model_gateway_runtime import model_gateway_output_retries
+from novelvideo.skills.ai_film_process import pack_block
 
 
 class AdaptedContentOutput(BaseModel):
@@ -186,13 +187,14 @@ async def rewrite_episode_content(
     def _task(text: str) -> str:
         return f"{header}\n\n## 原文\n{text}\n\n请输出改写后的逐行文本。"
 
+    pack = pack_block("content_rewriter", model_env="CONTENT_REWRITER_MODEL")
     agent = Agent(
         get_newapi_text_pydantic_model(
             "CONTENT_REWRITER_MODEL",
             brainclaw_profile=BrainClawProfile.CONTENT_REWRITE,
             capability="text.generate",
         ),
-        system_prompt=REWRITE_PROMPT,
+        system_prompt="\n\n".join(part for part in (REWRITE_PROMPT, pack) if part),
         output_type=AdaptedContentOutput,
         output_retries=model_gateway_output_retries(3),
         model_settings=get_newapi_structured_output_model_settings(),

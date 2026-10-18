@@ -30,8 +30,16 @@ def _single_render_mode_from_sketch(
     if width <= 0 or height <= 0:
         return None
 
+    # 按实际草图取最接近的画幅，保证「草图 → render 首帧」两步同画幅。
+    # 只认 2:3/16:9 会让 9:16 的草图被渲染成 2:3 首帧，进而在视频阶段被
+    # 撑成 9:16，凭空补出画面外的身体/衣物（穿帮）。
     ratio = width / height
-    return "1x1_16-9" if abs(ratio - 16 / 9) < abs(ratio - 2 / 3) else "1x1_2-3"
+    candidates = {
+        "1x1_9-16": 9 / 16,
+        "1x1_2-3": 2 / 3,
+        "1x1_16-9": 16 / 9,
+    }
+    return min(candidates, key=lambda key: abs(ratio - candidates[key]))
 
 async def _resolve_generation_project(project: str, user: dict, required_role: str = "editor"):
     return await _gen.resolve_project_scope(project, user, required_role=required_role)

@@ -49,6 +49,7 @@ AUTO_TASK_TYPES = frozenset({
     "episode_scene_planner",
     "episode_prop_planner",
     "scene_reference_asset",
+    "scene_pano_generation",
     "prop_reference_asset",
     "beat_video_prompt",
     "seedance2_prompt",
@@ -205,6 +206,22 @@ def _stage_key_for(task: TaskState | None, run: DirectorAutoRun) -> str:
     if task_type:
         return task_type
     return run.stage_key or "unknown"
+
+
+def _film_pack_delivery_block() -> str:
+    """成片合成/交付指令附带的流程包段落（第 06 份：衔接声音与成片验收）。
+
+    主线与画布的合成本身是纯音视频编排，没有发往模型的提示词，所以第 06 份
+    只能沿合成周边的 agent 指令送达：这里接管「成片已完成，去展示并收口」这一步。
+    任何异常都退回空串，注入只是增强，绝不打断自动成片。
+    """
+
+    try:
+        from novelvideo.skills.ai_film_process import pack_block
+
+        return pack_block("compose_delivery")
+    except Exception:  # noqa: BLE001 - 注入只是增强，不能影响自动成片
+        return ""
 
 
 def _retry_pause_detail(run: DirectorAutoRun) -> str:
@@ -813,6 +830,7 @@ def _task_label(task: TaskState) -> str:
         "episode_scene_planner": "本集场景规划",
         "episode_prop_planner": "本集道具规划",
         "scene_reference_asset": "场景参考图",
+        "scene_pano_generation": "场景 360 全景图",
         "prop_reference_asset": "道具参考图",
         "sketch_grid_generation": "草图网格",
         "sketch_generation": "草图生成",
@@ -833,6 +851,19 @@ def _task_label(task: TaskState) -> str:
         "compose_episode": "成片合成",
     }
     return labels.get(task.task_type, task.task_type)
+
+
+def _task_instruction(task: TaskState) -> str:
+    """The step's own command, bracketed for the chat timeline.
+
+    Automatic production narrates itself into the 捏导 conversation, and the
+    user reads those lines as step instructions rather than as prose.  Wrapping
+    the stage name in ``[]`` — ``[剧本处理] 已完成。`` — keeps every one of them
+    visually identical, so the bracketed text is always "this is what the run is
+    executing" and never part of a sentence about something else.
+    """
+
+    return f"[{_task_label(task)}]"
 
 
 def _missing_character_portrait(task: TaskState) -> str | None:
@@ -1350,6 +1381,10 @@ class DirectorAutoCoordinator:
             )
         prompt = instruction or base_prompt
         prompt += run_mode_block
+        if final_delivery:
+            pack_delivery = _film_pack_delivery_block()
+            if pack_delivery:
+                prompt += f"\n\n{pack_delivery}"
         if run.is_project_scope and run.target_episodes > 0:
             prompt += f"\n\n分集规划目标集数：{run.target_episodes}。"
         if run.voice_policy == "system":
@@ -1606,7 +1641,7 @@ class DirectorAutoCoordinator:
                         if granted:
                             await self._notify(
                                 updated,
-                                f"{_task_label(failed)}长时间没有进度更新，正在自动重试"
+                                f"{_task_instruction(failed)} 长时间没有进度更新，正在自动重试"
                                 f"（第 {attempt}/{MAX_STAGE_ATTEMPTS} 次）。",
                             )
                             taskless_continuations = 0
@@ -1621,7 +1656,7 @@ class DirectorAutoCoordinator:
                         )
                         await self._notify(
                             updated,
-                            f"本集自动已暂停：{_task_label(failed)}长时间没有进度更新，"
+                            f"本集自动已暂停：{_task_instruction(failed)} 长时间没有进度更新，"
                             "判定为卡住。请在弹出的提示中选择重试当前步骤或终止本次自动制作。",
                         )
                         return
@@ -1647,7 +1682,8 @@ class DirectorAutoCoordinator:
                             return
                         await self._notify(
                             recovering,
-                            f"检测到{_task_label(failed)}缺少前置肖像，正在自动补生成「{character}」肖像。",
+                            f"检测到 {_task_instruction(failed)} 缺少前置肖像，"
+                            f"正在自动补生成「{character}」肖像。",
                         )
                         if not await self._owns_run(run_id):
                             return
@@ -1691,7 +1727,7 @@ class DirectorAutoCoordinator:
                         )
                         await self._notify(
                             updated,
-                            f"本集自动已暂停：{_task_label(failed)}失败，{fatal}，无需自动重试。",
+                            f"本集自动已暂停：{_task_instruction(failed)} 失败，{fatal}，无需自动重试。",
                         )
                         return
                     granted, attempt = await self._grant_stage_retry(
@@ -1702,7 +1738,7 @@ class DirectorAutoCoordinator:
                     if granted:
                         await self._notify(
                             updated,
-                            f"{_task_label(failed)}执行失败，正在自动重试"
+                            f"{_task_instruction(failed)} 执行失败，正在自动重试"
                             f"（第 {attempt}/{MAX_STAGE_ATTEMPTS} 次）。",
                         )
                         taskless_continuations = 0
@@ -1717,13 +1753,14 @@ class DirectorAutoCoordinator:
                     )
                     await self._notify(
                         updated,
-                        f"本集自动已暂停：{_task_label(failed)}{('已取消' if failed.status == 'cancelled' else '失败')}，{reason}。"
+                        f"本集自动已暂停：{_task_instruction(failed)} "
+                        f"{('已取消' if failed.status == 'cancelled' else '失败')}，{reason}。"
                         f"（已自动重试 {max(0, min(attempt - 1, MAX_STAGE_ATTEMPTS))} 次仍未成功）",
                     )
                     return
                 compose = next((task for task in terminal if task.task_type == "compose_episode"), None)
                 if len(terminal) == 1:
-                    summary = f"✅ {_task_label(terminal[0])}已完成。"
+                    summary = f"✅ {_task_instruction(terminal[0])} 已完成。"
                 else:
                     summary = f"✅ 本批 {len(terminal)} 个任务已完成。"
                 if compose is not None:

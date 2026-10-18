@@ -87,6 +87,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+#: legacy ``get_pydantic_model()`` 在 CE 里的兜底模型。网关只开通 ``DC-*`` 逻辑
+#: 别名，直连厂商的预设模型名（如 ``doubao-seed-1-6-251015``）在网关上没有渠道，
+#: 落到它上面会让使用该工厂的 Agent 全部静默失效。
+LEGACY_AGENT_MODEL_ENV = "LEGACY_AGENT_MODEL"
+DEFAULT_LEGACY_AGENT_MODEL = "DC-hermes-LLM"
+
+#: 需要读图的校验/审阅 Agent 单独走视觉别名，避免和纯文本 Agent 共用一条路由。
+VERIFICATION_VISION_MODEL_ENV = "VERIFICATION_VISION_MODEL"
+VERIFICATION_VISION_MODEL_DEFAULT = "DC-video-identity-detector-LLM"
+
+
 def get_pydantic_model(
     provider_override: str | None = None,
     model_name_override: str | None = None,
@@ -117,9 +128,17 @@ def get_pydantic_model(
         )
 
     preset = PROVIDER_PRESETS[provider]
-    model_name = model_name_override or os.environ.get(
-        "MODEL_NAME", preset["default_model"]
+    model_name = str(model_name_override or "").strip() or _clean_env_value(
+        "MODEL_NAME"
     )
+    if not model_name:
+        # CE 网关只开通 ``DC-*`` 逻辑别名；把直连厂商的预设模型名发过去只会 4xx/5xx
+        # （网关里没有 ``doubao-seed-1-6-251015`` 这样的渠道），这些 Agent 会静默失效。
+        # EE 仍由部署环境决定模型名，保持原行为。
+        if uses_local_ce_runtime():
+            model_name = get_legacy_agent_model_name()
+        else:
+            model_name = preset["default_model"]
 
     if provider == "openrouter" and model_name.startswith("openrouter/"):
         model_name = model_name[len("openrouter/") :]
@@ -134,6 +153,32 @@ def get_pydantic_model(
             "MODEL_TIMEOUT",
             float(preset.get("timeout", 120)),
         ),
+    )
+
+
+def get_legacy_agent_model_name() -> str:
+    """CE 里 legacy Agent 应使用的网关别名（可用 ``LEGACY_AGENT_MODEL`` 覆盖）。"""
+
+    return _clean_env_value(LEGACY_AGENT_MODEL_ENV) or DEFAULT_LEGACY_AGENT_MODEL
+
+
+def get_verification_pydantic_model(*, vision: bool = False):
+    """校验/审阅类 Agent 专用模型工厂：走网关别名，不落直连厂商的预设模型名。
+
+    Args:
+        vision: 需要读图的校对/审阅 Agent 传 ``True``，用剧集链路已实测可用的视觉别名。
+    """
+
+    if vision:
+        return get_newapi_text_pydantic_model(
+            VERIFICATION_VISION_MODEL_ENV,
+            VERIFICATION_VISION_MODEL_DEFAULT,
+            capability="text.generate.agent",
+        )
+    return get_newapi_text_pydantic_model(
+        LEGACY_AGENT_MODEL_ENV,
+        DEFAULT_LEGACY_AGENT_MODEL,
+        capability="text.generate.agent",
     )
 
 

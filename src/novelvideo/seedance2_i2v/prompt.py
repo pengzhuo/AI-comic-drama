@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -572,7 +573,15 @@ def _reference_sentence_for_assets(
         if mode == Seedance2I2VMode.FIRST_LAST_FRAME and len(image_parts) >= 2:
             base = f"Use {image_parts[0]} and {image_parts[1]}, with a natural video transition"
         elif mode == Seedance2I2VMode.FIRST_FRAME and image_parts:
-            base = f"Use {image_parts[0]} to generate an image-to-video clip"
+            base = (
+                f"Use {image_parts[0]} to generate an image-to-video clip; "
+                "frame 0 must match the first frame exactly (framing, subject scale, "
+                "wardrobe, hairstyle, makeup, props, scene and lighting unchanged). Never "
+                "push in, crop out body parts or landmarks already visible in the "
+                "first frame, reframe a full-body shot into a portrait, change "
+                "clothing, colour, makeup or face, and keep every pose physically in "
+                "contact with its supporting surface"
+            )
         else:
             base = (
                 "Use " + ", ".join(image_parts)
@@ -586,7 +595,12 @@ def _reference_sentence_for_assets(
     if mode == Seedance2I2VMode.FIRST_LAST_FRAME and len(image_parts) >= 2:
         base = f"以{image_parts[0]}，{image_parts[1]}，视频自然过渡"
     elif mode == Seedance2I2VMode.FIRST_FRAME and image_parts:
-        base = f"以{image_parts[0]}生成图生视频"
+        base = (
+            f"以{image_parts[0]}生成图生视频，视频第 0 帧必须与首帧完全一致"
+            "（景别、取景范围、人物占比、服装、发型、妆容、道具、场景与光线不变），"
+            "禁止推近或裁掉首帧已可见的身体部位与地标，禁止把全身镜头重构成特写，"
+            "禁止换装、换色、换妆容或换脸，姿态必须与画面内支撑面真实接触"
+        )
     else:
         base = (
             "参考" + "、".join(image_parts)
@@ -735,6 +749,16 @@ def build_seedance2_prompt_draft(
     return normalize_seedance2_editor_prompt("".join(line for line in lines if line))
 
 
+def _clip_seconds(value: Any) -> int:
+    """Integer clip seconds from a request/config value; 0 when unknown."""
+
+    try:
+        seconds = int(math.ceil(float(value)))
+    except (TypeError, ValueError):
+        return 0
+    return seconds if seconds > 0 else 0
+
+
 def compute_seedance2_prompt_inputs_hash(
     *,
     mode: Seedance2I2VMode | str,
@@ -744,11 +768,18 @@ def compute_seedance2_prompt_inputs_hash(
     prompt_guidance: str = "",
     prompt_guidance_template_keys: list[str] | tuple[str, ...] | None = None,
     language: AssetLanguage = "zh",
+    duration: int | float | str | None = None,
 ) -> str:
-    """Hash only prompt-relevant inputs, excluding request-only video controls."""
+    """Hash only prompt-relevant inputs, excluding request-only video controls.
+
+    Clip duration is part of the prompt: the composer writes the beat clock and
+    the lip choreography inside it, so a changed duration must invalidate the
+    stored prompt. Other request-only controls still stay out of the hash.
+    """
 
     payload = {
         "mode": Seedance2I2VMode(mode).value,
+        "clip_duration_seconds": _clip_seconds(duration),
         "beat": {
             "visual_description": beat.get("visual_description") or "",
             "scene_ref": beat.get("scene_ref") or {},
@@ -790,6 +821,9 @@ def build_seedance2_prompt_composer_task(
 ) -> str:
     payload = {
         "mode": Seedance2I2VMode(mode).value,
+        "clip_duration_seconds": _clip_seconds(
+            (request_params or {}).get("duration")
+        ),
         "asset_manifest": build_seedance2_asset_manifest(assets),
         "beat": {
             "visual_description": beat.get("visual_description") or "",
@@ -815,6 +849,40 @@ def build_seedance2_prompt_composer_task(
         "rule_based_draft_prompt": normalize_seedance2_editor_prompt(draft_prompt),
     }
     language_rule = asset_language_instruction(language)
+    payload_mode = Seedance2I2VMode(mode).value
+    if payload_mode == Seedance2I2VMode.FIRST_FRAME.value:
+        mode_rule_zh = (
+            "- 本次是严格首帧模式：prompt 必须写明视频第 0 帧与首帧完全一致"
+            "（景别、取景、人物占比、服装、发型、妆容、道具、场景与光线不变），"
+            "并写明禁止推近、禁止裁掉首帧已可见的身体部位与地标、禁止换装/换色/换妆容/换脸，"
+            "姿态与画面支撑面必须真实接触；只能引用图片1，不得引用图片2及以后编号。\n"
+        )
+        mode_rule_en = (
+            "- This run is strict first frame: state that frame 0 matches the first "
+            "frame exactly (framing, subject scale, wardrobe, hairstyle, makeup, props, "
+            "scene, lighting unchanged), forbid push-in, cropping already-visible body "
+            "parts or landmarks, costume/colour/makeup/face changes, and require poses in "
+            "real contact with their supporting surface; reference 图片1 only.\n"
+        )
+    else:
+        mode_rule_zh = ""
+        mode_rule_en = ""
+    clip_seconds = _clip_seconds((request_params or {}).get("duration"))
+    if clip_seconds:
+        clock_rule_zh = (
+            f"- 本镜成片时长 {clip_seconds} 秒（clip_duration_seconds）：内部节拍时钟必须写作 "
+            f"0:00–0:{clip_seconds:02d}，运镜、动作、口型开合和台词都要落在该时钟内；"
+            "禁止照搬其它档位的时间轴（如 15 秒档、25–30 秒档）。\n"
+        )
+        clock_rule_en = (
+            f"- This clip is {clip_seconds} seconds long (clip_duration_seconds): write the "
+            f"internal beat clock as 0:00–0:{clip_seconds:02d} and keep every camera move, "
+            "action, lip movement, and spoken line inside it. Never reuse another tier's "
+            "timeline (such as a 15-second or 25–30-second clip).\n"
+        )
+    else:
+        clock_rule_zh = ""
+        clock_rule_en = ""
     if language == "en":
         return (
             "Write the final Seedance 2.0 image-to-video prompt from the JSON below.\n\n"
@@ -824,10 +892,12 @@ def build_seedance2_prompt_composer_task(
             "- Do not force every manifest asset into the prompt.\n"
             "- asset_fallbacks are text-only constraints and must never receive image numbers.\n"
             "- Do not describe the request JSON or output @.\n"
-            "- Keep duration, resolution, ratio, generate_audio, return_last_frame, and human_review out of the prompt.\n"
-            "- Preserve spoken dialogue verbatim while action directions may be rewritten naturally.\n"
+            "- Keep resolution, ratio, generate_audio, return_last_frame, and human_review out of the prompt.\n"
+            "- Express length only through the beat clock (for example 0:00–0:05), never as a duration parameter.\n"
+            f"{mode_rule_en}"
             f"- {language_rule}\n"
-            "- Output only the final prompt.\n\n"
+            f"{clock_rule_en}"
+            "- Only output the final prompt.\n\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
         )
     return (
@@ -839,11 +909,14 @@ def build_seedance2_prompt_composer_task(
         "- 音频素材是可选声线/声音参考，不是必须全部使用；没有必要就不要写入 prompt。\n"
         "- asset_fallbacks 是未发送的文字约束资产；可用其中 fallback_text 描述道具或角色，但不能给它编图片编号。\n"
         "- 不能重排编号，不能描述请求 JSON，不要输出 @。\n"
-        "- duration、resolution、ratio、generate_audio、return_last_frame、human_review "
+        "- 时长只体现为节拍时钟（例如 0:00–0:05），不要把 duration 写成参数；"
+        "resolution、ratio、generate_audio、return_last_frame、human_review "
         "只作为 API 请求参数，不要写进 prompt。\n"
         "- 如果用户写作要求和资产清单、道具 fallback 冲突，以资产清单和 fallback 为准。\n"
         "- dialogue 或 narration_segment 属于对白时，请根据语义区分动作说明和实际说出的台词；"
         "动作可自然改写，但实际台词必须逐字完整保留，不能删减或概括。\n"
+        f"{mode_rule_zh}"
+        f"{clock_rule_zh}"
         "- 只输出最终 prompt，不要解释。\n\n"
         f"输出语言：{language_rule}\n\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
@@ -854,16 +927,23 @@ def create_seedance2_prompt_composer_agent(language: AssetLanguage = "zh"):
     from pydantic_ai import Agent
 
     from novelvideo.config import get_newapi_text_pydantic_model
+    from novelvideo.skills.ai_film_process import pack_block
 
+    pack = pack_block("seedance2_prompt", model_env="SEEDANCE2_PROMPT_COMPOSER_MODEL")
     return Agent(
         get_newapi_text_pydantic_model(
             "SEEDANCE2_PROMPT_COMPOSER_MODEL",
             brainclaw_profile=BrainClawProfile.SEEDANCE2_PROMPT_COMPOSITION,
             capability="text.generate.workflow",
         ),
-        system_prompt=(
-            f"{SEEDANCE2_COMPOSER_SYSTEM_PROMPT}\n\n"
-            f"## Output Language\n{asset_language_instruction(language)}"
+        system_prompt="\n\n".join(
+            part
+            for part in (
+                SEEDANCE2_COMPOSER_SYSTEM_PROMPT,
+                pack,
+                f"## Output Language\n{asset_language_instruction(language)}",
+            )
+            if part
         ),
         output_type=str,
         name="Seedance 2.0 Prompt Composer",

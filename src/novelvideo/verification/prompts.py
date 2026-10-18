@@ -177,6 +177,28 @@ overall_passed = (total >= 6.0) AND (无 critical issue)
 返回四维分数、total、issues、overall_passed、summary。
 """
 
+VIDEO_CONSISTENCY_VERIFY_PROMPT = """\
+你是短剧成片的一致性审核员。输入图片按顺序为：
+1. 首帧 render：本镜的硬起点与唯一基准（服装、脸型、景别、场景、光线都以它为准）
+2..N. 该镜生成视频的若干帧（第 0 帧与中后段帧）
+
+只报告「影响成片可用性」的硬问题，不要报告正常的动作、表情、运镜、雨雪粒子和光照微差。
+
+## 必须检查的四类问题
+1. **服装与配饰**：衣物款式/颜色/材质、鞋帽、包袋、手持道具是否与首帧一致；同一段内出现第二套服装、丢失或更换配饰 → costume_changed=true
+2. **脸型与身份**：脸型、五官比例、发型是否仍是同一人；换成另一张脸、明显网红化或年龄跳变 → face_changed=true
+3. **景别与取景**：是否把首帧的全身/中景重构成胸像特写、是否裁掉首帧已可见的身体部位或地标、是否大幅推近或拉远 → framing_changed=true
+4. **物理与肢体**：身体是否与支撑面（地面/座椅/台阶）真实接触，是否悬空无接触、上半身直接贴地、腰部与地面粘连、手指或肢体缺失、人体融接、关节反折 → physical_defect=true
+
+## 判定口径
+- 只有肉眼可确认的明显问题才置 true；不确定时置 false，并在 summary 写明不确定点。
+- issues 逐条一句话，写清哪一项、哪一帧、看到了什么。
+- passed = 四项全为 false 且 issues 为空。
+
+## 输出
+输出结构化结果（costume_changed / face_changed / framing_changed / physical_defect / issues / summary）。
+"""
+
 FRAME_VERIFY_PROMPT = """\
 你是首帧渲染质量审核员。你检查 AI 渲染的高清首帧是否存在质量问题。
 

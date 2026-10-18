@@ -100,6 +100,13 @@ export function buildChatTaskLabel(task: Pick<
       : kindLabel;
   }
 
+  if (task.task_type === "scene_pano_generation") {
+    const sceneName = stringValue(result.scene_name) || scopeParts[1] || "";
+    return sceneName
+      ? t("tasks.chatLabel.scenePanoNamed", { scene: sceneName })
+      : t("tasks.chatLabel.scenePano");
+  }
+
   if (task.task_type === "character_portrait") {
     const characterName = stringValue(result.character_name) || scopeParts[1] || "";
     const mode = stringValue(result.mode);

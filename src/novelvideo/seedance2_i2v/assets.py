@@ -26,6 +26,7 @@ from novelvideo.project_config import (
 )
 from novelvideo.seedance2_i2v.character_voice_storage import probe_voice_sample_duration_seconds
 from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+from novelvideo.seedance2_i2v.speaker_matching import speaker_matches_character_name
 from novelvideo.seedance2_i2v.spoken_dialogue import (
     speaker_display_name,
     unique_seedance2_dialogue_speakers,
@@ -637,9 +638,7 @@ def _speaker_matches_character(speaker: str, character: Any) -> bool:
     character_name = _text(getattr(character, "name", ""))
     if not speaker_text or not character_name:
         return False
-    if speaker_text == character_name or speaker_text.startswith(f"{character_name}_"):
-        return True
-    if speaker_display_name(speaker_text) == character_name:
+    if speaker_matches_character_name(speaker_text, character_name):
         return True
     aliases = getattr(character, "aliases", None) or []
     return any(
@@ -939,6 +938,43 @@ def build_seedance2_project_assets(
             )
         )
 
+    resolved_characters = (
+        list(characters) if characters is not None else _load_sqlite_characters(project_output)
+    )
+
+    def add_voice_reference_audio() -> None:
+        """按 beat 的音频类型附加角色/解说参考声线。"""
+
+        audio_type = normalize_seedance2_audio_type(beat)
+        if audio_type == "dialogue":
+            for voice_asset in _dialogue_voice_assets(
+                project_output=project_output,
+                beat=beat,
+                characters=resolved_characters,
+            ):
+                add_audio(
+                    key=voice_asset["key"],
+                    label=voice_asset["label"],
+                    path=voice_asset["path"],
+                    selected=True,
+                    identity_id=voice_asset["identity_id"],
+                    note="Seedance 2.0 只发送角色参考声线，不预生成台词音频。",
+                )
+        elif audio_type == "narration":
+            voice_asset = _narration_voice_asset(
+                project_output=project_output,
+                characters=resolved_characters,
+                state_dir=state_dir,
+            )
+            add_audio(
+                key=voice_asset["key"],
+                label=voice_asset["label"],
+                path=voice_asset["path"],
+                selected=True,
+                identity_id=voice_asset["identity_id"],
+                note="Seedance 2.0 解说只发送参考声线，不预生成解说音频。",
+            )
+
     paths = PathResolver(project_output, episode)
     first_frame_source = paths.frame(beat_num)
     first_frame_path = (
@@ -956,9 +992,11 @@ def build_seedance2_project_assets(
             path=first_frame_path,
             selected=True,
             request_field="image_url",
-            note="首帧模式只发送这一张首帧图，不混用参考图。",
+            note="严格首帧模式：以这一张 render 首帧作为视频第 0 帧，画面不重构图。",
             crop_source_path=first_frame_source,
         )
+        # 严格首帧仍然保留参考声线，避免台词/解说丢掉音色一致性。
+        add_voice_reference_audio()
         return assets
 
     if mode == Seedance2I2VMode.FIRST_LAST_FRAME:
@@ -988,6 +1026,9 @@ def build_seedance2_project_assets(
             request_field="last_frame_image",
             crop_source_path=last_frame_source,
         )
+        # 首尾帧模式（keyframe）同样保留参考声线：漏掉它会让这些 beat 的音色
+        # 完全由模型自由发挥，跨 beat 的声音一致性直接失守。
+        add_voice_reference_audio()
         return assets
 
     add_image(
@@ -999,9 +1040,6 @@ def build_seedance2_project_assets(
         note="多参考模式下作为参考图发送，不作为严格首帧。",
     )
 
-    resolved_characters = (
-        list(characters) if characters is not None else _load_sqlite_characters(project_output)
-    )
     resolved_props = _load_sqlite_props(project_output)
     resolved_prop_menu = (
         list(prop_menu)
@@ -1082,35 +1120,7 @@ def build_seedance2_project_assets(
         note="用于约束场景结构、材质和空间关系。",
     )
 
-    audio_type = normalize_seedance2_audio_type(beat)
-    if audio_type == "dialogue":
-        for voice_asset in _dialogue_voice_assets(
-            project_output=project_output,
-            beat=beat,
-            characters=resolved_characters,
-        ):
-            add_audio(
-                key=voice_asset["key"],
-                label=voice_asset["label"],
-                path=voice_asset["path"],
-                selected=True,
-                identity_id=voice_asset["identity_id"],
-                note="Seedance 2.0 多参考模式只发送角色参考声线，不预生成台词音频。",
-            )
-    elif audio_type == "narration":
-        voice_asset = _narration_voice_asset(
-            project_output=project_output,
-            characters=resolved_characters,
-            state_dir=state_dir,
-        )
-        add_audio(
-            key=voice_asset["key"],
-            label=voice_asset["label"],
-            path=voice_asset["path"],
-            selected=True,
-            identity_id=voice_asset["identity_id"],
-            note="Seedance 2.0 解说只发送参考声线，不预生成解说音频。",
-        )
+    add_voice_reference_audio()
 
     return assets
 

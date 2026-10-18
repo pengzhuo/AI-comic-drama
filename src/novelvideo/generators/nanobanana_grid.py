@@ -861,8 +861,16 @@ def clamp_image_size(size: str) -> str:
 # =============================================================================
 # Sketch 模式配置
 # =============================================================================
-# Sketch 默认比例（向后兼容）
-DEFAULT_SKETCH_ASPECT_RATIO = "2:3"
+# Sketch 默认比例（向后兼容）。
+#
+# 整链画幅统一：草图 / 首帧 / 视频三段必须同画幅，否则视频模型要自己把
+# 2:3 的 render 首帧补成 9:16 画布（纵向凭空多出约 18% 画面），补出来的
+# 部分经常变成"从地里长出来的腰以下/新衣服"，是人物一致性与穿帮的主因之一。
+# 默认 9:16（与视频 ratio 一致），可用 DRAMACLAW_SKETCH_ASPECT_RATIO 覆盖或回滚。
+SKETCH_ASPECT_RATIO_ENV = "DRAMACLAW_SKETCH_ASPECT_RATIO"
+DEFAULT_SKETCH_ASPECT_RATIO = (
+    os.environ.get(SKETCH_ASPECT_RATIO_ENV, "").strip() or "9:16"
+)
 
 # =============================================================================
 # 再生模式配置表（Regen Mode Configs）

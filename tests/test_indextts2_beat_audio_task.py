@@ -276,10 +276,11 @@ async def test_indextts2_selected_runner_generates_narration_and_dialogue(
     assert result.failed == []
     assert result.generated_beats == [1, 2]
     assert [call["beat"] for call in generator.calls] == [1, 2]
-    assert (
-        generator.calls[0]["emotion_prompt"]
-        == "以第三人称旁白视角，用客观冷静的解说语气朗读"
-    )
+    # 项目解说语气在前，流程包第 06 份的配音两节附在其后（台词不受影响）。
+    narration_emotion = generator.calls[0]["emotion_prompt"]
+    assert narration_emotion.startswith("以第三人称旁白视角，用客观冷静的解说语气朗读")
+    assert "## 配音与表演" in narration_emotion
+    assert "## 成片验收" not in narration_emotion
     assert (project_dir / "audio" / "ep001" / "beat_01.mp3").read_bytes() == b"audio-1"
     assert (project_dir / "audio" / "ep001" / "beat_02.mp3").read_bytes() == b"audio-2"
 

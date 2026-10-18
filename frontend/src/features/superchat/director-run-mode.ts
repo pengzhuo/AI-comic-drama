@@ -43,6 +43,7 @@ const MAINLINE_EPISODE_TASK_TYPES = new Set([
   "episode_scene_planner",
   "episode_prop_planner",
   "scene_reference_asset",
+  "scene_pano_generation",
   "prop_reference_asset",
   "sketch_grid_generation",
   "sketch_generation",
@@ -120,10 +121,11 @@ export function loadDirectorRunState(project: string): DirectorAutoRunState {
 
 export function saveDirectorRunState(project: string, state: DirectorAutoRunState): void {
   if (typeof window === "undefined") return;
-  if (state.mode === "manual_confirm") {
-    window.localStorage.removeItem(storageKey(project));
-    return;
-  }
+  // 手动模式 is written explicitly instead of clearing the record: with no
+  // record at all meaning 「never chose」 (the panel opens on 一键成片), removing
+  // the key would silently turn an explicit 手动模式 back into the default.
+  // `loadDirectorRunState` normalizes a stored manual mode back to the plain
+  // default state.
   window.localStorage.setItem(storageKey(project), JSON.stringify({
     ...state,
     handledKeys: state.handledKeys.slice(-MAX_HANDLED_KEYS),
@@ -154,6 +156,34 @@ export function activateDirectorProjectAuto(): DirectorAutoRunState {
     voiceChoiceRequired: false,
     voicePrerequisiteErrors: [],
   };
+}
+
+/**
+ * The run-mode state a project opens with.
+ *
+ * 一键成片 is the standing default: it is what the product is for, and a mode
+ * on its own never dispatches anything — the user still has to send the start
+ * command *and* pass the second confirmation. A stored choice always wins, so
+ * an explicit 手动模式 is never overridden.
+ */
+export function initialDirectorRunState(project: string): DirectorAutoRunState {
+  if (typeof window === "undefined") return activateDirectorProjectAuto();
+  if (window.localStorage.getItem(storageKey(project)) === null) {
+    return activateDirectorProjectAuto();
+  }
+  return loadDirectorRunState(project);
+}
+
+/**
+ * State used when a run ends (completed/paused) on its own.
+ *
+ * The chosen mode is deliberately kept: silently dropping back to 手动模式 made
+ * the panel look like it had ignored the user's selection. Only the
+ * confirmation stage resets, so the next start still needs its explicit
+ * confirmation.
+ */
+export function settledDirectorRunState(mode: DirectorRunMode): DirectorAutoRunState {
+  return { ...defaultDirectorRunState(), mode };
 }
 
 export function awaitDirectorEpisodeAutoConfirmation(
@@ -215,7 +245,8 @@ export function directorAutoConfirmationTransportText(
     "state that 本集自动 will safely advance the current episode until the final composition is " +
     "complete, and will pause on failure, unmet prerequisites, destructive or ambiguous actions, " +
     `or choices that require the user.${voiceInstruction}\n` +
-    "[/DRAMACLAW_RUN_MODE_CONFIRMATION]";
+    "[/DRAMACLAW_RUN_MODE_CONFIRMATION]" +
+    DIRECTOR_KEYWORD_FORMAT_RULE;
 }
 
 export function resolveDirectorVoicePolicy(text: string): DirectorVoicePolicy | null {
@@ -252,11 +283,135 @@ export function emphasizeDirectorVoiceChoiceLabels(text: string): string {
   }, text);
 }
 
+export type DirectorKeywordTone = "destructive" | "warning" | "primary" | "step";
+
+/**
+ * 捏导回复里的动作关键字分色表。按「危险 → 需注意 → 常规」排序，
+ * 一个词只归属第一档。色值全部复用 DESIGN.md 已有的语义色，不新增颜色。
+ */
+const DIRECTOR_KEYWORD_GROUPS: ReadonlyArray<readonly [DirectorKeywordTone, readonly string[]]> = [
+  [
+    "destructive",
+    ["强制终止", "强制停止", "强制取消", "终止", "停止", "取消", "重置", "清空", "删除", "覆盖", "放弃"],
+  ],
+  ["warning", ["暂停", "重试", "重跑", "修改", "跳过", "回退", "撤销", "恢复"]],
+  ["primary", ["开始", "确认", "继续", "执行", "生成", "提交", "保存", "应用", "启动"]],
+];
+
+const DIRECTOR_KEYWORD_INDEX: ReadonlyMap<string, DirectorKeywordTone> = new Map(
+  DIRECTOR_KEYWORD_GROUPS.flatMap(([tone, words]) => words.map((word) => [word, tone] as const)),
+);
+
+/** 裸词匹配用的候选列表（长词优先，避免「终止」抢走「强制终止」）。 */
+const DIRECTOR_BARE_KEYWORD_PATTERN = DIRECTOR_KEYWORD_GROUPS
+  .flatMap(([, words]) => words)
+  .sort((left, right) => right.length - left.length)
+  .join("|");
+
+const DIRECTOR_CJK_PATTERN = /[\u3400-\u9fff\uf900-\ufaff]/u;
+
+/**
+ * 判断一段文字（通常来自方括号标签）属于哪一档颜色。
+ *
+ * `bracketed` 为真时，没命中任何命令词的方括号内容按「步骤名」处理（中性高亮）；
+ * 为假时返回 null，避免在自然语句里把普通词染色。
+ */
+export function directorKeywordTone(
+  label: string,
+  options: { bracketed?: boolean } = {},
+): DirectorKeywordTone | null {
+  const text = String(label ?? "").trim();
+  if (!text) return null;
+  const direct = DIRECTOR_KEYWORD_INDEX.get(text);
+  if (direct) return direct;
+  for (const [tone, words] of DIRECTOR_KEYWORD_GROUPS) {
+    if (words.some((word) => text.includes(word))) return tone;
+  }
+  return options.bracketed ? "step" : null;
+}
+
+/**
+ * 给助手消息里的方括号关键字加粗，让它走 `strong` 渲染器上色。
+ *
+ * 保留方括号本身（用户要求 `[终止]` 而不是「终止」），并且：
+ * * 跳过 markdown 链接 `[文本](地址)`；
+ * * 跳过已加粗的 `**[终止]**`，保证幂等；
+ * * 跳过 `[x]`、`[1]` 这类英文/数字标签，避免破坏任务列表与脚注。
+ */
+export function emphasizeDirectorCommandKeywords(text: string): string {
+  if (!text || (!text.includes("[") && !text.includes("【"))) return text;
+  return text.replace(/(?<!\*)[【[]([^【】[\]\n]{1,16})[】\]](?!\()/gu, (match, label: string) => {
+    const trimmed = String(label ?? "").trim();
+    if (!trimmed) return match;
+    if (!DIRECTOR_CJK_PATTERN.test(trimmed) && !DIRECTOR_KEYWORD_INDEX.has(trimmed)) return match;
+    return `**${match}**`;
+  });
+}
+
+export interface DirectorKeywordSegment {
+  text: string;
+  tone: DirectorKeywordTone | null;
+}
+
+/**
+ * 把一段纯文本切成「普通文字 / 上色关键字」片段。
+ *
+ * 用于 toast、按钮、弹窗这类受控文案：`bare` 为真时连不带方括号的关键字
+ * （例如按钮上的「终止当前任务」）也会被上色，方括号本身不会被去掉。
+ */
+export function directorKeywordSegments(
+  text: string,
+  options: { bare?: boolean } = {},
+): DirectorKeywordSegment[] {
+  const value = String(text ?? "");
+  if (!value) return [];
+  const pattern = options.bare
+    ? new RegExp(`[【[]([^【】[\\]\\n]{1,16})[】\\]]|(${DIRECTOR_BARE_KEYWORD_PATTERN})`, "gu")
+    : new RegExp("[【[]([^【】[\\]\\n]{1,16})[】\\]]", "gu");
+  const segments: DirectorKeywordSegment[] = [];
+  let cursor = 0;
+  for (const match of value.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > cursor) segments.push({ text: value.slice(cursor, index), tone: null });
+    const bracketed = match[1] ?? null;
+    const bare = match[2] ?? null;
+    const label = bracketed ?? bare ?? "";
+    const tone = directorKeywordTone(label, { bracketed: bracketed !== null });
+    if (tone && bracketed === null && !DIRECTOR_CJK_PATTERN.test(label)) {
+      segments.push({ text: match[0], tone: null });
+    } else if (tone) {
+      segments.push({ text: match[0], tone });
+    } else {
+      segments.push({ text: match[0], tone: null });
+    }
+    cursor = index + match[0].length;
+  }
+  if (cursor < value.length) segments.push({ text: value.slice(cursor), tone: null });
+  return segments;
+}
+
+/**
+ * 让模型把动作关键字写成方括号形式，前端才能按类型上色。
+ *
+ * 用户要求「模型自己生成的指令话术也要覆盖」，所以这条规则挂在每一轮对话的
+ * transport 文本上，而不是只改按钮文案。
+ */
+export const DIRECTOR_KEYWORD_FORMAT_RULE =
+  "\n\n[DRAMACLAW_KEYWORD_FORMAT]\n" +
+  "回复里凡是要用户点击、确认或选择的动作关键字，一律用方括号包起来（保留方括号本身），" +
+  "例如 [开始]、[确认]、[继续]、[执行]、[重试]、[暂停]、[终止]；" +
+  "步骤名同样写成 [步骤名]，例如 [生成首帧草图]。不要用引号、书名号或纯加粗代替方括号。" +
+  "前端会按类型上色：危险操作（[终止][停止][取消][重置] 等）显示警示色，" +
+  "需注意（[暂停][重试][修改][跳过] 等）显示提醒色，常规操作显示强调色，步骤名显示中性高亮。" +
+  "按钮文案不用额外加方括号，写关键字本身即可。\n" +
+  "[/DRAMACLAW_KEYWORD_FORMAT]";
+
 export function directorAutoVoiceChoiceTransportText(text: string): string {
   return `${text}\n\n[DRAMACLAW_VOICE_POLICY_REQUIRED]\n`+
     "Do not start episode auto and do not call generation tools. The user's voice policy is still " +
     "unclear. Ask only: ‘请选择：1）缺失声线由捏导自动匹配系统声线；2）我会到「捏塘」上传或录制自定义声线。’ " +
-    "Ask them to reply 系统声线 or 自定义声线.\n[/DRAMACLAW_VOICE_POLICY_REQUIRED]";
+    "Ask them to reply 系统声线 or 自定义声线.\n[/DRAMACLAW_VOICE_POLICY_REQUIRED]" +
+    DIRECTOR_KEYWORD_FORMAT_RULE;
 }
 
 export function markDirectorAutoHandled(
@@ -290,7 +445,8 @@ export function directorAutoRunTransportText(text: string): string {
     "applies Agent-credit billing. The durable auto coordinator is already running now: do not merely " +
     "describe what 本集自动 will do in the future. Inspect current state, report the concrete active " +
     "task or start the next safe task, and say clearly that automatic production has started.\n" +
-    "[/DRAMACLAW_RUN_MODE]";
+    "[/DRAMACLAW_RUN_MODE]" +
+    DIRECTOR_KEYWORD_FORMAT_RULE;
 }
 
 export function directorPipelineAutoConfirmationTransportText(
@@ -310,7 +466,8 @@ export function directorPipelineAutoConfirmationTransportText(
     "portraits) and produce every unfinished episode through final composition, and will pause on " +
     "failure, unmet prerequisites, destructive or ambiguous actions, or choices that require the " +
     `user.${voiceInstruction}\n` +
-    "[/DRAMACLAW_RUN_MODE_CONFIRMATION]";
+    "[/DRAMACLAW_RUN_MODE_CONFIRMATION]" +
+    DIRECTOR_KEYWORD_FORMAT_RULE;
 }
 
 export function directorPipelineAutoRunTransportText(text: string): string {
@@ -324,7 +481,8 @@ export function directorPipelineAutoRunTransportText(text: string): string {
     "limit. This mode never applies Agent-credit billing. The durable auto coordinator is already " +
     "running now: do not merely describe what 一键成片 will do in the future; inspect current state, " +
     "report the concrete active task or start the next safe task, and say clearly that automatic " +
-    "production has started.\n[/DRAMACLAW_RUN_MODE]";
+    "production has started.\n[/DRAMACLAW_RUN_MODE]" +
+    DIRECTOR_KEYWORD_FORMAT_RULE;
 }
 
 export function directorAutoUserMessageTransportText(text: string): string {
@@ -338,7 +496,8 @@ export function directorAutoUserMessageTransportText(text: string): string {
     "explicitly asks to stop or switch to manual mode, call " +
     "dramaclaw_control_episode_auto(action='pause'). Never cancel a queued or running generation task " +
     "unless the user explicitly confirms cancellation of that exact task.\n" +
-    "[/DRAMACLAW_AUTO_USER_MESSAGE]";
+    "[/DRAMACLAW_AUTO_USER_MESSAGE]" +
+    DIRECTOR_KEYWORD_FORMAT_RULE;
 }
 
 export function directorAutoInterventionTransportText(text: string): string {
@@ -353,7 +512,8 @@ export function directorAutoInterventionTransportText(text: string): string {
     "one concise follow-up " +
     "and keep the run suspended. A queued or running generation task must continue by default and must " +
     "not be cancelled unless the user explicitly confirms cancelling that exact task.\n" +
-    "[/DRAMACLAW_AUTO_INTERVENTION_CONFIRMATION]";
+    "[/DRAMACLAW_AUTO_INTERVENTION_CONFIRMATION]" +
+    DIRECTOR_KEYWORD_FORMAT_RULE;
 }
 
 function taskTimestamp(task: TaskState): number {

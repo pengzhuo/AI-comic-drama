@@ -30,6 +30,7 @@ from novelvideo.cognee.screenplay_normalizer import (
     normalize_time_of_day,
 )
 from novelvideo.utils.derived_scenes import compose_derived_scene_name
+from novelvideo.skills.ai_film_process import append_pack
 from novelvideo.workflows.literal_script_writing import (
     LiteralScriptWritingWorkflow,
     SceneBlock,
@@ -812,7 +813,11 @@ class AssetCompiler:
                 brainclaw_profile=BrainClawProfile.EPISODE_SCENE_RECONCILIATION,
                 capability="text.generate.agent",
             ),
-            system_prompt=BASE_SCENE_RECONCILE_PROMPT,
+            system_prompt=append_pack(
+                "episode_scene_planner",
+                BASE_SCENE_RECONCILE_PROMPT,
+                model_env="EPISODE_SCENE_RECONCILE_MODEL",
+            ),
             model_settings=get_newapi_structured_output_model_settings(),
             output_type=EpisodeBaseSceneReconcileOutput,
             output_retries=model_gateway_output_retries(2),
@@ -1176,7 +1181,11 @@ class AssetCompiler:
                 brainclaw_profile=BrainClawProfile.NARRATED_SCENE_ASSET_PLANNING,
                 capability="text.generate.agent",
             ),
-            system_prompt=NARRATED_SCENE_PROMPT,
+            system_prompt=append_pack(
+                "episode_scene_planner",
+                NARRATED_SCENE_PROMPT,
+                model_env="NARRATED_SCENE_ASSET_MODEL",
+            ),
             model_settings=get_newapi_structured_output_model_settings(),
             output_type=NarratedScenePlanOutput,
             output_retries=model_gateway_output_retries(2),
@@ -1259,7 +1268,11 @@ class AssetCompiler:
                 brainclaw_profile=BrainClawProfile.EPISODE_SCENE_PLANNING,
                 capability="text.generate.agent",
             ),
-            system_prompt=DERIVED_SCENE_PROMPT,
+            system_prompt=append_pack(
+                "episode_scene_planner",
+                DERIVED_SCENE_PROMPT,
+                model_env="EPISODE_SCENE_PLANNER_MODEL",
+            ),
             model_settings=get_newapi_structured_output_model_settings(),
             output_type=BlockDerivedSceneOutput,
             output_retries=model_gateway_output_retries(2),
@@ -1446,7 +1459,11 @@ class AssetCompiler:
                 brainclaw_profile=BrainClawProfile.EPISODE_PROP_PLANNING,
                 capability="text.generate.agent",
             ),
-            system_prompt=BLOCK_PROP_PROMPT,
+            system_prompt=append_pack(
+                "episode_prop_planner",
+                BLOCK_PROP_PROMPT,
+                model_env="EPISODE_PROP_PLANNER_MODEL",
+            ),
             model_settings=get_newapi_structured_output_model_settings(),
             output_type=BlockPropRequirements,
             output_retries=model_gateway_output_retries(2),

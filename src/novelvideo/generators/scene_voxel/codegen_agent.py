@@ -18,12 +18,24 @@ from typing import Any
 from PIL import Image
 from pydantic_ai import Agent, BinaryContent
 
-from novelvideo.config import get_pydantic_model
+from novelvideo.config import get_legacy_agent_model_name, get_pydantic_model
 
 _log = logging.getLogger(__name__)
 
 _PROVIDER = os.environ.get("VOXEL_VLM_PROVIDER", "openrouter")
-_MODEL = os.environ.get("VOXEL_VLM_MODEL", "openai/gpt-5.5")
+#: EE 仍走直连厂商模型；CE 网关只开通 ``DC-*`` 别名，直连模型名到了网关没有渠道。
+_VENDOR_DEFAULT_MODEL = "openai/gpt-5.5"
+
+
+def _voxel_model_name() -> str:
+    configured = os.environ.get("VOXEL_VLM_MODEL", "").strip()
+    if configured:
+        return configured
+    from novelvideo.shared.runtime_env import uses_local_ce_runtime
+
+    if uses_local_ce_runtime():
+        return get_legacy_agent_model_name()
+    return _VENDOR_DEFAULT_MODEL
 
 
 SYSTEM_PROMPT = """You are an expert 3D voxel scene designer for a comic-drama (漫剧) production pipeline.
@@ -308,7 +320,7 @@ async def generate_build_script(
     """
     model = get_pydantic_model(
         provider_override=_PROVIDER,
-        model_name_override=_MODEL,
+        model_name_override=_voxel_model_name(),
     )
     agent = Agent(
         model,

@@ -10,6 +10,9 @@ from typing import Any
 from novelvideo.freezone.video_node import validate_omni_reference_audio_durations
 from novelvideo.generators.video_generator import ShotReference
 from novelvideo.seedance2_i2v.character_voice_storage import probe_voice_sample_duration_seconds
+from novelvideo.seedance2_i2v.duration import (
+    resolve_seedance2_target_duration,
+)
 from novelvideo.seedance2_i2v.assets import (
     Seedance2ResolvedAsset,
     apply_prompt_audio_selection,
@@ -174,6 +177,22 @@ def _validate_dialogue_final_prompt(
         if asset.reference_label.startswith("音频")
     ]
     if not audio_labels or any(label not in final_prompt for label in audio_labels):
+        missing_voice_labels = list(
+            dict.fromkeys(
+                asset.label
+                for asset in assets
+                if asset.media_type == "audio"
+                and asset.key.startswith("voice:")
+                and not asset.exists
+            )
+        )
+        if missing_voice_labels:
+            raise ValueError(
+                "Seedance2 缺少参考声线："
+                + "、".join(missing_voice_labels)
+                + " 还没有音频文件，请到角色工作台上传或录制声线，"
+                "或使用「系统声线」生成后再生成视频"
+            )
         raise ValueError("Seedance2 最终提示词缺少参考声线，请在台词描述中写明对应音频编号")
 
 
@@ -280,7 +299,10 @@ async def prepare_seedance2_generation_inputs(
         reference_audio_paths=list(config.reference_audio_paths),
     )
 
-    target_duration = int(config.duration or duration or 0)
+    target_duration = resolve_seedance2_target_duration(
+        config_duration=config.duration,
+        requested=duration,
+    )
     config.duration = target_duration
     config.resolution = resolution or config.resolution
     config.ratio = ratio or config.ratio
@@ -314,6 +336,11 @@ async def prepare_seedance2_generation_inputs(
     if config.mode == Seedance2I2VMode.FIRST_FRAME:
         first_frames = selected_reference_paths(assets, "image_url")
         image_path = first_frames[0] if first_frames else None
+        # 严格首帧：视频第 0 帧锁死为 render 首帧，同时保留参考声线锁音色。
+        references = _references_from_paths(
+            image_paths=[],
+            audio_paths=config.reference_audio_paths,
+        )
     elif config.mode == Seedance2I2VMode.FIRST_LAST_FRAME:
         first_frames = selected_reference_paths(assets, "first_frame_image")
         last_frames = selected_reference_paths(assets, "last_frame_image")

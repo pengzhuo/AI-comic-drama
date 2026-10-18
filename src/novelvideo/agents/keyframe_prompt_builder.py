@@ -68,16 +68,23 @@ Output ONLY the transition prompt in the requested language.
 def create_keyframe_prompt_builder_agent(language: str = "zh") -> Agent:
     """创建首尾帧过渡提示词生成 Agent。"""
     from novelvideo.config import get_newapi_text_pydantic_model
+    from novelvideo.skills.ai_film_process import pack_block
     model = get_newapi_text_pydantic_model(
         "KEYFRAME_PROMPT_MODEL",
         brainclaw_profile=BrainClawProfile.KEYFRAME_TRANSITION_PROMPT_GENERATION,
         capability="text.generate.agent",
     )
+    pack = pack_block("beat_video_prompt", model_env="KEYFRAME_PROMPT_MODEL")
     return Agent(
         model,
-        system_prompt=(
-            f"{KEYFRAME_PROMPT_BUILDER_INSTRUCTIONS_EN}\n\n"
-            f"## Output Language\n{asset_language_instruction(language)}"
+        system_prompt="\n\n".join(
+            part
+            for part in (
+                KEYFRAME_PROMPT_BUILDER_INSTRUCTIONS_EN,
+                pack,
+                f"## Output Language\n{asset_language_instruction(language)}",
+            )
+            if part
         ),
         output_type=str,
         name="Keyframe Prompt Builder",

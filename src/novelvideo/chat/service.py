@@ -453,7 +453,7 @@ def _codex_developer_instructions(
     workspace: Path | None = None,
 ) -> str:
     if str(tool_mode or "").strip() == "freezone_canvas":
-        from novelvideo.freezone.workflow_planning import WORKFLOW_PLANNING_INSTRUCTIONS
+        from novelvideo.freezone.workflow_planning import workflow_planning_instructions
 
         skill_locators = (
             _codex_agent_skill_locator_instructions(workspace)
@@ -463,7 +463,7 @@ def _codex_developer_instructions(
         instructions_prefix = _CODEX_FREEZONE_DEVELOPER_INSTRUCTIONS + skill_locators
         return instructions_prefix + (
             " "
-            + WORKFLOW_PLANNING_INSTRUCTIONS
+            + workflow_planning_instructions()
             + " "
             + CANVAS_FINAL_RESPONSE_INSTRUCTIONS
             + " Your final response MUST be a JSON object, not plain text or Markdown. "

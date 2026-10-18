@@ -137,14 +137,13 @@ async def test_seedance2_voice_clone_uses_identity_reference_before_character(tm
     )
 
     assert result.success is True
-    assert generator.calls == [
-        {
-            "prompt": "你终于来了。",
-            "audio_url": "data://幼年时期_voice.wav",
-            "output_path": str(project_dir / "audio" / "ep001" / "beat_03.mp3"),
-            "emotion_prompt": "",
-        }
-    ]
+    assert len(generator.calls) == 1
+    call = generator.calls[0]
+    assert call["prompt"] == "你终于来了。"
+    assert call["audio_url"] == "data://幼年时期_voice.wav"
+    assert call["output_path"] == str(project_dir / "audio" / "ep001" / "beat_03.mp3")
+    # 没有项目/角色语气提示时，语气提示就是流程包第 06 份的配音两节。
+    assert call["emotion_prompt"].startswith("【制作流程包规范")
     assert (project_dir / "audio" / "ep001" / "beat_03.mp3").read_bytes() == b"beat-audio"
 
 
@@ -179,7 +178,13 @@ async def test_seedance2_voice_clone_sends_only_spoken_text_to_fal(tmp_path):
 
     assert result.success is True
     assert generator.calls[0]["prompt"] == "你终于来了。"
-    assert generator.calls[0]["emotion_prompt"] == "谢铮压低声音说"
+    # 语气提示保持「原值在前、流程包在后」，成片验收一节不进配音提示。
+    emotion = generator.calls[0]["emotion_prompt"]
+    assert emotion.startswith("谢铮压低声音说")
+    assert emotion.splitlines()[0] == "谢铮压低声音说"
+    assert "## 配音与表演" in emotion
+    assert "## 声音衔接" in emotion
+    assert "## 成片验收" not in emotion
 
 
 @pytest.mark.asyncio
@@ -681,3 +686,39 @@ def test_resolve_narrator_source_third_person_reports_hash_read_failure(
 
     assert resolution.audio_path is None
     assert "声线文件无法读取" in resolution.error
+
+
+def test_dialogue_text_drops_script_labels_and_leading_notes():
+    from novelvideo.seedance2_i2v.voice_clone import dialogue_text
+
+    # 配音只念台词：说话人标签和（表演提示）都不能被念出来。
+    assert (
+        dialogue_text(
+            {
+                "narration_segment":
+                    "许知意（os）：（神色坚定，喘息未平便开口）今天是我的生日……"
+            }
+        )
+        == "今天是我的生日……"
+    )
+    # 不是说话人标签的冒号短语必须原样保留。
+    assert (
+        dialogue_text({"narration_segment": "我说的是：今天是我的生日。"})
+        == "我说的是：今天是我的生日。"
+    )
+
+
+def test_dialogue_emotion_prompt_reuses_the_leading_performance_note():
+    from novelvideo.seedance2_i2v.voice_clone import dialogue_emotion_prompt
+
+    assert (
+        dialogue_emotion_prompt(
+            {"narration_segment": "（神色坚定，一手撑住墙面）今天是我的生日。"}
+        )
+        == "神色坚定，一手撑住墙面"
+    )
+    # （os）只说明说话人，不是表演提示。
+    assert (
+        dialogue_emotion_prompt({"narration_segment": "许知意（os）：我恨他们。"}) == ""
+    )
+    assert dialogue_emotion_prompt({"narration_segment": "你终于来了。"}) == ""

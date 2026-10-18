@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from novelvideo.config import INDEXTTS2_RECORD_MODEL, INDEXTTS2_RECORD_PROVIDER
+from novelvideo.seedance2_i2v.speaker_matching import select_character_for_speaker
 from novelvideo.seedance2_i2v.voice_audio_records import (
     upsert_seedance2_voice_audio_record,
 )
@@ -45,29 +46,28 @@ async def resolve_identity_voice_sha256(store, speaker: str) -> str:
     speaker = str(speaker or "").strip()
     if not speaker:
         return ""
-    for character in await store.list_characters():
-        if not speaker.startswith(character.name):
-            continue
-        identity = next(
-            (item for item in getattr(character, "identities", []) if item.identity_id == speaker),
-            None,
-        )
-        resolution = resolve_character_voice(
-            project_dir=store.project_dir,
-            character=character,
-            identity=identity,
-        )
-        if resolution.audio_path is not None:
-            return str(resolution.sha256 or "").strip()
-        if identity is not None:
-            legacy = find_identity_reference_audio(
-                Path(store.project_dir),
-                character.name,
-                identity.identity_name,
-            )
-            if legacy and legacy.exists():
-                return file_sha256(legacy)
+    character = select_character_for_speaker(speaker, await store.list_characters())
+    if character is None:
         return ""
+    identity = next(
+        (item for item in getattr(character, "identities", []) if item.identity_id == speaker),
+        None,
+    )
+    resolution = resolve_character_voice(
+        project_dir=store.project_dir,
+        character=character,
+        identity=identity,
+    )
+    if resolution.audio_path is not None:
+        return str(resolution.sha256 or "").strip()
+    if identity is not None:
+        legacy = find_identity_reference_audio(
+            Path(store.project_dir),
+            character.name,
+            identity.identity_name,
+        )
+        if legacy and legacy.exists():
+            return file_sha256(legacy)
     return ""
 
 

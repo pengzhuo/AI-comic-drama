@@ -2847,6 +2847,7 @@
     },
     "pastePlaceholder": "在这里粘贴小说文本，最多 1000 字",
     "startIngest": "开始导入",
+    "startOneClickFilm": "一键成片",
     "saveSettings": "保存设置",
     "settingsSaved": "项目设置已保存",
     "settingsSaveFailed": "项目设置保存失败",
@@ -3222,6 +3223,8 @@
         "fallback": "场景参考图",
         "named": "{{scene}}{{kind}}"
       },
+      "scenePano": "场景 360 全景图",
+      "scenePanoNamed": "{{scene}} 360 全景图",
       "beatRange": "Beat {{ranges}}",
       "sketchGrid": "草图网格 {{index}}/{{total}}",
       "sketch": "草图",

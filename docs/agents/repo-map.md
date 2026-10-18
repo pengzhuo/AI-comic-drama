@@ -58,7 +58,7 @@ with iterative `tsc -b` rather than a blind cut.
 | `director_world/` | 3D previz/staging/voxel + spatial contracts |
 | `export/` | Episode export (SRT/video/zip) |
 | `verification/` | Quality gates |
-| `styles/`, `prompts/`, `skills/`, `assets/` | Bundled content |
+| `styles/`, `prompts/`, `skills/`, `assets/` | Bundled content; `skills/ai_film_process/` = 制作流程包 — injection rules in [`skill-pack-injection.md`](skill-pack-injection.md) |
 | `utils/` | `model_context_budget`, `document_parsers`, `path_resolver`, `screenplay_scene_parser`, `upload_safety` |
 | `shared/runtime_env.py` | Runtime/edition flags (`is_ce_effective`) |
 

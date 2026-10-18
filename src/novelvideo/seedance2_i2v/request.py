@@ -77,6 +77,18 @@ def _validate_human_review_media_urls(params: dict[str, Any]) -> None:
         )
 
 
+def _rewrite_stale_image_references(prompt: str, *, image_count: int) -> str:
+    """把越界的「图片N」引用改写为首帧表述，避免严格首帧模式直接校验失败。"""
+
+    def replace(match: re.Match[str]) -> str:
+        number = int(match.group("number"))
+        if 1 <= number <= image_count:
+            return match.group(0)
+        return "首帧画面"
+
+    return re.sub(r"@?图片(?P<number>\d+)", replace, str(prompt or ""))
+
+
 def _validate_prompt_reference_numbers(
     prompt: str,
     *,
@@ -177,5 +189,19 @@ def build_seedance2_huimeng_params(
 
     if not first_frame:
         raise ValueError("first_frame is required for Seedance 2.0 first-frame mode")
+    audios = clean_reference_list(reference_audios)
+    if len(audios) > 3:
+        raise ValueError("reference_audios supports at most 3 audios")
+    # 严格首帧：只发送首帧图，提示词里越界的参考图编号改写为首帧表述。
+    params["prompt"] = _rewrite_stale_image_references(
+        params.get("prompt") or "", image_count=1
+    )
     params["image_url"] = first_frame
-    return _finalize_params(params, config, image_count=1)
+    if audios:
+        params["reference_audios"] = audios
+    return _finalize_params(
+        params,
+        config,
+        image_count=1,
+        audio_count=len(audios),
+    )

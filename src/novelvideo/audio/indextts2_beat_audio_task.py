@@ -20,6 +20,7 @@ from novelvideo.shared.billing_errors import (
     is_insufficient_credits_error,
 )
 from novelvideo.seedance2_i2v.models import parse_seedance2_config
+from novelvideo.seedance2_i2v.speaker_matching import select_character_for_speaker
 from novelvideo.seedance2_i2v.voice_audio_records import (
     classify_seedance2_voice_audio,
     upsert_seedance2_voice_audio_record,
@@ -218,7 +219,7 @@ async def _diagnose_missing_dialogue_voice(speaker: str, store) -> str:
         characters = await store.list_characters()
     except Exception as exc:  # pragma: no cover - defensive
         return f"读取角色失败：{exc}"
-    matched = next((c for c in characters if speaker.startswith(c.name)), None)
+    matched = select_character_for_speaker(speaker, characters)
     if matched is None:
         names = "、".join(c.name for c in characters) or "<无>"
         return f"未找到匹配角色（已存在角色：{names}）"

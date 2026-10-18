@@ -131,13 +131,18 @@ import {
   directorAutoVoiceChoiceTransportText,
   directorPipelineAutoConfirmationTransportText,
   directorPipelineAutoRunTransportText,
+  directorKeywordSegments,
+  directorKeywordTone,
+  emphasizeDirectorCommandKeywords,
   emphasizeDirectorVoiceChoiceLabels,
+  initialDirectorRunState,
   isDirectorEpisodeAutoSession,
   isDirectorEpisodeAutoStartIntent,
-  loadDirectorRunState,
   resolveDirectorVoicePolicy,
   saveDirectorRunState,
+  settledDirectorRunState,
   type DirectorAutoRunState,
+  type DirectorKeywordTone,
   type DirectorRunMode,
   type DirectorVoicePolicy,
 } from "@/features/superchat/director-run-mode";
@@ -670,6 +675,41 @@ function markdownChildrenText(children: ReactNode): string {
     .join("");
 }
 
+/**
+ * 动作关键字分色：色值全部来自 DESIGN.md 已有语义色（destructive / warning /
+ * primary）与既有的 cyan-300 强调色，不新增色值。
+ */
+const DIRECTOR_KEYWORD_CLASS: Record<DirectorKeywordTone, string> = {
+  destructive: "text-destructive",
+  warning: "text-warning",
+  primary: "text-primary",
+  step: "text-cyan-300",
+};
+
+/**
+ * 受控文案里的关键字上色（toast / 按钮 / 弹窗正文）。
+ *
+ * `bare` 为真时连不带方括号的关键字也会上色（例如按钮上的「终止当前任务」）；
+ * 没有任何关键字命中时直接返回纯文本，避免多余的 DOM 节点引起重排闪烁。
+ */
+function DirectorKeywordText({ text, bare = false }: { text: string; bare?: boolean }) {
+  const segments = directorKeywordSegments(text, { bare });
+  if (!segments.some((segment) => segment.tone)) return <>{text}</>;
+  return (
+    <>
+      {segments.map((segment, index) =>
+        segment.tone ? (
+          <span key={index} className={cn("font-semibold", DIRECTOR_KEYWORD_CLASS[segment.tone])}>
+            {segment.text}
+          </span>
+        ) : (
+          <span key={index}>{segment.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
 const MARKDOWN_COMPONENTS: MarkdownComponents = {
   h1: ({ children }) => <h1 className="mb-2 mt-3 text-lg font-semibold leading-7 first:mt-0">{children}</h1>,
   h2: ({ children }) => <h2 className="mb-2 mt-3 text-base font-semibold leading-6 first:mt-0">{children}</h2>,
@@ -693,12 +733,16 @@ const MARKDOWN_COMPONENTS: MarkdownComponents = {
   li: ({ children }) => <li className="pl-0.5">{children}</li>,
   strong: ({ children }) => {
     const label = markdownChildrenText(children).trim();
+    // 只处理前端自己加粗的方括号标签（[终止] / 【暂停】），避免影响模型原有的加粗。
+    const bracketed = /^[【[][^【】[\]]{1,16}[】\]]$/u.test(label);
+    const keywordTone = bracketed ? directorKeywordTone(label, { bracketed: true }) : null;
     return (
       <strong
         className={cn(
           "font-semibold text-foreground",
           label === "系统声线" && "text-cyan-300",
           label === "自定义声线" && "text-violet-300",
+          keywordTone && DIRECTOR_KEYWORD_CLASS[keywordTone],
         )}
       >
         {children}
@@ -750,7 +794,9 @@ const PlainMessageText = memo(function PlainMessageText({ text }: { text: string
 });
 
 const MarkdownMessageText = memo(function MarkdownMessageText({ text }: { text: string }) {
-  const normalized = emphasizeDirectorVoiceChoiceLabels(normalizeMessageText(text));
+  const normalized = emphasizeDirectorCommandKeywords(
+    emphasizeDirectorVoiceChoiceLabels(normalizeMessageText(text)),
+  );
   if (!normalized) return null;
 
   return (
@@ -12708,7 +12754,7 @@ export function SuperChatPanel({
   const [canvasCommandModeMenuOpen, setCanvasCommandModeMenuOpen] = useState(false);
   const directorRunProject = params.project?.trim() || "home";
   const [directorRunState, setDirectorRunState] = useState<DirectorAutoRunState>(() =>
-    loadDirectorRunState(directorRunProject),
+    initialDirectorRunState(directorRunProject),
   );
   const directorRunStateRef = useRef(directorRunState);
   const [directorRunModeMenuOpen, setDirectorRunModeMenuOpen] = useState(false);
@@ -13085,7 +13131,7 @@ export function SuperChatPanel({
   }, [canvasCommandExecutionMode]);
 
   useEffect(() => {
-    const loaded = loadDirectorRunState(directorRunProject);
+    const loaded = initialDirectorRunState(directorRunProject);
     directorRunStateRef.current = loaded;
     setDirectorRunState(loaded);
     const project = params.project?.trim();
@@ -13123,16 +13169,18 @@ export function SuperChatPanel({
       } else if (server.status === "paused" || server.status === "completed") {
         // A persisted terminal server run is authoritative. In particular,
         // do not leave an old pre-start confirmation in localStorage after a
-        // background task has already failed and paused the durable run.
-        const manual = defaultDirectorRunState();
-        directorRunStateRef.current = manual;
-        setDirectorRunState(manual);
-        saveDirectorRunState(directorRunProject, manual);
+        // background task has already failed and paused the durable run. The
+        // chosen mode survives: a finished run must not look like the panel
+        // silently fell back to 手动模式.
+        const settled = settledDirectorRunState(loaded.mode);
+        directorRunStateRef.current = settled;
+        setDirectorRunState(settled);
+        saveDirectorRunState(directorRunProject, settled);
       } else if (isDirectorEpisodeAutoSession(loaded)) {
-        const manual = defaultDirectorRunState();
-        directorRunStateRef.current = manual;
-        setDirectorRunState(manual);
-        saveDirectorRunState(directorRunProject, manual);
+        const settled = settledDirectorRunState(loaded.mode);
+        directorRunStateRef.current = settled;
+        setDirectorRunState(settled);
+        saveDirectorRunState(directorRunProject, settled);
       }
     }).catch(() => {
       // Keep the local pending state while the backend reconnects.
@@ -13207,7 +13255,11 @@ export function SuperChatPanel({
         return;
       }
       if (detail?.status === "paused" || detail?.status === "completed") {
-        updateDirectorRunState(defaultDirectorRunState());
+        // Keep the selected mode (see settledDirectorRunState) so a finished
+        // run does not read as 手动模式 in the trigger.
+        updateDirectorRunState(
+          settledDirectorRunState(directorRunStateRef.current.mode),
+        );
         if (detail.status === "completed") {
           toast.success(`第 ${detail.episode ?? "当前"} 集自动制作已完成`);
         } else if (detail.message && detail.message !== "用户切换为手动模式") {
@@ -13241,7 +13293,7 @@ export function SuperChatPanel({
           }
           await pauseDirectorAutoServer(project).catch(() => undefined);
           updateDirectorRunState(defaultDirectorRunState());
-          toast.info("已终止当前任务");
+          toast.info(<DirectorKeywordText text="已终止当前任务" bare />);
         } else if (action === "resume") {
           await resumeDirectorAutoServer(project);
           const current = directorRunStateRef.current;
@@ -13249,11 +13301,11 @@ export function SuperChatPanel({
             ...confirmDirectorEpisodeAuto(current),
             episode: notice?.episode ?? current.episode ?? 1,
           });
-          toast.info("已重试当前步骤，本集自动恢复推进");
+          toast.info(<DirectorKeywordText text="已重试当前步骤，本集自动恢复推进" bare />);
         } else {
           await pauseDirectorAutoServer(project);
           updateDirectorRunState(defaultDirectorRunState());
-          toast.info("已终止本次自动制作，可手动处理当前步骤");
+          toast.info(<DirectorKeywordText text="已终止本次自动制作，可手动处理当前步骤" bare />);
         }
         setDirectorStallNotice(null);
       } catch {
@@ -13268,12 +13320,12 @@ export function SuperChatPanel({
   const setDirectorExecutionMode = useCallback((mode: DirectorRunMode) => {
     if (mode === "episode_auto") {
       updateDirectorRunState(activateDirectorEpisodeAuto());
-      toast.success("已选择本集自动；发送开始指令后，还需再次确认才会执行", {
+      toast.success(<DirectorKeywordText text="已选择本集自动；发送开始指令后，还需再次确认才会执行" bare />, {
         duration: 10000,
       });
     } else if (mode === "pipeline_auto") {
       updateDirectorRunState(activateDirectorProjectAuto());
-      toast.success("已选择一键成片；发送开始指令后，还需再次确认才会执行", {
+      toast.success(<DirectorKeywordText text="已选择一键成片；发送开始指令后，还需再次确认才会执行" bare />, {
         duration: 10000,
       });
     } else {
@@ -16645,24 +16697,28 @@ export function SuperChatPanel({
                               className={cn(
                                 "h-8 gap-1.5 rounded-full px-2.5 text-xs text-muted-foreground hover:bg-black/[0.08] hover:text-foreground",
                                 directorRunModeMenuOpen && "bg-black/[0.08] text-foreground",
-                                directorRunState.mode === "episode_auto" && "text-emerald-300 hover:text-emerald-200",
+                                directorRunState.mode !== "manual_confirm" && "text-emerald-300 hover:text-emerald-200",
                               )}
                             />
                           }
                         >
-                          {directorRunState.mode === "episode_auto" ? (
-                            <>
-                              <Gauge className="size-3.5" />
-                              {directorRunState.confirmationStage === "confirmed"
-                                ? "本集自动 · 运行中"
-                                : directorRunState.confirmationStage === "awaiting_intervention"
-                                  ? "本集自动 · 待修改确认"
-                                : "本集自动 · 待确认"}
-                            </>
-                          ) : (
+                          {directorRunState.mode === "manual_confirm" ? (
                             <>
                               <ShieldAlert className="size-3.5" />
                               手动模式
+                            </>
+                          ) : (
+                            <>
+                              <Gauge className="size-3.5" />
+                              {`${
+                                directorRunState.mode === "pipeline_auto" ? "一键成片" : "本集自动"
+                              } · ${
+                                directorRunState.confirmationStage === "confirmed"
+                                  ? "运行中"
+                                  : directorRunState.confirmationStage === "awaiting_intervention"
+                                    ? "待修改确认"
+                                    : "待确认"
+                              }`}
                             </>
                           )}
                         </DropdownMenuTrigger>
@@ -17070,9 +17126,17 @@ export function SuperChatPanel({
               : "本集自动已暂停：任务长时间没有进度更新"}
           </DialogTitle>
           <p className="text-sm leading-6 text-muted-foreground">
-            {directorStallNotice?.mode === "soft"
-              ? "当前任务已连续较长时间没有进度更新，但仍在运行。你可以继续等待，或终止当前任务。"
-              : "当前步骤已连续较长时间没有进度更新，捏导已暂停自动推进。你可以重试当前步骤，或终止本次自动制作后手动处理。"}
+            {directorStallNotice?.mode === "soft" ? (
+              <DirectorKeywordText
+                text="当前任务已连续较长时间没有进度更新，但仍在运行。你可以继续等待，或终止当前任务。"
+                bare
+              />
+            ) : (
+              <DirectorKeywordText
+                text="当前步骤已连续较长时间没有进度更新，捏导已暂停自动推进。你可以重试当前步骤，或终止本次自动制作后手动处理。"
+                bare
+              />
+            )}
           </p>
           {directorStallNotice?.diagnostics ? (
             <div className="max-h-[45vh] overflow-auto">
@@ -17089,7 +17153,10 @@ export function SuperChatPanel({
               disabled={directorStallBusy}
               onClick={() => void resolveDirectorStall("pause")}
             >
-              {directorStallNotice?.mode === "soft" ? "终止当前任务" : "终止自动制作"}
+              <DirectorKeywordText
+                text={directorStallNotice?.mode === "soft" ? "终止当前任务" : "终止自动制作"}
+                bare
+              />
             </Button>
             <Button
               type="button"
@@ -17100,11 +17167,14 @@ export function SuperChatPanel({
                 )
               }
             >
-              {directorStallBusy
-                ? "处理中…"
-                : directorStallNotice?.mode === "soft"
-                  ? "继续等待"
-                  : "重试当前步骤"}
+              {directorStallBusy ? (
+                "处理中…"
+              ) : (
+                <DirectorKeywordText
+                  text={directorStallNotice?.mode === "soft" ? "继续等待" : "重试当前步骤"}
+                  bare
+                />
+              )}
             </Button>
           </div>
         </DialogContent>

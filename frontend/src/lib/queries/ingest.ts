@@ -233,7 +233,21 @@ export function isScriptProcessRunning(status: string | undefined): boolean {
   return !!status && _SCRIPT_PROCESS_LIVE_STATUSES.has(status);
 }
 
-export function useScriptProcess(project: string, enabled = true) {
+interface ScriptProcessQueryOptions {
+  /**
+   * Keep re-reading the status while the stage has not shown up yet — the
+   * import chains it, so the first read after an import can legitimately see
+   * neither a task nor a result. `0` disables the extra polling.
+   */
+  pollWhileWaitingMs?: number;
+}
+
+export function useScriptProcess(
+  project: string,
+  enabled = true,
+  options: ScriptProcessQueryOptions = {},
+) {
+  const pollWhileWaitingMs = options.pollWhileWaitingMs ?? 0;
   return useQuery({
     queryKey: queryKeys.scriptProcess(project),
     queryFn: ({ signal }) =>
@@ -241,9 +255,15 @@ export function useScriptProcess(project: string, enabled = true) {
         .get(p`api/v1/projects/${project}/script-process`, { signal })
         .json<ScriptProcessStatus>(),
     enabled: !!project && enabled,
-    // The stage is short-lived: poll only while a task is actually live.
-    refetchInterval: (query) =>
-      isScriptProcessRunning(query.state.data?.task?.status) ? 2000 : false,
+    // The stage is short-lived: poll only while a task is actually live, plus
+    // the caller's short waiting window right after an import.
+    refetchInterval: (query) => {
+      if (isScriptProcessRunning(query.state.data?.task?.status)) return 2000;
+      if (pollWhileWaitingMs > 0 && !query.state.data?.has_result) {
+        return pollWhileWaitingMs;
+      }
+      return false;
+    },
   });
 }
 

@@ -2733,6 +2733,7 @@
     },
     "pastePlaceholder": "Dán nội dung truyện vào đây, tối đa 1000 ký tự",
     "startIngest": "Bắt đầu nhập",
+    "startOneClickFilm": "Làm phim một chạm",
     "saveSettings": "Lưu cài đặt",
     "settingsSaved": "Đã lưu cài đặt dự án",
     "settingsSaveFailed": "Lưu cài đặt dự án thất bại",
@@ -3108,6 +3109,8 @@
         "fallback": "tham chiếu bối cảnh",
         "named": "{{scene}} — {{kind}}"
       },
+      "scenePano": "Ảnh toàn cảnh 360 của bối cảnh",
+      "scenePanoNamed": "{{scene}} — toàn cảnh 360",
       "beatRange": "Beat {{ranges}}",
       "sketchGrid": "Lưới phác thảo {{index}}/{{total}}",
       "sketch": "Phác thảo",

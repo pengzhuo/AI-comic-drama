@@ -35,6 +35,7 @@ from novelvideo.generators.nanobanana_grid import (
 from novelvideo.egress_context import TrustedEgressContext
 from novelvideo.director_world.paths import safe_name
 from novelvideo.models import NovelScene, build_scene_effective_prompt
+from novelvideo.skills.ai_film_process import apply_directive
 
 SceneReferenceKind = Literal["master", "spatial_layout", "reverse_master"]
 
@@ -499,21 +500,21 @@ def build_scene_reference_prompt(
     base_scene: NovelScene | None = None,
 ) -> str:
     if kind == "master":
-        return _master_prompt(
+        prompt = _master_prompt(
             scene,
             style_name=style_name,
             style_prompt=style_prompt,
             avoid_instructions=avoid_instructions,
             base_scene=base_scene,
         )
-    if kind == "spatial_layout":
-        return _spatial_layout_prompt(
+    elif kind == "spatial_layout":
+        prompt = _spatial_layout_prompt(
             scene,
             has_master_reference=has_master_reference,
             base_scene=base_scene,
         )
-    if kind == "reverse_master":
-        return _reverse_master_prompt(
+    elif kind == "reverse_master":
+        prompt = _reverse_master_prompt(
             scene,
             style_name=style_name,
             style_prompt=style_prompt,
@@ -521,7 +522,9 @@ def build_scene_reference_prompt(
             has_master_reference=has_master_reference,
             base_scene=base_scene,
         )
-    raise ValueError(f"Unsupported scene reference kind: {kind}")
+    else:
+        raise ValueError(f"Unsupported scene reference kind: {kind}")
+    return apply_directive("scene_reference_asset", prompt)
 
 
 def _output_path(project_dir: Path, scene_name: str, kind: SceneReferenceKind) -> Path:

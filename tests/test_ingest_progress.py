@@ -44,6 +44,10 @@ class _RecordingTaskManager:
     def update_progress_for_project(self, ctx, task_type, episode, **kwargs):
         self.updates.append({"task_type": task_type, "episode": episode, **kwargs})
 
+    def get_task_for_project(self, ctx, task_type, episode, **kwargs):
+        """The ingest hand-off probes the script-processing stage first."""
+        return None
+
 
 class _FakeStore:
     instance: "_FakeStore | None" = None
@@ -77,11 +81,21 @@ async def test_ingest_logs_preserve_intermediate_progress(
 ) -> None:
     """Ordinary Cognee logs must not send the progress bar back to zero."""
     from novelvideo import cognee
+    from novelvideo.task_backend import client as task_backend_client
     from novelvideo.task_backend.runners import ingest
 
     manager = _RecordingTaskManager()
     monkeypatch.setattr(ingest, "get_task_manager", lambda: manager)
     monkeypatch.setattr(cognee, "CogneeStore", _FakeStore)
+
+    async def _record_enqueue(ctx, **kwargs):
+        return None
+
+    # The import hands the script to the film-process pack; this test only
+    # measures the progress/log sequence, so the hand-off is stubbed out.
+    monkeypatch.setattr(
+        task_backend_client, "enqueue_project_task", _record_enqueue
+    )
 
     result = await ingest._run_ingest_fast(
         {"payload": {"novel_path": str(tmp_path / "novel.txt")}}, _ctx(tmp_path)

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from novelvideo.generators.tts_generator import TTSResult
+from novelvideo.seedance2_i2v.speaker_matching import select_character_for_speaker
 
 AudioUrlBuilder = Callable[[Path], str]
 IDENTITY_VOICE_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".webm")
@@ -47,11 +48,94 @@ def narration_style_prompt(style: str) -> str:
     return entry["prompt"]
 
 
+def _with_film_pack_emotion(stage: str, emotion_prompt: str) -> str:
+    """把流程包第 06 份（声音与成片验收）追加到 TTS 语气提示上。
+
+    只动语气提示，不动要朗读的台词；任何异常都退回原值，绝不影响配音生成。
+    """
+
+    from novelvideo.skills.ai_film_process import append_audio_directive
+
+    try:
+        return append_audio_directive(stage, emotion_prompt)
+    except Exception:  # noqa: BLE001 - 注入只是增强，不能影响配音生成
+        return emotion_prompt
+
+
 QUOTE_DIALOGUE_PATTERNS = (
     re.compile(r"“([^”]+)”"),
     re.compile(r"「([^」]+)」"),
     re.compile(r'"([^"]+)"'),
 )
+
+SCRIPT_SPEAKER_PREFIX_RE = re.compile(
+    r"(?P<speaker>[\w\u4e00-\u9fff·]{1,40})"
+    r"(?:（(?P<action>[^）]{0,120})）|\((?P<action_ascii>[^)]{0,120})\))?"
+    r"\s*[：:]"
+)
+SCRIPT_LEADING_NOTE_RE = re.compile(
+    r"^\s*(?:（(?P<zh_note>[^）]{1,120})）|\((?P<ascii_note>[^)]{1,120})\))\s*"
+)
+SCRIPT_LABEL_MAX_CHARS = 12
+SCRIPT_LABEL_VERBS = ("说", "道", "问", "答", "喊", "叫", "念", "读", "写")
+# ``（os）``/``（旁白）`` mark *who* is talking, not how; they are not acting cues.
+NON_PERFORMANCE_NOTE_MARKERS = frozenset(
+    {"os", "旁白", "画外", "内心独白", "独白", "心声", "内心"}
+)
+
+
+def looks_like_speaker_label(label: str) -> bool:
+    """Return whether a ``名前：`` prefix is a speaker label rather than prose.
+
+    ``角色（动作）：台词`` is the scripted shape, so a short name-like prefix is a
+    label; a clause such as ``我说的是：`` is prose and must survive untouched.
+    """
+
+    text = str(label or "").strip()
+    if not text or len(text) > SCRIPT_LABEL_MAX_CHARS:
+        return False
+    return not any(verb in text for verb in SCRIPT_LABEL_VERBS)
+
+
+def strip_leading_speaker_labels(text: str) -> str:
+    """Drop leading ``角色（os）：`` labels only, keeping performance notes."""
+
+    cleaned = str(text or "").strip()
+    while cleaned:
+        match = SCRIPT_SPEAKER_PREFIX_RE.match(cleaned)
+        if match is None or not looks_like_speaker_label(match.group("speaker")):
+            break
+        cleaned = cleaned[match.end() :].lstrip()
+    return cleaned
+
+
+def strip_leading_script_marks(text: str) -> str:
+    """Drop a leading ``角色（os）：`` label and ``（表演提示）`` notes from a line."""
+
+    cleaned = str(text or "").strip()
+    while cleaned:
+        label_stripped = strip_leading_speaker_labels(cleaned)
+        if label_stripped != cleaned:
+            cleaned = label_stripped
+            continue
+        note = SCRIPT_LEADING_NOTE_RE.match(cleaned)
+        if note is None:
+            break
+        cleaned = cleaned[note.end() :].lstrip()
+    return cleaned
+
+
+def leading_performance_note(text: str) -> str:
+    """The leading ``（表演提示）`` acting cue, reused as a TTS emotion prompt."""
+
+    cleaned = strip_leading_speaker_labels(text)
+    match = SCRIPT_LEADING_NOTE_RE.match(cleaned)
+    if match is None:
+        return ""
+    note = str(match.group("zh_note") or match.group("ascii_note") or "").strip()
+    if not note or note.lower() in NON_PERFORMANCE_NOTE_MARKERS:
+        return ""
+    return note
 
 
 @dataclass
@@ -101,6 +185,8 @@ def find_identity_reference_audio(
 
 
 def dialogue_text(beat: dict) -> str:
+    """Text the TTS must speak: the line only, never script labels or acting cues."""
+
     raw_text = str(
         beat.get("narration_segment") or beat.get("dialogue") or beat.get("narration") or ""
     ).strip()
@@ -112,7 +198,9 @@ def dialogue_text(beat: dict) -> str:
                 quoted_parts.append(quoted)
     if quoted_parts:
         return " ".join(quoted_parts)
-    return raw_text
+    # No quotes: drop the scripted ``角色（os）：`` label and the leading
+    # ``（表演提示）`` note so the actor does not read stage directions aloud.
+    return strip_leading_script_marks(raw_text) or raw_text
 
 
 def dialogue_emotion_prompt(beat: dict) -> str:
@@ -123,7 +211,9 @@ def dialogue_emotion_prompt(beat: dict) -> str:
         return ""
 
     if not any(pattern.search(raw_text) for pattern in QUOTE_DIALOGUE_PATTERNS):
-        return ""
+        # Without quotes the acting cue lives in the leading note, which is now
+        # kept out of the spoken text and drives the performance instead.
+        return leading_performance_note(raw_text)
 
     emotion_text = raw_text
     for pattern in QUOTE_DIALOGUE_PATTERNS:
@@ -385,6 +475,7 @@ async def generate_seedance2_narration_audio(
     builder = audio_url_builder or build_reference_audio_url
     output_path = beat_audio_path(project_dir, episode, beat_num)
     resolved_emotion = str(emotion_prompt or "").strip() or narration_style_prompt(narration_style)
+    resolved_emotion = _with_film_pack_emotion("narration_audio", resolved_emotion)
     maybe_result = generator.generate(
         prompt=text,
         audio_url=builder(narrator_audio_path),
@@ -498,32 +589,31 @@ async def resolve_dialogue_reference_audio(beat: dict, store) -> tuple[Path, str
         return None
 
     project_dir = Path(store.project_dir)
-    for character in await store.list_characters():
-        if not speaker.startswith(character.name):
-            continue
-
-        identity = next(
-            (item for item in character.identities if item.identity_id == speaker),
-            None,
-        )
-        resolution = resolve_character_voice(
-            project_dir=project_dir,
-            character=character,
-            identity=identity,
-        )
-        if resolution.audio_path is not None:
-            sha256 = resolution.sha256 or file_sha256(resolution.audio_path)
-            return (resolution.audio_path, sha256)
-
-        if identity is not None:
-            legacy = find_identity_reference_audio(
-                project_dir,
-                character.name,
-                identity.identity_name,
-            )
-            if legacy:
-                return (legacy, file_sha256(legacy))
+    character = select_character_for_speaker(speaker, await store.list_characters())
+    if character is None:
         return None
+
+    identity = next(
+        (item for item in character.identities if item.identity_id == speaker),
+        None,
+    )
+    resolution = resolve_character_voice(
+        project_dir=project_dir,
+        character=character,
+        identity=identity,
+    )
+    if resolution.audio_path is not None:
+        sha256 = resolution.sha256 or file_sha256(resolution.audio_path)
+        return (resolution.audio_path, sha256)
+
+    if identity is not None:
+        legacy = find_identity_reference_audio(
+            project_dir,
+            character.name,
+            identity.identity_name,
+        )
+        if legacy:
+            return (legacy, file_sha256(legacy))
     return None
 
 
@@ -565,6 +655,7 @@ async def generate_seedance2_dialogue_audio(
     builder = audio_url_builder or build_reference_audio_url
     output_path = beat_audio_path(store.project_dir, episode, beat_num)
     resolved_emotion_prompt = str(emotion_prompt or "").strip() or dialogue_emotion_prompt(beat)
+    resolved_emotion_prompt = _with_film_pack_emotion("dialogue_audio", resolved_emotion_prompt)
     maybe_result = generator.generate(
         prompt=narration,
         audio_url=builder(reference_path),

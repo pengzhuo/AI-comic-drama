@@ -41,6 +41,7 @@ from novelvideo.egress_context import (
     TrustedEgressContext,
     ambient_organization_egress_context,
 )
+from novelvideo.skills.ai_film_process import apply_directive
 
 PROP_REF_ASPECT_RATIO = "16:9"
 PROP_REF_IMAGE_SIZE = "0.5K"
@@ -87,7 +88,9 @@ def build_prop_reference_prompt(
     all_style = ", ".join(filter(None, [preset_style, style_keywords]))
     all_negative = preset_negative
 
-    return f"""Generate a 3-PANEL product reference sheet for a story prop.
+    return apply_directive(
+        "prop_reference_asset",
+        f"""Generate a 3-PANEL product reference sheet for a story prop.
 
 LAYOUT (1x3, 16:9 overall):
 - Three equal unlabeled panels arranged left to right
@@ -127,7 +130,8 @@ MUST AVOID:
 - Do NOT add text, labels, panel titles, captions, numbers, arrows, logos, watermarks, signatures, readable letters, Chinese characters, or English words
 - Do NOT include any people, hands, or body parts
 - Do NOT show the prop being held or worn
-- Do NOT add busy or distracting backgrounds"""
+- Do NOT add busy or distracting backgrounds""",
+    )
 
 
 async def generate_prop_reference(

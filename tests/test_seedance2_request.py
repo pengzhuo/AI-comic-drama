@@ -95,6 +95,8 @@ def test_build_seedance2_multimodal_request_limits_reference_counts():
         build_seedance2_huimeng_params(
             {
                 "mode": Seedance2I2VMode.MULTIMODAL_REFERENCE.value,
+                # 默认会强锁严格首帧，这里显式关掉才能测多参考分支的上限校验。
+                "strict_first_frame": False,
                 "final_prompt": "参考图片1生成视频。",
                 "human_review": False,
                 "human_review_user_set": True,
@@ -111,6 +113,7 @@ def test_build_seedance2_multimodal_request_validates_prompt_reference_numbers()
         build_seedance2_huimeng_params(
             {
                 "mode": Seedance2I2VMode.MULTIMODAL_REFERENCE.value,
+                "strict_first_frame": False,
                 "final_prompt": "参考图片3和音频1生成视频。",
                 "human_review": False,
                 "human_review_user_set": True,
@@ -118,6 +121,25 @@ def test_build_seedance2_multimodal_request_validates_prompt_reference_numbers()
             reference_images=["https://example.com/1.png", "https://example.com/2.png"],
             reference_audios=["https://example.com/1.mp3"],
         )
+
+
+def test_build_seedance2_strict_first_frame_rewrites_stale_image_refs():
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
+
+    params = build_seedance2_huimeng_params(
+        {
+            "mode": Seedance2I2VMode.FIRST_FRAME.value,
+            "final_prompt": "参考图片1与图片3，锁住首帧。",
+            "human_review": False,
+            "human_review_user_set": True,
+        },
+        first_frame="https://example.com/first.png",
+    )
+
+    assert params["image_url"] == "https://example.com/first.png"
+    # 严格首帧只发 1 张图，越界的「图片3」被改写成首帧表述而不是抛错。
+    assert params["prompt"] == "参考图片1与首帧画面，锁住首帧。"
 
 
 def test_human_review_requires_http_media_urls():
@@ -1572,3 +1594,121 @@ def test_newapi_seedance_source_video_ratio_uses_vendor_adaptive(
     result = generator._apply_seedance_source_video_ratio(payload)
 
     assert result["metadata"]["ratio"] == expected_ratio
+
+async def test_submit_video_candidates_falls_back_on_client_rejection():
+    from novelvideo.generators.video_generator import (
+        NewApiVideoError,
+        NewApiVideoGenerator,
+    )
+
+    generator = NewApiVideoGenerator(
+        api_key="test-key",
+        endpoint="https://newapi.example",
+        model="seedance-2.0-fast",
+    )
+    strict = {"model": "seedance-2.0-fast", "metadata": {"image_url": "a.png"}}
+    fallback = {
+        "model": "seedance-2.0-fast",
+        "metadata": {"reference_images": ["a.png"]},
+    }
+    posted: list[dict] = []
+    logs: list[str] = []
+
+    async def fake_post_json(_url: str, payload: dict, *, headers=None):
+        posted.append(payload)
+        if len(posted) == 1:
+            raise NewApiVideoError(
+                "privacy", request_id="req-1", status_code=400
+            )
+        return {"id": "task-1"}
+
+    generator._post_json = fake_post_json  # type: ignore[method-assign]
+
+    submitted, payload = await generator._submit_video_candidates(
+        "https://newapi.example/v1/video/generations",
+        [strict, fallback],
+        on_log=logs.append,
+    )
+
+    assert submitted == {"id": "task-1"}
+    assert payload is fallback
+    assert posted == [strict, fallback]
+    assert any("兜底" in message for message in logs)
+
+
+async def test_submit_video_candidates_does_not_fall_back_on_server_error():
+    from novelvideo.generators.video_generator import (
+        NewApiVideoError,
+        NewApiVideoGenerator,
+    )
+
+    generator = NewApiVideoGenerator(
+        api_key="test-key",
+        endpoint="https://newapi.example",
+        model="seedance-2.0-fast",
+    )
+    posted: list[dict] = []
+
+    async def fake_post_json(_url: str, payload: dict, *, headers=None):
+        posted.append(payload)
+        raise NewApiVideoError("upstream", status_code=503)
+
+    generator._post_json = fake_post_json  # type: ignore[method-assign]
+
+    with pytest.raises(NewApiVideoError):
+        await generator._submit_video_candidates(
+            "https://newapi.example/v1/video/generations",
+            [{"model": "seedance-2.0-fast"}, {"model": "seedance-2.0-fast"}],
+        )
+
+    # 5xx 不确定是否已创建任务，必须直接抛出交上层处理，不能重复提交。
+    assert len(posted) == 1
+
+
+async def test_submit_video_candidates_raises_when_all_rejected():
+    from novelvideo.generators.video_generator import (
+        NewApiVideoError,
+        NewApiVideoGenerator,
+    )
+
+    generator = NewApiVideoGenerator(
+        api_key="test-key",
+        endpoint="https://newapi.example",
+        model="seedance-2.0-fast",
+    )
+    posted: list[dict] = []
+
+    async def fake_post_json(_url: str, payload: dict, *, headers=None):
+        posted.append(payload)
+        if len(posted) == 1:
+            raise NewApiVideoError("strict rejected by policy", status_code=400)
+        raise NewApiVideoError("fallback also rejected", status_code=400)
+
+    generator._post_json = fake_post_json  # type: ignore[method-assign]
+
+    # 兜底也被拒时，把最后一次的上游原因抛出去，而不是笼统的错误码。
+    with pytest.raises(NewApiVideoError, match="fallback also rejected"):
+        await generator._submit_video_candidates(
+            "https://newapi.example/v1/video/generations",
+            [{"model": "seedance-2.0-fast"}, {"model": "seedance-2.0-fast"}],
+        )
+
+    assert len(posted) == 2
+
+
+async def test_submit_video_candidates_rejects_empty_candidates():
+    from novelvideo.generators.video_generator import (
+        NewApiVideoError,
+        NewApiVideoGenerator,
+    )
+
+    generator = NewApiVideoGenerator(
+        api_key="test-key",
+        endpoint="https://newapi.example",
+        model="seedance-2.0-fast",
+    )
+
+    with pytest.raises(NewApiVideoError, match="没有可用的候选参数"):
+        await generator._submit_video_candidates(
+            "https://newapi.example/v1/video/generations", []
+        )

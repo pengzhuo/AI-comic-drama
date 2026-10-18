@@ -14,7 +14,7 @@
 | 8 | 身份规划 | Step 9 身份图 |
 | 9 | 身份图 | Step 10 剧本 |
 | 10 | 可选解说改写，然后生成剧本 | Step 11 场景/道具上下文 |
-| 11 | 场景/道具上下文 | Step 12 草图 |
+| 11 | 场景/道具上下文（含缺失的资产参考图） | Step 12 草图 |
 | 12 | 草图、配色检测、全局视频优化 | Step 13 首帧 |
 | 13 | 首帧 | Step 14 配音前置与音频 |
 | 14 | 声线准备和音频 | Step 15 单 beat 视频 |
@@ -71,6 +71,19 @@ CP2 判定：脚本、场景/道具上下文足够推进草图；当前后端没
   5. 道具列表 → `GET /projects/{project}/props`
 - 上述流程中同一轮最多执行一个写操作：补一个场景、启动一次道具规划、或执行当前 `next_step` 的一个任务；不要补多个场景后再启动道具规划。
 - 完成判定：脚本、场景/道具上下文足够推进草图；不要要求 `anchor_image_url`
+
+**Step 11.5 资产参考图（`next_step == "asset_references"`）**：
+- 这一步是「脚本 → 草图」之间的自动关卡，逐张补齐**项目场景库全部场景**的参考图，以及**每个道具**的参考图：场景正面（`master`）、反面（`reverse_master`）、空间布局（`spatial_layout`）、360 全景，道具三视图。
+- 缺哪张补哪张；已完成的场景/道具不会回灌，后期由剧本派生出来的新场景变体也会在这里被补上。全部补完后 `next_step` 自动进入 `sketch_generation`。
+- 每轮只启动**一个**参考图任务，启动后立即收口；不要在同一轮把多个场景/道具一起派发。
+- 自动推进模式（`pipeline_auto`）已能直接派发这一步，代理不需要再手工调用扫描；只有自动派发被跳过（同名任务已试过）时，才由代理按下面对应的单张接口补。
+- 单张接口：
+  - 场景正面：`POST /projects/{project}/scenes/{name}/master/generate-async`
+  - 场景反面：`POST /projects/{project}/scenes/{name}/reverse/generate-async`
+  - 场景 360：`POST /projects/{project}/scenes/{name}/pano/generate-async`（body `{"source":"master"}`；master 不存在时用 `{"source":"text"}`）
+  - 道具参考图：`POST /projects/{project}/props/{name}/reference/generate-async`
+  - 空间布局（`spatial_layout`）：没有单独的 REST 路由，只由自动派发补齐，代理不需要手动处理
+- 这些图是后续草图和首帧的**视觉锚点**：草图只吃场景图，首帧同时吃场景图与道具图。缺图会让服装、道具、环境在镜头之间漂移，所以不要跳过这一步直接出草图。
 
 **Step 12（草图生成前置）**：先完成 `assign-colors`（幂等），下一轮再生成草图。
 - 当前状态尚未配色时，本轮只调用 `assign-colors` 并收口。

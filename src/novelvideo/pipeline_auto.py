@@ -11,9 +11,14 @@ agent-driven continuation for that single step. This keeps the fast path
 strictly additive — an unknown stage never blocks production.
 
 Handled mainline stages: film-process-pack script processing, character/episode
-building, portraits, identity plan/images, script, sketches, global video
-optimization, first frames (Render), TTS, Seedance 2.0 prompts, per-beat video
-and episode compose.
+building, portraits, identity plan/images, script, asset references (missing
+scene/prop reference images), sketches, global video optimization, first frames
+(Render), TTS, Seedance 2.0 prompts, per-beat video and episode compose.
+
+Asset references is a blocking stage between ``script`` and ``sketches``: one
+round enqueues exactly one missing scene/prop image so a single broken entry can
+never stall the rest, and gaps already tried in this run are skipped. It can be
+switched off with ``DRAMACLAW_AUTO_ASSET_REFERENCES``.
 
 The one deliberate exception is ``coloring`` (sketch identity/prop detection):
 it is a synchronous, credit-billed vision call with no task type, so it does not
@@ -128,6 +133,8 @@ async def dispatch_next_stage(
         return await _dispatch_identity_image(ctx, store, current_episode, project_dir, attempted)
     if next_step == "script_writer":
         return await _dispatch_script_writer(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "asset_references":
+        return await _dispatch_asset_references(ctx, store, project_dir, attempted)
     if next_step == "sketch_generation":
         return await _dispatch_sketches(ctx, store, current_episode, project_dir, attempted)
     if next_step == "global_optimize_video":
@@ -326,6 +333,143 @@ async def _dispatch_script_writer(
     if not result.get("ok"):
         return None, None
     return "script_writer", signature
+
+
+async def _dispatch_asset_references(
+    ctx: Any,
+    store: Any,
+    project_dir: Path,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """补齐项目里缺失的场景 / 道具参考图，每轮只入队一个任务。
+
+    关卡排在「脚本生成」与「草图生成」之间：草图只吃场景图、首帧同时吃场景图与
+    道具图，所以这些图必须先存在。存量项目与后期新增的场景变体都按「缺哪张补
+    哪张」处理。
+
+    payload 逐字段复刻 REST 端点（``scenes.py`` / ``props.py``），不改模型、网关
+    与生成参数；已尝试过的缺口跳过，让同一个坏条目不至于挡住其余条目。
+    """
+
+    from novelvideo.asset_references import asset_reference_gaps_for_store
+
+    gaps = await asset_reference_gaps_for_store(store, project_dir)
+    if not gaps:
+        return None, None
+    for gap in gaps:
+        if gap.signature in attempted:
+            continue
+        dispatched = await _enqueue_asset_reference(ctx, store, project_dir, gap)
+        if dispatched is not None:
+            return dispatched, gap.signature
+    return None, None
+
+
+async def _enqueue_asset_reference(
+    ctx: Any,
+    store: Any,
+    project_dir: Path,
+    gap: Any,
+) -> str | None:
+    """按缺口类型复刻对应 REST 端点的入队 payload。"""
+
+    from novelvideo.api.routes.props import _project_style
+    from novelvideo.task_scopes import (
+        prop_reference_asset_scope,
+        scene_reference_asset_scope,
+        stage_asset_scope,
+    )
+
+    output_dir = str(project_dir)
+    style = _project_style(ctx.requester_username, ctx.project_name)
+
+    if gap.kind == "scene":
+        from novelvideo.api.routes.scenes import _scene_reference_billing_metadata
+
+        scope = scene_reference_asset_scope(gap.name, gap.detail)
+        await enqueue_project_task(
+            ctx,
+            task_type="scene_reference_asset",
+            product_surface="mainline",
+            queue_kind="default",
+            episode=0,
+            scope=scope,
+            payload={
+                "scene_name": gap.name,
+                "kind": gap.detail,
+                "model": "",
+                "style": style,
+                "output_dir": output_dir,
+                "billing": _scene_reference_billing_metadata(""),
+            },
+        )
+        return "scene_reference_asset"
+
+    if gap.kind == "pano":
+        from novelvideo.api.routes.scenes import (
+            _scene_360_description,
+            _scene_pano_billing_metadata,
+        )
+        from novelvideo.utils.path_resolver import compute_scene_master_path
+
+        scene = await store.get_scene(gap.name)
+        if scene is None:
+            return None
+        source = "master" if compute_scene_master_path(project_dir, gap.name) else "text"
+        step = f"pano_from_{source}"
+        params: dict[str, Any] = {
+            "description": _scene_360_description(scene),
+            "style": style,
+            "timeout_seconds": 1800,
+        }
+        scope = stage_asset_scope(gap.name, step)
+        await enqueue_project_task(
+            ctx,
+            task_type="scene_pano_generation",
+            product_surface="mainline",
+            queue_kind="world",
+            episode=0,
+            scope=scope,
+            payload={
+                "scene_name": gap.name,
+                "step": step,
+                "params": params,
+                "project_dir": output_dir,
+                "billing": _scene_pano_billing_metadata(params),
+            },
+        )
+        return "scene_pano_generation"
+
+    from novelvideo.api.routes.model_credits import _fixed_image_billing_params
+    from novelvideo.generators.nanobanana_prop import (
+        _prop_reference_image_source,
+        resolve_prop_reference_image_model,
+    )
+
+    _, selected_model = _prop_reference_image_source("")
+    pricing_model = selected_model or resolve_prop_reference_image_model()
+    await enqueue_project_task(
+        ctx,
+        task_type="prop_reference_asset",
+        product_surface="mainline",
+        queue_kind="default",
+        episode=0,
+        scope=prop_reference_asset_scope(gap.name),
+        payload={
+            "prop_name": gap.name,
+            "style": style,
+            "model": "",
+            "output_dir": output_dir,
+            "billing": {
+                "pricing_kind": "image",
+                "pricing_model": pricing_model,
+                "pricing_params": _fixed_image_billing_params(
+                    "prop_reference", model=pricing_model
+                ),
+            },
+        },
+    )
+    return "prop_reference_asset"
 
 
 async def _dispatch_sketches(

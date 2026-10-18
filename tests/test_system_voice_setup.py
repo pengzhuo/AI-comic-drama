@@ -308,3 +308,160 @@ async def test_system_voice_setup_runner_reports_progress(monkeypatch, tmp_path)
 
     assert result["ready"] is True
     assert [update["progress"] for update in progress_updates] == [0.05, 1.0]
+
+
+def _write_gateway_sample(project_dir, voice: str) -> bytes:
+    content = f"gateway:{voice}".encode()
+    cache = project_dir / "assets" / "system_voices"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / f"gateway-doubao-seed-audio-1-0__{voice}.mp3").write_bytes(content)
+    return content
+
+
+@pytest.mark.asyncio
+async def test_prepare_missing_system_voices_blocks_character_without_gender(
+    monkeypatch,
+    tmp_path,
+):
+    """性别为空的角色不再静默落到男声池，而是给出可执行的补齐提示。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.models import NovelCharacter
+
+    narrator_updates: list[dict] = []
+    generated: list[str] = []
+
+    class ExplodingEdgeTTSGenerator:
+        def __init__(self, voice: str, egress_context=None) -> None:  # noqa: ARG002
+            generated.append(voice)
+
+        async def generate(self, *, text, output_path, generate_subtitle):  # noqa: ARG002
+            raise AssertionError("不得为未设置性别的角色生成声线")
+
+    _patch_voice_setup_io(monkeypatch, system_voice_setup, narrator_updates)
+    monkeypatch.setattr(system_voice_setup, "EdgeTTSGenerator", ExplodingEdgeTTSGenerator)
+
+    store = _FakeStore(tmp_path)
+    store.characters = [
+        NovelCharacter(name="系统提示音", gender="", age_group="youth", is_main=False)
+    ]
+    store.beats = [
+        {
+            "beat_number": 13,
+            "audio_type": "dialogue",
+            "speaker": "系统提示音",
+            "narration_segment": "恭喜您已完成今日任务。",
+        }
+    ]
+
+    result = await system_voice_setup.prepare_missing_system_voices(
+        store=store,
+        username="alice",
+        project="demo",
+        project_dir=tmp_path,
+        episode=1,
+    )
+
+    assert result["prepared_count"] == 0
+    assert result["ready"] is False
+    assert not generated
+    assert any(
+        "系统提示音" in detail and "性别" in detail
+        for detail in result["remaining_errors"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepare_missing_system_voices_avoids_duplicate_presets(
+    monkeypatch,
+    tmp_path,
+):
+    """同项目内声线去重：已被别的角色占用的预置音色不再复用。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.audio import indextts2_beat_audio_task
+    from novelvideo.models import NovelCharacter
+    from novelvideo.freezone import audio_node
+
+    narrator_updates: list[dict] = []
+    writer_calls: list[dict] = []
+
+    async def fake_write_newapi_audio_speech(**kwargs):
+        writer_calls.append(kwargs)
+        path = Path(kwargs["output_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"gateway:{kwargs['voice']}".encode())
+        return {"ok": True}
+
+    async def no_remaining_errors(**kwargs):  # noqa: ARG001
+        return []
+
+    monkeypatch.setattr(
+        indextts2_beat_audio_task,
+        "collect_indextts2_voice_prereq_errors",
+        no_remaining_errors,
+    )
+    monkeypatch.setattr(
+        system_voice_setup,
+        "load_effective_narration_style_for_voice",
+        lambda username, project: "third_person",
+    )
+    monkeypatch.setattr(
+        system_voice_setup, "load_narrator_reference_audio", lambda username, project: {"path": ""}
+    )
+    monkeypatch.setattr(
+        system_voice_setup,
+        "set_narrator_reference_audio",
+        lambda username, project, **kwargs: narrator_updates.append(kwargs),
+    )
+    monkeypatch.setenv("SYSTEM_VOICE_TTS_MODEL", "doubao-seed-audio-1-0")
+    monkeypatch.setattr(
+        audio_node, "_write_newapi_audio_speech", fake_write_newapi_audio_speech
+    )
+
+    # 许知意 已经占了 xiaohe；刘奶奶 的稳定选择同样是 xiaohe，必须让位。
+    claimed_voice = system_voice_setup.GATEWAY_FEMALE_VOICES[0]
+    content = _write_gateway_sample(tmp_path, claimed_voice)
+    existing = tmp_path / "assets" / "characters" / "许知意" / "voices" / "system_voice.mp3"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_bytes(content)
+
+    store = _FakeStore(tmp_path)
+    store.characters = [
+        NovelCharacter(name="许知意", gender="女", age_group="youth", is_main=True),
+        NovelCharacter(name="刘奶奶", gender="女", age_group="elder", is_main=False),
+    ]
+    store.characters[0].reference_audio_path = (
+        "assets/characters/许知意/voices/system_voice.mp3"
+    )
+    store.characters[0].reference_audio_sha256 = system_voice_setup.voice_content_sha256(
+        content
+    )
+    store.beats = [
+        {
+            "beat_number": 2,
+            "audio_type": "dialogue",
+            "speaker": "许知意",
+            "narration_segment": "今天是我的生日……",
+        },
+        {
+            "beat_number": 6,
+            "audio_type": "dialogue",
+            "speaker": "刘奶奶",
+            "narration_segment": "孩子，别怕。",
+        },
+    ]
+
+    result = await system_voice_setup.prepare_missing_system_voices(
+        store=store,
+        username="alice",
+        project="demo",
+        project_dir=tmp_path,
+        episode=1,
+    )
+
+    assert result["ready"] is True
+    by_target = {item["target"]: item for item in result["prepared"]}
+    assert set(by_target) == {"刘奶奶"}
+    assert by_target["刘奶奶"]["voice"] == system_voice_setup.GATEWAY_FEMALE_VOICES[1]
+    assert by_target["刘奶奶"]["voice"] != claimed_voice

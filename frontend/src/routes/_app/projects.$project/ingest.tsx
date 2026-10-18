@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -13,6 +13,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   ChevronRight,
+  Clapperboard,
   FileText,
   FishSymbol,
   Info,
@@ -42,7 +43,11 @@ import {
 import { FormatCheckDetailsDialog } from "@/components/ingest/FormatCheckDetailsDialog";
 import { NovelFormatDialog } from "@/components/ingest/NovelFormatDialog";
 import { KnowledgeGraphVisualization } from "@/components/ingest/KnowledgeGraphVisualization";
-import { ScriptProcessCard } from "@/components/ingest/ScriptProcessCard";
+import { ScriptProcessProgress } from "@/components/ingest/ScriptProcessProgress";
+import {
+  activateDirectorProjectAuto,
+  saveDirectorRunState,
+} from "@/features/superchat/director-run-mode";
 import { IngestElapsedTime } from "@/components/ingest/IngestElapsedTime";
 import { useStyles } from "@/lib/queries/styles";
 import { useCancelTask, useTasks } from "@/lib/queries/tasks";
@@ -599,6 +604,7 @@ function UploadedFileCard({
   ingestCostDisplay,
   ingestPromotion,
   onStart,
+  onStartOneClick,
   onCancel,
   isCancelling,
   onReupload,
@@ -620,6 +626,8 @@ function UploadedFileCard({
   ingestCostDisplay?: string | null;
   ingestPromotion?: CreditPromotionDisplay | null;
   onStart: () => void;
+  /** Jump to 捏导 with 一键成片 pre-selected (never starts anything by itself). */
+  onStartOneClick: () => void;
   onCancel: () => void;
   isCancelling: boolean;
   onReupload: () => void;
@@ -728,6 +736,10 @@ function UploadedFileCard({
                   />
                 </Button>
               )}
+              <OneClickFilmButton
+                onClick={onStartOneClick}
+                disabled={isStarting}
+              />
               {/* 已锁定的重导入源只允许原文件重试；普通临时上传在失败或停止后
                   仍允许换文件。删除只针对尚未完成导入的临时上传。 */}
               {!sourceLocked && (
@@ -894,6 +906,28 @@ function IngestStartButton({
   );
 }
 
+function OneClickFilmButton({
+  disabled,
+  onClick,
+}: {
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      onClick={onClick}
+      disabled={disabled}
+      className="h-8 min-h-8 gap-1.5 rounded-[8px] border-black/10 bg-transparent px-3 text-xs font-normal shadow-none transition-colors hover:bg-black/8"
+    >
+      <Clapperboard className="size-3" />
+      {t("ingest.startOneClickFilm")}
+    </Button>
+  );
+}
+
 const IngestCreditCostSlot = memo(function IngestCreditCostSlot({
   display,
   promotion,
@@ -987,6 +1021,7 @@ function IngestPage() {
 
 export function IngestPageContent({ project }: { project: string }) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
 
   // Upload state
@@ -1530,6 +1565,17 @@ export function IngestPageContent({ project }: { project: string }) {
     uploadPastedText,
   ]);
 
+  // 一键成片: jump straight to 捏导 with the one-click mode pre-selected. An
+  // explicit mode choice is written to the project's stored run state so the
+  // panel opens on 一键成片 even when the user last worked in 手动模式; nothing
+  // starts by itself — the director still needs its start command and the
+  // second confirmation.
+  const handleStartOneClickFilm = useCallback(() => {
+    if (!project) return;
+    saveDirectorRunState(project, activateDirectorProjectAuto());
+    void navigate({ to: `/projects/${project}/assistant` });
+  }, [navigate, project]);
+
   const handleReimportExisting = useCallback(async () => {
     setReuploadConfirmOpen(false);
     const sourceFilename = chaptersData?.source_filename;
@@ -1922,6 +1968,11 @@ export function IngestPageContent({ project }: { project: string }) {
                     costDisplay={ingestFeatureCostDisplay}
                     promotion={ingestFeatureCostData?.promotion}
                   />
+
+                  <OneClickFilmButton
+                    onClick={handleStartOneClickFilm}
+                    disabled={ingestStarted}
+                  />
                 </div>
               </div>
             </motion.section>
@@ -1963,6 +2014,7 @@ export function IngestPageContent({ project }: { project: string }) {
                       ? handleRetryReimport
                       : handleStartIngest
                   }
+                  onStartOneClick={handleStartOneClickFilm}
                   onCancel={handleCancelIngest}
                   isCancelling={cancelTask.isPending}
                   onReupload={() => {
@@ -2158,10 +2210,12 @@ export function IngestPageContent({ project }: { project: string }) {
                     </div>
                   </div>
 
-                  {/* Film-process-pack script processing (auto after import, re-runnable) */}
-                  <ScriptProcessCard
+                  {/* Film-process-pack script processing: chained by the import,
+                      so this only reports progress. */}
+                  <ScriptProcessProgress
                     project={project}
                     enabled={Boolean(project)}
+                    watchMs={taskStream.status === "completed" ? 300_000 : 0}
                     className={INGEST_SURFACE_SUBTLE_CLASS}
                   />
 

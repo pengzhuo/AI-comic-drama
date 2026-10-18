@@ -13,6 +13,7 @@ from typing import Any
 
 from starlette.concurrency import run_in_threadpool
 
+from novelvideo.asset_references import asset_reference_gaps_for_store
 from novelvideo.project_context import ProjectContext
 from novelvideo.script_process import has_script_process_result
 from novelvideo.sqlite_store import SQLiteStore
@@ -32,6 +33,7 @@ STEP_MAP: dict[str, tuple[str | None, str]] = {
     "identity_plan": (None, "身份规划"),
     "identity_images": (None, "身份图生成"),
     "script": ("script_writer", "脚本生成"),
+    "asset_references": (None, "资产参考图"),
     "sketches": ("sketch_generation", "草图生成"),
     "coloring": (None, "配色+身份/道具检测"),
     "global_optimize": ("global_optimize_video", "全局视频优化"),
@@ -347,6 +349,11 @@ async def compute_pipeline_status(
     beats = await store.get_beats_as_dicts(target_ep)
     has_script = _all_or_empty([_beat_has_script_content(b) for b in beats])
 
+    # 脚本之后、草图之前：把项目里该有的场景/道具参考图补齐。草图只吃场景图、
+    # 首帧同时吃场景图与道具图，缺图就会让服装/道具/环境在镜头之间漂移。
+    asset_gaps = await asset_reference_gaps_for_store(store, project_dir)
+    has_asset_references = not asset_gaps
+
     sketches_dir = project_dir / "sketches" / f"ep{target_ep:03d}"
     has_sketches = _beat_sketch_series_complete(sketches_dir, beats)
 
@@ -372,6 +379,8 @@ async def compute_pipeline_status(
         "identity_images_done": len(planned_identities) - len(missing_identities),
         "identities_missing": missing_identities,
         "script": has_script,
+        "asset_references": has_asset_references,
+        "asset_references_missing": [gap.as_dict() for gap in asset_gaps],
         "sketches": has_sketches,
         "coloring": has_coloring,
         "global_optimize": has_global_optimize,
@@ -392,6 +401,7 @@ async def compute_pipeline_status(
         "identity_plan",
         "identity_images",
         "script",
+        "asset_references",
         "sketches",
         "coloring",
         "global_optimize",

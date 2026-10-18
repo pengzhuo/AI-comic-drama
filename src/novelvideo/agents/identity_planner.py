@@ -30,6 +30,7 @@ from novelvideo.utils.source_language import (
     asset_language_instruction,
     detect_asset_language,
 )
+from novelvideo.skills.ai_film_process import pack_block
 
 if TYPE_CHECKING:
     from novelvideo.cognee import CogneeStore
@@ -978,12 +979,19 @@ class IdentityPlanner:
             language_instruction = asset_language_instruction(
                 detect_asset_language(content_text)
             )
+            pack = pack_block(
+                "identity_planner", "plan", model_env="IDENTITY_PLANNER_ANALYSIS_MODEL"
+            )
             agent = Agent(
                 self._identity_model(
                     "IDENTITY_PLANNER_ANALYSIS_MODEL",
                     brainclaw_profile=BrainClawProfile.IDENTITY_DEFAULT_ANALYSIS,
                 ),
-                system_prompt=f"{DEFAULT_IDENTITY_PROMPT}\n{language_instruction}",
+                system_prompt="\n".join(
+                    part
+                    for part in (DEFAULT_IDENTITY_PROMPT, pack, language_instruction)
+                    if part
+                ),
                 model_settings=self._identity_model_settings(),
                 output_type=EpisodeDefaultIdentities,
             )
@@ -1066,12 +1074,19 @@ class IdentityPlanner:
             language_instruction = asset_language_instruction(
                 detect_asset_language(content_text)
             )
+            pack = pack_block(
+                "identity_planner", "plan", model_env="IDENTITY_PLANNER_ANALYSIS_MODEL"
+            )
             agent = Agent(
                 self._identity_model(
                     "IDENTITY_PLANNER_ANALYSIS_MODEL",
                     brainclaw_profile=BrainClawProfile.IDENTITY_SPECIAL_ANALYSIS,
                 ),
-                system_prompt=f"{OTHER_IDENTITY_PROMPT}\n{language_instruction}",
+                system_prompt="\n".join(
+                    part
+                    for part in (OTHER_IDENTITY_PROMPT, pack, language_instruction)
+                    if part
+                ),
                 model_settings=self._identity_model_settings(),
                 output_type=EpisodeIdentityRequirements,
             )
@@ -1520,10 +1535,17 @@ class IdentityPlanner:
                 "\n".join((character_name, visual_state, reason))
             )
             language_instruction = asset_language_instruction(language)
+            pack = pack_block(
+                "identity_planner",
+                "appearance",
+                model_env="IDENTITY_PLANNER_APPEARANCE_MODEL",
+            )
             appearance_agent = Agent(
                 self._identity_model("IDENTITY_PLANNER_APPEARANCE_MODEL"),
-                system_prompt=(
-                    f"{APPEARANCE_GENERATION_PROMPT}\n{language_instruction}"
+                system_prompt="\n".join(
+                    part
+                    for part in (APPEARANCE_GENERATION_PROMPT, pack, language_instruction)
+                    if part
                 ),
                 model_settings=self._identity_model_settings(),
                 output_type=AppearanceDescription,

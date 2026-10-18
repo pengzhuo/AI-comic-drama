@@ -340,7 +340,7 @@ def infer_scene_id_from_master_path(path: Path, project_dir: Path) -> str:
 
 def build_scene_360_prompt(scene_id: str) -> str:
     normalized_scene_id = (scene_id or "").strip() or "the target scene"
-    return (
+    prompt = (
         f"Generate a 360-degree equirectangular panorama image in exact 2:1 "
         f"aspect ratio for scene `{normalized_scene_id}`.\n\n"
         "INPUT IMAGE ROLE:\n"
@@ -369,6 +369,9 @@ def build_scene_360_prompt(scene_id: str) -> str:
         "- No broken seam, no duplicated doorway at seam, no mirrored left/right halves.\n"
         "- No photorealism drift if the reference is stylized."
     )
+    from novelvideo.skills.ai_film_process import apply_directive
+
+    return apply_directive("scene_reference_asset", prompt)
 
 
 def build_multi_view_prompt(body: FreezoneCharacterMultiViewRequest) -> str:
@@ -393,7 +396,7 @@ def build_multi_view_prompt(body: FreezoneCharacterMultiViewRequest) -> str:
     preset_text = preset_map.get(body.preset, "custom camera reposition")
     shot_size_text = shot_size_map.get(body.shot_size, "medium shot")
     user_block = f"\nUser prompt:\n{body.prompt.strip()}" if body.prompt.strip() else ""
-    return (
+    prompt = (
         "Reframe the provided source image into a new camera angle while preserving the same scene, "
         "same characters, same identities, same costume continuity, and same lighting logic unless explicitly changed.\n\n"
         f"Preset target: {preset_text}.\n"
@@ -408,6 +411,9 @@ def build_multi_view_prompt(body: FreezoneCharacterMultiViewRequest) -> str:
         "- Do not add text, UI, borders, watermark, or collage layout.\n"
         "- Keep the result production-ready and visually coherent."
     )
+    from novelvideo.skills.ai_film_process import apply_directive
+
+    return apply_directive("identity_image", prompt)
 
 
 def _describe_color_temperature(kelvin: int | None) -> str | None:

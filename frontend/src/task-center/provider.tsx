@@ -138,6 +138,7 @@ function invalidateCompletedAssetQueries(
   if (
     task.task_type === "build_scenes" ||
     task.task_type === "scene_reference_asset" ||
+    task.task_type === "scene_pano_generation" ||
     task.task_type === "stage_asset"
   ) {
     queryClient.invalidateQueries({ queryKey: queryKeys.scenes(projectId) });

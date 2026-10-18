@@ -20,6 +20,7 @@ from novelvideo.seedance2_i2v.character_voice_storage import (
     utc_now_iso,
     voice_content_sha256,
 )
+from novelvideo.seedance2_i2v.speaker_matching import select_character_for_speaker
 from novelvideo.seedance2_i2v.voice_clone import (
     dialogue_text,
     narration_beat_text,
@@ -79,39 +80,83 @@ def _env_voice_pool(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return voices or default
 
 
+_FEMALE_GENDER_MARKERS = ("女", "female", "woman", "girl")
+_MALE_GENDER_MARKERS = ("男", "male", "man", "boy")
+
+
+def character_gender(character) -> str:
+    """Normalized gender: ``female``, ``male``, or ``""`` when the script is unclear.
+
+    An empty gender used to silently fall through to the male pool, which is how
+    female characters ended up speaking with a male preset. Callers must now
+    decide explicitly instead of guessing.
+    """
+
+    raw = str(getattr(character, "gender", "") or "").strip().lower().replace(" ", "")
+    if not raw:
+        return ""
+    if any(marker in raw for marker in _FEMALE_GENDER_MARKERS):
+        return "female"
+    if any(marker in raw for marker in _MALE_GENDER_MARKERS):
+        return "male"
+    return ""
+
+
+def gender_missing_error(character) -> str | None:
+    """Actionable message when a character cannot be matched to a preset voice."""
+
+    if character_gender(character):
+        return None
+    name = str(getattr(character, "name", "") or "").strip() or "未命名角色"
+    return (
+        f"角色「{name}」未设置性别，无法匹配系统声线："
+        "请在角色面板补充性别，或为该角色上传/录制声线"
+    )
+
+
 def _is_female(character) -> bool:
-    gender = str(getattr(character, "gender", "") or "").strip().lower()
-    return "女" in gender or gender in {"female", "woman", "girl"}
+    return character_gender(character) == "female"
 
 
 def _is_child(character) -> bool:
     return str(getattr(character, "age_group", "") or "").strip().lower() == "child"
 
 
-def _stable_voice(pool: tuple[str, ...], character) -> str:
+def _stable_voice(
+    pool: tuple[str, ...], character, *, claimed: set[str] | None = None
+) -> str:
+    """Deterministic pool pick, rotating past voices another character uses."""
+
     stable_index = sum(ord(char) for char in str(getattr(character, "name", "") or ""))
+    if claimed:
+        for offset in range(len(pool)):
+            voice = pool[(stable_index + offset) % len(pool)]
+            if voice not in claimed:
+                return voice
     return pool[stable_index % len(pool)]
 
 
-def _edge_voice_for_character(character) -> str:
+def _edge_voice_for_character(character, *, claimed: set[str] | None = None) -> str:
     if _is_female(character):
         if _is_child(character):
             return CHILD_VOICE
-        return _stable_voice(FEMALE_VOICES, character)
-    return _stable_voice(MALE_VOICES, character)
+        return _stable_voice(FEMALE_VOICES, character, claimed=claimed)
+    return _stable_voice(MALE_VOICES, character, claimed=claimed)
 
 
-def _gateway_voice_for_character(character) -> str:
+def _gateway_voice_for_character(character, *, claimed: set[str] | None = None) -> str:
     if _is_female(character):
         if _is_child(character):
             return _env_voice("SYSTEM_VOICE_TTS_CHILD_VOICE", GATEWAY_CHILD_VOICE)
         return _stable_voice(
             _env_voice_pool("SYSTEM_VOICE_TTS_FEMALE_VOICES", GATEWAY_FEMALE_VOICES),
             character,
+            claimed=claimed,
         )
     return _stable_voice(
         _env_voice_pool("SYSTEM_VOICE_TTS_MALE_VOICES", GATEWAY_MALE_VOICES),
         character,
+        claimed=claimed,
     )
 
 
@@ -127,12 +172,59 @@ def _narrator_voice_candidates() -> list[tuple[str, str]]:
     return candidates
 
 
-def _character_voice_candidates(character) -> list[tuple[str, str]]:
+def _character_voice_candidates(
+    character, *, claimed: set[str] | None = None
+) -> list[tuple[str, str]]:
     candidates: list[tuple[str, str]] = []
     if gateway_voice_model():
-        candidates.append(("gateway", _gateway_voice_for_character(character)))
-    candidates.append(("edge", _edge_voice_for_character(character)))
+        candidates.append(
+            ("gateway", _gateway_voice_for_character(character, claimed=claimed))
+        )
+    candidates.append(("edge", _edge_voice_for_character(character, claimed=claimed)))
     return candidates
+
+
+def _cached_system_voice_hashes(project_dir: Path) -> dict[str, str]:
+    """Map ``sha256 -> preset voice`` for the samples already cached in a project."""
+
+    cache_dir = project_dir / "assets" / "system_voices"
+    if not cache_dir.is_dir():
+        return {}
+    hashes: dict[str, str] = {}
+    for path in sorted(cache_dir.glob("*.mp3")):
+        stem = path.stem
+        if "__" not in stem:
+            continue
+        voice = stem.split("__", 1)[1]
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        if content:
+            hashes[voice_content_sha256(content)] = voice
+    return hashes
+
+
+def _claimed_system_voices(*, project_dir: Path, characters: list) -> set[str]:
+    """Preset voices already taken by a character in this project.
+
+    Characters keep only the hash of their reference sample, so the cached
+    system-voice samples are what maps that hash back to the preset it came
+    from. A character with a custom (捏塘) sample simply never matches.
+    """
+
+    known = _cached_system_voice_hashes(project_dir)
+    if not known:
+        return set()
+    claimed: set[str] = set()
+    for character in characters:
+        sha256 = str(getattr(character, "reference_audio_sha256", "") or "").strip()
+        if not sha256:
+            continue
+        voice = known.get(sha256)
+        if voice:
+            claimed.add(voice)
+    return claimed
 
 
 def _safe_voice_filename(voice: str) -> str:
@@ -227,10 +319,7 @@ async def _system_voice_content(
 
 
 def _matching_character(speaker: str, characters: list):
-    return next(
-        (character for character in characters if speaker.startswith(character.name)),
-        None,
-    )
+    return select_character_for_speaker(speaker, characters)
 
 
 async def prepare_missing_system_voices(
@@ -280,6 +369,8 @@ async def prepare_missing_system_voices(
 
     prepared: list[dict[str, str]] = []
     content_cache: dict[str, tuple[bytes, str, str]] = {}
+    claimed_voices = _claimed_system_voices(project_dir=root, characters=characters)
+    gender_missing: list[str] = []
 
     if needs_narrator and narration_style != "first_person":
         stored = load_narrator_reference_audio(username, project)
@@ -314,11 +405,16 @@ async def prepare_missing_system_voices(
             )
 
     for character_name, character in character_targets.items():
+        gender_error = gender_missing_error(character)
+        if gender_error:
+            gender_missing.append(gender_error)
+            continue
         content, provider, voice = await _system_voice_content(
             project_dir=root,
-            candidates=_character_voice_candidates(character),
+            candidates=_character_voice_candidates(character, claimed=claimed_voices),
             cache=content_cache,
         )
+        claimed_voices.add(voice)
         rel_path, sha256, updated_at = persist_character_voice_file(
             project_dir=root,
             character_name=character_name,
@@ -355,6 +451,9 @@ async def prepare_missing_system_voices(
     )
     for speaker in sorted(unresolved_speakers):
         detail = f"未找到说话身份对应角色：{speaker}"
+        if detail not in remaining:
+            remaining.append(detail)
+    for detail in gender_missing:
         if detail not in remaining:
             remaining.append(detail)
     return {

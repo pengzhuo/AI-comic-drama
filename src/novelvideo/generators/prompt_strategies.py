@@ -78,6 +78,7 @@ ONE continuous image. ZERO visible boundaries between regions."""
                 ctx, ordered_chars, include_face_desc=False, include_silhouette=False
             ),
             components.build_identity_lock(ctx, ordered_chars, compact=True),
+            components.build_wardrobe_and_makeup_lock(ctx, ordered_chars),
             components.build_asset_identity_lock(ctx),
             components.build_fusion_rules(ctx, ordered_chars),
             components.build_time_of_day_rules(ctx),

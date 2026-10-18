@@ -1839,7 +1839,7 @@ def get_workflow_skill(args: dict[str, Any]) -> dict[str, Any]:
             source_anchor_recipe_ids.setdefault(output_kind, []).append(recipe_id)
     input_contract = _skill_input_contract(skill, args)
     compact = bool(args.get("compact"))
-    from novelvideo.freezone.workflow_planning import WORKFLOW_PLANNING_INSTRUCTIONS
+    from novelvideo.freezone.workflow_planning import workflow_planning_instructions
 
     planning_skill = _without_private_fields(skill)
     allowed_node_types = {
@@ -1854,7 +1854,7 @@ def get_workflow_skill(args: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "schema_version": "freezone_workflow_skill_package.v1",
-        "agent_instruction": WORKFLOW_PLANNING_INSTRUCTIONS,
+        "agent_instruction": workflow_planning_instructions(),
         "skill_id": _text(skill.get("id")),
         "user_goal": _workflow_goal_text(args),
         "source": _catalog_source(skill),

@@ -1307,9 +1307,14 @@ class CogneeStore:
 只返回 JSON，不要有其他内容。"""
 
         try:
+            from novelvideo.official_defaults import DEFAULT_COGNEE_LLM_MODEL
+
             log("调用 LLM 分配事件...")
             response = await litellm.acompletion(
-                model=os.environ.get("LLM_MODEL", "gpt-4o"),
+                model=(
+                    os.environ.get("LLM_MODEL", "").strip()
+                    or DEFAULT_COGNEE_LLM_MODEL
+                ),
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 response_format={"type": "json_object"},

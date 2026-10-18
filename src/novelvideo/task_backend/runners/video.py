@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import shutil
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from novelvideo.project_context import ProjectContext
+from novelvideo.seedance2_i2v.spoken_dialogue import beat_subtitle_text
 from novelvideo.task_backend.cancel import (
     TaskTimedOut,
     await_envelope_with_cancel_watch,
@@ -97,6 +102,242 @@ def _append_freezone_video_node_history(
     )
 
 
+def _beat_expects_speech(beat: dict[str, Any]) -> bool:
+    """这一 beat 是否必须有真实人声（台词或解说）。
+
+    只有「有文本 + 音频类型是台词/解说」的 beat 才要求音轨非静音：动作/静音 beat
+    本来就该没有对白，不能因为音轨安静就判不通过。
+    """
+
+    from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
+
+    if not str(beat_subtitle_text(beat) or "").strip():
+        return False
+    return normalize_seedance2_audio_type(beat) in {"dialogue", "narration"}
+
+
+def _beat_identity_reference_paths(
+    output_dir: str, beat: dict[str, Any]
+) -> list[str]:
+    """Resolve the beat's identity reference images (best effort)."""
+
+    import json as _json
+
+    from novelvideo.models import real_detected_identities
+
+    raw = beat.get("detected_identities")
+    if raw is None:
+        raw = beat.get("detected_identities_json") or []
+    if isinstance(raw, str):
+        try:
+            raw = _json.loads(raw)
+        except (TypeError, ValueError):
+            raw = []
+    if isinstance(raw, dict):
+        raw = list(raw.values())
+    if not isinstance(raw, (list, tuple)):
+        raw = []
+
+    paths: list[str] = []
+    chars_root = Path(output_dir) / "assets" / "characters"
+    for identity_id in real_detected_identities(list(raw)):
+        character, _, identity = str(identity_id).partition("_")
+        candidate = (
+            chars_root / character / "identities" / f"{identity}.png"
+            if identity
+            else chars_root / character / "portrait.png"
+        )
+        if candidate.exists():
+            paths.append(candidate.as_posix())
+    return paths
+
+
+async def _apply_video_consistency_gate(
+    *,
+    video_gen: Any,
+    generate_kwargs: dict[str, Any],
+    result: Any,
+    frame_path: Any,
+    video_path: Path,
+    beat: dict[str, Any],
+    output_dir: str,
+    payload_config: dict[str, Any] | None = None,
+    on_log,
+    strict_first_frame_degraded: bool = False,
+    beat_num: int = 0,
+) -> tuple[Any, dict[str, Any]]:
+    """生成后一致性自检 + 有界重跑；返回（最终结果, 报告）。
+
+    每次重跑都是一版新画面，所以先把上一版留在临时目录里：重跑次数用尽时选「最接近
+    首帧」的那一版落回正式路径（而不是盲留最后一版），并把需要人工复核的原因写进
+    报告与 ``videos/beats/epNNN/review_flags.json``。
+    """
+
+    from novelvideo.verification.video_consistency_gate import (
+        VideoConsistencyGate,
+        consistency_gate_config,
+        frame_aspect_warning,
+        pick_best_attempt,
+    )
+
+    settings = consistency_gate_config(config=payload_config)
+    if not settings.enabled or not str(frame_path or "").strip():
+        return result, {"enabled": False}
+
+    gate = VideoConsistencyGate()
+    identity_paths = _beat_identity_reference_paths(output_dir, beat)
+    attempts: list[dict[str, Any]] = []
+    current = result
+    notes: list[str] = []
+
+    aspect_warning = frame_aspect_warning(
+        Path(str(frame_path)), str((payload_config or {}).get("ratio") or "")
+    )
+    if aspect_warning:
+        on_log(f"画幅告警：{aspect_warning}")
+        notes.append(aspect_warning)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="video_gate_"))
+    chosen: Path | None = None
+    chosen_attempt: int | None = None
+    try:
+        for attempt in range(1, settings.max_attempts + 1):
+            snapshot = work_dir / f"attempt_{attempt}{video_path.suffix}"
+            try:
+                shutil.copy2(video_path, snapshot)
+            except OSError:
+                snapshot = Path(video_path)
+            verdict = await gate.check(
+                video_path=snapshot,
+                first_frame_path=Path(str(frame_path)),
+                identity_image_paths=identity_paths,
+                audio_type=str(beat.get("audio_type") or ""),
+                expects_speech=_beat_expects_speech(beat),
+                log=on_log,
+            )
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    **verdict.as_dict(),
+                    "video_path": str(snapshot),
+                }
+            )
+            if verdict.passed:
+                if attempt > 1:
+                    on_log(f"一致性自检通过（第 {attempt} 次生成）")
+                chosen = snapshot
+                chosen_attempt = attempt
+                break
+            summary = "；".join(verdict.reasons[:3]) or "画面与首帧不一致"
+            if attempt >= settings.max_attempts:
+                # 有界重跑用尽：不阻断产线，但要选最接近首帧的一版并显式标记人工复核。
+                best = pick_best_attempt(attempts) or {}
+                candidate = Path(str(best.get("video_path") or snapshot))
+                if candidate != snapshot:
+                    on_log(f"重跑次数用尽，改用最接近首帧的第 {best.get('attempt')} 版成片")
+                chosen = candidate
+                chosen_attempt = int(best.get("attempt") or attempt)
+                on_log(f"一致性自检未通过且重跑次数用尽，已标记人工复核：{summary}")
+                break
+            on_log(f"一致性自检未通过，强化提示词后重跑（第 {attempt + 1} 次生成）：{summary}")
+            generate_kwargs = dict(generate_kwargs)
+            generate_kwargs["prompt"] = verdict.reinforce_prompt(
+                str(generate_kwargs.get("prompt") or "")
+            )
+            current = await video_gen.generate(**generate_kwargs)
+            if current.status.value != "done":
+                raise RuntimeError(current.error or "视频生成失败")
+
+        if chosen is not None and chosen != Path(video_path):
+            shutil.copy2(chosen, video_path)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    # 报告必须描述「真正落盘的那一版」：重跑用尽时它可能不是最后一次生成的那版。
+    final = next(
+        (item for item in attempts if item.get("attempt") == chosen_attempt),
+        attempts[-1] if attempts else {},
+    )
+    review_reasons = [
+        str(reason) for reason in (final.get("reasons") or []) if str(reason).strip()
+    ]
+    if aspect_warning:
+        review_reasons.append(aspect_warning)
+    report: dict[str, Any] = {
+        "enabled": True,
+        "attempts": attempts,
+        "notes": notes,
+        "final_attempt": final.get("attempt"),
+        "frame0_similarity": final.get("frame0_similarity"),
+        "passed": bool(final.get("passed")),
+        "strict_first_frame_degraded": bool(strict_first_frame_degraded),
+        "needs_human_review": bool(review_reasons),
+        "review_reasons": review_reasons,
+    }
+    if strict_first_frame_degraded:
+        on_log(
+            "严格首帧未生效：上游拒绝了硬首帧通路，已降级为多参考通路"
+            "（首帧只作参考图1，不再硬锁）"
+        )
+    write_review_flags(
+        videos_dir=Path(video_path).parent,
+        beat_num=int(beat_num or beat.get("beat_number") or 0),
+        report=report,
+    )
+    return current, report
+
+
+def write_review_flags(*, videos_dir: Path, beat_num: int, report: dict[str, Any]) -> None:
+    """把需要人工复核的结论累积到 ``videos/beats/epNNN/review_flags.json``。
+
+    不新增 beats 表字段：复核标记是生成过程的副产物，跟着产物走即可。没有需要复核的
+    条目时该文件不存在，避免给正常集引入噪声。
+    """
+
+    flags_path = Path(videos_dir) / "review_flags.json"
+    existing: dict[str, Any] = {}
+    if flags_path.exists():
+        try:
+            loaded = json.loads(flags_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError):
+            existing = {}
+    beats = existing.get("beats")
+    flags = dict(beats) if isinstance(beats, dict) else {}
+
+    entry: dict[str, Any] = {
+        "beat_number": int(beat_num or 0),
+        "reasons": list(report.get("review_reasons") or []),
+        "final_attempt": report.get("final_attempt"),
+        "frame0_similarity": report.get("frame0_similarity"),
+        "strict_first_frame_degraded": bool(report.get("strict_first_frame_degraded")),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    needs_review = bool(report.get("needs_human_review")) or bool(
+        report.get("strict_first_frame_degraded")
+    )
+    if needs_review:
+        flags[str(int(beat_num or 0))] = entry
+    else:
+        flags.pop(str(int(beat_num or 0)), None)
+
+    if not flags:
+        try:
+            flags_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    payload = {"schema": "beat_review_flags_v1", "beats": flags}
+    try:
+        flags_path.parent.mkdir(parents=True, exist_ok=True)
+        flags_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        logger.warning("failed to write review flags %s", flags_path, exc_info=True)
+
+
 async def _run_single_video_async(
     envelope: dict[str, Any], ctx: ProjectContext
 ) -> dict[str, Any]:
@@ -111,6 +352,7 @@ async def _run_single_video_async(
     _log(manager, ctx, envelope, f"开始生成 Beat {beat_num} 视频")
 
     from novelvideo.generators.video_generator import (
+        FALLBACK_MULTI_REFERENCE_LOG,
         ShotReference,
         create_video_generator,
     )
@@ -144,7 +386,13 @@ async def _run_single_video_async(
         gen_kwargs["resolution"] = str(single_resolution)
     video_gen = create_video_generator(backend=backend_str, **gen_kwargs)
 
+    # 严格首帧通路会被上游内容审核拒绝（写实人脸），提交期会静默降级为多参考通路。
+    # 这里捕获降级标记，让自检报告如实反映「硬首帧实际未生效」。
+    strict_first_frame_degraded = {"value": False}
+
     def on_log(msg: str) -> None:
+        if FALLBACK_MULTI_REFERENCE_LOG in str(msg):
+            strict_first_frame_degraded["value"] = True
         _log(manager, ctx, envelope, msg)
 
     def on_progress(value: float) -> None:
@@ -236,6 +484,35 @@ async def _run_single_video_async(
     if result.status.value != "done":
         raise RuntimeError(result.error or "视频生成失败")
 
+    gate_report: dict[str, Any] = {"enabled": False}
+    if is_seedance2_backend:
+        # 生成后自检：严格首帧 / 服装脸型 / 肢体物理，不通过时有界重跑。
+        result, gate_report = await _apply_video_consistency_gate(
+            video_gen=video_gen,
+            generate_kwargs=generate_kwargs,
+            result=result,
+            frame_path=frame_path,
+            video_path=video_path,
+            beat=beat,
+            output_dir=output_dir,
+            payload_config=config,
+            on_log=on_log,
+            strict_first_frame_degraded=strict_first_frame_degraded["value"],
+            beat_num=beat_num,
+        )
+    elif strict_first_frame_degraded["value"]:
+        # 自检关闭时不跑画面复核，但「严格首帧未生效」仍要落盘，不能静默。
+        write_review_flags(
+            videos_dir=videos_dir,
+            beat_num=beat_num,
+            report={
+                "review_reasons": [
+                    "严格首帧未生效：上游拒绝了硬首帧通路，已降级为多参考通路"
+                ],
+                "strict_first_frame_degraded": True,
+            },
+        )
+
     video_pool_id = None
     try:
         from novelvideo.generators.video_pool_indexer import add_video_to_pool
@@ -259,6 +536,11 @@ async def _run_single_video_async(
         "beat_num": beat_num,
         "video_pool_id": video_pool_id,
     }
+    if gate_report.get("enabled"):
+        task_result["consistency_gate"] = gate_report
+    if strict_first_frame_degraded["value"]:
+        # 自检关掉时也要如实暴露这次降级，避免「严格首帧」看起来生效了。
+        task_result["strict_first_frame_degraded"] = True
     provider_task_id = getattr(result, "provider_task_id", None) or getattr(
         result, "task_id", None
     )
@@ -343,6 +625,84 @@ def _video_has_audio_stream(
     except subprocess.TimeoutExpired as exc:
         raise TaskTimedOut(timeout_seconds=timeout_seconds) from exc
     return result.returncode == 0 and bool(result.stdout.strip())
+
+
+_COMPOSE_CLIP_ENCODER_ARGS = [
+    "-c:v",
+    "libx264",
+    "-preset",
+    "fast",
+    "-crf",
+    "23",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-pix_fmt",
+    "yuv420p",
+]
+
+
+def _beat_prefers_embedded_audio(beat: dict[str, Any]) -> bool:
+    """True when a beat's own clip already carries the performed dialogue.
+
+    Seedance 2.0 beats generated with ``generate_audio`` speak the line
+    natively, so the separate dubbing track is only a timing/preview artifact
+    and must not overwrite the model's own performance in the final cut.
+    """
+
+    raw = str(beat.get("seedance2_config_json") or "").strip()
+    if not raw or raw in {"{}", "null", "None"}:
+        return False
+    try:
+        from novelvideo.seedance2_i2v.models import parse_seedance2_config
+
+        config = parse_seedance2_config(raw)
+    except Exception:
+        return False
+    return bool(config.generate_audio)
+
+
+def _beat_dub_alignment_args(
+    video_path: Path,
+    audio_path: Path,
+    *,
+    timeout_seconds: int | None,
+) -> list[str]:
+    """Map the beat's dubbing track and align both sides by padding.
+
+    The old ``-shortest`` cut whichever side was longer: a 5s shot carrying a
+    6.7s line lost the end of the dialogue, and a 9.4s line over a 5s shot lost
+    the picture. Pad the shorter side instead (clone the last frame / pad with
+    silence) so a beat keeps both its full picture and its full line.
+    """
+
+    video_seconds = _audio_duration(video_path, timeout_seconds=timeout_seconds) or 0.0
+    dub_seconds = _audio_duration(audio_path, timeout_seconds=timeout_seconds) or 0.0
+    target_seconds = max(video_seconds, dub_seconds)
+    if target_seconds <= 0:
+        # Both probes failed: keep the previous truncating behaviour rather than
+        # risk an unbounded clip (apad alone would never end).
+        return [
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            *_COMPOSE_CLIP_ENCODER_ARGS,
+            "-shortest",
+        ]
+    pad_seconds = max(target_seconds - video_seconds, 0.0)
+    return [
+        "-filter_complex",
+        f"[0:v]tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}[v];[1:a]apad[a]",
+        "-map",
+        "[v]",
+        "-map",
+        "[a]",
+        *_COMPOSE_CLIP_ENCODER_ARGS,
+        "-t",
+        f"{target_seconds:.3f}",
+    ]
 
 
 async def _run_video_generation_async(
@@ -586,29 +946,22 @@ def run_compose_episode(
                 current_task=f"合成 Beat {beat_num}...",
             )
             cmd = ["ffmpeg", "-y", "-i", str(video_path)]
-            has_embedded_audio = False
-            if audio_path.exists():
+            has_embedded_audio = _video_has_audio_stream(
+                video_path,
+                timeout_seconds=subprocess_timeout(30),
+            )
+            check_cancel()
+            keep_native_audio = has_embedded_audio and _beat_prefers_embedded_audio(
+                beat
+            )
+            if audio_path.exists() and not keep_native_audio:
                 cmd.extend(["-i", str(audio_path)])
                 cmd.extend(
-                    [
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "1:a:0",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "fast",
-                        "-crf",
-                        "23",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "128k",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-shortest",
-                    ]
+                    _beat_dub_alignment_args(
+                        video_path,
+                        audio_path,
+                        timeout_seconds=subprocess_timeout(30),
+                    )
                 )
                 manager.update_progress_for_project(
                     ctx,
@@ -616,32 +969,14 @@ def run_compose_episode(
                     episode,
                     logs=[f"Beat {beat_num} 使用独立音频: {audio_path.name}"],
                 )
-            else:
-                has_embedded_audio = _video_has_audio_stream(
-                    video_path,
-                    timeout_seconds=subprocess_timeout(30),
-                )
-                check_cancel()
-            if has_embedded_audio:
+            elif has_embedded_audio:
                 cmd.extend(
                     [
                         "-map",
                         "0:v:0",
                         "-map",
                         "0:a:0",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "fast",
-                        "-crf",
-                        "23",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "128k",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-shortest",
+                        *_COMPOSE_CLIP_ENCODER_ARGS,
                     ]
                 )
                 manager.update_progress_for_project(
@@ -650,7 +985,7 @@ def run_compose_episode(
                     episode,
                     logs=[f"Beat {beat_num} 使用视频内置音轨"],
                 )
-            elif not audio_path.exists():
+            else:
                 cmd.extend(
                     [
                         "-f",
@@ -661,18 +996,7 @@ def run_compose_episode(
                         "0:v:0",
                         "-map",
                         "1:a:0",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "fast",
-                        "-crf",
-                        "23",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "128k",
-                        "-pix_fmt",
-                        "yuv420p",
+                        *_COMPOSE_CLIP_ENCODER_ARGS,
                         "-shortest",
                     ]
                 )
@@ -681,9 +1005,7 @@ def run_compose_episode(
             check_cancel()
             if result.returncode == 0:
                 video_clips.append(str(clip_path))
-                clip_srt_entries.append(
-                    (str(beat.get("narration_segment") or "").strip(), str(clip_path))
-                )
+                clip_srt_entries.append((beat_subtitle_text(beat), str(clip_path)))
             else:
                 manager.update_progress_for_project(
                     ctx,
@@ -730,14 +1052,15 @@ def run_compose_episode(
         if subtitle_path is not None:
             # libass renders SRT at a constant default PlayRes (~384x288) and
             # then scales to the film, so FontSize is resolution-independent:
-            # keep it small (~14) and bottom-centered with a modest margin for a
-            # movie-style subtitle band instead of text that fills the frame.
+            # 11 lands around 49px on a 1280-high film (3.8% of the height) with
+            # a modest bottom margin, i.e. a movie-style band instead of text
+            # that fills the frame.
             subtitle_style = (
                 "FontName=Noto Sans CJK SC,"
-                "FontSize=14,"
+                "FontSize=11,"
                 "PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,"
-                "BorderStyle=1,Outline=1,Shadow=0,MarginV=20,Alignment=2"
+                "BorderStyle=1,Outline=1,Shadow=0,MarginV=24,Alignment=2"
             )
             filter_parts.append(
                 f"[outv]subtitles=filename='{subtitle_path}':"

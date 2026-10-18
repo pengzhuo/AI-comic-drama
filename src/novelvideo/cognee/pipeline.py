@@ -40,6 +40,7 @@ from novelvideo.cognee.screenplay_normalizer import (
     normalize_screenplay_scenes,
 )
 from novelvideo.time_of_day import LlmTimeOfDay
+from novelvideo.skills.ai_film_process import append_pack
 
 # 重要：必须先导入 config，在 cognee 被导入之前设置环境变量
 from . import config as _cognee_config  # noqa: F401
@@ -419,6 +420,7 @@ async def extract_characters_from_graph(
 - aliases 只保留原文里真实出现过、且能稳定指向该角色的称呼
 - 不要把过于泛化、依赖上下文才成立的称谓塞进 aliases，例如“男人 / 女人 / 老板 / 爸爸 / 女儿 / 店员”这类高歧义称呼默认不要收，除非图谱上下文已经明确它稳定指向同一角色
 - 如果信息不足，只允许对 role / body_type / description 做保守推测；不要为 aliases 编造原文未出现的称呼"""
+    system_prompt = append_pack("build_characters", system_prompt)
 
     try:
         result = await LLMGateway.acreate_structured_output(
@@ -545,6 +547,7 @@ async def extract_episodes_with_characters(
 - 情节连贯，前后呼应
 - 高潮放在中后期
 - 确保角色名称与已确认列表一致"""
+    system_prompt = append_pack("build_episodes", system_prompt)
 
     log("调用 LLM 规划剧集...")
     result = await LLMGateway.acreate_structured_output(
@@ -1430,6 +1433,7 @@ async def extract_scenes_from_graph(
 - scene_type 只能是 interior、exterior、nature。
 - evidence_lines 必须来自输入图谱上下文，不得编造。
 - 图谱证据不足时宁缺毋滥，不要猜测地点。"""
+    system_prompt = append_pack("build_scenes", system_prompt)
     try:
         result = await LLMGateway.acreate_structured_output(
             context_text,
@@ -1986,6 +1990,7 @@ async def extract_props_from_graph(
 - aliases 不要发散编造；不要加入过于泛化、容易误匹配其他物件的词
 - 不要把过短、过泛、或高碰撞的类别词放进 aliases，例如“箱子 / 盒子 / 剑 / 刀 / 文件 / 车”这类默认不要收，除非图谱上下文明确表明原文就是把该具名道具稳定地这样称呼
 - 如果某个别名只是主名称的重复写法，则不要重复输出"""
+    system_prompt = append_pack("build_props", system_prompt)
 
     try:
         result = await LLMGateway.acreate_structured_output(

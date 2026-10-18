@@ -31,10 +31,6 @@ import { CreditBalanceBadge } from "@/components/layout/credit-balance-badge";
 import { BrandLockup } from "@/components/layout/brand-lockup";
 import { NotificationDrawer } from "@/components/notifications/notification-drawer";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
-import {
-  PetGalleryDialog,
-  type CompanionSelection,
-} from "@/features/companion/petdex/PetGalleryDialog";
 import { useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@/stores/auth-store";
 import { useAppStore } from "@/stores/app-store";
@@ -66,7 +62,6 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const params = useParams({ strict: false }) as { project?: string };
-  const [companionOpen, setCompanionOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [releaseNotificationStateVersion, setReleaseNotificationStateVersion] = useState(0);
@@ -99,11 +94,6 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
     resetUserSessionState({ queryClient });
   };
   const avatarUrl = useAuthStore((s) => s.avatarUrl);
-  const companionKind = useAppStore((s) => s.companionKind);
-  const companionPet = useAppStore((s) => s.companionPet);
-  const pikoAccessory = useAppStore((s) => s.pikoAccessory);
-  const setCompanion = useAppStore((s) => s.setCompanion);
-  const setPikoAccessory = useAppStore((s) => s.setPikoAccessory);
   const setLanguage = useAppStore((s) => s.setLanguage);
   const showLogout = authRequired();
   const ceRuntime = isCeRuntime();
@@ -166,15 +156,6 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
   useEffect(() => {
     if (notificationOpen) markAllAnnouncementsRead(announcementIds);
   }, [announcementIds, markAllAnnouncementsRead, notificationOpen]);
-
-  const handleCompanionConfirm = (
-    selection: CompanionSelection,
-    accessory: typeof pikoAccessory,
-  ) => {
-    setCompanion(selection.kind, selection.pet);
-    setPikoAccessory(accessory);
-    window.dispatchEvent(new Event("mybuddy-companion-reset"));
-  };
 
   const clearAccountCloseTimer = () => {
     if (accountCloseTimerRef.current === null) return;
@@ -387,22 +368,6 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
               ) : null}
             </Button>
           </div>
-          <Button
-            id="mybuddy-companion-entry"
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            className="companion-capsule-entry -ml-0.5 -mr-0.5 size-[32px]"
-            onClick={() => setCompanionOpen(true)}
-            aria-label={t("myBuddy.companion.entry")}
-          >
-            <img
-              src="/piko/entry/companion-capsule.png"
-              alt=""
-              aria-hidden="true"
-              className="companion-capsule-entry__icon size-[22px] object-contain [image-rendering:pixelated]"
-            />
-          </Button>
           <CreditBalanceBadge />
           <div
             id="superchat-header-controls"
@@ -472,14 +437,6 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
             document.body,
           )
         : null}
-      <PetGalleryDialog
-        open={companionOpen}
-        onOpenChange={setCompanionOpen}
-        currentKind={companionKind}
-        currentPet={companionPet}
-        currentAccessory={pikoAccessory}
-        onConfirm={handleCompanionConfirm}
-      />
       {notificationCenterHidden() ? null : (
         <NotificationDrawer
           open={notificationOpen}

@@ -1108,6 +1108,84 @@ PANEL SHAPE CONSTRAINT (CRITICAL):
         return "\n".join(lines)
 
     @staticmethod
+    def build_wardrobe_and_makeup_lock(
+        ctx: PromptContext,
+        ordered_chars: List[str] = None,
+    ) -> str:
+        """首帧服装 / 配饰 / 发型 / 妆容硬锁（Render 模式）。
+
+        渲染首帧是整条链路的视觉锚点：首帧的服装一旦被「重新设计」，后面每个 beat 都会
+        沿着错的那一版漂，草图上的颜色标识也救不回来。所以这里按身份把服装、配饰、
+        发型与妆容钉死在参考图和文字描述上，并显式禁止增删层叠与配饰。
+
+        妆容没有独立字段：它写在各身份的 ``appearance_details`` / ``identity_appearances``
+        里，与服装同源，因此共用同一条硬约束。
+        """
+
+        if not ctx.characters:
+            return ""
+
+        if ordered_chars is None:
+            ordered_chars = PromptComponents.extract_panel_characters_from_detected(
+                ctx.beats, ctx.characters
+            )
+
+        char_identity_ids = PromptComponents._collect_char_identity_ids(
+            ctx.beats,
+            use_detected_identities=(ctx.mode == PromptMode.RENDER),
+        )
+
+        wear_lines: list[str] = []
+        for char_name in ordered_chars:
+            char_cfg = ctx.characters.get(char_name)
+            if not char_cfg:
+                continue
+            tag = PromptComponents.compute_char_tag(char_name)
+            identities = char_identity_ids.get(char_name, set())
+            wears: list[str] = []
+            if identities and char_cfg.identity_appearances:
+                for iid in sorted(identities):
+                    suffix = iid.split("_", 1)[1] if "_" in iid else iid
+                    appearance = str(
+                        char_cfg.identity_appearances.get(suffix, "") or ""
+                    ).strip()
+                    if not appearance:
+                        continue
+                    label = PromptComponents.compute_char_tag(
+                        char_name, identity_id=iid
+                    )
+                    wears.append(f"{label} = {appearance}")
+            if not wears:
+                appearance = str(char_cfg.appearance_details or "").strip()
+                if appearance:
+                    wears.append(f"{tag} = {appearance}")
+            if wears:
+                wear_lines.append("- " + " | ".join(wears))
+
+        if not wear_lines:
+            return ""
+
+        lines = [
+            "WARDROBE, ACCESSORY & MAKEUP LOCK (first-frame consistency, non-negotiable):",
+            "Each character's costume, accessories, hairstyle and makeup MUST be copied EXACTLY "
+            "from their attached identity reference image and the locked text below: same garment "
+            "type, cut, length, material, layering, color and color value, same accessories, same "
+            "hairstyle, same makeup.",
+            "Do NOT redesign, recolor, shorten, lengthen, restyle, clean up, or \u201cimprove\u201d any "
+            "garment, and do NOT add or remove layers, coats, bags, umbrellas, hats, glasses, "
+            "jewelry, watches, or any other accessory.",
+            "Do NOT change makeup: brow / lip / eye makeup, blush, contour, lashes, skin finish and "
+            "hair styling must stay identical across all panels and identical to the identity "
+            "reference. Never add or remove makeup that the locked text does not describe.",
+            "Every panel showing the same character shows the SAME outfit and the SAME makeup. If "
+            "the sketch, the camera angle, or the beat text conflicts with the identity reference "
+            "or the locked text, the identity reference and the locked text win.",
+            "Keep uniform / workwear / school outfit / scrubs / gown exactly as described; never "
+            "swap them for casual clothing, and never swap casual clothing for a uniform.",
+        ]
+        return "\n".join(lines + wear_lines)
+
+    @staticmethod
     def build_task_declaration(ctx: PromptContext, skip_ascii: bool = False) -> str:
         """构建任务声明（合并比例、网格、风格、panel 数量约束）。
 

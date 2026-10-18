@@ -64,8 +64,9 @@ class EventExtractor:
         from pydantic_ai import Agent
         from novelvideo.config import (
             get_newapi_structured_output_model_settings,
-            get_pydantic_model,
+            get_newapi_text_pydantic_model,
         )
+        from novelvideo.official_defaults import DEFAULT_COGNEE_LLM_MODEL
 
         def log(msg: str):
             if on_log:
@@ -101,7 +102,11 @@ class EventExtractor:
 
         try:
             agent = Agent(
-                get_pydantic_model(),
+                get_newapi_text_pydantic_model(
+                    "COGNEE_LLM_MODEL",
+                    DEFAULT_COGNEE_LLM_MODEL,
+                    capability="cognee.llm",
+                ),
                 model_settings=get_newapi_structured_output_model_settings(),
                 output_type=ExtractedEventList,
             )

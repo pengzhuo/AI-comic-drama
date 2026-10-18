@@ -3001,7 +3001,11 @@ def _beat_sketch_prompt(context: dict[str, Any], marker_context: dict[str, Any])
             "REFERENCE IMAGES: none. This sketch stage follows NovelVideo production logic and uses text/color markers only.",
         ]
     )
-    return "\n".join(part for part in sections if part is not None)
+    from novelvideo.skills.ai_film_process import apply_directive
+
+    return apply_directive(
+        "sketch_generation", "\n".join(part for part in sections if part is not None)
+    )
 
 
 def _beat_render_prompt(context: dict[str, Any]) -> str:

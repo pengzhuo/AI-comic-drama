@@ -572,14 +572,16 @@ async def test_freezone_audio_speech_drama_first_person_uses_project_narrator(
 
     assert result.voice_source == "project_narrator"
     assert result.voice_sha256 == narrator_sha
-    assert FakeTTSGenerator.calls == [
-        {
-            "prompt": "画外音响起。",
-            "audio_url": "data://voice.wav",
-            "output_path": freezone_audio_speech_output_path(project_dir, "job-1"),
-            "emotion_prompt": "以第三人称旁白视角，用客观冷静的解说语气朗读",
-        }
-    ]
+    assert len(FakeTTSGenerator.calls) == 1
+    call = FakeTTSGenerator.calls[0]
+    assert call["prompt"] == "画外音响起。"
+    assert call["audio_url"] == "data://voice.wav"
+    assert call["output_path"] == freezone_audio_speech_output_path(project_dir, "job-1")
+    # 项目解说语气在前，流程包第 06 份的配音两节附在其后（台词不受影响）。
+    assert call["emotion_prompt"].startswith("以第三人称旁白视角，用客观冷静的解说语气朗读")
+    assert "## 配音与表演" in call["emotion_prompt"]
+    assert "## 声音衔接" in call["emotion_prompt"]
+    assert "## 成片验收" not in call["emotion_prompt"]
 
 
 @pytest.mark.asyncio

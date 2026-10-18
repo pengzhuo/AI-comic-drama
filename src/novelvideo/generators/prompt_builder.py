@@ -48,7 +48,28 @@ class UnifiedPromptBuilder:
     def build(self) -> str:
         """构建完整提示词（根据模式选择策略）。"""
         strategy = self._strategies[self.ctx.mode]
-        return strategy.build(self.ctx, self.components)
+        prompt = strategy.build(self.ctx, self.components)
+        return _apply_pack_directive(self.ctx.mode, prompt)
+
+
+#: 画面提示词注入的精简规范块按模式取阶段：草图与动作分镜归「分镜与人物表演」，
+#: 渲染首帧归「首帧生成」。二者当前都落在第 03 份，但保持映射显式便于后续拆分。
+_PACK_STAGE_BY_MODE: dict[PromptMode, str] = {
+    PromptMode.RENDER: "selected_regen",
+    PromptMode.SKETCH: "sketch_generation",
+    PromptMode.ACTION_STORYBOARD: "sketch_generation",
+}
+
+
+def _apply_pack_directive(mode: PromptMode, prompt: str) -> str:
+    """本次出图前置的精简规范块（失败时原样返回，绝不挡住出图）。"""
+
+    from novelvideo.skills.ai_film_process import apply_directive
+
+    try:
+        return apply_directive(_PACK_STAGE_BY_MODE.get(mode, "sketch_generation"), prompt)
+    except Exception:  # noqa: BLE001 - 注入只是增强，不能影响生成链路
+        return prompt
 
 
 # =============================================================================

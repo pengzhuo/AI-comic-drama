@@ -3276,6 +3276,24 @@ const CHAT_LAUNCHER_MARGIN = 8;
 const CHAT_LAUNCHER_DEFAULT_POS = { right: 16, bottom: 180 };
 const CHAT_LAUNCHER_DRAG_THRESHOLD = 4;
 
+/**
+ * 捏导字样由浏览器真实排版，不再烤进视频里。
+ *
+ * 视频是 1008×366，按 96×35 显示（object-cover，竖向不裁切、左右各裁约
+ * 0.2px），视频框在 44px 命中区内垂直居中，所以视频顶边落在按钮的 4.5px 处。
+ * 下列取值来自原美术字形在原视频里的 ink box（x 426—864、y 101—293）换算到
+ * 按钮坐标系后的结果：水平中心 61.5px、垂直中心 23.4px。
+ */
+const CHAT_LAUNCHER_LABEL_LEFT = 40;
+const CHAT_LAUNCHER_LABEL_TOP = 12;
+const CHAT_LAUNCHER_LABEL_WIDTH = 43;
+const CHAT_LAUNCHER_LABEL_FONT_SIZE = 20;
+/**
+ * 原美术字形的墨色（接近 DESIGN.md 的 `text` 暗色值 #e8eaf0）；视频底板恒为
+ * 暗色，所以这里取固定值，不跟随主题变量。
+ */
+const CHAT_LAUNCHER_LABEL_COLOR = "#e8eaf0";
+
 function loadChatLauncherPos(): { right: number; bottom: number } {
   try {
     const raw = window.localStorage.getItem(CHAT_LAUNCHER_POS_STORAGE_KEY);
@@ -3456,6 +3474,20 @@ function FreezoneChatToggleButton({
         style={{ height: CHAT_LAUNCHER_VISUAL_HEIGHT }}
         aria-hidden="true"
       />
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute select-none whitespace-nowrap text-center leading-none font-black brightness-[1.08] transition-[filter] duration-200 ease-out [text-shadow:0_1px_2px_rgba(0,0,0,0.45)] group-hover/nie-dao:brightness-[1.16] group-focus-visible/nie-dao:brightness-[1.16]"
+        style={{
+          left: CHAT_LAUNCHER_LABEL_LEFT,
+          top: CHAT_LAUNCHER_LABEL_TOP,
+          width: CHAT_LAUNCHER_LABEL_WIDTH,
+          fontSize: CHAT_LAUNCHER_LABEL_FONT_SIZE,
+          color: CHAT_LAUNCHER_LABEL_COLOR,
+          fontFamily: "var(--font-family-ui-default)",
+        }}
+      >
+        捏导
+      </span>
     </Button>
   );
 }

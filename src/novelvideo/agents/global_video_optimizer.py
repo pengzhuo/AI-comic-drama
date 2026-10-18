@@ -182,15 +182,19 @@ def create_global_video_reviewer_agent(language: str = "en") -> Agent:
         get_newapi_structured_output_model_settings,
         get_superpower_pydantic_model,
     )
+    from novelvideo.skills.ai_film_process import pack_block
 
     model = get_superpower_pydantic_model(
         feature_provider_env="GLOBAL_VIDEO_PROVIDER",
         feature_model_env="GLOBAL_VIDEO_MODEL",
         brainclaw_profile=BrainClawProfile.GLOBAL_VIDEO_MOTION_PLANNING,
     )
+    pack = pack_block("beat_video_prompt", model_env="GLOBAL_VIDEO_MODEL")
     return Agent(
         model,
-        system_prompt=GLOBAL_VIDEO_REVIEWER_INSTRUCTIONS_EN,
+        system_prompt="\n\n".join(
+            part for part in (GLOBAL_VIDEO_REVIEWER_INSTRUCTIONS_EN, pack) if part
+        ),
         output_type=NativeOutput(ReviewResult),
         model_settings=get_newapi_structured_output_model_settings(),
         name="Video Prompt Reviewer",
@@ -200,8 +204,10 @@ def create_global_video_reviewer_agent(language: str = "en") -> Agent:
 def create_global_video_optimizer_agent(language: str = "zh") -> Agent:
     """创建全局视频优化 Agent。"""
     from novelvideo.config import get_newapi_text_pydantic_model
+    from novelvideo.skills.ai_film_process import pack_block
 
     legacy_model = os.environ.get("GLOBAL_VIDEO_MODEL", "").strip()
+    pack = pack_block("global_optimize_video", model_env="GLOBAL_VIDEO_OPTIMIZER_MODEL")
     return Agent(
         get_newapi_text_pydantic_model(
             "GLOBAL_VIDEO_OPTIMIZER_MODEL",
@@ -209,9 +215,14 @@ def create_global_video_optimizer_agent(language: str = "zh") -> Agent:
             brainclaw_profile=BrainClawProfile.GLOBAL_VIDEO_MOTION_PLANNING,
             capability="text.generate.agent",
         ),
-        system_prompt=(
-            f"{GLOBAL_VIDEO_OPTIMIZER_INSTRUCTIONS_EN}\n\n"
-            f"## Output Language\n{asset_language_instruction(language)}"
+        system_prompt="\n\n".join(
+            part
+            for part in (
+                GLOBAL_VIDEO_OPTIMIZER_INSTRUCTIONS_EN,
+                pack,
+                f"## Output Language\n{asset_language_instruction(language)}",
+            )
+            if part
         ),
         output_type=str,
         name="Global Video Motion Director",
@@ -776,7 +787,13 @@ Output a JSON array of objects, one per panel:
 
 
 def _create_identity_detector_agent() -> Agent:
-    """创建 AI 角色颜色识别 Agent。"""
+    """创建 AI 角色颜色识别 Agent。
+
+    这里刻意**不**注入流程包：该环节是纯视觉读取（只看图 + 颜色映射，产出
+    每个 panel 出现哪些颜色标记），不产出任何画面提示词；注入几十 KB 规范
+    既无收益，又会把请求推向 ``MODEL_CONTEXT_BUDGET_EXCEEDED``（致命、不重试）。
+    """
+
     from novelvideo.config import (
         get_newapi_structured_output_model_settings,
         get_newapi_text_pydantic_model,

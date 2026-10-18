@@ -29,11 +29,11 @@ class ConsistencyVerifier:
         if self._agent is None:
             from novelvideo.config import (
                 get_newapi_structured_output_model_settings,
-                get_pydantic_model,
+                get_verification_pydantic_model,
             )
 
             self._agent = Agent(
-                get_pydantic_model(),
+                get_verification_pydantic_model(vision=True),
                 system_prompt=CONSISTENCY_VERIFY_PROMPT,
                 output_type=ConsistencyResult,
                 model_settings=get_newapi_structured_output_model_settings(),
@@ -96,7 +96,23 @@ class ConsistencyVerifier:
         identity_beats: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
         for beat in beats:
             beat_num = beat["beat_number"]
-            identities = beat.get("character_identities", {})
+            # 真实字段是 detected_identities（identity_id 列表），
+            # 旧代码读的 character_identities 从来不存在，分组一直是空的。
+            identities = (
+                beat.get("detected_identities")
+                or beat.get("character_identities")
+                or {}
+            )
+            if isinstance(identities, dict):
+                identity_pairs = list(identities.items())
+            elif isinstance(identities, (list, tuple)):
+                identity_pairs = [
+                    (str(item).split("_", 1)[0], str(item))
+                    for item in identities
+                    if str(item or "").strip()
+                ]
+            else:
+                identity_pairs = []
             find_fn = find_sketch_for_beat if verify_type == "sketch" else find_frame_for_beat
             img = find_fn(project_dir, episode_num, beat_num)
             if not img:
@@ -106,7 +122,7 @@ class ConsistencyVerifier:
             if not safe_img:
                 logger.warning("Skipping image outside project dir: %s", img)
                 continue
-            for char_name, identity_id in identities.items():
+            for char_name, identity_id in identity_pairs:
                 identity_beats[identity_id].append((beat_num, str(safe_img), char_name))
 
         # 只检查出现在 2+ beat 中的角色

@@ -232,6 +232,54 @@ async def test_two_coordinators_only_one_process_continues_the_same_run(
 
 
 @pytest.mark.asyncio
+async def test_final_delivery_turn_carries_the_film_pack_sound_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """成片交付这一步带上流程包第 06 份（合成本身没有发往模型的提示词入口）。"""
+
+    from novelvideo.skills import ai_film_process
+
+    prompts: list[str] = []
+    ctx = context(tmp_path)
+
+    async def fake_resolve_project_context(**_kwargs):
+        return ctx
+
+    async def fake_stream_reply(_username, _project_id, prompt, _on_event, **_kwargs):
+        prompts.append(prompt)
+
+    monkeypatch.setattr(director_auto, "resolve_project_context", fake_resolve_project_context)
+    monkeypatch.setattr(
+        director_auto.chat_service,
+        "chat_run_lock_is_active",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        director_auto.chat_service,
+        "stream_assistant_reply",
+        fake_stream_reply,
+    )
+    coordinator = DirectorAutoCoordinator(DirectorAutoStore(tmp_path / "director-auto.db"))
+    run = run_record(tmp_path, episode=2)
+
+    assert await coordinator._agent_continue(run, final_delivery=True) is False
+    assert "制作流程包规范" in prompts[0]
+    assert "成片验收" in prompts[0]
+
+    # 普通推进回合不带第 06 份，避免每回合都多背一段规范。
+    prompts.clear()
+    assert await coordinator._agent_continue(run) is False
+    assert "制作流程包规范" not in prompts[0]
+
+    # 总开关关掉后连交付回合也不注入。
+    prompts.clear()
+    monkeypatch.setenv(ai_film_process.PACK_INJECTION_ENV, "0")
+    assert await coordinator._agent_continue(run, final_delivery=True) is False
+    assert "制作流程包规范" not in prompts[0]
+
+
+@pytest.mark.asyncio
 async def test_agent_continuation_is_pinned_to_the_auto_run_episode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -350,7 +398,7 @@ async def test_completed_task_notifies_and_triggers_one_server_continuation(
     await asyncio.sleep(0.08)
 
     assert coordinator.continuations == 1
-    assert coordinator.notifications == ["✅ 角色身份图已完成。本集自动正在继续下一步。"]
+    assert coordinator.notifications == ["✅ [角色身份图] 已完成。本集自动正在继续下一步。"]
     saved = store.get("alice", "project-1")
     assert saved is not None
     assert saved.handled_task_ids == ("new-complete",)
@@ -670,7 +718,7 @@ async def test_missing_portrait_is_repaired_once_without_pausing_auto_mode(
     assert len(coordinator.instructions) == 1
     assert "仅启动该角色的一个 Portrait" in coordinator.instructions[0]
     assert coordinator.notifications == [
-        "检测到角色身份图缺少前置肖像，正在自动补生成「锦绣」肖像。"
+        "检测到 [角色身份图] 缺少前置肖像，正在自动补生成「锦绣」肖像。"
     ]
     await coordinator.shutdown()
 

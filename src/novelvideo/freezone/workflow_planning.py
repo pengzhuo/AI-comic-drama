@@ -19,3 +19,22 @@ WORKFLOW_PLANNING_INSTRUCTIONS = (
     "and connect each contributing video/audio node with composition_input_for. "
     "A single video output without composition does not need a videoComposeNode."
 )
+
+
+def workflow_planning_instructions() -> str:
+    """画布工作流规划指令 + 流程包第 06 份（衔接声音与成片验收）。
+
+    画布上出现配音/合成节点时，规划这一步就要带上第 06 份的声音与成片硬规则
+    （合成本身是纯音视频编排，没有发往模型的提示词入口，只能沿规划指令送达）。
+    注入只是增强，任何异常都退回原始指令。
+    """
+
+    try:
+        from novelvideo.skills.ai_film_process import pack_block
+
+        pack = pack_block("canvas_workflow_plan")
+    except Exception:  # noqa: BLE001 - 注入只是增强，不能影响画布规划
+        return WORKFLOW_PLANNING_INSTRUCTIONS
+    if not pack:
+        return WORKFLOW_PLANNING_INSTRUCTIONS
+    return f"{WORKFLOW_PLANNING_INSTRUCTIONS}\n\n{pack}"

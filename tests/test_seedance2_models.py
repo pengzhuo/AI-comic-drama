@@ -15,7 +15,8 @@ def test_seedance2_video_config_defaults_to_multimodal_reference():
     config = Seedance2VideoConfig()
 
     assert config.mode == Seedance2I2VMode.MULTIMODAL_REFERENCE
-    assert config.duration == 4
+    # 产品基准：Seedance 2.0 单镜最短 5 秒（对白 beat 再按音频下限抬长）。
+    assert config.duration == 5
     assert config.resolution == "720p"
     assert config.ratio == "9:16"
     assert config.generate_audio is True

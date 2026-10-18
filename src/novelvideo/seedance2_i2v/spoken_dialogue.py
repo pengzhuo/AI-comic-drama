@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
-from novelvideo.seedance2_i2v.voice_clone import dialogue_text, normalize_seedance2_audio_type
-
-
-_SPEAKER_PREFIX_RE = re.compile(
-    r"(?P<speaker>[\w\u4e00-\u9fff·]{1,40})"
-    r"(?:（(?P<action>[^）]{0,120})）|\((?P<action_ascii>[^)]{0,120})\))?"
-    r"\s*[：:]"
-)
-_LEADING_PERFORMANCE_NOTE_RE = re.compile(
-    r"^\s*(?:（[^）]{1,120}）|\([^)]{1,120}\))\s*"
+from novelvideo.seedance2_i2v.voice_clone import (
+    SCRIPT_LEADING_NOTE_RE as _LEADING_PERFORMANCE_NOTE_RE,
+    SCRIPT_SPEAKER_PREFIX_RE as _SPEAKER_PREFIX_RE,
+    dialogue_text,
+    normalize_seedance2_audio_type,
+    strip_leading_script_marks as _strip_leading_script_marks,
 )
 
 
@@ -92,6 +87,29 @@ def required_seedance2_dialogue_texts(beat: dict[str, Any]) -> list[str]:
         if spoken_text:
             text = spoken_text
     return [text]
+
+
+_SUBTITLE_AUDIO_TYPES = frozenset({"dialogue", "narration"})
+
+
+def beat_subtitle_text(beat: dict[str, Any]) -> str:
+    """Return the text a composed film burns in as this beat's subtitle.
+
+    字幕只显示真正念出来的内容：去掉 ``许知意（os）：`` 这类说话人标签和
+    ``（神色坚定，喘息未平便开口）`` 这类表演提示，句末标点保留，多行文本逐行
+    清洗；没有语音的 beat（silence/音效等）不出字幕，免得把画面描述当成台词。
+    """
+
+    if normalize_seedance2_audio_type(beat) not in _SUBTITLE_AUDIO_TYPES:
+        return ""
+    raw = _spoken_source(beat)
+    if not raw:
+        return ""
+    return "\n".join(
+        cleaned
+        for cleaned in (_strip_leading_script_marks(line) for line in raw.splitlines())
+        if cleaned
+    )
 
 
 def unique_seedance2_dialogue_speakers(beat: dict[str, Any]) -> list[str]:

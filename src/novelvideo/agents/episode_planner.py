@@ -166,9 +166,12 @@ def create_episode_planner_agent(tools: List[Callable]) -> Agent:
     Returns:
         配置好的 Agent
     """
+    from novelvideo.skills.ai_film_process import pack_block
+
+    pack = pack_block("build_episodes")
     return Agent(
         get_pydantic_model(brainclaw_profile=BrainClawProfile.EPISODE_STORY_PLANNING),
-        system_prompt=EPISODE_PLANNER_PROMPT,
+        system_prompt="\n\n".join(part for part in (EPISODE_PLANNER_PROMPT, pack) if part),
         tools=tools,
         output_type=EpisodePlannerOutput,
         model_settings=get_newapi_structured_output_model_settings(),

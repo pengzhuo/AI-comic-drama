@@ -36,6 +36,7 @@ from novelvideo.image_request_usage import (
     update_image_request_status,
 )
 from novelvideo.services.style_service import StyleService
+from novelvideo.skills.ai_film_process import apply_directive
 from novelvideo.generators.nanobanana_grid import (
     _InlineImagePart,
     _call_huimeng_image_api,
@@ -945,7 +946,7 @@ MUST AVOID:
 - Do not include multiple characters
 - Do not convert this into realistic photography or real-human actor rendering
 """
-            return prompt.strip()
+            return apply_directive("character_portrait", prompt.strip())
 
         prompt = f"""Generate a face-only character identity reference portrait for identity locking.
 
@@ -985,7 +986,7 @@ MUST AVOID:
 - Do not include multiple characters
 - Do NOT create beauty-filter skin, glamor retouching, fashion-magazine polish, doll-like skin, or cosmetic-ad aesthetics
 """
-        return prompt.strip()
+        return apply_directive("character_portrait", prompt.strip())
 
     @staticmethod
     def _costume_reference_block(has_costume_reference: bool) -> str:
@@ -1082,7 +1083,7 @@ STRICT REQUIREMENTS (MUST AVOID):
 - No text, labels, or panel numbers on the image
 - Do not add environment scenery, props, or poster composition
 """
-            return prompt.strip()
+            return apply_directive("identity_image", prompt.strip())
 
         prompt = f"""Character identity reference sheet. Neutral studio setup.
 PLAIN SOLID WHITE or LIGHT GRAY background ONLY — no environment, no scenery, no props. {style_keywords}
@@ -1145,7 +1146,7 @@ STRICT REQUIREMENTS (MUST AVOID):
 - Do NOT create beauty-retouched, glamorized, cosmetic-ad, or fashion-editorial output
 - Keep the project style consistent across all 4 panels
 """
-        return prompt.strip()
+        return apply_directive("identity_image", prompt.strip())
 
     async def _generate_single_image(
         self,

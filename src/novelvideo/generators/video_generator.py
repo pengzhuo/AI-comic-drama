@@ -4,7 +4,9 @@
 """
 
 import asyncio
+import copy
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -843,10 +845,18 @@ class SeedanceVideoGenerator(VideoGeneratorBase):
         )
 
 
+#: 严格首帧被上游拒绝后改走多参考通路的日志标记。
+#:
+#: 写实人脸首帧在 ``image_url``（硬首帧）通路上会被上游内容审核拒绝
+#: （``InputImageSensitiveContentDetected.PrivacyInformation``），提交期 4xx
+#: 降级阶梯因此几乎每次都会生效：首帧退化为「参考图1」，不再是硬锁。运行器据此
+#: 把「严格首帧实际未生效」记进自检报告，避免静默降级。
+FALLBACK_MULTI_REFERENCE_LOG = "已按兜底方案提交：首帧改为参考图1（多参考通路）"
+
+
 @dataclass
 class ShotReference:
     """Seedance 2.0 素材引用。"""
-
     type: str  # "image" / "video" / "audio" / "file" / "link"
     path: str  # 本地文件路径或公开 URL
     role: str  # "首帧" / "角色参考" / "场景参考" / "配乐" / "音色参考"
@@ -1763,19 +1773,50 @@ class HuimengVideoGenerator(VideoGeneratorBase):
             )
 
         has_multimodal_refs = any(ref_counts.values())
+        has_image_refs = bool(
+            ref_counts.get("image_count") or ref_counts.get("video_count")
+        )
 
         if is_seedance2_model:
             from novelvideo.seedance2_i2v.models import Seedance2I2VMode
             from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
 
+            requested_mode = str(seedance2_config.get("mode") or "").strip()
+            if (
+                first_frame
+                and seedance2_config.get("strict_first_frame") is not False
+                and requested_mode
+                in {
+                    "",
+                    Seedance2I2VMode.MULTIMODAL_REFERENCE.value,
+                    Seedance2I2VMode.FIRST_FRAME.value,
+                }
+            ):
+                # 严格首帧默认开启：配置里没写 strict_first_frame=False
+                # （旧配置多为多参考）时，有首帧就走严格首帧，避免继续漂移。
+                requested_mode = Seedance2I2VMode.FIRST_FRAME.value
             if last_frame:
                 mode = Seedance2I2VMode.FIRST_LAST_FRAME
-            elif has_multimodal_refs:
+            elif first_frame and requested_mode in {
+                Seedance2I2VMode.FIRST_FRAME.value,
+                Seedance2I2VMode.FIRST_LAST_FRAME.value,
+            }:
+                # 严格首帧：只发首帧图（可带参考声线），视频第 0 帧不重构图。
+                mode = Seedance2I2VMode.FIRST_FRAME
+            elif has_image_refs:
                 mode = Seedance2I2VMode.MULTIMODAL_REFERENCE
             elif first_frame:
                 mode = Seedance2I2VMode.FIRST_FRAME
             else:
                 mode = Seedance2I2VMode.TEXT_TO_VIDEO
+            if (
+                mode is not Seedance2I2VMode.FIRST_FRAME
+                and mode is not Seedance2I2VMode.FIRST_LAST_FRAME
+                and "strict_first_frame" not in seedance2_config
+            ):
+                # 这次请求没法锁首帧（例如只给了参考图没有首帧图），
+                # 显式关掉默认严格首帧，避免参数构建器再把它改回首帧模式。
+                seedance2_config["strict_first_frame"] = False
 
             config = seedance2_config
             config_resolution = str(
@@ -2147,6 +2188,59 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             backoff=NEWAPI_VIDEO_RETRY_BACKOFF_SECONDS,
             label="newapi video submit",
         )
+
+    async def _submit_video_candidates(
+        self,
+        url: str,
+        candidates: list[dict],
+        *,
+        headers: dict[str, str] | None = None,
+        on_log: Callable[[str], None] | None = None,
+        on_request: Callable[[dict], Any] | None = None,
+    ) -> tuple[dict, dict]:
+        """按顺序提交候选请求体，遇到「明确的客户端拒绝」再降级重试。
+
+        降级只发生在 4xx：这种响应证明上游没有创建任务（不会重复计费/重复生成），
+        5xx、超时等不确定失败一律直接抛出，交给上层的重试与对账逻辑处理。
+        返回 (提交响应, 实际生效的请求体)。
+        """
+
+        def log(message: str) -> None:
+            if on_log is not None:
+                on_log(message)
+
+        for index, candidate in enumerate(candidates):
+            if on_request is not None:
+                result = on_request(candidate)
+                if inspect.isawaitable(result):
+                    await result
+            try:
+                if headers is None:
+                    submitted = await self._post_json(url, candidate)
+                else:
+                    submitted = await self._post_json(
+                        url, candidate, headers=headers
+                    )
+            except NewApiVideoError as exc:
+                status_code = exc.status_code
+                can_fallback = (
+                    index < len(candidates) - 1
+                    and isinstance(status_code, int)
+                    and 400 <= status_code < 500
+                )
+                if not can_fallback:
+                    # 没有兜底方案时把上游原始拒绝原因抛出去，方便定位。
+                    raise
+                log(
+                    f"平台拒绝了这套输入参数（HTTP {status_code}），"
+                    "自动改用兜底方案重试…"
+                )
+                continue
+            if index:
+                log(FALLBACK_MULTI_REFERENCE_LOG)
+            return submitted, candidate
+
+        raise NewApiVideoError("DramaClawAPI 提交失败：没有可用的候选参数")
 
     async def _get_json(
         self,
@@ -3288,6 +3382,11 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             )
             return VideoGenResult(status=VideoGenStatus.FAILED, error=safe_error)
 
+        # Seedance 2.0「严格首帧」是增强通路：上游若用输入审核/参数限制拒绝首帧
+        # 输入（例如真人质感首帧），这里按 4xx 提交失败自动退到既有参考图通路，
+        # 保证产线不中断。只有明确的客户端拒绝（没有创建任务）才会触发降级。
+        seedance2_fallbacks: list[tuple[dict[str, object], dict[str, object]]] = []
+
         if requested_mode:
             try:
                 await self._apply_huimeng_protocol_media_inputs(
@@ -3483,15 +3582,48 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             from novelvideo.seedance2_i2v.models import Seedance2I2VMode
             from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
 
-            has_references = any(reference_params.values())
+            has_image_references = bool(
+                reference_params.get("reference_images")
+                or reference_params.get("reference_videos")
+            )
+            requested_seedance2_mode = str(
+                seedance2_config.get("mode") or ""
+            ).strip()
+            if (
+                first_frame
+                and seedance2_config.get("strict_first_frame") is not False
+                and requested_seedance2_mode
+                in {
+                    "",
+                    Seedance2I2VMode.MULTIMODAL_REFERENCE.value,
+                    Seedance2I2VMode.FIRST_FRAME.value,
+                }
+            ):
+                # 严格首帧默认开启：配置里没写 strict_first_frame=False
+                # （旧配置多为多参考）时，有首帧就走严格首帧，避免继续漂移。
+                requested_seedance2_mode = Seedance2I2VMode.FIRST_FRAME.value
             if last_frame:
                 mode = Seedance2I2VMode.FIRST_LAST_FRAME
-            elif has_references:
+            elif first_frame and requested_seedance2_mode in {
+                Seedance2I2VMode.FIRST_FRAME.value,
+                Seedance2I2VMode.FIRST_LAST_FRAME.value,
+            }:
+                # 严格首帧：视频第 0 帧锁死为 render 首帧，只附带参考声线。
+                mode = Seedance2I2VMode.FIRST_FRAME
+            elif has_image_references:
                 mode = Seedance2I2VMode.MULTIMODAL_REFERENCE
             elif first_frame:
                 mode = Seedance2I2VMode.FIRST_FRAME
             else:
                 mode = Seedance2I2VMode.TEXT_TO_VIDEO
+            if (
+                mode is not Seedance2I2VMode.FIRST_FRAME
+                and mode is not Seedance2I2VMode.FIRST_LAST_FRAME
+                and "strict_first_frame" not in seedance2_config
+            ):
+                # 这次请求没法锁首帧（例如只给了参考图没有首帧图），
+                # 显式关掉默认严格首帧，避免参数构建器再把它改回首帧模式。
+                seedance2_config["strict_first_frame"] = False
 
             config_resolution = str(
                 seedance2_config.get("resolution") or self.resolution or "720p"
@@ -3536,6 +3668,33 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             payload["prompt"] = seedance2_params.pop("prompt")
             payload["seconds"] = str(seedance2_params.pop("duration"))
             metadata.update(seedance2_params)
+
+            if mode == Seedance2I2VMode.FIRST_FRAME and first_frame:
+                from novelvideo.seedance2_i2v.request import (
+                    _rewrite_stale_image_references,
+                )
+
+                fallback_metadata = {
+                    key: value
+                    for key, value in metadata.items()
+                    if key != "image_url"
+                }
+                fallback_images = [
+                    first_frame,
+                    *[
+                        url
+                        for url in (reference_params.get("reference_images") or [])
+                        if url != first_frame
+                    ],
+                ]
+                fallback_metadata["reference_images"] = fallback_images
+                fallback_payload = dict(payload)
+                fallback_payload["metadata"] = fallback_metadata
+                fallback_payload["prompt"] = _rewrite_stale_image_references(
+                    str(payload.get("prompt") or ""),
+                    image_count=len(fallback_images),
+                )
+                seedance2_fallbacks.append((fallback_payload, fallback_metadata))
         else:
             try:
                 await self._apply_huimeng_protocol_media_inputs(
@@ -3576,40 +3735,52 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                 enforce_newapi_video_mode_contract,
             )
 
-            self._canonicalize_video_payload(payload, metadata)
-            payload = apply_media_request_schema(
-                payload, self.request_schema, self.model_params
-            )
-            payload = enforce_newapi_video_mode_contract(
-                payload,
-                mode=requested_mode,
-                fixed_duration=duration,
-            )
-            payload = enforce_newapi_media_geometry_contract(
-                payload, media_type="video"
-            )
-            payload = enforce_newapi_video_duration_contract(payload)
-            payload = self._apply_seedance_source_video_ratio(payload)
+            def _wire_payload(
+                candidate_payload: dict, candidate_metadata: dict
+            ) -> dict:
+                """把一套候选参数规范成最终请求体（每套候选独立规范化）。"""
+
+                body = copy.deepcopy(candidate_payload)
+                meta = body.get("metadata")
+                if not isinstance(meta, dict):
+                    meta = copy.deepcopy(candidate_metadata)
+                    body["metadata"] = meta
+                self._canonicalize_video_payload(body, meta)
+                body = apply_media_request_schema(
+                    body, self.request_schema, self.model_params
+                )
+                body = enforce_newapi_video_mode_contract(
+                    body,
+                    mode=requested_mode,
+                    fixed_duration=duration,
+                )
+                body = enforce_newapi_media_geometry_contract(
+                    body, media_type="video"
+                )
+                body = enforce_newapi_video_duration_contract(body)
+                return self._apply_seedance_source_video_ratio(body)
+
+            wire_candidates = [_wire_payload(payload, metadata)]
+            for fallback_payload, fallback_metadata in seedance2_fallbacks:
+                wire_candidates.append(
+                    _wire_payload(fallback_payload, fallback_metadata)
+                )
             reservation_id = await _reserve_video_model_call(
                 self.model,
                 source="newapi_video_generation",
                 resolution=request_resolution,
                 duration_seconds=duration,
             )
-            await update_current_model_call_log(
-                request_payload=payload,
-            )
             submit_attempted = True
-            if organization_request:
-                submitted = await self._post_json(
-                    f"{request_base_url}/video/generations",
-                    payload,
-                    headers=request_headers,
-                )
-            else:
-                submitted = await self._post_json(
-                    f"{request_base_url}/video/generations", payload
-                )
+            submitted, payload = await self._submit_video_candidates(
+                f"{request_base_url}/video/generations",
+                wire_candidates,
+                headers=request_headers if organization_request else None,
+                on_log=log,
+                on_request=lambda candidate: update_current_model_call_log(
+                    request_payload=candidate
+                ),
+            )
             await update_current_model_call_log(
                 response_payload=submitted,
             )
