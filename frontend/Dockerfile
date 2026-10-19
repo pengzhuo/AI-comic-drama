@@ -35,7 +35,10 @@ ENV VITE_HIDE_MODEL_GUIDE=${VITE_HIDE_MODEL_GUIDE}
 # keep `pnpm install` from erroring on skipped (unneeded) dependency build scripts.
 RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+# 可选镜像源：默认官方 registry，行为与现在完全一致。构建时传
+# --build-arg NPM_REGISTRY=https://registry.npmmirror.com 可显著加快 pnpm install。
+ARG NPM_REGISTRY=""
+RUN pnpm install --frozen-lockfile --registry="${NPM_REGISTRY:-https://registry.npmjs.org}"
 
 COPY . .
 RUN pnpm build

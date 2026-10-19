@@ -143,13 +143,26 @@ def test_source_file_extends_release_and_builds_all_three() -> None:
             "INSTALL_WORLD": "${INSTALL_WORLD:-0}",
             "HERMES_REPO": "${HERMES_REPO:-https://github.com/dramaclaw/hermes-agent.git}",
             "HERMES_REF": "${HERMES_REF:-brainclaw/evidence-plane}",
+            "APT_MIRROR": "${APT_MIRROR:-}",
+            "PYPI_MIRROR": "${PYPI_MIRROR:-}",
         },
     }
     assert services["newapi"]["build"] == {
         "context": "${DRAMACLAW_GATEWAY_SRC:-../dramaclaw-gateway}",
         "dockerfile": "Dockerfile",
     }
-    assert services["web"]["build"] == {"context": "./frontend", "dockerfile": "Dockerfile"}
+    assert services["web"]["build"] == {
+        "context": "./frontend",
+        "dockerfile": "Dockerfile",
+        "args": {
+            "NPM_REGISTRY": "${NPM_REGISTRY:-}",
+            "VITE_HIDE_RELEASE_POPUP": "${VITE_HIDE_RELEASE_POPUP:-}",
+            "VITE_HIDE_PIKO_ENTRY": "${VITE_HIDE_PIKO_ENTRY:-}",
+            "VITE_HIDE_NOTIFICATION_CENTER": "${VITE_HIDE_NOTIFICATION_CENTER:-}",
+            "VITE_HIDE_OFFICIAL_CHANNELS": "${VITE_HIDE_OFFICIAL_CHANNELS:-}",
+            "VITE_HIDE_MODEL_GUIDE": "${VITE_HIDE_MODEL_GUIDE:-}",
+        },
+    }
 
     assert set(source["volumes"]) == {"ce-data", "newapi-data"}
 
@@ -165,9 +178,13 @@ def test_compose_runtime_matches_the_selected_image() -> None:
     source = _api(SOURCE_FILE)["environment"]
     release = _api(RELEASE_FILE)["environment"]
     assert source["DRAMACLAW_CHAT_BACKEND"] == "${DRAMACLAW_CHAT_BACKEND:-codex}"
-    assert source["HERMES_CLI_PATH"] == "/usr/local/bin/hermes"
     assert release["DRAMACLAW_CHAT_BACKEND"] == "${DRAMACLAW_CHAT_BACKEND:-hermes}"
-    assert release["HERMES_CLI_PATH"] == "/root/.local/bin/hermes"
+    # Both images install hermes through the same Dockerfile, so both default to
+    # the path that Dockerfile bakes in; HERMES_CLI_PATH stays overridable for
+    # images that install it elsewhere (2.0.4 used `uv tool install`).
+    expected_hermes_path = "${HERMES_CLI_PATH:-/usr/local/bin/hermes}"
+    assert source["HERMES_CLI_PATH"] == expected_hermes_path
+    assert release["HERMES_CLI_PATH"] == expected_hermes_path
 
 
 def test_all_ce_compose_variants_keep_hermes_explicit_fallback_enabled() -> None:

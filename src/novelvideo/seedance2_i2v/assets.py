@@ -46,6 +46,10 @@ MIN_REFERENCE_ASPECT_RATIO = 0.4
 MAX_REFERENCE_ASPECT_RATIO = 2.5
 MIN_REFERENCE_DIMENSION = 300
 MAX_REFERENCE_DIMENSION = 6000
+#: 上游对参考图/首帧的硬门槛是 ``MIN_REFERENCE_DIMENSION``（300px），但那是「能收下」
+#: 的下限：网格草图分出来的「首帧」常常只有 250x375，勉强过门槛也没有可用的锚点细节。
+#: 低于这个短边就先按比例放大一份再送上游——放大不裁切，构图与图片编号语义都不变。
+VIDEO_REFERENCE_MIN_SHORT_SIDE = 768
 MIN_SEEDANCE2_VOICE_REFERENCE_SECONDS = 3.0
 MAX_SEEDANCE2_VOICE_REFERENCE_SECONDS = 5.0
 
@@ -407,6 +411,40 @@ def _read_jpeg_size(path: Path) -> tuple[int, int] | None:
 
 def read_seedance2_image_size(path: Path) -> tuple[int, int] | None:
     return _read_png_size(path) or _read_jpeg_size(path)
+
+
+def upscale_undersized_reference_image(
+    path: Path,
+    *,
+    output_path: Path,
+    min_short_side: int = VIDEO_REFERENCE_MIN_SHORT_SIDE,
+) -> Path:
+    """短边不足的参考图等比放大一份，返回能送上游的路径。
+
+    只放大、不裁切，所以画面构图与资产语义都不变；上游只关心栅格是否达标。
+    读不出尺寸、没有 PIL 或写盘失败时原样返回 ``path``，保持旧行为（宁可丢图，
+    也不要让这里抛异常把整条流水线带停）。
+    """
+
+    size = read_seedance2_image_size(path)
+    if not size:
+        return path
+    width, height = size
+    short_side = min(width, height)
+    if short_side <= 0 or short_side >= min_short_side:
+        return path
+    scale = min_short_side / float(short_side)
+    target = (max(1, round(width * scale)), max(1, round(height * scale)))
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            resized = image.convert("RGB").resize(target, Image.Resampling.LANCZOS)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        resized.save(output_path, format="PNG")
+    except Exception:
+        return path
+    return output_path if output_path.exists() else path
 
 
 def validate_seedance2_reference_image(path: Path) -> str:
@@ -866,6 +904,17 @@ def build_seedance2_project_assets(
     ) -> None:
         nonlocal next_image_number
         exists = path.exists()
+        if exists and selected:
+            path = upscale_undersized_reference_image(
+                path,
+                output_path=(
+                    Path(project_output)
+                    / "video_input_frames"
+                    / f"ep{episode:03d}"
+                    / f"beat_{beat_num:02d}_{re.sub(r'[^0-9A-Za-z_.-]+', '_', str(key))[:40]}.png"
+                ),
+            )
+            exists = path.exists()
         validation_error = validate_seedance2_reference_image(path) if exists and selected else ""
         use = selected and exists and not validation_error
         image_number = next_image_number if use else None

@@ -836,3 +836,77 @@ def test_validate_reference_audio_request_total_bound_and_probe_failures(monkeyp
 
     monkeypatch.setattr(pipeline, "probe_voice_sample_duration_seconds", boom)
     pipeline._validate_reference_audio_request(["a.wav", "b.wav", "c.wav"])
+
+def test_small_first_frame_is_upscaled_before_it_is_sent(tmp_path, monkeypatch):
+    """网格草图分出来的小首帧会被上游的栅格门槛判不合格、静默丢弃。
+
+    丢弃之后请求会退化成文生视频，而提示词里仍写着「引用@图片1」：要么上游直接报
+    「提示词引用了 图片1，但当前请求只发送了 0 个图片素材」，要么画面失去锚点。
+    这里断言这种首帧会先被等比放大成可送出的锚点。
+    """
+
+    from PIL import Image
+
+    from novelvideo import project_config as pc
+    from novelvideo.seedance2_i2v.assets import (
+        VIDEO_REFERENCE_MIN_SHORT_SIDE,
+        build_seedance2_project_assets,
+        read_seedance2_image_size,
+        selected_reference_paths,
+    )
+
+    monkeypatch.setattr(pc, "OUTPUT_DIR", tmp_path / "state")
+    project_dir = tmp_path / "output" / "alice" / "project"
+    frame = project_dir / "frames" / "ep001" / "beat_01.png"
+    frame.parent.mkdir(parents=True)
+    Image.new("RGB", (250, 375), (10, 20, 30)).save(frame)
+
+    assets = build_seedance2_project_assets(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=1,
+        beat={"beat_number": 1},
+        mode=Seedance2I2VMode.FIRST_FRAME,
+    )
+
+    sent = selected_reference_paths(assets, "image_url")
+    assert len(sent) == 1
+    anchor = Path(sent[0])
+    assert anchor != frame
+    assert anchor.exists()
+    size = read_seedance2_image_size(anchor)
+    assert size is not None
+    assert min(size) >= VIDEO_REFERENCE_MIN_SHORT_SIDE
+    # 等比放大：纵横比不变，原始首帧保持不动。
+    assert abs(size[0] / size[1] - 250 / 375) < 0.02
+    assert read_seedance2_image_size(frame) == (250, 375)
+
+    first = next(asset for asset in assets if asset.key == "first_frame")
+    assert first.selected is True
+    assert first.validation_error == ""
+
+
+def test_large_first_frame_is_sent_as_is(tmp_path, monkeypatch):
+    """够大的首帧不该被改写：没有放大就不会有多余的中间产物。"""
+
+    from novelvideo import project_config as pc
+    from novelvideo.seedance2_i2v.assets import (
+        build_seedance2_project_assets,
+        selected_reference_paths,
+    )
+
+    monkeypatch.setattr(pc, "OUTPUT_DIR", tmp_path / "state")
+    project_dir = tmp_path / "output" / "alice" / "project"
+    frame = project_dir / "frames" / "ep001" / "beat_01.png"
+    _write_png(frame, width=1024, height=1536)
+
+    assets = build_seedance2_project_assets(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=1,
+        beat={"beat_number": 1},
+        mode=Seedance2I2VMode.FIRST_FRAME,
+    )
+
+    assert selected_reference_paths(assets, "image_url") == [str(frame)]
+    assert not (project_dir / "video_input_frames").exists()

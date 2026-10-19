@@ -15,7 +15,7 @@ services:
     # Source images include the pinned Codex runtime and the reviewed Hermes fork.
     environment:
       DRAMACLAW_CHAT_BACKEND: "${DRAMACLAW_CHAT_BACKEND:-codex}"
-      HERMES_CLI_PATH: /usr/local/bin/hermes
+      HERMES_CLI_PATH: "${HERMES_CLI_PATH:-/usr/local/bin/hermes}"
     build:
       context: .
       dockerfile: Dockerfile
@@ -27,6 +27,11 @@ services:
         # Keep the reviewed Hermes fork available for explicit fallback.
         HERMES_REPO: "${HERMES_REPO:-https://github.com/dramaclaw/hermes-agent.git}"
         HERMES_REF: "${HERMES_REF:-brainclaw/evidence-plane}"
+        # 可选：构建期镜像源（默认官方源）。国内构建建议设 APT_MIRROR=mirrors.aliyun.com。
+        APT_MIRROR: "${APT_MIRROR:-}"
+        # 可选：构建期 PyPI 镜像（默认官方源）。国内构建建议设
+        # PYPI_MIRROR=https://mirrors.aliyun.com/pypi/simple/。
+        PYPI_MIRROR: "${PYPI_MIRROR:-}"
   newapi:
     extends:
       file: docker-compose.release.yml
@@ -43,6 +48,18 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # 可选：构建期 npm 镜像（默认官方 registry）。国内构建建议设
+        # NPM_REGISTRY=https://registry.npmmirror.com。
+        NPM_REGISTRY: "${NPM_REGISTRY:-}"
+        # 实例级 UI 隐藏开关（构建期写入前端产物，默认空 = 官方原样）。
+        # 自建实例设成 1 可去掉首次进入的更新弹窗、状态栏 Piko 入口、
+        # 通知中心、官方渠道页与模型引导页。见 frontend/src/lib/ui-hide-flags.ts。
+        VITE_HIDE_RELEASE_POPUP: "${VITE_HIDE_RELEASE_POPUP:-}"
+        VITE_HIDE_PIKO_ENTRY: "${VITE_HIDE_PIKO_ENTRY:-}"
+        VITE_HIDE_NOTIFICATION_CENTER: "${VITE_HIDE_NOTIFICATION_CENTER:-}"
+        VITE_HIDE_OFFICIAL_CHANNELS: "${VITE_HIDE_OFFICIAL_CHANNELS:-}"
+        VITE_HIDE_MODEL_GUIDE: "${VITE_HIDE_MODEL_GUIDE:-}"
 
 # extends 不带顶层 volumes，需在此重申（名字与 release 文件一致，数据卷共用）。
 volumes:

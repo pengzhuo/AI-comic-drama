@@ -29,7 +29,19 @@ def normalize_video_title(title: str) -> str:
 
 
 def _drawtext_fontfile_arg() -> str:
+    """Return the ``:fontfile=`` argument for ffmpeg ``drawtext``.
+
+    Candidate order matters: drawtext does *not* consult fontconfig, so without a
+    CJK-capable fontfile every Chinese glyph in a burned title becomes a tofu
+    box. The Linux path is what the container image installs via
+    ``fonts-noto-cjk``; the macOS paths keep local runs working.
+    """
+
     for path in (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-SC-Regular.otf",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",

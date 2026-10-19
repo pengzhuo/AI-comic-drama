@@ -48,9 +48,16 @@ from novelvideo.ports.video_delivery import (
     VideoDeliveryError,
     VideoDeliveryReceipt,
 )
+from novelvideo.prompt_safety import (
+    is_text_moderation_rejection,
+    sanitize_prompt_for_moderation,
+)
 from novelvideo.video_request_usage import (
     record_video_request,
     update_video_request_status,
+)
+from novelvideo.generators.anchor_moderation import (
+    plan_anchor_variants,
 )
 from novelvideo.shared.billing_errors import (
     find_billing_error,
@@ -852,6 +859,27 @@ class SeedanceVideoGenerator(VideoGeneratorBase):
 #: 降级阶梯因此几乎每次都会生效：首帧退化为「参考图1」，不再是硬锁。运行器据此
 #: 把「严格首帧实际未生效」记进自检报告，避免静默降级。
 FALLBACK_MULTI_REFERENCE_LOG = "已按兜底方案提交：首帧改为参考图1（多参考通路）"
+
+
+def _moderation_sanitized_candidate(candidate: dict) -> dict | None:
+    """把一档候选的提示词做内容审核中性化；无可改动时返回 ``None``。"""
+
+    prompt = str(candidate.get("prompt") or "")
+    cleaned = sanitize_prompt_for_moderation(prompt)
+    if not cleaned or cleaned == prompt:
+        return None
+    clone = copy.deepcopy(candidate)
+    clone["prompt"] = cleaned
+    return clone
+
+
+def _remove_file_quietly(path: str) -> None:
+    """删除首帧降级档位的临时文件；失败无所谓（系统临时目录会自行回收）。"""
+
+    try:
+        os.remove(path)
+    except OSError:
+        return
 
 
 @dataclass
@@ -2189,12 +2217,52 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             label="newapi video submit",
         )
 
+    @staticmethod
+    def _anchor_variant_candidate_factory(
+        *,
+        image_path: str,
+        variant: Any,
+        payload: dict,
+        metadata: dict,
+        wire: Callable[[dict, dict], dict],
+        log: Callable[[str], None],
+    ) -> Callable[[], Any]:
+        """构造一档**惰性**首帧降级候选。
+
+        惰性很关键：正常情况第一档原图就过审，后面几档既不该做本地图像变换，也不该
+        往媒体中转上传（那是白白的网络与存储开销）。只有前档真的被 4xx 拒绝、轮到
+        这一档时，才生成变体、上传、并规范成请求体。
+        """
+
+        async def _build() -> dict:
+            from novelvideo.generators.anchor_moderation import (
+                materialize_anchor_variant,
+            )
+
+            variant_path = await asyncio.to_thread(
+                materialize_anchor_variant, image_path, variant
+            )
+            try:
+                relayed = await NewApiVideoGenerator._relay_frame_input(variant_path)
+            finally:
+                if variant_path != image_path:
+                    await asyncio.to_thread(_remove_file_quietly, variant_path)
+            log(f"首帧降级档位已上传媒体中转：{variant.label}")
+            rung_metadata = dict(metadata)
+            rung_metadata["image_url"] = relayed
+            rung_payload = dict(payload)
+            rung_payload["metadata"] = rung_metadata
+            return wire(rung_payload, rung_metadata)
+
+        return _build
+
     async def _submit_video_candidates(
         self,
         url: str,
-        candidates: list[dict],
+        candidates: list[Any],
         *,
         headers: dict[str, str] | None = None,
+        labels: list[str] | None = None,
         on_log: Callable[[str], None] | None = None,
         on_request: Callable[[dict], Any] | None = None,
     ) -> tuple[dict, dict]:
@@ -2202,6 +2270,13 @@ class NewApiVideoGenerator(VideoGeneratorBase):
 
         降级只发生在 4xx：这种响应证明上游没有创建任务（不会重复计费/重复生成），
         5xx、超时等不确定失败一律直接抛出，交给上层的重试与对账逻辑处理。
+
+        候选既可以是请求体 ``dict``，也可以是返回请求体的可调用对象（惰性候选：
+        只有真正轮到它时才做本地图像变换与媒体上传，见首帧审核降级阶梯）。``labels``
+        与候选一一对应，降级时用它说明「这一档为什么被换掉、换成了什么」。
+
+        除图片通路降级外，若最后一档被「提示词文本内容审核」拒绝，再补一档
+        **只换提示词**的候选（图片通路不变），避免同一段敏感表述把重跑必然打死。
         返回 (提交响应, 实际生效的请求体)。
         """
 
@@ -2209,7 +2284,20 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             if on_log is not None:
                 on_log(message)
 
-        for index, candidate in enumerate(candidates):
+        def label_for(position: int, default: str) -> str:
+            if labels is not None and 0 <= position < len(labels):
+                return str(labels[position])
+            return default
+
+        work: list[Any] = list(candidates)
+        sanitized: dict | None = None
+        index = 0
+        while index < len(work):
+            candidate = work[index]
+            if callable(candidate):
+                candidate = candidate()
+            if inspect.isawaitable(candidate):
+                candidate = await candidate
             if on_request is not None:
                 result = on_request(candidate)
                 if inspect.isawaitable(result):
@@ -2224,20 +2312,49 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             except NewApiVideoError as exc:
                 status_code = exc.status_code
                 can_fallback = (
-                    index < len(candidates) - 1
+                    index < len(work) - 1
                     and isinstance(status_code, int)
                     and 400 <= status_code < 500
                 )
-                if not can_fallback:
-                    # 没有兜底方案时把上游原始拒绝原因抛出去，方便定位。
-                    raise
-                log(
-                    f"平台拒绝了这套输入参数（HTTP {status_code}），"
-                    "自动改用兜底方案重试…"
-                )
-                continue
+                if can_fallback:
+                    log(
+                        f"{label_for(index, '当前输入参数')}被上游拒绝"
+                        f"（HTTP {status_code}），自动降级重试…"
+                    )
+                    index += 1
+                    continue
+                text_moderated = is_text_moderation_rejection(str(exc))
+                if sanitized is None and text_moderated:
+                    sanitized = _moderation_sanitized_candidate(candidate)
+                    if sanitized is not None:
+                        log("提示词被上游内容审核拒绝，改用中性化提示词重试…")
+                        work.append(sanitized)
+                        index += 1
+                        continue
+                if text_moderated:
+                    # 中性化也救不回来：给前端一句能照着改的话，而不是嵌套 JSON。
+                    # 注意区分「中性化后仍被拒」与「提示词本就是中性文本、无可再降级」，
+                    # 后者若照抄前者会误导用户以为已经尝试过改写。
+                    progress = (
+                        "已尝试中性化改写仍被拒"
+                        if sanitized is not None
+                        else "提示词已是中性文本，无可再降级"
+                    )
+                    raise NewApiVideoError(
+                        f"上游内容审核拒绝了本镜提示词（{progress}），"
+                        f"请修改本 beat 的画面描述后重试。原始错误：{str(exc)[:300]}",
+                        request_id=getattr(exc, "request_id", ""),
+                        status_code=status_code,
+                    ) from exc
+                # 没有兜底方案时把上游原始拒绝原因抛出去，方便定位。
+                raise
             if index:
-                log(FALLBACK_MULTI_REFERENCE_LOG)
+                if candidate is sanitized:
+                    log("已采用中性化提示词提交")
+                elif labels is not None and index < len(labels):
+                    log(f"已降级采用：{label_for(index, '兜底方案')}")
+                else:
+                    log(FALLBACK_MULTI_REFERENCE_LOG)
             return submitted, candidate
 
         raise NewApiVideoError("DramaClawAPI 提交失败：没有可用的候选参数")
@@ -3383,9 +3500,11 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             return VideoGenResult(status=VideoGenStatus.FAILED, error=safe_error)
 
         # Seedance 2.0「严格首帧」是增强通路：上游若用输入审核/参数限制拒绝首帧
-        # 输入（例如真人质感首帧），这里按 4xx 提交失败自动退到既有参考图通路，
-        # 保证产线不中断。只有明确的客户端拒绝（没有创建任务）才会触发降级。
+        # 输入（例如真人质感首帧），这里按 4xx 提交失败自动逐步降级，保证产线不中断。
+        # 降级顺序：锚图逐档降质（尽量保住首帧锁定）→ 既有参考图通路（会漂移）。
+        # 只有明确的客户端拒绝（没有创建任务）才会触发降级。
         seedance2_fallbacks: list[tuple[dict[str, object], dict[str, object]]] = []
+        anchor_ladder_variants: list[Any] = []
 
         if requested_mode:
             try:
@@ -3695,6 +3814,13 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                     image_count=len(fallback_images),
                 )
                 seedance2_fallbacks.append((fallback_payload, fallback_metadata))
+
+                # 首帧真人隐私审核的降级阶梯：原图 → 模糊 → 逐档下采样。上游对
+                # 首帧位查真人、对参考位不查，所以原先只能直接跳到「多参考兜底」，
+                # 代价是丢掉首帧锁定、画面漂移。这里先把锚图本身逐档降质，尽量把
+                # 首帧锁住；只有全部档位都被拒才退回多参考。
+                # 只在这里规划档位：候选工厂本身要等 ``_wire_payload`` 定义之后再建。
+                anchor_ladder_variants.extend(plan_anchor_variants(image_path)[1:])
         else:
             try:
                 await self._apply_huimeng_protocol_media_inputs(
@@ -3761,10 +3887,24 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                 return self._apply_seedance_source_video_ratio(body)
 
             wire_candidates = [_wire_payload(payload, metadata)]
+            wire_labels = ["首帧原图"]
+            for variant in anchor_ladder_variants:
+                wire_candidates.append(
+                    self._anchor_variant_candidate_factory(
+                        image_path=image_path,
+                        variant=variant,
+                        payload=payload,
+                        metadata=metadata,
+                        wire=_wire_payload,
+                        log=log,
+                    )
+                )
+                wire_labels.append(variant.label)
             for fallback_payload, fallback_metadata in seedance2_fallbacks:
                 wire_candidates.append(
                     _wire_payload(fallback_payload, fallback_metadata)
                 )
+                wire_labels.append(FALLBACK_MULTI_REFERENCE_LOG)
             reservation_id = await _reserve_video_model_call(
                 self.model,
                 source="newapi_video_generation",
@@ -3776,6 +3916,7 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                 f"{request_base_url}/video/generations",
                 wire_candidates,
                 headers=request_headers if organization_request else None,
+                labels=wire_labels,
                 on_log=log,
                 on_request=lambda candidate: update_current_model_call_log(
                     request_payload=candidate

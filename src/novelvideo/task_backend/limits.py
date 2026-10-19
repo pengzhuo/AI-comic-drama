@@ -10,7 +10,7 @@ from novelvideo.task_backend.queues import normalize_queue_kind
 PROJECT_LANE_LIMIT_DEFAULTS = {
     "default": 12,
     "video": 4,
-    "world": 2,
+    "world": 3,
     "ffmpeg": 2,
 }
 
@@ -21,17 +21,23 @@ PROJECT_LANE_MIN_DEFAULTS = {
     "ffmpeg": 1,
 }
 
+#: 每用户每 lane 的在飞上限。``video`` 原本是 1，而项目级 lane 的「有效上限」是
+#: ``min(hard, max(min, users*user))`` —— 单用户项目下 user=1 会把视频吞吐硬压成
+#: **1 路**：实测 95 次生成、单次 p50 152s，整段视频阶段因此铺了 3.7h 墙钟。
+#: 与项目级 hard limit（4）对齐后才能真正并行。
 PROJECT_USER_LANE_LIMIT_DEFAULTS = {
     "default": 3,
-    "video": 1,
-    "world": 1,
+    "video": 4,
+    "world": 3,
     "ffmpeg": 1,
 }
 
+#: CE inline 执行槽位。``video``/``world`` 原本分别只有 2/1，比项目级 hard limit
+#: 还低，等于「配了 4 路却只跑 2 路」。
 GLOBAL_LANE_CONCURRENCY_DEFAULTS = {
     "default": 8,
-    "video": 2,
-    "world": 1,
+    "video": 4,
+    "world": 3,
     "ffmpeg": 1,
 }
 

@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from novelvideo.prompt_safety import sanitize_prompt_for_moderation
+
 from .models import VideoConsistencyIssues
 from .prompts import VIDEO_CONSISTENCY_VERIFY_PROMPT
 from .utils import compress_image
@@ -35,9 +37,71 @@ FRAME0_WARN_SIMILARITY = 0.9
 
 #: 自检总开关环境变量（``0/false/off/no`` 关闭）。
 GATE_ENV = "DRAMACLAW_VIDEO_CONSISTENCY_GATE"
-#: 重跑次数上限（含首次生成，默认 3 次机会 = 最多重跑 2 次）。
+#: 重跑次数上限（含首次生成，默认 2 次机会 = 最多重跑 1 次）。
+#:
+#: 从 3 降到 2 是刻意的：重跑一轮要花一次完整生成，而绝大多数重跑只是景别变紧
+#: （见下面 ``MARK_ONLY_REASON_KINDS``），画面本身并没有坏。把「值得重跑的问题」
+#: 收窄之后，第 3 次机会的边际收益已经低于它的时间成本。
 GATE_ATTEMPTS_ENV = "DRAMACLAW_VIDEO_CONSISTENCY_ATTEMPTS"
-DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_ATTEMPTS = 2
+
+#: 问题维度。自检不再只看「有没有问题」，而是按维度决定「值不值得重跑」。
+REASON_KIND_FRAME0 = "frame0"
+REASON_KIND_AUDIO = "audio"
+REASON_KIND_IDENTITY = "identity"
+REASON_KIND_COSTUME = "costume"
+REASON_KIND_PHYSICAL = "physical"
+REASON_KIND_FRAMING = "framing"
+REASON_KIND_OTHER = "other"
+
+#: 会触发重跑的维度：首帧锁失效（画面被整体重做＝一致性硬指标崩了）、身份/服装
+#: 道具（一致性硬指标）、声音（口型必然对不上）、肢体物理穿帮（画面确实坏了）。
+#:
+#: 首帧硬失配刻意放在这里：它不是「构图偏好」，而是「这一版根本没有从首帧开始
+#: 渲染」——衣服/化妆/道具的锁定全靠首帧，只标记不重跑等于放任漂移过闸。
+RERUN_REASON_KINDS: frozenset[str] = frozenset(
+    {
+        REASON_KIND_FRAME0,
+        REASON_KIND_AUDIO,
+        REASON_KIND_IDENTITY,
+        REASON_KIND_COSTUME,
+        REASON_KIND_PHYSICAL,
+    }
+)
+
+#: 只标记不重跑的维度：景别/构图偏好，以及视觉模型的自由描述。这些偏差记进
+#: ``review_flags.json`` 供人工判断，但不值得再花一整轮生成——也正是原先最大的
+#: 重跑来源。
+MARK_ONLY_REASON_KINDS: frozenset[str] = frozenset(
+    {REASON_KIND_FRAMING, REASON_KIND_OTHER}
+)
+
+#: 关键字 → 维度。先出现的规则优先，所以顺序即优先级。
+_REASON_KIND_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # 首帧硬失配优先于其它维度：它一旦命中，说明这一版没有从首帧开始渲染。
+    (REASON_KIND_FRAME0, ("差异过大", "整体重做")),
+    (REASON_KIND_AUDIO, ("音轨", "口型", "静音", "对不上")),
+    (REASON_KIND_IDENTITY, ("脸型", "身份", "换脸", "五官", "长相")),
+    (
+        REASON_KIND_COSTUME,
+        ("服装", "配饰", "换装", "衣", "道具", "发型", "发饰", "鞋"),
+    ),
+    (
+        REASON_KIND_PHYSICAL,
+        ("肢体", "姿态物理", "物理穿帮", "悬空", "贴地", "融接", "肢体缺失"),
+    ),
+    (REASON_KIND_FRAMING, ("景别", "构图", "取景", "镜头", "画幅", "裁剪", "特写", "重构")),
+)
+
+
+def classify_reason(reason: str) -> str:
+    """把一个自检原因归到某个维度（无法归类时归 ``other``，即只标记）。"""
+
+    text = str(reason or "")
+    for kind, keywords in _REASON_KIND_KEYWORDS:
+        if any(keyword in text for keyword in keywords):
+            return kind
+    return REASON_KIND_OTHER
 
 #: 平均音量低于这个 dB 视为静音（ffmpeg volumedetect 的 ``mean_volume``）。
 SILENT_MEAN_VOLUME_DB = -50.0
@@ -70,10 +134,39 @@ class VideoConsistencyVerdict:
     issues: VideoConsistencyIssues | None = None
     notes: list[str] = field(default_factory=list)
 
+    @property
+    def rerun_reasons(self) -> list[str]:
+        """值得再花一轮生成去修的原因（身份/服装道具/声音/肢体）。"""
+
+        return [
+            reason
+            for reason in self.reasons
+            if classify_reason(reason) in RERUN_REASON_KINDS
+        ]
+
+    @property
+    def marked_reasons(self) -> list[str]:
+        """只标记人工复核、不触发重跑的原因（景别类 + 自由描述）。"""
+
+        return [
+            reason
+            for reason in self.reasons
+            if classify_reason(reason) not in RERUN_REASON_KINDS
+        ]
+
+    @property
+    def should_rerun(self) -> bool:
+        """是否值得重跑：只有硬问题才重跑，景别类偏差只标记。"""
+
+        return bool(self.rerun_reasons)
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "reasons": list(self.reasons),
+            "rerun_reasons": self.rerun_reasons,
+            "marked_reasons": self.marked_reasons,
+            "should_rerun": self.should_rerun,
             "frame0_similarity": self.frame0_similarity,
             "notes": list(self.notes),
             "issues": (
@@ -82,11 +175,20 @@ class VideoConsistencyVerdict:
         }
 
     def reinforce_prompt(self, prompt: str) -> str:
-        """把本次判定到的问题写成下一版的强化提示词。"""
+        """把本次判定到的问题写成下一版的强化提示词。
 
-        issues = "；".join(self.reasons) or "画面对首帧的延续不够严格"
-        suffix = REINFORCE_SUFFIX.format(issues=issues)
-        base = str(prompt or "").rstrip()
+        只强化**值得重跑**的问题：把景别类偏差也写进强化提示词，会让每一版都被
+        迫「复刻构图」，反而更容易崩；强化提示词只该锁定身份、服装道具、物理与口型。
+
+        注入前统一过一遍内容审核中性化：视觉模型对画面的自由描述里会出现
+        「吊带背心」这类词，一旦被上游文本审核命中，重跑的这一版会直接 4xx，
+        等于让「重跑一次」变成「必失败一次」。
+        """
+
+        focus = self.rerun_reasons or self.reasons
+        issues = "；".join(focus) or "画面对首帧的延续不够严格"
+        suffix = sanitize_prompt_for_moderation(REINFORCE_SUFFIX.format(issues=issues))
+        base = sanitize_prompt_for_moderation(str(prompt or "").rstrip())
         return f"{base}{suffix}" if base else suffix.lstrip("\n")
 
 
@@ -552,9 +654,20 @@ class VideoConsistencyGate:
 
 
 __all__ = [
+    "DEFAULT_MAX_ATTEMPTS",
+    "MARK_ONLY_REASON_KINDS",
+    "REASON_KIND_AUDIO",
+    "REASON_KIND_COSTUME",
+    "REASON_KIND_FRAME0",
+    "REASON_KIND_FRAMING",
+    "REASON_KIND_IDENTITY",
+    "REASON_KIND_OTHER",
+    "REASON_KIND_PHYSICAL",
+    "RERUN_REASON_KINDS",
     "VideoConsistencyGate",
     "VideoConsistencyVerdict",
     "audio_track_state",
+    "classify_reason",
     "consistency_gate_config",
     "extract_frame",
     "frame_aspect_warning",

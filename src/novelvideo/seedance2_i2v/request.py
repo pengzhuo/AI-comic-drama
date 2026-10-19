@@ -77,12 +77,44 @@ def _validate_human_review_media_urls(params: dict[str, Any]) -> None:
         )
 
 
+#: 引用编号校验要跳过的「否定语境」。
+#:
+#: 生成的提示词常带「本镜无音频输入，不引用@音频1及任何后续编号」「不引用@图片2及以后任何
+#: 编号」这类**声明不引用**的句子；它们不含真实引用，照字面校验会把整个 beat 直接判失败
+#: （``提示词引用了 音频1，但当前请求只发送了 0 个音频素材``）。
+_NEGATED_REFERENCE_MARKERS = (
+    "不引用",
+    "不发送",
+    "不使用",
+    "不包含",
+    "不需要",
+    "无需",
+    "不含",
+    "未引用",
+    "未使用",
+    "没有",
+    "无",
+    "非",
+)
+_NEGATION_LOOKBACK = 8
+
+
+def _is_negated_reference(prompt: str, start: int) -> bool:
+    """判断某个「图片N/视频N/音频N」是否处在否定语境里（即声明不引用）。"""
+
+    window = str(prompt or "")[max(0, start - _NEGATION_LOOKBACK) : start]
+    return any(window.endswith(marker) for marker in _NEGATED_REFERENCE_MARKERS)
+
+
 def _rewrite_stale_image_references(prompt: str, *, image_count: int) -> str:
     """把越界的「图片N」引用改写为首帧表述，避免严格首帧模式直接校验失败。"""
 
     def replace(match: re.Match[str]) -> str:
         number = int(match.group("number"))
         if 1 <= number <= image_count:
+            return match.group(0)
+        if _is_negated_reference(match.string, match.start()):
+            # 「不引用@图片2及以后任何编号」是在声明不引用，不该被改成首帧表述。
             return match.group(0)
         return "首帧画面"
 
@@ -101,8 +133,11 @@ def _validate_prompt_reference_numbers(
         "视频": int(video_count),
         "音频": int(audio_count),
     }
+    text = str(prompt or "")
     for label, limit in limits.items():
-        for match in re.finditer(rf"@?{label}(\d+)", str(prompt or "")):
+        for match in re.finditer(rf"@?{label}(\d+)", text):
+            if _is_negated_reference(text, match.start()):
+                continue
             number = int(match.group(1))
             if 1 <= number <= limit:
                 continue

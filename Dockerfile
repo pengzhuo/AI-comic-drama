@@ -24,12 +24,29 @@ FROM ${CODEX_RUNTIME_IMAGE} AS codex-runtime
 
 FROM python:3.12-slim
 ARG CODEX_REF
+# 可选镜像源：默认留空 = 与官方源完全一致的行为，只影响构建期拉包，运行时不读。
+# deb.debian.org 在国内经常断流（实测低于 100KB/s，apt 层能拖数小时）；构建时传
+# --build-arg APT_MIRROR=mirrors.aliyun.com 会先把 sources 改写到镜像站，同一层约一两分钟。
+ARG APT_MIRROR=""
+# 可选 PyPI 镜像：默认留空 = 与官方源完全一致的行为，只影响构建期拉包，运行时不读。
+# files.pythonhosted.org 在国内这台机器实测只有 ~200KB/s（uv sync 要下 ~250MB），构建时传
+# --build-arg PYPI_MIRROR=https://mirrors.aliyun.com/pypi/simple/ 可显著加快。
+ARG PYPI_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do \
+        if [ -f "$f" ]; then sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; fi; \
+      done; \
+    fi
 COPY --from=vtracer-builder /usr/local/cargo/bin/vtracer /usr/local/bin/vtracer
 
 # 项目全程用 uv 管理(与 host 一致)。Dockerfile 也用 uv,使 uv.lock 锁版本 +
 # [[tool.uv.dependency-metadata]] override(da2 的 torch==2.5.0 冲突、sharp 的 gsplat)
 # 生效——pip 不认这些 override,会在 da2/world 解析冲突时 build 失败。
-RUN pip install --no-cache-dir uv
+RUN if [ -n "$PYPI_MIRROR" ]; then \
+      pip install --no-cache-dir --index-url "$PYPI_MIRROR" uv; \
+    else \
+      pip install --no-cache-dir uv; \
+    fi
 
 ENV ST_EDITION=ce \
     ST_CONTROL_PLANE_DSN= \
@@ -52,8 +69,12 @@ COPY --from=codex-runtime /codex-runtime.json /opt/codex-runtime.json
 # vendored codex-linux-sandbox binary's default pipeline execs system bwrap
 # (Landlock is only its --use-legacy-landlock fallback, which we do not use).
 # The binary itself is installed further down, per TARGETARCH.
+#
+# fonts-noto-cjk is required, not optional: composed episodes burn Chinese
+# subtitles in through libass, which renders tofu boxes when the image ships no
+# CJK-capable font (DejaVu alone covers no Han glyphs).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg bubblewrap \
+    && apt-get install -y --no-install-recommends ffmpeg bubblewrap fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # deploy/codex/ is copied again, in full, further down as part of the
@@ -117,6 +138,9 @@ ARG INSTALL_WORLD=0
 # uv.lock contains the pinned Codex Python SDK as a Git source. Keep git in
 # this build layer only; it is not needed by the running application.
 RUN set -eux; \
+    if [ -n "$PYPI_MIRROR" ]; then \
+        export UV_DEFAULT_INDEX="$PYPI_MIRROR" UV_INDEX_URL="$PYPI_MIRROR" PIP_INDEX_URL="$PYPI_MIRROR"; \
+    fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends git; \
     if [ "$INSTALL_WORLD" = "1" ]; then \
@@ -152,6 +176,9 @@ RUN set -eux; \
 ARG HERMES_REPO="https://github.com/dramaclaw/hermes-agent.git"
 ARG HERMES_REF="brainclaw/evidence-plane"
 RUN set -eux; \
+    if [ -n "$PYPI_MIRROR" ]; then \
+        export UV_DEFAULT_INDEX="$PYPI_MIRROR" UV_INDEX_URL="$PYPI_MIRROR" PIP_INDEX_URL="$PYPI_MIRROR"; \
+    fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends git; \
     rm -rf /var/lib/apt/lists/*; \

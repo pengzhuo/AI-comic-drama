@@ -105,6 +105,28 @@ def test_master_gap_is_listed_before_its_pano(tmp_path: Path) -> None:
     assert [gap.kind for gap in gaps] == ["scene", "scene", "scene", "pano"]
 
 
+def test_dependency_gate_holds_back_anchored_images(tmp_path: Path) -> None:
+    master = AssetReferenceGap("scene", "A", "master")
+    reverse = AssetReferenceGap("scene", "A", "reverse_master")
+    spatial = AssetReferenceGap("scene", "A", "spatial_layout")
+    pano = AssetReferenceGap("pano", "A")
+    prop = AssetReferenceGap("prop", "黑伞")
+
+    assert asset_refs.scene_master_ready(tmp_path, "A") is False
+    # master 自己与完全独立的道具图不受影响。
+    assert asset_refs.gap_dependency_ready(tmp_path, master) is True
+    assert asset_refs.gap_dependency_ready(tmp_path, prop) is True
+    # 以 master 为视觉锚的三张图都得等它落盘。
+    for gap in (reverse, spatial, pano):
+        assert asset_refs.gap_dependency_ready(tmp_path, gap) is False
+
+    _write(tmp_path / "assets" / "scenes" / "A" / "master.png")
+
+    assert asset_refs.scene_master_ready(tmp_path, "A") is True
+    for gap in (master, reverse, spatial, pano, prop):
+        assert asset_refs.gap_dependency_ready(tmp_path, gap) is True
+
+
 def test_env_switch_disables_the_stage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(asset_refs.ASSET_REFERENCES_ENV, "0")
     assert asset_refs.asset_references_enabled() is False
@@ -152,7 +174,7 @@ def _ctx(tmp_path: Path) -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_enqueues_one_reference_at_a_time(
+async def test_dispatch_enqueues_every_missing_reference_in_one_round(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     calls: list[dict] = []
@@ -162,18 +184,30 @@ async def test_dispatch_enqueues_one_reference_at_a_time(
         return SimpleNamespace(task_state=SimpleNamespace(task_id="t"))
 
     monkeypatch.setattr(pipeline_auto, "enqueue_project_task", fake_enqueue)
-    store = _AssetStore([_scene("A"), _scene("B")], [_prop("伞")])
+    scenes = [_scene("A"), _scene("B")]
+    props = [_prop("黑伞")]
+    store = _AssetStore(scenes, props)
+    for name in ("A", "B"):
+        _write(tmp_path / "assets" / "scenes" / name / "master.png")
 
     task_type, signature = await pipeline_auto._dispatch_asset_references(
         _ctx(tmp_path), store, tmp_path, set()
     )
 
+    # 一轮发完全部**就绪**的缺口：master 已落盘，同一场景其余两张与 360 都不再等它，
+    # 道具图更是完全独立。逐张串行只是白白拉长前置阶段。
+    assert len(calls) == 7
+    assert {call["task_type"] for call in calls} == {
+        "scene_reference_asset",
+        "scene_pano_generation",
+        "prop_reference_asset",
+    }
+    # 返回值仍是首个缺口：签名逐个记账，「缺口全部记完 → 交给 agent」的终止语义不变。
     assert task_type == "scene_reference_asset"
-    assert signature == "dispatch:asset_ref:scene:A:master"
-    assert len(calls) == 1
+    assert signature == "dispatch:asset_ref:scene:A:reverse_master"
     payload = calls[0]["payload"]
     assert payload["scene_name"] == "A"
-    assert payload["kind"] == "master"
+    assert payload["kind"] == "reverse_master"
     assert payload["output_dir"] == str(tmp_path)
     assert payload["model"] == ""
     assert calls[0]["task_type"] == "scene_reference_asset"
@@ -184,9 +218,42 @@ async def test_dispatch_enqueues_one_reference_at_a_time(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_skips_an_attempted_gap_and_takes_the_next(
+async def test_dispatch_only_sends_masters_before_their_scene_anchors_land(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """同一场景里依赖 master 的图必须先等 master 落盘，否则注定白跑一趟。"""
+
+    calls: list[dict] = []
+
+    async def fake_enqueue(ctx, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(task_state=SimpleNamespace(task_id="t"))
+
+    monkeypatch.setattr(pipeline_auto, "enqueue_project_task", fake_enqueue)
+    store = _AssetStore([_scene("A"), _scene("B")], [_prop("黑伞")])
+
+    task_type, signature = await pipeline_auto._dispatch_asset_references(
+        _ctx(tmp_path), store, tmp_path, set()
+    )
+
+    # 两个场景各发一张 master（跨场景并行），完全独立的道具图同批发出；而反向 /
+    # 空间布局 / 360 押后到 master 落盘后的下一轮。
+    assert [call["payload"].get("kind") for call in calls] == ["master", "master", None]
+    assert [call["task_type"] for call in calls] == [
+        "scene_reference_asset",
+        "scene_reference_asset",
+        "prop_reference_asset",
+    ]
+    assert task_type == "scene_reference_asset"
+    assert signature == "dispatch:asset_ref:scene:A:master"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_a_scene_whose_master_is_still_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """master 已记账但还没落盘：本轮发不出去，也不能空手记一次「已尝试」。"""
+
     calls: list[dict] = []
 
     async def fake_enqueue(ctx, **kwargs):
@@ -200,8 +267,37 @@ async def test_dispatch_skips_an_attempted_gap_and_takes_the_next(
         _ctx(tmp_path), store, tmp_path, {"dispatch:asset_ref:scene:A:master"}
     )
 
+    assert calls == []
+    assert task_type is None
+    assert signature is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_an_attempted_gap_and_sends_the_rest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict] = []
+
+    async def fake_enqueue(ctx, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(task_state=SimpleNamespace(task_id="t"))
+
+    monkeypatch.setattr(pipeline_auto, "enqueue_project_task", fake_enqueue)
+    store = _AssetStore([_scene("A")], [])
+    _write(tmp_path / "assets" / "scenes" / "A" / "master.png")
+
+    task_type, signature = await pipeline_auto._dispatch_asset_references(
+        _ctx(tmp_path), store, tmp_path, {"dispatch:asset_ref:scene:A:master"}
+    )
+
     assert task_type == "scene_reference_asset"
+    # master 已记账 → 本轮跳过它，同一场景其余的缺口（反向主图 / 空间布局 / 360）
+    # 一次发完。
     assert signature == "dispatch:asset_ref:scene:A:reverse_master"
+    assert [call["payload"].get("kind") for call in calls[:2]] == [
+        "reverse_master",
+        "spatial_layout",
+    ]
     assert calls[0]["payload"]["kind"] == "reverse_master"
 
 

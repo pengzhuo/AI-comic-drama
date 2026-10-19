@@ -23,6 +23,11 @@ from novelvideo.task_backend.registry import register_project_task_runner
 from novelvideo.task_backend.subprocesses import run_project_subprocess
 from novelvideo.task_identity import project_task_state_key
 from novelvideo.task_state import get_task_manager
+from novelvideo.verification.subtitle_font import (
+    SubtitleFont,
+    SubtitleFontError,
+    resolve_subtitle_font,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,15 +110,34 @@ def _append_freezone_video_node_history(
 def _beat_expects_speech(beat: dict[str, Any]) -> bool:
     """这一 beat 是否必须有真实人声（台词或解说）。
 
-    只有「有文本 + 音频类型是台词/解说」的 beat 才要求音轨非静音：动作/静音 beat
-    本来就该没有对白，不能因为音轨安静就判不通过。
+    规则本体在 ``seedance2_i2v.voice_preflight``（与参考声线预检同源，避免两处口径
+    漂移）；这里只是给运行器留一个本地入口。
     """
 
-    from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
+    from novelvideo.seedance2_i2v.voice_preflight import beat_expects_speech
 
-    if not str(beat_subtitle_text(beat) or "").strip():
-        return False
-    return normalize_seedance2_audio_type(beat) in {"dialogue", "narration"}
+    return beat_expects_speech(beat)
+
+
+def _speech_reference_audio_gap(
+    *,
+    beat: dict[str, Any],
+    beat_num: int,
+    references: list[Any],
+    seedance2_config: Any,
+) -> str:
+    """说话 beat 却没有参考声线时返回错误文案（否则空串）。见 voice_preflight。"""
+
+    from novelvideo.seedance2_i2v.voice_preflight import (
+        speech_reference_audio_gap,
+    )
+
+    return speech_reference_audio_gap(
+        beat=beat,
+        beat_num=beat_num,
+        references=references,
+        seedance2_config=seedance2_config,
+    )
 
 
 def _beat_identity_reference_paths(
@@ -229,6 +253,16 @@ async def _apply_video_consistency_gate(
                 chosen_attempt = attempt
                 break
             summary = "；".join(verdict.reasons[:3]) or "画面与首帧不一致"
+            if not verdict.should_rerun:
+                # 景别/构图这类偏差只标记人工复核，不重跑：重跑一轮要花一次完整
+                # 生成，而画面本身（身份、服装、道具、声音）并没有坏。
+                chosen = snapshot
+                chosen_attempt = attempt
+                on_log(
+                    "一致性自检只发现景别/构图类偏差，按「标记人工复核、不重跑」处理："
+                    f"{summary}"
+                )
+                break
             if attempt >= settings.max_attempts:
                 # 有界重跑用尽：不阻断产线，但要选最接近首帧的一版并显式标记人工复核。
                 best = pick_best_attempt(attempts) or {}
@@ -273,6 +307,11 @@ async def _apply_video_consistency_gate(
         "strict_first_frame_degraded": bool(strict_first_frame_degraded),
         "needs_human_review": bool(review_reasons),
         "review_reasons": review_reasons,
+        # 按维度拆开记：重跑的代价是「多生成一次」，所以哪一类问题触发了重跑要能
+        # 直接被统计出来（景别类现在只标记，不再计入 generated_attempts 的增长）。
+        "rerun_reasons": list(final.get("rerun_reasons") or []),
+        "marked_reasons": list(final.get("marked_reasons") or []),
+        "generations": len(attempts),
     }
     if strict_first_frame_degraded:
         on_log(
@@ -479,6 +518,15 @@ async def _run_single_video_async(
         generate_kwargs["audio_setting"] = str(config["audio_setting"])
     if is_seedance2_backend:
         generate_kwargs["seedance2_config"] = seedance2_config
+        voice_gap = _speech_reference_audio_gap(
+            beat=beat,
+            beat_num=beat_num,
+            references=model_references,
+            seedance2_config=seedance2_config,
+        )
+        if voice_gap:
+            _log(manager, ctx, envelope, f"参考声线预检未通过：{voice_gap}")
+            raise RuntimeError(voice_gap)
 
     result = await video_gen.generate(**generate_kwargs)
     if result.status.value != "done":
@@ -877,6 +925,72 @@ def _build_srt_from_clips(entries: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+#: 字幕样式里与字体无关的部分；libass 按恒定 PlayRes 缩放，FontSize 与影片
+#: 分辨率无关，11 在 1280 高的成片上约 49px（3.8% 画面高），是电影式底带
+#: 而不是铺满画面的字块。
+def _subtitle_force_style(font: SubtitleFont | None) -> str:
+    """Build the libass ``force_style`` for the resolved subtitle font.
+
+    字体名必须来自 ``resolve_subtitle_font``：镜像里没有对应字体时 libass 会
+    静默回退到无中文字形的字体，把整片字幕烧成豆腐块。
+    """
+
+    family = font.family if font is not None else "Noto Sans CJK SC"
+    return (
+        f"FontName={family},"
+        "FontSize=11,"
+        "PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,"
+        "BorderStyle=1,Outline=1,Shadow=0,MarginV=24,Alignment=2"
+    )
+
+
+def _resolve_compose_subtitle_font(
+    beats: list[dict[str, Any]],
+    *,
+    manager,
+    ctx: ProjectContext,
+    episode: int,
+) -> SubtitleFont | None:
+    """Resolve (and self-check) the subtitle font before the burn pass runs.
+
+    自检只验证"字体是否画得出本期实际字幕文本"，所以必须在逐 clip 归一化之前
+    跑：等烧完再发现缺字形，几分钟的编码就白做了。
+    """
+
+    planned_text = "\n".join(beat_subtitle_text(beat) for beat in beats)
+    if not planned_text.strip():
+        return None
+    try:
+        font = resolve_subtitle_font(planned_text)
+    except SubtitleFontError as exc:
+        manager.update_progress_for_project(
+            ctx,
+            "compose_episode",
+            episode,
+            logs=[f"字幕字体自检失败: {exc}"],
+        )
+        raise
+    if font is None:
+        manager.update_progress_for_project(
+            ctx,
+            "compose_episode",
+            episode,
+            logs=["未检测到 fontconfig，跳过字幕字体自检"],
+        )
+        return None
+    message = f"字幕字体自检通过: {font.family} ({font.file})"
+    if font.missing:
+        message += f"；以下字符缺字形: {''.join(font.missing[:20])}"
+    manager.update_progress_for_project(
+        ctx,
+        "compose_episode",
+        episode,
+        logs=[message],
+    )
+    return font
+
+
 def run_compose_episode(
     envelope: dict[str, Any], ctx: ProjectContext
 ) -> dict[str, Any]:
@@ -925,6 +1039,17 @@ def run_compose_episode(
         target_width, target_height = map(int, resolution.split("x"))
     except Exception:
         target_width, target_height = 720, 1280
+
+    # 字幕字体自检必须在逐 clip 归一化之前：缺字形时立刻失败，别等几分钟编码完
+    # 才发现整片字幕是豆腐块。
+    subtitle_font: SubtitleFont | None = None
+    if add_subtitles:
+        subtitle_font = _resolve_compose_subtitle_font(
+            beats,
+            manager=manager,
+            ctx=ctx,
+            episode=episode,
+        )
 
     video_clips: list[str] = []
     clip_srt_entries: list[tuple[str, str]] = []
@@ -1055,13 +1180,7 @@ def run_compose_episode(
             # 11 lands around 49px on a 1280-high film (3.8% of the height) with
             # a modest bottom margin, i.e. a movie-style band instead of text
             # that fills the frame.
-            subtitle_style = (
-                "FontName=Noto Sans CJK SC,"
-                "FontSize=11,"
-                "PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,"
-                "BorderStyle=1,Outline=1,Shadow=0,MarginV=24,Alignment=2"
-            )
+            subtitle_style = _subtitle_force_style(subtitle_font)
             filter_parts.append(
                 f"[outv]subtitles=filename='{subtitle_path}':"
                 f"force_style='{subtitle_style}'[vsub]"

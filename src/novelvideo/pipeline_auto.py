@@ -16,9 +16,10 @@ scene/prop reference images), sketches, global video optimization, first frames
 (Render), TTS, Seedance 2.0 prompts, per-beat video and episode compose.
 
 Asset references is a blocking stage between ``script`` and ``sketches``: one
-round enqueues exactly one missing scene/prop image so a single broken entry can
-never stall the rest, and gaps already tried in this run are skipped. It can be
-switched off with ``DRAMACLAW_AUTO_ASSET_REFERENCES``.
+round enqueues every *ready* missing scene/prop image (they are independent, and
+the task keys are idempotent), while gaps whose ``master`` anchor has not landed
+yet — and gaps already tried in this run — are skipped. It can be switched off
+with ``DRAMACLAW_AUTO_ASSET_REFERENCES``.
 
 The one deliberate exception is ``coloring`` (sketch identity/prop detection):
 it is a synchronous, credit-billed vision call with no task type, so it does not
@@ -27,6 +28,7 @@ fit the coordinator's task bookkeeping and is still driven by the agent.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,7 @@ from novelvideo.pipeline_status import (
     compute_pipeline_status,
 )
 from novelvideo.task_backend.client import enqueue_project_task
+from novelvideo.task_state import get_task_manager
 from novelvideo.utils.path_resolver import compute_identity_path, compute_portrait_path
 
 DEFAULT_EPISODE_TARGET = 10
@@ -44,11 +47,20 @@ DEFAULT_COMPOSE_RESOLUTION = "720x1280"
 # ships the same chunk size so a 40-beat episode goes out in the same batches the
 # workbench tool would send.
 MAX_SINGLE_VIDEO_BATCH = 9
-#: First frames are dispatched in smaller chunks on purpose. One beat can be
-#: rejected by upstream content moderation while its neighbours render fine, and
-#: a smaller chunk keeps that failure from discarding a whole batch's renders
-#: when the coordinator has to retry the stage.
-AUTO_FIRST_FRAME_CHUNK = 3
+#: First frames are dispatched in chunks. The runtime caps ``batch_size`` at 9 and
+#: a whole episode is ~40 beats, so 9 means "one round per 9 renders" instead of
+#: 13 rounds of 3. A beat rejected by upstream moderation still only costs the
+#: retry of its own render (the batch is re-derived from what is still missing),
+#: and the signature carries the chunk, so the next call after this chunk
+#: completes reads as progress rather than a retry.
+AUTO_FIRST_FRAME_CHUNK = 9
+#: 2.0 提示词一条 beat 一个任务（任务是协调器记账的抓手）。每条提示词只吃这条
+#: beat 自己的数据 + 下一条 beat 的首尾帧信息，彼此没有先后依赖——真正需要按顺序
+#: 传下去的是 ``global_optimize_video`` 的上一镜提示词链，那一步在这之前已经按 beat
+#: 串行跑完了。所以一轮发 ``AUTO_SEEDANCE2_PROMPT_BATCH`` 条：任务键按
+#: (task_type, episode, beat_num) 幂等，窗口重叠不会重复生成；一次只发一条会把
+#: 39 条提示词排成 39 个前后相接的 LLM 往返（实测 ~32s/条 ≈ 21min）。
+AUTO_SEEDANCE2_PROMPT_BATCH = 4
 
 
 async def dispatch_next_stage(
@@ -280,20 +292,30 @@ async def _dispatch_seedance2_prompt(
     project_dir: Path,
     attempted: set[str],
 ) -> tuple[str | None, str | None]:
-    """Write the next beat's Seedance 2.0 final prompt.
+    """Write the next beats' Seedance 2.0 final prompts (one task per beat).
 
     Seedance 2.0 will not render a beat whose 2.0 prompt was never composed, and
     composing it is an LLM round-trip per beat. Dispatching one beat at a time as
     a real task keeps the coordinator's task bookkeeping intact (a taskless
     continuation would drift into the "no new task" pause).
+
+    提示词之间**没有**先后依赖（见 ``AUTO_SEEDANCE2_PROMPT_BATCH``），所以一轮发
+    满一批：窗口 = 「还没就位的最前面 N 条」，已经发过的按任务键/签名跳过、继续往后
+    看，所以在飞的那几条不会挡住后面的 beat，失败过的那一条也不会把整段卡死。
     """
 
     beats = await store.get_beats_as_dicts(episode)
+    dispatched: tuple[str | None, str | None] | None = None
+    first_skipped: str | None = None
+    pending = 0
     for beat in sorted(beats, key=lambda item: int(item.get("beat_number") or 0)):
         beat_num = int(beat.get("beat_number") or 0)
         if beat_num <= 0 or beat_seedance2_prompt_ready(beat):
             continue
-        return await _enqueue_once(
+        if pending >= AUTO_SEEDANCE2_PROMPT_BATCH:
+            break
+        pending += 1
+        result = await _enqueue_once(
             ctx,
             attempted,
             task_type="seedance2_prompt",
@@ -307,7 +329,13 @@ async def _dispatch_seedance2_prompt(
                 "beat_num": beat_num,
             },
         )
-    return None, None
+        if result[0] is not None and dispatched is None:
+            dispatched = result
+        elif first_skipped is None:
+            first_skipped = result[1]
+    if dispatched is not None:
+        return dispatched
+    return None, first_skipped
 
 
 async def _dispatch_script_writer(
@@ -341,28 +369,56 @@ async def _dispatch_asset_references(
     project_dir: Path,
     attempted: set[str],
 ) -> tuple[str | None, str | None]:
-    """补齐项目里缺失的场景 / 道具参考图，每轮只入队一个任务。
+    """补齐项目里缺失的场景 / 道具参考图：**一轮把就绪的缺口都发出去**。
 
     关卡排在「脚本生成」与「草图生成」之间：草图只吃场景图、首帧同时吃场景图与
     道具图，所以这些图必须先存在。存量项目与后期新增的场景变体都按「缺哪张补
     哪张」处理。
 
+    原先每轮只入队一个缺口，缺口之间被迫串行；它们彼此独立、没有先后依赖，串行
+    只是白白拉长前置阶段。任务键按 (task_type, episode, scope) 幂等，同一条缺口
+    重复入队不会产生重复生成。
+
+    整批并行只适用于**真正独立**的缺口：同一个场景里 ``reverse_master`` /
+    ``spatial_layout`` / 360 全景都以 ``master`` 为视觉锚，master 还没落盘就发出去
+    只会立刻失败（或把全景降级成文生想象）。所以同一轮里每个场景先只发 ``master``，
+    等它落盘后的下一轮再发依赖它的那几张——跨场景照旧整批并行，同一场景内只有两波，
+    而不再把注定的失败发出去（见 :func:`gap_dependency_ready`）。
+
+    已尝试过的缺口仍然跳过，让同一个坏条目不至于挡住其余条目；缺口全部记账之后
+    这一阶段自然交出控制权。
+
     payload 逐字段复刻 REST 端点（``scenes.py`` / ``props.py``），不改模型、网关
-    与生成参数；已尝试过的缺口跳过，让同一个坏条目不至于挡住其余条目。
+    与生成参数。
     """
 
-    from novelvideo.asset_references import asset_reference_gaps_for_store
+    from novelvideo.asset_references import (
+        asset_reference_gaps_for_store,
+        gap_dependency_ready,
+    )
 
     gaps = await asset_reference_gaps_for_store(store, project_dir)
     if not gaps:
         return None, None
-    for gap in gaps:
-        if gap.signature in attempted:
-            continue
+    pending = [
+        gap
+        for gap in gaps
+        if gap.signature not in attempted and gap_dependency_ready(project_dir, gap)
+    ]
+    if not pending:
+        return None, None
+
+    first_task_type: str | None = None
+    for gap in pending:
         dispatched = await _enqueue_asset_reference(ctx, store, project_dir, gap)
-        if dispatched is not None:
-            return dispatched, gap.signature
-    return None, None
+        if dispatched is not None and first_task_type is None:
+            first_task_type = dispatched
+    if first_task_type is None:
+        return None, None
+    # 返回值保持原来的形状（首个缺口 + 它的签名）：「已尝试过的缺口本轮跳过、
+    # 全部尝试过就交给 agent」的终止语义因此完全不变——签名逐个记账，缺口全部
+    # 记完自然收敛，坏条目也不会把这一阶段拖成死循环。
+    return first_task_type, pending[0].signature
 
 
 async def _enqueue_asset_reference(
@@ -420,7 +476,7 @@ async def _enqueue_asset_reference(
         params: dict[str, Any] = {
             "description": _scene_360_description(scene),
             "style": style,
-            "timeout_seconds": 1800,
+            "timeout_seconds": 900,
         }
         scope = stage_asset_scope(gap.name, step)
         await enqueue_project_task(
@@ -550,6 +606,13 @@ async def _dispatch_first_frames(
     limit) so a beat rejected by upstream moderation only costs the retry of a
     few renders, and the signature carries the chunk, so the next call after
     this chunk completes reads as progress rather than a retry.
+
+    **一轮一块（单飞）**：就绪窗口是「缺首帧的 beat 取前 9 个」，而帧是在块跑完
+    时才落盘的，所以窗口会随帧落盘整体右移——[18..26] 里 18 号补上后，下一次算
+    出来的是 [19..27]，区间变了签名就不是「同一块」，重叠派发会把 19-26 再渲染
+    一遍（同一批 beat 两份任务重复生成，后落盘的那份覆盖先前那份）。块内并发由
+    ``NANOBANANA_REGEN_CONCURRENCY`` 提供，所以这里要求同时只有一块在飞：这一块
+    终止后（含失败），下一轮按最新的就绪集合继续派发，失败 beat 的重试语义不变。
     """
 
     from novelvideo.api.routes.generation import (
@@ -557,6 +620,9 @@ async def _dispatch_first_frames(
         enqueue_selected_regen_task,
     )
     from novelvideo.utils.path_resolver import PathResolver
+
+    if await _has_in_flight_task(ctx, "selected_regen"):
+        return None, None
 
     beats = await store.get_beats_as_dicts(episode)
     if not beats:
@@ -620,6 +686,62 @@ async def _dispatch_tts(
     return "audio_generation_indextts2", signature
 
 
+async def _in_flight_beat_numbers(ctx: Any, task_type: str) -> set[int]:
+    """Return beat numbers with a task of ``task_type`` still in flight.
+
+    「就绪」是看产物算的，而产物在任务跑完之前一直不存在——所以「首帧已就绪、还没
+    视频」的 beat 在它的视频任务正在生成时**依然算就绪**，会一直占着批次头部，让后
+    面真正新增的就绪 beat 永远排不进来。剔除在飞的 beat，批次头部才会向前走，
+    各阶段才能真正重叠。
+    """
+
+    from novelvideo.task_state import ACTIVE_PROJECT_TASK_STATUSES
+
+    def _collect() -> set[int]:
+        try:
+            tasks = get_task_manager().list_tasks_for_project(ctx)
+        except Exception:  # noqa: BLE001 - 查不到就别剔，宁可多派一次（幂等）
+            return set()
+        numbers: set[int] = set()
+        for task in tasks:
+            if str(getattr(task, "task_type", "") or "") != task_type:
+                continue
+            if str(getattr(task, "status", "") or "") not in ACTIVE_PROJECT_TASK_STATUSES:
+                continue
+            try:
+                number = int(getattr(task, "beat_num", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                numbers.add(number)
+        return numbers
+
+    return await asyncio.to_thread(_collect)
+
+
+async def _has_in_flight_task(ctx: Any, task_type: str) -> bool:
+    """该项目是否已有 ``task_type`` 的任务在飞（「同一阶段单飞」的闸门）。
+
+    查不到任务列表时不拦（宁可多派一次：同一条缺口/同一块按 scope 幂等，重复入队
+    不会重复生成），比起因为一次查询抖动把整条流水线停住更安全。
+    """
+
+    from novelvideo.task_state import ACTIVE_PROJECT_TASK_STATUSES
+
+    def _collect() -> bool:
+        try:
+            tasks = get_task_manager().list_tasks_for_project(ctx)
+        except Exception:  # noqa: BLE001
+            return False
+        return any(
+            str(getattr(task, "task_type", "") or "") == task_type
+            and str(getattr(task, "status", "") or "") in ACTIVE_PROJECT_TASK_STATUSES
+            for task in tasks
+        )
+
+    return await asyncio.to_thread(_collect)
+
+
 async def _dispatch_single_videos(
     ctx: Any,
     store: Any,
@@ -630,11 +752,12 @@ async def _dispatch_single_videos(
     """Enqueue the ready beats' videos in the same payload the REST route uses.
 
     "Ready" means the promoted first frame exists and the beat still has no
-    video; beats whose frame never materialised are left to the agent (it can
-    explain what is missing) instead of being dispatched into a guaranteed
-    failure. The chunk is capped at the runtime's own ``batch_size <= 9`` limit,
-    and the signature carries the chunk so the next call (after this chunk
-    completes) is recognised as progress rather than a retry.
+    video, **and no video task for it is already in flight** — otherwise the
+    beats being generated keep occupying the head of the list and newly finished
+    frames never get dispatched. The chunk is capped at the runtime's own
+    ``batch_size <= 9`` limit, and the signature carries the chunk so the next
+    call (after this chunk completes) is recognised as progress rather than a
+    retry.
     """
 
     from novelvideo.api.schemas import SingleVideoRequest
@@ -645,10 +768,12 @@ async def _dispatch_single_videos(
     if not beats:
         return None, None
     paths = PathResolver(str(project_dir), episode)
+    in_flight = await _in_flight_beat_numbers(ctx, "single_video")
     ready = sorted(
         beat_num
         for beat_num in (int(beat.get("beat_number") or 0) for beat in beats)
         if beat_num > 0
+        and beat_num not in in_flight
         and paths.first_frame_for_video(beat_num).exists()
         and not paths.video(beat_num).exists()
     )

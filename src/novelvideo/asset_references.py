@@ -38,6 +38,12 @@ ASSET_REFERENCES_ENV = "DRAMACLAW_AUTO_ASSET_REFERENCES"
 #: 一个场景需要的静态参考图，顺序即生成顺序（master 是其余两张的视觉锚）。
 SCENE_REFERENCE_KINDS: tuple[str, ...] = ("master", "reverse_master", "spatial_layout")
 
+#: 以 ``master`` 为视觉锚的场景参考图：master 不在时生成器直接报「请先生成
+#: master」，发出去只会白跑一趟再重来。
+_SCENE_MASTER_DEPENDENT_KINDS: frozenset[str] = frozenset(
+    {"reverse_master", "spatial_layout"}
+)
+
 _SCENE_KIND_LABELS = {
     "master": "正面",
     "reverse_master": "反面",
@@ -105,6 +111,32 @@ def scene_reference_gaps(project_dir: Path, scene_name: str) -> list[AssetRefere
         for kind in SCENE_REFERENCE_KINDS
         if not canonical[kind](project_dir, scene_name).exists()
     ]
+
+
+def scene_master_ready(project_dir: Path, scene_name: str) -> bool:
+    """场景正面主图是否已落盘（其余两张场景图与 360 全景的视觉锚）。"""
+
+    return canonical_scene_master_path(project_dir, scene_name).exists()
+
+
+def gap_dependency_ready(project_dir: Path, gap: AssetReferenceGap) -> bool:
+    """这条缺口的前置产物是否已就位；没就位就先别发，发了必然白跑。
+
+    ``master`` 是所有场景图的视觉锚，另外两类场景图（``reverse_master`` /
+    ``spatial_layout``）没有它就生成不了——生成器会直接报「请先生成 master」。
+    360 全景虽然名义上有 ``pano_from_text`` 兜底，但只有 ``pano_from_master``
+    才吃得到 master/reverse 的视觉锚与 overlap 分析，master 没落盘就派发等于把
+    片场环境换成一次文生想象，与场景正面图不一致。
+
+    所以同一个场景先只发 ``master``，等它落盘后的下一轮再发依赖它的那几张：跨场景
+    仍然整批并行，只是同一场景内不再把注定的失败和注定降级的全景发出去。
+    """
+
+    if gap.kind == "scene" and gap.detail in _SCENE_MASTER_DEPENDENT_KINDS:
+        return scene_master_ready(project_dir, gap.name)
+    if gap.kind == "pano":
+        return scene_master_ready(project_dir, gap.name)
+    return True
 
 
 def scene_pano_ready(project_dir: Path, scene_name: str) -> bool:

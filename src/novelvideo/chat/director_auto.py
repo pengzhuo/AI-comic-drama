@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from typing import Any, Iterable
 
 from novelvideo.chat import service as chat_service
 from novelvideo.chat.live_events import broadcast_project_chat_event
+from novelvideo.pipeline_timing import record_event
 from novelvideo.project_context import ProjectContext, resolve_project_context
 from novelvideo.shared.billing_errors import (
     BILLING_RULE_NOT_CONFIGURED_CODE,
@@ -73,6 +75,9 @@ AUTO_TASK_TYPES = frozenset({
 ACTIVE_STATUSES = frozenset({"submitting", "queued", "pending", "running"})
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 POLL_SECONDS = 1.5
+#: 重叠派发的节流：在已有任务在飞时，最多每这么久试一次「下一批就绪阶段」。
+#: 太密只是白白重算 pipeline status，太疏又会留下成片的空转窗口。
+OVERLAP_DISPATCH_SECONDS = 5.0
 INITIAL_GRACE_SECONDS = 5.0
 LEASE_SECONDS = 45.0
 HEARTBEAT_SECONDS = 10.0
@@ -1493,12 +1498,17 @@ class DirectorAutoCoordinator:
             return "缺少配音声线，且未选择声线策略（系统声线／自定义声线）"
         return None
 
-    async def _dispatch_stage(self, run: DirectorAutoRun) -> tuple[bool, str | None]:
+    async def _dispatch_stage(
+        self, run: DirectorAutoRun, *, overlapped: bool = False
+    ) -> tuple[bool, str | None]:
         """Deterministic fast path: enqueue the next stage directly.
 
         Returns ``(dispatched, signature)``. ``dispatched`` is False when the
         stage has no deterministic handler or was already attempted, so the
-        caller should fall back to the agent.
+        caller should fall back to the agent. ``overlapped`` marks dispatches
+        that went out while an earlier stage was still running (see
+        ``_dispatch_overlap``); the timing log uses it to show how much of the
+        pipeline actually overlapped.
         """
 
         from novelvideo.pipeline_auto import dispatch_next_stage
@@ -1517,7 +1527,50 @@ class DirectorAutoCoordinator:
             close = getattr(store, "close", None)
             if close:
                 await close()
+        if task_type is not None:
+            record_event(
+                run.context.output_dir,
+                "dispatch",
+                stage=task_type,
+                signature=signature,
+                overlapped=overlapped,
+            )
         return task_type is not None, signature
+
+    async def _dispatch_overlap(self, run: DirectorAutoRun) -> bool:
+        """在已有任务在飞时，把下一批已就绪的阶段也发出去（失败静默）。
+
+        与 ``_continue_owned`` 的唯一区别是**不回退到 agent**：重叠派发是纯提速
+        路径，任何异常或「暂无就绪产物」都只是「这次没重叠」，绝不能把 agent 拉进来
+        改写正常流程。
+        """
+
+        if not (run.is_project_scope and run.is_deterministic):
+            return False
+        try:
+            dispatched, signature = await self._dispatch_stage(run, overlapped=True)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "overlap dispatch skipped project=%s", run.project_id, exc_info=True
+            )
+            return False
+        if not dispatched:
+            return False
+        if signature and signature not in run.recovery_keys:
+            recorded = DirectorAutoRun(
+                **{
+                    **asdict(run),
+                    "updated_at": _utc_now(),
+                    "recovery_keys": tuple(
+                        sorted({*run.recovery_keys, signature})
+                    ),
+                }
+            )
+            try:
+                await self._update_owned(recorded)
+            except Exception:  # noqa: BLE001
+                logger.debug("overlap dispatch record failed", exc_info=True)
+        return True
 
     async def _continue_owned(self, run: DirectorAutoRun) -> bool:
         """Advance one step: deterministic dispatch when configured, else agent."""
@@ -1562,6 +1615,8 @@ class DirectorAutoCoordinator:
 
     async def _run(self, run_id: str, username: str, project_id: str) -> None:
         taskless_continuations = 0
+        last_overlap_at = 0.0
+        busy_since: float | None = None
         while not self._stopping:
             if not await self._owns_run(run_id):
                 return
@@ -1582,8 +1637,27 @@ class DirectorAutoCoordinator:
             active = [task for task in pending_new if task.status in ACTIVE_STATUSES]
             if active:
                 taskless_continuations = 0
+                now = time.monotonic()
+                if busy_since is None:
+                    busy_since = now
+                    record_event(run.context.output_dir, "busy_start")
+                # 有任务在飞不代表必须干等：确定性调度是「按产物就绪」派发的，所以
+                # 可以在旧任务跑完之前，把下一批已经就绪的活也发出去，让
+                # 草图→首帧→视频→合成在时间上重叠。这是整条链路最大的一块提速：
+                # 实测首帧阶段 49 次生成只花了 1.5h 计算，却铺了 10.2h 墙钟——绝大部分
+                # 时间都花在「等这一阶段彻底结束才开始下一阶段」。
+                if now - last_overlap_at >= OVERLAP_DISPATCH_SECONDS:
+                    last_overlap_at = now
+                    await self._dispatch_overlap(run)
                 await asyncio.sleep(POLL_SECONDS)
                 continue
+            if busy_since is not None:
+                record_event(
+                    run.context.output_dir,
+                    "busy_end",
+                    duration_seconds=round(time.monotonic() - busy_since, 1),
+                )
+                busy_since = None
 
             terminal = [
                 task

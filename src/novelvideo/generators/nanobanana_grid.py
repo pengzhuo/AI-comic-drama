@@ -309,7 +309,13 @@ def _newapi_request_id_from_headers(headers: Any) -> str:
     )
 
 
-NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS = 1800.0
+# Image generation needs far more headroom than a text call: the slower grids
+# (``LingShan-G2`` at 2K/4K) legitimately run for minutes. But 1800s was worse
+# than generous — the one-click pipeline only re-dispatches the stage *after* the
+# request settles, so a single hung call stalled the whole stage for half an hour
+# for no gain (observed p90 ≈ 215s, max ≈ 646s across a full episode). 900s is
+# still ~4x the observed p90 while capping the stall at 15 minutes.
+NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS = 900.0
 
 # A transient gateway blip (upstream 5xx, rate limiting, a connection that never
 # went out) used to fail the whole beat — and, in the one-click pipeline, pause
@@ -7978,6 +7984,24 @@ def _generation_beat_number(beat: dict, fallback_index: int) -> int:
     return fallback_index + 1
 
 
+#: 单张图各自往返上游,并发只受它约束;``1x1`` 首帧模式下 9 张图串行渲染 = 9 个完整
+#: 往返的墙钟。默认 3 是在「把网络等待叠起来」和「不给网关制造突发」之间取的折中,
+#: 可用环境变量调(reserve 的 default lane 仍按任务数限额,这里只收敛任务内部的调用)。
+REGEN_CONCURRENCY_ENV = "NANOBANANA_REGEN_CONCURRENCY"
+DEFAULT_REGEN_CONCURRENCY = 3
+
+
+def _regen_concurrency(job_count: int) -> int:
+    """本次再生成允许同时在飞的图片请求数（1 表示退回串行）。"""
+
+    raw = str(os.environ.get(REGEN_CONCURRENCY_ENV, "") or "").strip()
+    try:
+        limit = int(raw) if raw else DEFAULT_REGEN_CONCURRENCY
+    except ValueError:
+        limit = DEFAULT_REGEN_CONCURRENCY
+    return max(1, min(limit, max(int(job_count), 1)))
+
+
 async def regenerate_selected_beats(
     selected_beats: List[dict],
     mode_key: str,
@@ -8004,6 +8028,9 @@ async def regenerate_selected_beats(
 
     从 REGEN_MODE_CONFIGS[mode_key] 读取 rows, cols, aspect_ratio, image_size，
     使用 perfect_grid_split 分割后逐 grid 调用 generate_grid。
+
+    各 grid 之间无依赖，因此并发发出（见 ``_regen_concurrency``，串行模式下退回原
+    来的逐个 await）。返回值仍按 grid 顺序排列，与串行时一致。
 
     Args:
         selected_beats: 选中的 beat 数据列表
@@ -8133,10 +8160,31 @@ async def regenerate_selected_beats(
         return grid_idx, result
 
     indexed_results: list[tuple[int, GridGenerationResult]] = []
-    for completed, job in enumerate(jobs, start=1):
-        indexed_results.append(await generate_job(job))
-        if progress_callback:
-            progress_callback(completed, len(jobs))
+    limit = _regen_concurrency(len(jobs))
+    if limit <= 1:
+        for completed, job in enumerate(jobs, start=1):
+            indexed_results.append(await generate_job(job))
+            if progress_callback:
+                progress_callback(completed, len(jobs))
+    else:
+        # 逐张串行渲染时,每张都是一次独立的网关往返,前一张不回来下一张就不发,
+        # 于是「1x1」模式的 9 张首帧被排成 9 个完整往返;墙钟全花在等网络上。
+        # 这些 job 彼此无依赖(各自建生成器、各写各的输出路径),可以并发,只要给
+        # 网关留出上限。顺序由下面的 sort(grid_idx) 还原,产物与串行时完全一致。
+        semaphore = asyncio.Semaphore(limit)
+        completed_count = 0
+
+        async def run_job(job: tuple):
+            nonlocal completed_count
+            async with semaphore:
+                item = await generate_job(job)
+            indexed_results.append(item)
+            completed_count += 1
+            if progress_callback:
+                progress_callback(completed_count, len(jobs))
+            return item
+
+        await asyncio.gather(*(run_job(job) for job in jobs))
 
     indexed_results.sort(key=lambda item: item[0])
     results = [result for _grid_idx, result in indexed_results]

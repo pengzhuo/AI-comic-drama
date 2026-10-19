@@ -206,6 +206,33 @@ async def test_dispatch_seedance2_prompt_is_complete_when_all_beats_have_one(
     assert calls == []
 
 
+@pytest.mark.asyncio
+async def test_dispatch_seedance2_prompt_fills_a_batch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """提示词只吃各自 beat 的数据，一条一轮会把 39 条排成 39 个前后相接的往返。"""
+
+    patch_status(monkeypatch, "seedance2_prompt", episode=1)
+    calls = capture_enqueue(monkeypatch)
+    beats = [{"beat_number": number, "seedance2_config_json": ""} for number in range(1, 8)]
+
+    class Store:
+        async def get_beats_as_dicts(self, _episode: int):
+            return beats
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=Store(), episode=1
+    )
+
+    batch = pipeline_auto.AUTO_SEEDANCE2_PROMPT_BATCH
+    assert batch > 1
+    assert task_type == "seedance2_prompt"
+    # 返回第一条（与单发的语义一致：签名仍然指向「最前面的未完成 beat」）。
+    assert signature == "dispatch:seedance2_prompt:1:1"
+    assert [call["beat_num"] for call in calls] == list(range(1, batch + 1))
+    assert all(call["task_type"] == "seedance2_prompt" for call in calls)
+
+
 def _write_video_inputs(tmp_path: Path, beat_numbers: tuple[int, ...]) -> None:
     frames = tmp_path / "frames" / "ep001"
     frames.mkdir(parents=True, exist_ok=True)
@@ -279,6 +306,46 @@ async def test_dispatch_single_videos_caps_the_chunk_at_the_runtime_limit(
     assert task_type == "single_video"
     assert signature == "dispatch:single_video:1:1-9"
     assert [call["beat_num"] for call in calls] == list(range(1, 10))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_single_videos_skips_beats_already_generating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """在飞的 beat 依然「没有视频」，必须靠任务状态把它从就绪集合里剔掉。
+
+    「就绪」是看产物算的，而产物在任务跑完之前一直不存在：正在生成的 beat 会一直
+    占着批次头部，让后面新就绪的首帧永远排不进来，各阶段也就没法重叠。
+    """
+
+    patch_status(monkeypatch, "single_video", episode=1)
+    calls = _capture_single_video_enqueues(monkeypatch)
+    _write_video_inputs(tmp_path, (1, 2, 3, 4))
+    monkeypatch.setattr(
+        pipeline_auto,
+        "get_task_manager",
+        lambda: SimpleNamespace(
+            list_tasks_for_project=lambda _ctx: [
+                SimpleNamespace(task_type="single_video", status="running", beat_num=1),
+                SimpleNamespace(task_type="single_video", status="queued", beat_num=2),
+                # 已结束的任务不算在飞：beat 3 会被重新派发。
+                SimpleNamespace(task_type="single_video", status="completed", beat_num=3),
+                # 其它任务类型不算。
+                SimpleNamespace(task_type="selected_regen", status="running", beat_num=4),
+            ]
+        ),
+    )
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2, 3, 4)),
+        episode=1,
+    )
+
+    assert task_type == "single_video"
+    assert [call["beat_num"] for call in calls] == [3, 4]
+    assert signature == "dispatch:single_video:1:3-4"
 
 
 @pytest.mark.asyncio
@@ -520,7 +587,7 @@ async def test_dispatch_first_frames_uses_the_sketch_aspect_for_the_mode(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_first_frames_caps_the_chunk_below_the_runtime_limit(
+async def test_dispatch_first_frames_chunk_matches_the_runtime_limit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     patch_status(monkeypatch, "selected_regen", episode=1)
@@ -535,10 +602,13 @@ async def test_dispatch_first_frames_caps_the_chunk_below_the_runtime_limit(
         episode=1,
     )
 
-    assert pipeline_auto.AUTO_FIRST_FRAME_CHUNK < pipeline_auto.MAX_SINGLE_VIDEO_BATCH
+    # 首帧现在是「一轮发满 9 张」而不是 3 张：首帧彼此独立，且这一阶段最长的一集
+    # 也就 40 个 beat，小批次会让 40 张图排成 13 轮。9 正好是运行时自己的上限。
+    assert pipeline_auto.AUTO_FIRST_FRAME_CHUNK == pipeline_auto.MAX_SINGLE_VIDEO_BATCH
+    chunk = list(range(1, pipeline_auto.AUTO_FIRST_FRAME_CHUNK + 1))
     assert task_type == "selected_regen"
-    assert signature == "dispatch:selected_regen:1:1-3"
-    assert calls[0]["beat_indices"] == list(range(1, 4))
+    assert signature == f"dispatch:selected_regen:1:{chunk[0]}-{chunk[-1]}"
+    assert calls[0]["beat_indices"] == chunk
 
 
 @pytest.mark.asyncio
@@ -560,6 +630,64 @@ async def test_dispatch_first_frames_does_not_repeat_a_chunk(
     assert task_type is None
     assert signature == "dispatch:selected_regen:1:1-2"
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_waits_for_the_in_flight_chunk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """首帧一律单飞：就绪窗口会随帧落盘右移，重叠派发必然重复渲染同一批 beat。
+
+    这里把「上一块还在跑」摆出来（同一个 beat 集也可以不在窗口里），断言这一轮
+    一个任务都不发；块内的并发由 ``NANOBANANA_REGEN_CONCURRENCY`` 负责。
+    """
+
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    _write_sketches(tmp_path, (1, 2, 3))
+
+    monkeypatch.setattr(
+        pipeline_auto,
+        "get_task_manager",
+        lambda: SimpleNamespace(
+            list_tasks_for_project=lambda _ctx: [
+                SimpleNamespace(task_type="selected_regen", status="running", beat_num=None),
+            ]
+        ),
+    )
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2, 3)),
+        episode=1,
+    )
+
+    assert task_type is None
+    assert signature is None
+    assert calls == []
+
+    # 上一块结束后（已终态）立刻按最新就绪集合继续派发。
+    monkeypatch.setattr(
+        pipeline_auto,
+        "get_task_manager",
+        lambda: SimpleNamespace(
+            list_tasks_for_project=lambda _ctx: [
+                SimpleNamespace(task_type="selected_regen", status="completed", beat_num=None),
+            ]
+        ),
+    )
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2, 3)),
+        episode=1,
+    )
+
+    assert task_type == "selected_regen"
+    assert signature == "dispatch:selected_regen:1:1-3"
+    assert calls[0]["beat_indices"] == [1, 2, 3]
 
 
 @pytest.mark.asyncio

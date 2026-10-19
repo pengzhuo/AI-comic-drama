@@ -186,7 +186,9 @@ def test_newapi_sketch_config_defaults_to_dc_image2_low_quality(monkeypatch):
 
     assert image_bytes == b"sketch"
     assert error == ""
-    assert posted["timeout"] == nanobanana_grid.NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS == 1800.0
+    # 1800s 比「慷慨」更糟：一次挂住的请求会把整个阶段卡满半小时，而实测单次
+    # p90 只有约 215s、最长 646s。900s 仍是 p90 的 4 倍，同时把卡顿上限压到 15 分钟。
+    assert posted["timeout"] == nanobanana_grid.NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS == 900.0
     assert posted["json"]["model"] == "LingShan-G2"
     assert posted["json"]["quality"] == "low"
     assert (posted["json"]["width"], posted["json"]["height"]) == (688, 1024)

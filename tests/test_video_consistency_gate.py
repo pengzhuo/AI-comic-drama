@@ -234,12 +234,23 @@ async def test_runner_gate_reruns_with_reinforced_prompt(monkeypatch, tmp_path):
     runners = pytest.importorskip("novelvideo.task_backend.runners.video")
 
     class FakeVerdict:
-        def __init__(self, passed, reasons=()):
+        def __init__(self, passed, reasons=(), *, rerun=True):
             self.passed = passed
             self.reasons = list(reasons)
+            # 「有问题」与「值得再花一轮生成」是两件事：景别/构图类偏差只标记
+            # 人工复核，不该重跑。
+            self.should_rerun = (not passed) and rerun
+            self.rerun_reasons = list(reasons) if self.should_rerun else []
+            self.marked_reasons = [] if self.should_rerun else list(reasons)
 
         def as_dict(self):
-            return {"passed": self.passed, "reasons": self.reasons}
+            return {
+                "passed": self.passed,
+                "reasons": self.reasons,
+                "should_rerun": self.should_rerun,
+                "rerun_reasons": self.rerun_reasons,
+                "marked_reasons": self.marked_reasons,
+            }
 
         def reinforce_prompt(self, prompt):
             return f"{prompt}|强化"
@@ -294,6 +305,97 @@ async def test_runner_gate_reruns_with_reinforced_prompt(monkeypatch, tmp_path):
     assert report["enabled"] is True
     assert [item["passed"] for item in report["attempts"]] == [False, True]
     assert any("重跑" in message for message in logs)
+
+
+async def test_runner_gate_marks_framing_only_problems_without_regenerating(
+    monkeypatch, tmp_path
+):
+    """景别类偏差只标记人工复核，不重跑。
+
+    这是原先最大的重跑来源：26/39 个 beat 被标记，其中 19 个只是景别被重构，画面
+    本身（身份、服装、道具、声音）并没有坏，却每次都要再花一整轮生成。
+    """
+
+    runners = pytest.importorskip("novelvideo.task_backend.runners.video")
+
+    class FakeVerdict:
+        def __init__(self, passed, reasons=(), *, rerun=True):
+            self.passed = passed
+            self.reasons = list(reasons)
+            self.should_rerun = (not passed) and rerun
+            self.rerun_reasons = list(reasons) if self.should_rerun else []
+            self.marked_reasons = [] if self.should_rerun else list(reasons)
+
+        def as_dict(self):
+            return {
+                "passed": self.passed,
+                "reasons": self.reasons,
+                "should_rerun": self.should_rerun,
+                "rerun_reasons": self.rerun_reasons,
+                "marked_reasons": self.marked_reasons,
+            }
+
+        def reinforce_prompt(self, prompt):
+            return f"{prompt}|强化"
+
+    class FakeGate:
+        def __init__(self):
+            self.checked: list[int] = []
+
+        async def check(self, **kwargs):
+            self.checked.append(len(self.checked) + 1)
+            return FakeVerdict(
+                False,
+                ["景别与首帧不一致（被重构为更近的镜头或裁掉了画面内容）"],
+                rerun=False,
+            )
+
+    class FakeResult:
+        class _Status:
+            value = "done"
+
+        status = _Status()
+        error = None
+
+    class FakeGen:
+        def __init__(self):
+            self.prompts: list[str] = []
+
+        async def generate(self, **kwargs):
+            self.prompts.append(kwargs["prompt"])
+            return FakeResult()
+
+    gate = FakeGate()
+    monkeypatch.setattr(
+        "novelvideo.verification.video_consistency_gate.VideoConsistencyGate",
+        lambda: gate,
+    )
+
+    gen = FakeGen()
+    logs: list[str] = []
+    result, report = await runners._apply_video_consistency_gate(
+        video_gen=gen,
+        generate_kwargs={"prompt": "原始提示词", "duration": 5},
+        result=FakeResult(),
+        frame_path=tmp_path / "frame.png",
+        video_path=tmp_path / "clip.mp4",
+        beat={"audio_type": "none"},
+        output_dir=str(tmp_path),
+        payload_config=None,
+        on_log=logs.append,
+    )
+
+    # 只生成一次；景别偏差进人工复核清单，但不换提示词重跑。
+    assert len(gate.checked) == 1
+    # 没有重跑，所以不会再向生成器发第二次请求。
+    assert gen.prompts == []
+    assert report["generations"] == 1
+    assert report["needs_human_review"] is True
+    assert report["rerun_reasons"] == []
+    assert report["marked_reasons"] == [
+        "景别与首帧不一致（被重构为更近的镜头或裁掉了画面内容）"
+    ]
+    assert any("不重跑" in message for message in logs)
 
 
 async def test_runner_gate_skips_when_disabled(monkeypatch, tmp_path):
