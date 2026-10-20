@@ -12,6 +12,7 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import replace
@@ -2350,6 +2351,57 @@ async def _chat_heartbeat(
             return
 
 
+def _chat_disconnect_grace_seconds() -> float:
+    """How long a dropped chat socket may keep a running turn alive.
+
+    ``0`` (the default) means a dropped socket never tears the turn down: the
+    agent keeps working, the reply is persisted, and the client picks it up from
+    the transcript when it reconnects. Canvas turns routinely outlive one mobile
+    socket — closing the assistant sheet remounts the panel and replaces the
+    socket — and killing the runtime there throws minutes of work away and
+    reports the empty-reply placeholder instead of the real answer. A positive
+    value restores the teardown, after giving the same scope that many seconds to
+    come back on a new socket. Deliberate stops keep going through
+    ``POST /chat/cancel``.
+    """
+    raw = str(
+        os.environ.get("DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS") or ""
+    ).strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "invalid DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS=%r; treating as 0",
+            raw,
+        )
+        return 0.0
+
+
+async def _wait_for_scope_reconnect(
+    *,
+    username: str,
+    scope: ChatScope | None,
+    timeout: float,
+) -> bool:
+    if scope is None or timeout <= 0:
+        return False
+    from novelvideo.chat.live_events import scope_has_live_websocket
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            if await scope_has_live_websocket(username=username, scope=scope):
+                return True
+        except Exception:
+            return False
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.5)
+
+
 async def _interrupt_agent_on_disconnect(
     disconnected: asyncio.Event,
     *,
@@ -2358,8 +2410,31 @@ async def _interrupt_agent_on_disconnect(
     project: str,
     agent_profile: str,
     runtime_ids: dict[str, str | None],
+    scope: ChatScope | None = None,
 ) -> None:
     await disconnected.wait()
+    grace_seconds = _chat_disconnect_grace_seconds()
+    if grace_seconds > 0:
+        if await _wait_for_scope_reconnect(
+            username=username, scope=scope, timeout=grace_seconds
+        ):
+            logger.info(
+                "chat socket reconnected inside the disconnect grace; keeping the "
+                "running turn user=%s backend=%s",
+                username,
+                runtime_backend,
+            )
+            return
+    elif scope is not None:
+        logger.info(
+            "chat socket dropped during a running turn; keeping it alive "
+            "(set DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS>0 to restore teardown) "
+            "user=%s backend=%s scope=%s",
+            username,
+            runtime_backend,
+            scope.to_dict(),
+        )
+        return
     # A socket can disappear while the runtime is still starting. Give the
     # matching turn a short window to publish its IDs, but never fall back to
     # a username-wide shutdown.
@@ -3447,6 +3522,7 @@ async def _stream_project_turn(
             project=project,
             agent_profile=agent_profile,
             runtime_ids=runtime_ids,
+            scope=scope,
         )
     )
     bridge_result_receive_task = asyncio.create_task(
@@ -3808,6 +3884,7 @@ async def _stream_home_turn_codex(
             project="",
             agent_profile="main",
             runtime_ids=runtime_ids,
+            scope=scope,
         )
     )
     done_sent = False
@@ -4107,6 +4184,7 @@ async def _stream_home_turn(
             project="",
             agent_profile="main",
             runtime_ids=runtime_ids,
+            scope=scope,
         )
     )
     done_sent = False

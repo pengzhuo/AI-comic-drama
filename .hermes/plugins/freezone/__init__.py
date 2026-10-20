@@ -69,6 +69,43 @@ _REPO_SRC = Path(__file__).resolve().parents[3] / "src"
 if _REPO_SRC.exists() and str(_REPO_SRC) not in sys.path:
     sys.path.insert(0, str(_REPO_SRC))
 
+
+def _append_app_environment_site_packages() -> None:
+    """把 DramaClaw 的 uv 运行环境 site-packages 追加到 sys.path。
+
+    Hermes worker 跑在镜像的系统解释器上（HERMES_CLI_PATH -> /usr/local/bin/hermes
+    -> /usr/local/bin/python），而 novelvideo 的第三方依赖只装在 uv 管理的项目环境
+    里（UV_PROJECT_ENVIRONMENT，默认 /app/.venv）。``_REPO_SRC`` 让 novelvideo 源码
+    可导入，但它依赖的发行版（jsonschema / ulid / portalocker / referencing /
+    rpds / mcp ...）只存在于 app 环境。
+
+    必须用 append 而不是 insert：解释器自带的包继续优先，只有系统里确实缺的发行版
+    才从 app 环境解析，保证 Hermes 自身环境不受影响。
+    """
+    roots: list[Path] = []
+    configured = (os.environ.get("UV_PROJECT_ENVIRONMENT") or "").strip()
+    if configured:
+        roots.append(Path(configured))
+    roots.append(Path("/app/.venv"))
+    for root in roots:
+        lib = root / "lib"
+        if not lib.is_dir():
+            continue
+        for version_dir in sorted(lib.glob("python3.*")):
+            site_packages = version_dir / "site-packages"
+            if not site_packages.is_dir():
+                continue
+            target = str(site_packages)
+            if target not in sys.path:
+                sys.path.append(target)
+            return
+
+
+try:
+    _append_app_environment_site_packages()
+except Exception:  # noqa: BLE001 - 环境兜底失败不能拖垮插件加载
+    pass
+
 _WORKFLOW_GRAPH_IMPORT_ERROR: Exception | None = None
 try:
     from novelvideo.freezone.agent_workflows.graph import build_workflow_graph_commands

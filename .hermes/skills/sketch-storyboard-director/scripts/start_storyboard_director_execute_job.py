@@ -12,6 +12,13 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+try:  # 系统解释器下把 app 环境的第三方依赖兜进来，见 novelvideo/runtime_env.py
+    from novelvideo.runtime_env import ensure_app_environment_site_packages
+
+    ensure_app_environment_site_packages()
+except Exception:  # noqa: BLE001 - 兜底失败不能拖垮脚本
+    pass
+
 from novelvideo.task_jobs import start_sketch_edit_execute_job  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sketch-correction-worker" / "scripts"))

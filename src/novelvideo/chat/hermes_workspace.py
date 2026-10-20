@@ -1083,7 +1083,11 @@ def _ensure_freezone_config_policy(config_yaml: Path) -> None:
     agent = config.get("agent")
     if not isinstance(agent, dict):
         agent = {}
-    agent["max_turns"] = _configured_max_turns("HERMES_FREEZONE_MAX_TURNS", 12)
+    # A canvas workflow turn legitimately needs well over a dozen tool-calling
+    # iterations (skill plan, capabilities, tool discovery, admission, draft
+    # preparation, preflight recovery, canvas commands). At 12 the agent could
+    # finish all the work and still be cut off with an empty reply.
+    agent["max_turns"] = _configured_max_turns("HERMES_FREEZONE_MAX_TURNS", 24)
     # 捏画 worker 是画布 agent,不是 coding agent:关掉 Hermes 的 coding 姿态,
     # 否则每个 system prompt 多 ~3.9k 字符,且教模型用 registry 已禁用的
     # read_file/patch/terminal 等工具。

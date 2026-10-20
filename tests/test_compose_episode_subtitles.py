@@ -149,11 +149,11 @@ def test_compose_episode_burns_spoken_lines_at_movie_size(tmp_path, monkeypatch)
     assert captured["srt"] == (
         "1\n"
         "00:00:00,000 --> 00:00:01,000\n"
-        "今天是我的生日……他们连一句生日快乐都不肯说。\n"
+        r"{\an2}今天是我的生日……他们连一句生日快乐都不肯说。" "\n"
         "\n"
         "2\n"
         "00:00:01,000 --> 00:00:02,000\n"
-        "我已经这么努力了，为什么还是没人愿意留下？\n"
+        r"{\an2}我已经这么努力了，为什么还是没人愿意留下？" "\n"
     )
     assert "（神色坚定" not in captured["srt"]
     assert "许知意（os）" not in captured["srt"]
@@ -161,3 +161,36 @@ def test_compose_episode_burns_spoken_lines_at_movie_size(tmp_path, monkeypatch)
 
     assert "FontSize=11" in captured["filter"]
     assert "MarginV=24" in captured["filter"]
+
+
+def test_burned_subtitle_style_centers_every_line():
+    from novelvideo.task_backend.runners import video
+
+    style = video._subtitle_force_style(None)
+
+    # Alignment=2 = 整块底部居中，libass 对折行后的每一行也各自居中。
+    assert "Alignment=2" in style
+    # 多行自动折行时左右留白必须相等，否则行看着像偏了一边。
+    margins = dict(re.findall(r"(Margin[LRV])=(\d+)", style))
+    assert margins["MarginL"] == margins["MarginR"]
+    assert margins["MarginV"] == "24"
+
+
+def test_burned_subtitle_cues_carry_the_per_line_center_tag(monkeypatch):
+    from novelvideo.task_backend.runners import video
+
+    monkeypatch.setattr(video, "_ffprobe_duration", lambda _path: 2.5)
+
+    srt = video._build_srt_from_clips(
+        [("我不走。\n那就别回来。", "a.mp4"), ("", "b.mp4")]
+    )
+
+    assert srt == (
+        "1\n"
+        "00:00:00,000 --> 00:00:02,500\n"
+        r"{\an2}我不走。" "\n"
+        "那就别回来。" "\n"
+    )
+    # 只有真的出字幕的 cue 才带标签，静音 beat 不占位。
+    assert srt.count(video.SUBTITLE_ALIGNMENT_TAG) == 1
+

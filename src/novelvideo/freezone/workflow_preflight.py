@@ -1,6 +1,7 @@
 """Shared deterministic runtime checks; transports supply authenticated live catalogs."""
 
 from copy import deepcopy
+import logging
 from typing import Any
 import math
 
@@ -9,6 +10,8 @@ from novelvideo.freezone.clarifications import (
     video_model_constraint_adjustment_clarification,
 )
 from novelvideo.freezone.video_node import FREEZONE_DEFAULT_VIDEO_BACKEND
+
+logger = logging.getLogger(__name__)
 
 _RECOMMENDED_GENERATION_MODEL_VALUES = {
     "auto",
@@ -67,6 +70,56 @@ def _catalog_entry_identifiers(entry: dict[str, Any]) -> set[str]:
     }
 
 
+def _bare_model_name(model: str) -> str:
+    """``newapi_seedance-2.0-fast`` -> ``seedance-2.0-fast``.
+
+    The product defaults keep the gateway prefix the catalog used when they were
+    written, while a scoped catalog may publish the same model under its bare id
+    (and vice versa: the entry carries the bare id and the alias carries the
+    prefixed form). A recommended model must resolve through either spelling, or
+    every symbolic default fails on an instance whose catalog dropped one of
+    them.
+    """
+    value = str(model or "").strip()
+    prefix = "newapi_"
+    if value.casefold().startswith(prefix):
+        return value[len(prefix) :]
+    return value
+
+
+_CATALOG_CAPABILITY_KEYS = (
+    "ratioOptions",
+    "resolutionOptions",
+    "qualityOptions",
+    "minDuration",
+    "maxDuration",
+    "supportsGenerateAudio",
+    "supportedModes",
+)
+
+
+def _catalog_model_summaries(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Selectable models with the capabilities a reselection needs.
+
+    Blockers that mean "pick a different model" must carry this list, otherwise
+    the agent has to re-explore the catalog (or guess) before it can retry.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    for entry in catalog:
+        model_id = str(
+            entry.get("id") or entry.get("apiModel") or entry.get("api_model") or ""
+        ).strip()
+        if model_id and model_id not in by_id:
+            by_id[model_id] = entry
+    return [
+        {
+            "id": model_id,
+            **{key: entry[key] for key in _CATALOG_CAPABILITY_KEYS if key in entry},
+        }
+        for model_id, entry in by_id.items()
+    ]
+
+
 def _catalog_entry_for_model(
     catalog: list[dict[str, Any]], requested: str
 ) -> dict[str, Any] | None:
@@ -123,12 +176,25 @@ def resolve_generation_recommendations(
         entry = _catalog_entry_for_model(
             catalog, _RECOMMENDED_MODEL_ALIASES[kind] if symbolic else requested
         )
+        if entry is None and symbolic:
+            bare = _bare_model_name(_RECOMMENDED_MODEL_ALIASES[kind])
+            if bare and bare.casefold() != _RECOMMENDED_MODEL_ALIASES[kind].casefold():
+                entry = _catalog_entry_for_model(catalog, bare)
         if entry is None:
             if symbolic or symbolic_fields:
+                logger.info(
+                    "recommended generation model is not visible: kind=%s requested=%r "
+                    "catalog=%d",
+                    kind,
+                    requested or "<symbolic>",
+                    len(catalog),
+                )
                 blockers.append({
                     "path": f"runtime.models.{node.get('id') or kind}.model",
                     "code": "recommended_model_unavailable",
                     "message": "The selected model is unavailable for recommended parameters",
+                    "recovery": "choose_catalog_model",
+                    "available_models": _catalog_model_summaries(catalog),
                 })
             continue
         model_id = str(entry.get("id") or "").strip()
@@ -137,6 +203,8 @@ def resolve_generation_recommendations(
                 "path": f"runtime.models.{node.get('id') or kind}.model",
                 "code": "recommended_model_unavailable",
                 "message": "The recommended catalog entry has no model id",
+                "recovery": "choose_catalog_model",
+                "available_models": _catalog_model_summaries(catalog),
             })
             continue
         option_fields = {
@@ -964,17 +1032,9 @@ def evaluate_workflow_preflight(
                 if isinstance(raw_models, list)
                 else []
             )
-            # Primary ids for the available_models listing only; a node may name
-            # the same entry by any legal identifier (id, apiModel, alias...).
-            catalog_by_id = {
-                str(
-                    item.get("id") or item.get("apiModel") or item.get("api_model") or ""
-                ).strip(): item
-                for item in catalog
-                if str(
-                    item.get("id") or item.get("apiModel") or item.get("api_model") or ""
-                ).strip()
-            }
+            # A node may name an entry by any legal identifier (id, apiModel, a
+            # catalog alias...), so match through all of them before calling a
+            # requested model missing.
             missing = sorted(
                 model
                 for model in requested
@@ -999,25 +1059,7 @@ def evaluate_workflow_preflight(
                         if model.casefold() in _RECOMMENDED_GENERATION_MODEL_VALUES
                         else "model_unavailable"
                     ),
-                    "available_models": [
-                        {
-                            "id": model_id,
-                            **{
-                                key: entry[key]
-                                for key in (
-                                    "ratioOptions",
-                                    "resolutionOptions",
-                                    "qualityOptions",
-                                    "minDuration",
-                                    "maxDuration",
-                                    "supportsGenerateAudio",
-                                    "supportedModes",
-                                )
-                                if key in entry
-                            },
-                        }
-                        for model_id, entry in catalog_by_id.items()
-                    ],
+                    "available_models": _catalog_model_summaries(catalog),
                 }
                 for model in missing
             )

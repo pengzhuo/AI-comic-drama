@@ -4105,6 +4105,140 @@ async def test_disconnect_closes_only_matching_hermes_thread(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_disconnect_keeps_the_running_turn_when_a_scope_is_known(monkeypatch):
+    """一个掉线的 socket 不等于一个被放弃的回合。
+
+    移动端关掉捏导抽屉会重挂面板（连带换掉 socket），旧代码在这里把
+    hermes 子进程杀掉，整轮工作丢失，用户只看到「没有收到有效回复」。
+    """
+    disconnected = asyncio.Event()
+    disconnected.set()
+    calls = []
+
+    async def interrupt(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True
+
+    class FakePool:
+        async def close_user_thread(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("a dropped socket must not close the worker")
+
+    from novelvideo.chat import hermes_pool
+
+    monkeypatch.delenv("DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS", raising=False)
+    monkeypatch.setattr(chat_service, "interrupt_chat_turn", interrupt)
+    monkeypatch.setattr(hermes_pool, "pool", FakePool())
+
+    await chat_routes._interrupt_agent_on_disconnect(
+        disconnected,
+        runtime_backend="hermes",
+        username="alice",
+        project="project-a",
+        agent_profile="freezone:main",
+        runtime_ids={"thread_id": "session-a", "turn_id": "turn-a"},
+        scope=ChatScope(kind="project", id="project-a", surface="freezone"),
+    )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_disconnect_grace_waits_for_the_scope_to_come_back(monkeypatch):
+    from novelvideo.chat import live_events
+
+    disconnected = asyncio.Event()
+    disconnected.set()
+    scope = ChatScope(kind="project", id="project-a", surface="freezone")
+    seen = []
+
+    async def has_live_socket(*, username, scope):
+        seen.append((username, scope.id, scope.surface))
+        return True
+
+    async def interrupt(*args, **kwargs):
+        raise AssertionError("a reconnected scope must not be interrupted")
+
+    monkeypatch.setenv("DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS", "30")
+    monkeypatch.setattr(live_events, "scope_has_live_websocket", has_live_socket)
+    monkeypatch.setattr(chat_service, "interrupt_chat_turn", interrupt)
+
+    await chat_routes._interrupt_agent_on_disconnect(
+        disconnected,
+        runtime_backend="codex",
+        username="alice",
+        project="project-a",
+        agent_profile="freezone:main",
+        runtime_ids={"thread_id": "thread-a", "turn_id": "turn-a"},
+        scope=scope,
+    )
+
+    assert seen == [("alice", "project-a", "freezone")]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_grace_still_interrupts_a_scope_that_stays_away(monkeypatch):
+    from novelvideo.chat import live_events
+
+    disconnected = asyncio.Event()
+    disconnected.set()
+    calls = []
+
+    async def has_live_socket(*, username, scope):
+        return False
+
+    async def interrupt(username, project, thread_id, turn_id, *, backend=None):
+        calls.append((username, project, thread_id, turn_id, backend))
+        return True
+
+    monkeypatch.setenv("DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS", "0.01")
+    monkeypatch.setattr(live_events, "scope_has_live_websocket", has_live_socket)
+    monkeypatch.setattr(chat_service, "interrupt_chat_turn", interrupt)
+
+    await chat_routes._interrupt_agent_on_disconnect(
+        disconnected,
+        runtime_backend="codex",
+        username="alice",
+        project="project-a",
+        agent_profile="freezone:main",
+        runtime_ids={"thread_id": "thread-a", "turn_id": "turn-a"},
+        scope=ChatScope(kind="project", id="project-a", surface="freezone"),
+    )
+
+    assert calls == [("alice", "project-a", "thread-a", "turn-a", "codex")]
+
+
+@pytest.mark.asyncio
+async def test_chat_disconnect_grace_seconds_reads_the_environment(monkeypatch):
+    monkeypatch.delenv("DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS", raising=False)
+    assert chat_routes._chat_disconnect_grace_seconds() == 0.0
+    monkeypatch.setenv("DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS", "45")
+    assert chat_routes._chat_disconnect_grace_seconds() == 45.0
+    monkeypatch.setenv("DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS", "not-a-number")
+    assert chat_routes._chat_disconnect_grace_seconds() == 0.0
+    monkeypatch.setenv("DRAMACLAW_CHAT_DISCONNECT_GRACE_SECONDS", "-5")
+    assert chat_routes._chat_disconnect_grace_seconds() == 0.0
+
+
+def test_interrupted_turn_reports_an_interruption_not_a_generic_retry():
+    """没有终态事件/超时/取消的回合要落可诊断文案，而不是「稍后重试」。
+
+    「稍后重试」把一次中断说成模型的空回复，用户会重复提交同一件事，而
+    服务端其实已经把这一轮的工作做了一半。
+    """
+    interrupted = chat_service._turn_was_interrupted
+    assert interrupted(stream_completed=True, disposition="completed") is False
+    assert interrupted(stream_completed=False, disposition="failed") is True
+    assert interrupted(stream_completed=True, disposition="timeout") is True
+    assert interrupted(stream_completed=True, disposition="cancelled") is True
+    assert (
+        chat_service._INTERRUPTED_AGENT_REPLY_MESSAGE
+        != chat_service._EMPTY_AGENT_REPLY_MESSAGE
+    )
+    assert "继续" in chat_service._INTERRUPTED_AGENT_REPLY_MESSAGE
+
+
+@pytest.mark.asyncio
 async def test_interrupt_chat_turn_uses_captured_backend(monkeypatch):
     monkeypatch.setattr(
         chat_service,

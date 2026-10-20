@@ -902,12 +902,23 @@ def _srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
+#: libass 覆盖标签：``\an2`` 即"整块底部居中"，折成多行时每一行都由 libass
+#: 各自居中摆放（与 ``force_style`` 的 ``Alignment=2`` 同一语义）。每条 cue 都
+#: 自带这个标签，这样就算 ``force_style`` 将来被丢掉或被改坏（例如字体族名里
+#: 意外带上逗号导致样式串解析失败），字幕也不会退化成左对齐。
+SUBTITLE_ALIGNMENT_TAG = r"{\an2}"
+
+
 def _build_srt_from_clips(entries: list[tuple[str, str]]) -> str:
     """Build an SRT aligned to the composed clip timeline.
 
     ``entries`` is an ordered list of ``(narration_text, clip_path)``. Every
     clip advances the timeline (silent beats included) so subtitle timings match
     the concatenated film; only clips with text emit a cue.
+
+    每条 cue 的正文前置 :data:`SUBTITLE_ALIGNMENT_TAG`（底部居中，逐行居中），
+    保证"居中"既写在样式里也写在字幕本身里。该 SRT 只用于本函数调用方的临时
+    烧录用文件，不交付用户，所以这些标签不会污染导出的 ``.srt``。
     """
     lines: list[str] = []
     cursor = 0.0
@@ -920,7 +931,7 @@ def _build_srt_from_clips(entries: list[tuple[str, str]]) -> str:
             seq += 1
             lines.append(str(seq))
             lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
-            lines.append(text)
+            lines.append(f"{SUBTITLE_ALIGNMENT_TAG}{text}")
             lines.append("")
     return "\n".join(lines)
 
@@ -928,6 +939,12 @@ def _build_srt_from_clips(entries: list[tuple[str, str]]) -> str:
 #: 字幕样式里与字体无关的部分；libass 按恒定 PlayRes 缩放，FontSize 与影片
 #: 分辨率无关，11 在 1280 高的成片上约 49px（3.8% 画面高），是电影式底带
 #: 而不是铺满画面的字块。
+#:
+#: ``Alignment=2`` = 整块底部居中，libass 对多行文本会把每一行也各自居中
+#: （已用同款 force_style 烧录两行 cue 验证：Alignment=2 两行都居中，
+#: Alignment=1 才会左对齐）。``MarginL``/``MarginR`` 显式取和 libass 默认
+#: 相同的 10，既保证左右边距一定对称（多行自动折行时左右留白相等），也不改
+#: 变既有成片的折行位置与像素。
 def _subtitle_force_style(font: SubtitleFont | None) -> str:
     """Build the libass ``force_style`` for the resolved subtitle font.
 
@@ -941,7 +958,8 @@ def _subtitle_force_style(font: SubtitleFont | None) -> str:
         "FontSize=11,"
         "PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,"
-        "BorderStyle=1,Outline=1,Shadow=0,MarginV=24,Alignment=2"
+        "BorderStyle=1,Outline=1,Shadow=0,"
+        "MarginL=10,MarginR=10,MarginV=24,Alignment=2"
     )
 
 

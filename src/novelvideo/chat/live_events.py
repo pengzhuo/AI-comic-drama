@@ -48,6 +48,19 @@ async def unregister_chat_websocket(websocket: WebSocket) -> None:
             _connections.pop(key, None)
 
 
+async def scope_has_live_websocket(*, username: str, scope: ChatScope) -> bool:
+    """Whether a chat socket is currently registered for this scope.
+
+    A dropped socket is not the same thing as an abandoned turn: the same scope
+    reconnects from a fresh socket (typically within a second), so callers that
+    must decide whether a running turn still has a transport to deliver to ask
+    this instead of trusting the socket that disappeared.
+    """
+    key = _scope_key(username, scope)
+    async with _lock:
+        return bool(_connections.get(key))
+
+
 async def broadcast_project_chat_event(
     *,
     username: str,

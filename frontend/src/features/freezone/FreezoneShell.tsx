@@ -2834,7 +2834,10 @@ function FreezoneChatDock({
 
   useEffect(() => {
     if (!isDesktop) {
-      setShouldRenderPanel(open);
+      // 移动端同样遵守 busy 守卫：面板靠 Sheet keepMounted 保活，这里让
+      // shouldRenderPanel 与桌面端语义一致（手机横竖屏切换、或窗口尺寸跨过
+      // 断点时不会因为一个 false 把进行中的一轮掐掉）。
+      setShouldRenderPanel(open || shouldKeepPanelMounted);
       setPanelVisible(open);
       return;
     }
@@ -2990,6 +2993,14 @@ function FreezoneChatDock({
         <Sheet open={open} onOpenChange={onOpenChange}>
           <SheetContent
             side="right"
+            // 移动端关抽屉 = 卸载面板，而面板一卸载就断掉 chat WS，服务端会把这
+            // 一轮判成「用户走了」并中断（桌面端走 shouldKeepPanelMounted 保住挂
+            // 载，所以只有手机复现）。busy 期间照样保留挂载，只是不再显示。
+            keepMounted={shouldKeepPanelMounted}
+            // keepMounted 隐藏 popup 用的是 `hidden` 属性（UA 规则 [hidden]），
+            // 而这里的 `flex` 是作者样式，会盖过去——不显式 display:none 的话
+            // 抽屉关了面板还杵在屏幕上。
+            style={shouldKeepPanelMounted && !open ? { display: "none" } : undefined}
             className="flex w-full flex-col gap-0 bg-card p-0 sm:!max-w-[560px]"
           >
             <SheetHeader className="sr-only">

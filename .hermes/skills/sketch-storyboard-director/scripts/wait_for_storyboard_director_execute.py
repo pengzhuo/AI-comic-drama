@@ -12,6 +12,13 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+try:  # 系统解释器下把 app 环境的第三方依赖兜进来，见 novelvideo/runtime_env.py
+    from novelvideo.runtime_env import ensure_app_environment_site_packages
+
+    ensure_app_environment_site_packages()
+except Exception:  # noqa: BLE001 - 兜底失败不能拖垮脚本
+    pass
+
 from novelvideo.task_jobs import (  # noqa: E402
     resolve_user_project_from_context,
     wait_for_task_terminal,

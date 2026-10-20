@@ -41,13 +41,21 @@ function SheetContent({
   children,
   side = "right",
   showCloseButton = true,
+  keepMounted,
   ...props
 }: SheetPrimitive.Popup.Props & {
   side?: "top" | "right" | "bottom" | "left"
   showCloseButton?: boolean
+  /**
+   * Keep the popup in the DOM (hidden) once closed. Anything the panel owns —
+   * a live chat socket, a running turn — keeps working instead of being torn
+   * down by the close, which is what mobile users hit when they dismiss the
+   * sheet mid-turn.
+   */
+  keepMounted?: boolean
 }) {
   return (
-    <SheetPortal>
+    <SheetPortal keepMounted={keepMounted}>
       <SheetOverlay />
       <SheetPrimitive.Popup
         data-slot="sheet-content"

@@ -1,93 +1,89 @@
+"""Tests for the system-interpreter app-environment fallback."""
+
 from __future__ import annotations
 
-import os
+import sys
+from pathlib import Path
 
-import pytest
-
-
-def test_preserve_st_env_restores_changed_and_added_st_keys(monkeypatch) -> None:
-    from novelvideo.shared.env_guard import preserve_st_env
-
-    monkeypatch.setenv("ST_EXISTING", "before")
-    monkeypatch.delenv("ST_ADDED", raising=False)
-    monkeypatch.setenv("LLM_API_KEY", "before")
-
-    with preserve_st_env():
-        monkeypatch.setenv("ST_EXISTING", "after")
-        monkeypatch.setenv("ST_ADDED", "new")
-        monkeypatch.setenv("LLM_API_KEY", "after")
-
-    assert "ST_ADDED" not in os.environ
-    assert os.environ["ST_EXISTING"] == "before"
-    assert os.environ["LLM_API_KEY"] == "after"
+from novelvideo import runtime_env
 
 
-def test_cookie_secure_defaults_true_and_parses_boolean_values(monkeypatch) -> None:
-    import novelvideo.shared.runtime_env as runtime_env
-
-    monkeypatch.setattr(runtime_env, "load_project_dotenv", lambda override=False: None)
-    cookie_secure = runtime_env.cookie_secure
-
-    monkeypatch.delenv("ST_COOKIE_SECURE", raising=False)
-    assert cookie_secure() is True
-
-    for value in ("1", "true"):
-        monkeypatch.setenv("ST_COOKIE_SECURE", value)
-        assert cookie_secure() is True
-
-    for value in ("0", "false"):
-        monkeypatch.setenv("ST_COOKIE_SECURE", value)
-        assert cookie_secure() is False
+def _fake_app_environment(root: Path, *, python: str = "python3.12") -> Path:
+    site_packages = root / "lib" / python / "site-packages"
+    site_packages.mkdir(parents=True)
+    return site_packages
 
 
-def test_is_ce_effective_defaults_to_ce_without_control_plane_dsn(monkeypatch) -> None:
-    import novelvideo.shared.runtime_env as runtime_env
+def test_appends_the_configured_app_environment_to_sys_path(monkeypatch, tmp_path):
+    site_packages = _fake_app_environment(tmp_path / "app-venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / "app-venv"))
+    monkeypatch.setattr(sys, "path", list(sys.path))
 
-    monkeypatch.setattr(runtime_env, "load_project_dotenv", lambda override=False: None)
+    assert runtime_env.ensure_app_environment_site_packages() is True
+    # Appended, never inserted: the interpreter's own distributions stay first.
+    assert sys.path[-1] == str(site_packages)
+    assert sys.path.index(str(site_packages)) > 0
 
-    cases = (
-        ("", "ce", True),
-        (" postgresql://example ", "ce", False),
-        ("postgresql://example", "", False),
-        ("", "", True),
+    # Idempotent, so the entry points can call it defensively.
+    assert runtime_env.ensure_app_environment_site_packages() is False
+    assert sys.path.count(str(site_packages)) == 1
+
+
+def test_falls_back_to_the_packaged_app_environment(monkeypatch, tmp_path):
+    site_packages = _fake_app_environment(tmp_path / "app")
+    monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+    monkeypatch.setattr(runtime_env, "DEFAULT_APP_ENVIRONMENT_ROOTS", (str(tmp_path / "app"),))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    assert runtime_env.app_environment_site_packages() == site_packages
+    assert runtime_env.ensure_app_environment_site_packages() is True
+
+
+def test_is_a_no_op_without_an_app_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / "missing"))
+    monkeypatch.setattr(runtime_env, "DEFAULT_APP_ENVIRONMENT_ROOTS", (str(tmp_path / "also-missing"),))
+    before = list(sys.path)
+
+    assert runtime_env.app_environment_site_packages() is None
+    assert runtime_env.ensure_app_environment_site_packages() is False
+    assert sys.path == before
+
+
+def test_ignores_an_app_environment_without_site_packages(monkeypatch, tmp_path):
+    configured = tmp_path / "configured"
+    (configured / "lib" / "python3.12").mkdir(parents=True)
+    packaged = _fake_app_environment(tmp_path / "packaged")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(configured))
+    monkeypatch.setattr(runtime_env, "DEFAULT_APP_ENVIRONMENT_ROOTS", (str(tmp_path / "packaged"),))
+
+    # The configured root exists but carries no site-packages, so the packaged
+    # default is still tried instead of returning nothing.
+    assert runtime_env.app_environment_site_packages() == packaged
+
+
+def test_hermes_skill_entry_scripts_bootstrap_the_fallback():
+    """Skill scripts run on the system interpreter, so each one opts in.
+
+    A regenerated entry script that loses this block fails at import time with a
+    missing third-party distribution, which reaches the user as "drafts are
+    unavailable" rather than as an obvious error.
+    """
+    root = Path(__file__).resolve().parents[1] / ".hermes" / "skills"
+    scripts = sorted(
+        path
+        for directory in (
+            root / "sketch-correction-worker" / "scripts",
+            root / "sketch-storyboard-director" / "scripts",
+        )
+        for path in directory.glob("*.py")
     )
-    for dsn, edition, expected in cases:
-        if dsn:
-            monkeypatch.setenv("ST_CONTROL_PLANE_DSN", dsn)
-        else:
-            monkeypatch.delenv("ST_CONTROL_PLANE_DSN", raising=False)
-        if edition:
-            monkeypatch.setenv("ST_EDITION", edition)
-        else:
-            monkeypatch.delenv("ST_EDITION", raising=False)
+    entry_scripts = [
+        path
+        for path in scripts
+        if "SRC_ROOT" in path.read_text(encoding="utf-8")
+    ]
 
-        assert runtime_env.is_ce_effective() is expected
-
-
-@pytest.mark.parametrize(
-    ("configured_edition", "dsn", "expected"),
-    [
-        (None, None, "ce"),
-        ("", "", "ce"),
-        ("  ", "  ", "ce"),
-        (" CE ", None, "ce"),
-        (None, "postgresql://example", "ee"),
-        ("", "postgresql://example", "ee"),
-        ("ee", None, "ee"),
-        ("ee", "postgresql://example", "ee"),
-    ],
-)
-def test_runtime_edition_defaults_and_explicit_selection(
-    monkeypatch, configured_edition, dsn, expected
-) -> None:
-    from novelvideo.shared import runtime_env
-
-    monkeypatch.setattr(runtime_env, "load_project_dotenv", lambda **kwargs: None)
-    for key, value in (("ST_EDITION", configured_edition), ("ST_CONTROL_PLANE_DSN", dsn)):
-        if value is None:
-            monkeypatch.delenv(key, raising=False)
-        else:
-            monkeypatch.setenv(key, value)
-
-    assert runtime_env.edition() == expected
-    assert runtime_env.is_ce_effective() is (expected == "ce")
+    assert len(entry_scripts) == 11
+    for path in entry_scripts:
+        text = path.read_text(encoding="utf-8")
+        assert "ensure_app_environment_site_packages()" in text, path.name

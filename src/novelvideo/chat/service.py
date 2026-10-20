@@ -190,6 +190,28 @@ _can_merge_ui_specs = presentation.can_merge_ui_specs
 _merge_ui_specs = presentation.merge_ui_specs
 _MERGEABLE_MEDIA_SPEC_TYPES = presentation.MERGEABLE_MEDIA_SPEC_TYPES
 
+# Two different "no usable reply" outcomes. The first is a genuine model no-op;
+# the second means the round was cut off mid-flight (the socket went away, or
+# the runtime exited before it answered). Reporting the second one as the first
+# hides what happened and makes the user redo work the agent had already done.
+_EMPTY_AGENT_REPLY_MESSAGE = "这轮操作没有收到捏导的有效回复，请稍后重试。"
+_INTERRUPTED_AGENT_REPLY_MESSAGE = (
+    "本轮在中途被中断了（连接断开或运行时提前退出），这一步没有完成。"
+    "回复「继续」，捏导会接着往下做。"
+)
+
+
+def _turn_was_interrupted(*, stream_completed: bool, disposition: str) -> bool:
+    """Whether the round was cut off rather than answered.
+
+    ``complete`` is synthesised for a timeout too, so a timeout/cancel
+    disposition counts as an interruption alongside a stream that ended with no
+    terminal event at all (the runtime died, or its transport was torn down
+    while it was still working).
+    """
+    return (not stream_completed) or disposition in {"timeout", "cancelled"}
+
+
 _CODEX_MODEL_PROVIDER = "dramaclaw_gateway"
 _DEFAULT_CODEX_MODEL = "DC-codex-agent-LLM"
 _DEFAULT_CODEX_REASONING_EFFORT = "medium"
@@ -3255,6 +3277,7 @@ async def _stream_assistant_reply_hermes(
     # authorization and therefore nothing to settle.
     turn_operation = _turn_operation_finalizer(authorization)
     turn_disposition = _DEFAULT_TURN_DISPOSITION
+    turn_stream_completed = False
 
     async def _settle_turn_operation() -> None:
         """Close the ledger entry for this turn, whatever ended it.
@@ -3269,7 +3292,7 @@ async def _stream_assistant_reply_hermes(
 
     async def hermes_events_with_session_retry():
         nonlocal thread, assistant_text, tool_text, current_tool_name, current_tool_hidden
-        nonlocal turn_disposition
+        nonlocal turn_disposition, turn_stream_completed
         from novelvideo.chat.hermes_sdk import (
             HermesSessionUnavailableError,
             _is_session_unavailable_error,
@@ -3299,6 +3322,7 @@ async def _stream_assistant_reply_hermes(
                         continue
                     if stream_event.type == "complete":
                         saw_complete = True
+                        turn_stream_completed = True
                         turn_disposition = _turn_disposition_for(stream_event)
                     guard_details = (
                         getattr(stream_event, "guard", None) or {}
@@ -3722,7 +3746,14 @@ async def _stream_assistant_reply_hermes(
             tool_mode=tool_mode,
         )
         if not assistant_text.strip():
-            assistant_text = "这轮操作没有收到捏导的有效回复，请稍后重试。"
+            assistant_text = (
+                _INTERRUPTED_AGENT_REPLY_MESSAGE
+                if _turn_was_interrupted(
+                    stream_completed=turn_stream_completed,
+                    disposition=turn_disposition,
+                )
+                else _EMPTY_AGENT_REPLY_MESSAGE
+            )
         if (
             _allows_mainline_media_ui_specs(tool_mode)
             and not tool_ui_specs
@@ -3760,7 +3791,7 @@ async def _stream_assistant_reply_hermes(
                     username,
                     store_scope,
                     "assistant",
-                    "这轮操作没有收到捏导的有效回复，请稍后重试。",
+                    assistant_text,
                     media=[],
                     turn_id=turn_id,
                     idempotency_key=f"assistant:{turn_id}" if turn_id else None,
@@ -3770,7 +3801,7 @@ async def _stream_assistant_reply_hermes(
                     add_assistant_message,
                     username,
                     project,
-                    "这轮操作没有收到捏导的有效回复，请稍后重试。",
+                    assistant_text,
                     [],
                     project_dir=project_dir,
                     project_state_dir=project_state_dir,

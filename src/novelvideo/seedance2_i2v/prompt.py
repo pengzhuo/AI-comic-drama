@@ -613,6 +613,15 @@ def _reference_sentence_for_assets(
     return base
 
 
+#: 叠加文字的"居中"判据：用户填的位置里出现这些词，就说明整块文字要水平居中。
+_OVERLAY_CENTER_HINTS = ("居中", "中心", "中间", "center", "middle")
+
+
+def _overlay_placement_is_centered(placement: str) -> bool:
+    lowered = placement.lower()
+    return any(hint in lowered for hint in _OVERLAY_CENTER_HINTS)
+
+
 def build_text_overlay_prompt_fragment(
     text_overlay: dict[str, Any] | None,
     language: AssetLanguage = "zh",
@@ -642,9 +651,21 @@ def build_text_overlay_prompt_fragment(
         timing = _sentence_text(overlay.get("timing")) or "throughout the clip"
         style = _sentence_text(overlay.get("style")) or "clean and readable"
         speaker_text = f", spoken by {speaker_display_name(speaker) or speaker}" if speaker else ""
+        centering_rule = (
+            " Typesetting: if the text wraps onto multiple lines, center every line "
+            "individually inside the text block - no left alignment, no hanging indent, "
+            "no space padding - and keep the text to at most two lines."
+        )
+        if _overlay_placement_is_centered(placement):
+            centering_rule = (
+                " Typesetting: center the text block horizontally in frame; if the text "
+                "wraps onto multiple lines, center every line individually inside the block "
+                "- no left alignment, no hanging indent, no space padding - and keep the "
+                "text to at most two lines."
+            )
         return (
             f'Use {kind_label} text "{content}" at {placement}, visible {timing}, '
-            f"with a {style} style{speaker_text}."
+            f"with a {style} style{speaker_text}.{centering_rule}"
         )
     speaker_text = ""
     if speaker:
@@ -654,9 +675,19 @@ def build_text_overlay_prompt_fragment(
             if identity
             else f"，说话人为{character}"
         )
+    centering_rule = (
+        "文字排版要求：若文字因过长折成多行，每一行都必须相对文字块各自居中，"
+        "禁止左对齐、禁止悬挂缩进、禁止用空格手工对齐；文字块最多两行。"
+    )
+    if _overlay_placement_is_centered(placement):
+        centering_rule = (
+            "文字排版要求：文字块整体在画面中水平居中；若因过长折成多行，每一行都必须"
+            "相对文字块各自居中，禁止左对齐、禁止悬挂缩进、禁止用空格手工对齐；"
+            "文字块最多两行。"
+        )
     return (
         f"画面文字使用{kind_label}“{content}”，位置为{placement}，"
-        f"出现时机为{timing}，文字样式为{style}{speaker_text}。"
+        f"出现时机为{timing}，文字样式为{style}{speaker_text}。{centering_rule}"
     )
 
 
@@ -883,6 +914,32 @@ def build_seedance2_prompt_composer_task(
     else:
         clock_rule_zh = ""
         clock_rule_en = ""
+    overlay_rule_zh = ""
+    overlay_rule_en = ""
+    overlay = text_overlay or {}
+    if overlay.get("enabled") and _sentence_text(overlay.get("content")):
+        if _overlay_placement_is_centered(
+            _sentence_text(overlay.get("placement")) or "画面下方居中"
+        ):
+            overlay_rule_zh = (
+                "- 叠加文字（text_overlay）：文字块整体在画面中水平居中；若因长度折成多行，"
+                "每一行都必须相对文字块各自居中，禁止左对齐、禁止悬挂缩进、禁止用空格对齐。\n"
+            )
+            overlay_rule_en = (
+                "- Overlay text (text_overlay): center the text block horizontally in frame; if it "
+                "wraps onto multiple lines, center every line individually inside the block - no "
+                "left alignment, no hanging indent, no space padding.\n"
+            )
+        else:
+            overlay_rule_zh = (
+                "- 叠加文字（text_overlay）：按 placement 指定的位置摆放文字块；若因长度折成多行，"
+                "每一行都必须相对文字块各自居中，禁止左对齐、禁止悬挂缩进、禁止用空格对齐。\n"
+            )
+            overlay_rule_en = (
+                "- Overlay text (text_overlay): place the block as the placement asks; if it wraps "
+                "onto multiple lines, center every line individually inside the block - no left "
+                "alignment, no hanging indent, no space padding.\n"
+            )
     if language == "en":
         return (
             "Write the final Seedance 2.0 image-to-video prompt from the JSON below.\n\n"
@@ -897,6 +954,7 @@ def build_seedance2_prompt_composer_task(
             f"{mode_rule_en}"
             f"- {language_rule}\n"
             f"{clock_rule_en}"
+            f"{overlay_rule_en}"
             "- Only output the final prompt.\n\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
         )
@@ -917,6 +975,7 @@ def build_seedance2_prompt_composer_task(
         "动作可自然改写，但实际台词必须逐字完整保留，不能删减或概括。\n"
         f"{mode_rule_zh}"
         f"{clock_rule_zh}"
+        f"{overlay_rule_zh}"
         "- 只输出最终 prompt，不要解释。\n\n"
         f"输出语言：{language_rule}\n\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"

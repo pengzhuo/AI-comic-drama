@@ -1159,3 +1159,123 @@ def test_seedance2_composer_task_writes_the_real_beat_clock():
         draft_prompt="",
     )
     assert "本镜成片时长" not in without_duration
+
+
+def test_text_overlay_prompt_requires_every_line_centered():
+    from novelvideo.seedance2_i2v.prompt import build_text_overlay_prompt_fragment
+
+    zh = build_text_overlay_prompt_fragment(
+        {
+            "enabled": True,
+            "kind": "subtitle",
+            "content": "几天前，地下室中",
+            "placement": "画面下方居中",
+            "timing": "全片持续",
+            "style": "干净易读",
+        }
+    )
+
+    assert "位置为画面下方居中" in zh
+    assert "文字块整体在画面中水平居中" in zh
+    assert "每一行都必须相对文字块各自居中" in zh
+    assert "禁止左对齐" in zh
+    assert "禁止悬挂缩进" in zh
+    assert "文字块最多两行" in zh
+
+    en = build_text_overlay_prompt_fragment(
+        {
+            "enabled": True,
+            "kind": "subtitle",
+            "content": "Days earlier, in the basement",
+            "placement": "bottom center",
+            "timing": "throughout the clip",
+            "style": "clean and readable",
+        },
+        language="en",
+    )
+
+    assert "at bottom center" in en
+    assert "center the text block horizontally in frame" in en
+    assert "center every line individually inside the block" in en
+    assert "no left alignment" in en
+    assert "at most two lines" in en
+
+
+def test_text_overlay_prompt_keeps_an_off_center_placement():
+    from novelvideo.seedance2_i2v.prompt import build_text_overlay_prompt_fragment
+
+    fragment = build_text_overlay_prompt_fragment(
+        {
+            "enabled": True,
+            "kind": "speech_bubble",
+            "content": "我不会再求任何人。",
+            "placement": "角色嘴边左侧",
+            "timing": "全片持续",
+            "style": "手写体",
+        }
+    )
+
+    # 用户指定的非居中位置不被覆盖，但逐行居中仍然必须遵守。
+    assert "位置为角色嘴边左侧" in fragment
+    assert "文字块整体在画面中水平居中" not in fragment
+    assert "每一行都必须相对文字块各自居中" in fragment
+
+
+def test_text_overlay_prompt_is_empty_when_disabled():
+    from novelvideo.seedance2_i2v.prompt import build_text_overlay_prompt_fragment
+
+    assert build_text_overlay_prompt_fragment({}) == ""
+    assert build_text_overlay_prompt_fragment({"enabled": False, "content": "字幕"}) == ""
+
+
+def test_seedance2_composer_task_states_the_overlay_centering_rule():
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.prompt import build_seedance2_prompt_composer_task
+
+    def composer_task(text_overlay, language="zh"):
+        return build_seedance2_prompt_composer_task(
+            mode=Seedance2I2VMode.FIRST_FRAME,
+            beat={"narration_segment": "今天是我的生日。"},
+            assets=[],
+            text_overlay=text_overlay,
+            prompt_guidance="",
+            draft_prompt="",
+            language=language,
+        )
+
+    centered = composer_task(
+        {
+            "enabled": True,
+            "kind": "subtitle",
+            "content": "几天前，地下室中",
+            "placement": "画面下方居中",
+        }
+    )
+    assert "叠加文字（text_overlay）：文字块整体在画面中水平居中" in centered
+    assert "每一行都必须相对文字块各自居中" in centered
+
+    english = composer_task(
+        {
+            "enabled": True,
+            "kind": "subtitle",
+            "content": "Days earlier, in the basement",
+            "placement": "bottom center",
+        },
+        language="en",
+    )
+    assert "center the text block horizontally in frame" in english
+    assert "center every line individually inside the block" in english
+
+    off_center = composer_task(
+        {
+            "enabled": True,
+            "kind": "speech_bubble",
+            "content": "我不会再求任何人。",
+            "placement": "角色嘴边左侧",
+        }
+    )
+    assert "按 placement 指定的位置摆放文字块" in off_center
+    assert "文字块整体在画面中水平居中" not in off_center
+    assert "每一行都必须相对文字块各自居中" in off_center
+
+    assert "叠加文字（text_overlay）" not in composer_task({})
