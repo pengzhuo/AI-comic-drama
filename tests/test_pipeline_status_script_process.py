@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from novelvideo import pipeline_status as pipeline_status_module
+from novelvideo import screenplay_preprocess
 from novelvideo import script_process
 
 
@@ -85,6 +86,10 @@ async def test_freshly_imported_project_goes_to_script_processing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _patch(monkeypatch, tmp_path, configured=False)
+    # 预处理（确定性规范化）先跑，之后才是技能阶段。
+    screenplay_preprocess.save_preprocess_result(
+        tmp_path, payload={"changed": False}, normalized_text="1-1 车间 夜 内\n"
+    )
 
     data = await _status(tmp_path, _Store())
 
@@ -99,6 +104,9 @@ async def test_processing_advances_to_configuring(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _patch(monkeypatch, tmp_path, configured=False)
+    screenplay_preprocess.save_preprocess_result(
+        tmp_path, payload={"changed": False}, normalized_text="1-1 车间 夜 内\n"
+    )
     script_process.save_script_process_result(
         tmp_path,
         payload={"understanding": "理解"},

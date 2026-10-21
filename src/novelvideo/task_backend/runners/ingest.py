@@ -15,10 +15,12 @@ from novelvideo.task_state import get_task_manager
 
 logger = logging.getLogger(__name__)
 
-#: Stage the import hands off to.  The bundled「通用AI影视制作流程包」script
-#: processing (阶段 1—2) is what every later stage reads, and it is chained from
-#: here instead of from the REST handler so the automatic hand-off survives a
-#: closed browser tab.
+#: Stage the import hands off to.  剧本预处理（确定性规范化）runs first and then
+#: chains the bundled「通用AI影视制作流程包」script processing (阶段 1—2) itself, so
+#: every later stage reads one canonical screenplay.  Chained from here instead of
+#: from the REST handler so the automatic hand-off survives a closed browser tab.
+SCREENPLAY_PREPROCESS_TASK_TYPE = "screenplay_preprocess"
+
 SCRIPT_PROCESS_TASK_TYPE = "script_process"
 
 #: A queued/running stage must not be duplicated by the hand-off below.
@@ -111,13 +113,52 @@ async def _run_ingest_fast(
         await store.close()
 
     # The import itself is done and persisted at this point, so the next stage
-    # never reads a half-written novel.
-    await _enqueue_script_process(ctx)
+    # never reads a half-written novel.  A fresh import invalidates any previous
+    # normalization result, then the analysed text is recorded durably: the task
+    # row above expires, the digest does not.
+    _reset_preprocess_artifacts(ctx)
+    remember_ingest_completion(ctx)
+    await _enqueue_screenplay_preprocess(ctx)
     return result
 
 
-async def _enqueue_script_process(ctx: ProjectContext) -> None:
-    """Chain the film-process-pack script processing after a successful import.
+def _reset_preprocess_artifacts(ctx: ProjectContext) -> None:
+    """Drop the previous 剧本预处理 artifacts so the new import is re-processed."""
+
+    from novelvideo.screenplay_preprocess import clear_preprocess_artifacts
+
+    try:
+        clear_preprocess_artifacts(ctx.output_dir)
+    except Exception:  # noqa: BLE001 - 清理失败不该让已成功的导入失败
+        logger.exception("failed to clear stale screenplay preprocess artifacts")
+
+
+def remember_ingest_completion(ctx: ProjectContext) -> None:
+    """把「这份 novel.txt 已经分析完」写进项目配置。
+
+    ``pipeline_status`` 用它判断摄入阶段是否完成：只看 ``ingest_fast`` 任务行
+    会让导入完成一小时后的项目重新显示「小说摄入」。
+
+    指纹取自「系统实际消费的文本」（``novel_source.load_imported_novel_content``），
+    所以剧本预处理跑完后必须再调用一次，把标记刷成规范化文本的指纹。
+    """
+
+    from novelvideo.novel_source import novel_source_digest
+    from novelvideo.project_config import save_project_config_in_state_dir
+
+    try:
+        digest = novel_source_digest(ctx.output_dir)
+        if not digest:
+            return
+        save_project_config_in_state_dir(
+            ctx.state_dir, config={"ingest_source_digest": digest}
+        )
+    except Exception:  # noqa: BLE001 - 导入已成功,记账失败不该让它失败
+        logger.exception("failed to persist durable ingest digest")
+
+
+async def _enqueue_screenplay_preprocess(ctx: ProjectContext) -> None:
+    """Chain 剧本预处理 after a successful import; it chains 剧本处理 itself.
 
     Best effort by design: the import already succeeded, so a rejected hand-off
     must never fail it.  A duplicate is harmless — the stage skips itself when a
@@ -125,27 +166,27 @@ async def _enqueue_script_process(ctx: ProjectContext) -> None:
     same stage on its own.
     """
 
-    from novelvideo.script_process import has_script_process_result
+    from novelvideo.screenplay_preprocess import has_preprocess_result
     from novelvideo.task_backend.client import enqueue_project_task
 
     try:
-        if has_script_process_result(ctx.output_dir):
+        if has_preprocess_result(ctx.output_dir):
             return
         existing = get_task_manager().get_task_for_project(
-            ctx, SCRIPT_PROCESS_TASK_TYPE, 0
+            ctx, SCREENPLAY_PREPROCESS_TASK_TYPE, 0
         )
         if existing is not None and existing.status in _ACTIVE_TASK_STATUSES:
             return
         await enqueue_project_task(
             ctx,
-            task_type=SCRIPT_PROCESS_TASK_TYPE,
+            task_type=SCREENPLAY_PREPROCESS_TASK_TYPE,
             product_surface="mainline",
             queue_kind="default",
             episode=0,
             payload={"output_dir": str(ctx.output_dir)},
         )
     except Exception:  # noqa: BLE001 - the import result is authoritative
-        logger.exception("failed to hand off script processing after ingest")
+        logger.exception("failed to hand off screenplay preprocessing after ingest")
 
 
 register_project_task_runner("ingest_fast", run_ingest_fast)

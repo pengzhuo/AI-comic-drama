@@ -55,6 +55,19 @@ Default and EE builds use the existing `build` command. Source-available CE rele
 At runtime, the app still prefers backend `GET /api/v1/config` as the source of truth.
 `VITE_EDITION=ce` only decides the fallback edition when that request is unavailable.
 
+### Instance-level UI hides
+
+`npm run build:ce` also loads `.env.ce.local` (git-ignored through `*.local`). This
+deployment keeps its per-instance hides there: the Piko status-bar entry, the
+notification center (including the login-page bell), the on-entry release popup, the
+official gateway channels, the model-configuration guide link and the GitHub star
+lookups, plus a local announcement source for
+`VITE_LOGIN_ANNOUNCEMENTS_URL`. All of these are **build-time** values, so a bundle
+built without that file silently brings every entry back — check the file is present
+before building a hot-patch bundle, and see
+[`docs/agents/web-hotpatch-deploy.md`](../docs/agents/web-hotpatch-deploy.md) for the
+build → deploy → verify checklist.
+
 Auth is cookie-backed. `AuthStore.login()` POSTs `/api/v1/auth/login` with `credentials: "include"`; the backend sets an HttpOnly `st_api_key` cookie, and the SPA persists only `{ username, role }` as a login marker. Every subsequent `ky` request uses `credentials: "include"` so the browser attaches the cookie. 401 on any request logs out + hard-redirects to `/login`.
 
 ## Route map

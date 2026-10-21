@@ -162,6 +162,37 @@ INTERNATIONAL_SCENE_RE = re.compile(
 )
 SPEAKER_LINE_RE = re.compile(r"^[^\n：:]{1,24}[：:].+$")
 
+# Production annotations may share the heading line with the location, for
+# example ``场景：纺织厂三号线车间    夜 内        天气：闷热，车间内无风``. They
+# describe the shoot, not the place, so they must not leak into the location
+# name (scene assets are matched by name/alias). Labels are only honoured when
+# they carry a colon, so ordinary prose and locations that end in the same
+# characters are left untouched.
+SCENE_ATTRIBUTE_LABELS = (
+    "天气",
+    "备注",
+    "光线",
+    "光照",
+    "色调",
+    "质感",
+    "氛围",
+    "画面",
+    "镜头",
+    "音效",
+    "声音",
+    "音乐",
+    "特效",
+    "提示",
+    "说明",
+    "注意",
+)
+SCENE_ATTRIBUTE_RE = re.compile(
+    r"(?:^|[\s，,；;])" rf"(?:{'|'.join(SCENE_ATTRIBUTE_LABELS)})\s*[：:]"
+)
+# ``内—外``/``内/外`` mixes both values in a single heading. The plate keeps one
+# scene type, so the interior value wins and the mixed marker is dropped.
+MIXED_INTERIOR_EXTERIOR_RE = re.compile(r"(?:内|外)\s*[-–—－~/]\s*(?:内|外)")
+
 
 @dataclass
 class ParsedSceneBlock:
@@ -491,6 +522,10 @@ def parse_location_header(line: str) -> tuple[str, str, str] | None:
 def parse_location_line(line: str) -> list[tuple[str, str, bool]]:
     text = _strip_location_prefix(line)
     text = _strip_numbered_scene_prefix(text)
+    # ``1-1 场景：急诊部 黄昏 内`` keeps its label after the scene number is cut.
+    text = _strip_location_prefix(text)
+    text = _strip_scene_attributes(text)
+    text = _normalize_mixed_interior_exterior(text)
     text = re.sub(r"（[^）]*）", "", text).strip()
     if not text:
         return []
@@ -541,6 +576,92 @@ def parse_location_line(line: str) -> list[tuple[str, str, bool]]:
     parts = [part.strip() for part in re.split(r"\s*/\s*|、", text) if part.strip()]
     parts = _inherit_building_prefix(parts)
     return [(name, tod, interior_exterior == "内") for name in parts]
+
+
+def split_scene_heading_attributes(line: str) -> tuple[str, str]:
+    """Split ``<heading>    天气：…`` into the heading and the trailing note.
+
+    The note is returned verbatim (without its leading separator) so callers can
+    re-emit it on its own line instead of leaving it inside the location name.
+    """
+
+    text = line or ""
+    match = SCENE_ATTRIBUTE_RE.search(text)
+    if not match:
+        return text, ""
+    heading = text[: match.start()].strip(" \t，,；;").strip()
+    note = text[match.start() :].strip(" \t，,；;").strip()
+    return (heading or text), note
+
+
+def is_bare_scene_number_line(line: str) -> bool:
+    """True for a scene number that stands alone on its line (``1-1``).
+
+    Episode headers (``第 1 集``) are structural, not scene numbers, and a lone
+    ``1`` is too ambiguous to merge, so both are excluded.
+    """
+
+    text = (line or "").strip()
+    if not text or EPISODE_HEADER_RE.match(text) or ENGLISH_EPISODE_HEADER_RE.match(text):
+        return False
+    numbered = NUMBERED_SCENE_RE.match(text)
+    if numbered and not (numbered.group("rest") or "").strip():
+        return True
+    marker = SCENE_MARKER_RE.match(text)
+    return bool(marker and _looks_like_bare_scene_marker(text))
+
+
+def canonical_scene_heading(line: str) -> str | None:
+    """Canonical ``场号 地点 时间 内/外`` form of a scene-heading line.
+
+    ``None`` means "not a self-describing heading" — callers must leave the line
+    alone. The result is always recognised by :func:`is_scene_start_line`, so
+    normalizing a header can never drop a scene boundary. A heading that omitted
+    its time anchor keeps omitting it: the parser must keep reporting it as
+    inferred rather than inventing one.
+    """
+
+    text = (line or "").strip()
+    if not text or EPISODE_HEADER_RE.match(text) or ENGLISH_EPISODE_HEADER_RE.match(text):
+        return None
+    if is_bare_scene_number_line(text):
+        return None
+
+    number = ""
+    body = text
+    numbered = NUMBERED_SCENE_RE.match(text)
+    if numbered and _looks_like_scene_number_line(numbered):
+        number = f"{numbered.group('episode')}-{numbered.group('scene')}"
+        body = (numbered.group("rest") or "").strip()
+    elif LABELED_LOCATION_RE.match(text):
+        body = text
+    else:
+        marker = SCENE_MARKER_RE.match(text)
+        if not (marker and _looks_like_bare_scene_marker(text)):
+            return None
+
+    cleaned, _ = split_scene_heading_attributes(body)
+    cleaned = _strip_location_prefix(cleaned).strip()
+    if not cleaned:
+        return None
+
+    candidate = " ".join(part for part in (number, cleaned) if part)
+    if _has_explicit_time_token(cleaned):
+        locs = parse_location_line(cleaned)
+        times = {time_of_day for _, time_of_day, _ in locs}
+        interiors = {interior for _, _, interior in locs}
+        if locs and len(times) == 1 and len(interiors) == 1:
+            names = "/".join(name for name, _, _ in locs)
+            interior = "内" if next(iter(interiors)) else "外"
+            candidate = " ".join(
+                part
+                for part in (number, names, next(iter(times)), interior)
+                if part
+            )
+
+    if not is_scene_start_line(candidate):
+        return None
+    return candidate
 
 
 def parse_character_line(line: str) -> list[str]:
@@ -608,6 +729,8 @@ def _apply_partial_location(block: ParsedSceneBlock, location_line: str) -> None
 
     text = _strip_location_prefix(location_line)
     text = _strip_numbered_scene_prefix(text)
+    text = _strip_scene_attributes(text)
+    text = _normalize_mixed_interior_exterior(text)
     time_match = re.search(rf"({TIME_TOKEN_RE})\s*$", text)
     if time_match:
         block.time_of_day = time_match.group(1)
@@ -658,6 +781,23 @@ def _strip_numbered_scene_prefix(line: str) -> str:
     if match and _looks_like_scene_number_line(match):
         return (match.group("rest") or "").strip()
     return line
+
+
+def _strip_scene_attributes(text: str) -> str:
+    """Cut trailing production annotations (``天气：…``) off a heading."""
+
+    candidate = text or ""
+    match = SCENE_ATTRIBUTE_RE.search(candidate)
+    if not match:
+        return candidate
+    trimmed = candidate[: match.start()].strip(" \t，,；;").strip()
+    return trimmed or candidate
+
+
+def _normalize_mixed_interior_exterior(text: str) -> str:
+    """Collapse ``内—外`` into the plate value the rest of the pipeline uses."""
+
+    return MIXED_INTERIOR_EXTERIOR_RE.sub("内", text or "")
 
 
 def _looks_like_scene_number_line(match: re.Match[str]) -> bool:

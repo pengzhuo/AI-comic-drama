@@ -24,11 +24,32 @@ def novel_import_required_response() -> dict[str, str | bool]:
     }
 
 
-def load_imported_novel_content(project_dir: str | Path) -> str | None:
+def load_raw_imported_novel_content(project_dir: str | Path) -> str | None:
+    """原始导入文本（``novel.txt``），不含剧本预处理的结果。"""
+
     novel_path = Path(project_dir) / "novel.txt"
     if not novel_path.exists():
         return None
     return novel_path.read_text(encoding="utf-8")
+
+
+def load_imported_novel_content(project_dir: str | Path) -> str | None:
+    """系统实际消费的导入文本。
+
+    剧本预处理跑过之后，``novel.normalized.txt`` 就是系统应该读的那一份
+    （场景头已归一、尾部标注已拆行）；原文仍留在 ``novel.txt``（以及首次预处理
+    时的 ``novel.original.txt`` 留档）里，供展示与比对。
+    """
+
+    normalized_path = Path(project_dir) / "novel.normalized.txt"
+    try:
+        if normalized_path.is_file():
+            normalized = normalized_path.read_text(encoding="utf-8")
+            if normalized.strip():
+                return normalized
+    except OSError:
+        pass
+    return load_raw_imported_novel_content(project_dir)
 
 
 def has_imported_novel(project_dir: str | Path) -> bool:
@@ -41,6 +62,26 @@ def require_imported_novel(project_dir: str | Path) -> str:
     if not content or not content.strip():
         raise NovelImportRequiredError()
     return content
+
+
+def novel_source_digest(project_dir: str | Path) -> str | None:
+    """导入小说的内容指纹；没有（或为空）返回 None。
+
+    ``ingest_fast`` 的任务行只是「进行中」的瞬时记录，完成后过
+    ``COMPLETED_TTL`` 就被惰性删除，所以「这份文本是否已经分析过」要落在持久
+    产物上：摄入完成时把当时的指纹写进项目配置，之后比对指纹即可，重新上传
+    换了文本就自动失效。
+
+    算法与 ``story_analysis.source_sha256`` 保持一致（下游脚本处理结果里的
+    ``source_sha256`` 就是它），存量项目才能在缺少配置标记时直接与已有结果
+    比对（见 ``pipeline_status._ingest_artifact_digest_matches``）。
+    """
+    content = load_imported_novel_content(project_dir)
+    if not content or not content.strip():
+        return None
+    from novelvideo.story_analysis import source_sha256
+
+    return source_sha256(content)
 
 
 def resolve_uploaded_novel_filename(

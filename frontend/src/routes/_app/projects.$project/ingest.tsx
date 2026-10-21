@@ -44,6 +44,7 @@ import { FormatCheckDetailsDialog } from "@/components/ingest/FormatCheckDetails
 import { NovelFormatDialog } from "@/components/ingest/NovelFormatDialog";
 import { KnowledgeGraphVisualization } from "@/components/ingest/KnowledgeGraphVisualization";
 import { ScriptProcessProgress } from "@/components/ingest/ScriptProcessProgress";
+import { ScreenplayPreprocessProgress } from "@/components/ingest/ScreenplayPreprocessProgress";
 import {
   activateDirectorProjectAuto,
   saveDirectorRunState,
@@ -2209,6 +2210,16 @@ export function IngestPageContent({ project }: { project: string }) {
                       })}
                     </div>
                   </div>
+
+                  {/* Deterministic screenplay preprocessing: chained by the import
+                      before the film-process-pack stage, so this reports progress
+                      (and allows a manual (re)run for older projects). */}
+                  <ScreenplayPreprocessProgress
+                    project={project}
+                    enabled={Boolean(project)}
+                    watchMs={taskStream.status === "completed" ? 300_000 : 0}
+                    className={INGEST_SURFACE_SUBTLE_CLASS}
+                  />
 
                   {/* Film-process-pack script processing: chained by the import,
                       so this only reports progress. */}

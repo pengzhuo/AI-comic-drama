@@ -6,6 +6,7 @@ import { Bell, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import styles from "@/components/login/login.module.css";
 import { AnnouncementCard as SharedAnnouncementCard } from "@/components/notifications/announcement-card";
+import { notificationCenterHidden } from "@/lib/ui-hide-flags";
 import {
   type Announcement,
   type AnnouncementText,
@@ -40,6 +41,10 @@ export function AnnouncementEntry() {
   useEffect(() => {
     if (open && ids.length > 0) markAllRead(ids);
   }, [ids, markAllRead, open]);
+
+  // 实例级开关（VITE_HIDE_NOTIFICATION_CENTER）：关掉公告中心时，登录页顶栏
+  // 也不留这个铃铛。放在所有 hook 之后，免得变成条件性调用 hook。
+  if (notificationCenterHidden()) return null;
 
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>

@@ -37,18 +37,20 @@ with iterative `tsc -b` rather than a blind cut.
 | `cli.py` | CLI entry: `novelvideo api --port 8780` |
 | `api/app.py` | FastAPI app construction, startup hooks |
 | `api/__init__.py` | Router registration (`api_router`, `/api/v1`) |
-| `api/routes/*.py` | REST routes: `ingest`, `projects`, `characters`, `episodes`, `scripts`, `content`, `generation`, `tasks`, `pipeline`, `freezone`, `chat`, `styles`, `assets`, `scenes`, `props` |
+| `api/routes/*.py` | REST routes: `ingest`, `projects`, `characters`, `episodes`, `scripts`, `content`, `generation`, `tasks`, `pipeline`, `screenplay`, `freezone`, `chat`, `styles`, `assets`, `scenes`, `props` |
 | `api/deps.py` | Project scope/store factories (`resolve_project_scope`, `make_sqlite_store_for_context`) |
 | `api/schemas.py` | Pydantic request/response models |
 | `task_backend/registry.py` | Task runner registry |
 | `task_backend/client.py` | `enqueue_project_task` / `cancel_project_task` facade |
 | `task_backend/runners/__init__.py` | Registers all built-in runners |
-| `task_backend/runners/*.py` | Per-stage runners (`ingest`, `graph_build`, `identity`, `script_process`, `script`, `sketch`, `render`, `video`, `audio`, `character_image`, `episode_assets`, `freezone`) |
+| `task_backend/runners/*.py` | Per-stage runners (`ingest`, `screenplay_preprocess`, `graph_build`, `identity`, `script_process`, `script`, `sketch`, `render`, `video`, `audio`, `character_image`, `episode_assets`, `freezone`) |
 | `ports/local/tasks.py` | CE in-process task backend (`InlineTaskBackend`) |
 | `chat/service.py` | Chat/agent orchestration + streaming |
 | `chat/director_auto.py` | Durable server-side auto coordinator (episode / project scope) |
 | `chat/dramaclaw_mcp.py` | MCP server (see `.mcp.json`) |
 | `agents/*.py` | LLM agents: `episode_planner`, `identity_planner`, `content_rewriter`, `asset_compiler`, `global_video_optimizer` |
+| `novel_source.py` | Imported-script read funnel (`load_imported_novel_content` prefers the normalized text) |
+| `screenplay_preprocess.py` | 剧本预处理 artifacts (`screenplay/preprocess.json`, `novel.normalized.txt`, `novel.original.txt`) |
 | `workflows/*.py` | Script-writing workflows (`script_writing`, `literal_script_writing`, `script_processing`) |
 | `structured_ingest.py`, `structured_extraction.py`, `structured_builders.py` | Structured (`structured_v1`) ingest + extraction |
 | `cognee/` | Legacy knowledge-graph pipeline (`store`, `pipeline`, `event_extractor`, `screenplay_normalizer`) |
@@ -59,7 +61,7 @@ with iterative `tsc -b` rather than a blind cut.
 | `export/` | Episode export (SRT/video/zip) |
 | `verification/` | Quality gates |
 | `styles/`, `prompts/`, `skills/`, `assets/` | Bundled content; `skills/ai_film_process/` = 制作流程包 — injection rules in [`skill-pack-injection.md`](skill-pack-injection.md) |
-| `utils/` | `model_context_budget`, `document_parsers`, `path_resolver`, `screenplay_scene_parser`, `upload_safety` |
+| `utils/` | `model_context_budget`, `document_parsers`, `path_resolver`, `screenplay_normalize`, `screenplay_scene_parser`, `upload_safety` |
 | `shared/runtime_env.py` | Runtime/edition flags (`is_ce_effective`) |
 
 ## Frontend (`frontend/src/`)

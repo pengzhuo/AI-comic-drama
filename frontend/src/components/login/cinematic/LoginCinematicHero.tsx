@@ -9,6 +9,7 @@ import { AppleMark, GithubMark, WindowsMark } from "@/components/platform-marks"
 import { useDesktopRelease } from "@/hooks/use-desktop-release";
 import { PRODUCT_MANUAL_URL } from "@/lib/product-manual";
 import { detectDesktopPlatform, type DesktopPlatform } from "@/lib/desktop-download";
+import { githubStarsHidden } from "@/lib/ui-hide-flags";
 import styles from "@/components/login/login.module.css";
 import layout from "./hero-layout.module.css";
 import { businessWechatQrUrl } from "./media";
@@ -34,6 +35,8 @@ function useGithubStars(repo: string): number {
 
   useEffect(() => {
     if (cachedStars !== null) return;
+    // 与 `hooks/use-github-stars.ts` 同一开关：私有实例不发这次请求。
+    if (githubStarsHidden()) return;
     let active = true;
     fetch(`https://api.github.com/repos/${repo}`, {
       headers: { Accept: "application/vnd.github+json" },

@@ -5,6 +5,7 @@ from novelvideo.time_of_day import normalize_time_of_day
 from novelvideo.utils.screenplay_quality import assess_screenplay_scene_headers
 from novelvideo.utils.screenplay_quality import check_screenplay_import_quality
 from novelvideo.utils.screenplay_scene_parser import parse_scene_blocks
+from novelvideo.utils.screenplay_scene_parser import parse_location_line
 from novelvideo.utils.screenplay_scene_parser import is_scene_start_line
 from novelvideo.workflows.literal_script_writing import LiteralScriptWritingWorkflow
 
@@ -764,3 +765,97 @@ def test_one_int_ext_scene_downgrades_the_whole_script():
     assert assessment.status == "repairable"
     assert assessment.detected_headers == 2
     assert assessment.standard_headers == 1
+
+
+def test_two_line_scene_header_with_weather_attribute_parses_clean_location():
+    """编号独占一行 + ``场景：地点 时间 内外 天气：…`` 的两行式场头必须解析出干净地点。
+
+    DramaClaw 导入的《蜡染新娘》就是这种写法；把整行当地点会让场景资产精确匹配失败，
+    最终报「未识别到任何场景」。
+    """
+    text = (
+        "第 1 集【事故】\n"
+        "\n"
+        "1-1\n"
+        "\n"
+        "场景：中爪哇 · 苏尔约集团纺织厂 三号线车间    夜 内        天气：闷热，车间内无风\n"
+        "\n"
+        "人物：班邦（34岁，三号线挡车工）、瓦万（50岁，车间主任）\n"
+        "\n"
+        "△ 夜班最后一小时。\n"
+        "\n"
+        "班邦：（急 高声）主任！三号机的罩子还没装回去！\n"
+        "\n"
+        "1-2\n"
+        "\n"
+        "场景：日惹 · 哥打格德 阿雅的蜡染作坊 院子    夜 外        天气：晴，闷热，无风\n"
+        "\n"
+        "阿雅：（平静）喂？……是我。\n"
+    )
+
+    blocks = [block for block in parse_scene_blocks(text) if block.header_line]
+
+    assert [block.location for block in blocks] == [
+        "中爪哇 · 苏尔约集团纺织厂 三号线车间",
+        "日惹 · 哥打格德 阿雅的蜡染作坊 院子",
+    ]
+    assert [block.time_of_day for block in blocks] == ["夜", "夜"]
+    assert [block.interior_exterior for block in blocks] == ["内", "外"]
+    assert all(block.time_inferred is False for block in blocks)
+    assert all(block.lines for block in blocks)
+
+    assessment = assess_screenplay_scene_headers(text)
+    assert assessment.status == "standard"
+    assert assessment.detected_headers == 2
+    assert assessment.standard_headers == 2
+
+
+@pytest.mark.parametrize(
+    "line, expected_location",
+    [
+        ("1-1 纺织厂 三号线车间 夜 内  天气：闷热", "纺织厂 三号线车间"),
+        ("1-1 纺织厂 三号线车间 夜 内  备注：需动作指导", "纺织厂 三号线车间"),
+        ("1-1 纺织厂 三号线车间 夜 内  光线：顶灯白得发青", "纺织厂 三号线车间"),
+        ("1-1 纺织厂 三号线车间 夜 内  镜头：手部特写", "纺织厂 三号线车间"),
+    ],
+)
+def test_scene_heading_attribute_tail_is_not_part_of_the_location(
+    line, expected_location
+):
+    (location, time_of_day, interior) = parse_location_line(line)[0]
+    assert location == expected_location
+    assert time_of_day == "夜"
+    assert interior is True
+
+
+def test_scene_attribute_label_inside_a_location_name_is_kept():
+    """只有带冒号的标注才会被剪掉，地点名里的同名字符保持完整。"""
+    (location, _, _) = parse_location_line("1-1 注释大厦 顶层 夜 内")[0]
+    assert location == "注释大厦 顶层"
+
+
+def test_mixed_interior_exterior_heading_collapses_to_interior():
+    (location, time_of_day, interior) = parse_location_line(
+        "60-3 日惹 · 哥打格德 阿雅作坊 屋里 → 屋外 日 内—外        天气：阴转晴"
+    )[0]
+    assert location == "日惹 · 哥打格德 阿雅作坊 屋里 → 屋外"
+    assert time_of_day == "日"
+    assert interior is True
+
+
+def test_location_label_after_the_scene_number_is_stripped():
+    (location, time_of_day, interior) = parse_location_line("1-1 场景：急诊部 黄昏 内")[0]
+    assert location == "急诊部"
+    assert time_of_day == "黄昏"
+    assert interior is True
+
+
+def test_dialogue_line_with_weather_word_is_not_a_scene_header():
+    text = (
+        "1-1 急诊部 夜 内\n"
+        "班邦：（急）预报说天气：晴，可走廊还在滴水。\n"
+    )
+    blocks = [block for block in parse_scene_blocks(text) if block.header_line]
+    assert len(blocks) == 1
+    assert blocks[0].location == "急诊部"
+    assert blocks[0].lines == ["班邦：（急）预报说天气：晴，可走廊还在滴水。"]

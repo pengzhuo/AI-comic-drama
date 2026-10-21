@@ -14,6 +14,7 @@ from novelvideo.task_backend.runners import (  # noqa: F401
     prop_reference,
     render,
     scene_reference,
+    screenplay_preprocess,
     script,
     script_process,
     skill_import,

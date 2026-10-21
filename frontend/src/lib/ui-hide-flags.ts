@@ -52,3 +52,12 @@ export function notificationCenterHidden(): boolean {
 export function modelGuideHidden(): boolean {
   return envFlag(import.meta.env.VITE_HIDE_MODEL_GUIDE);
 }
+
+/**
+ * Skip the upstream star lookups behind the GitHub badges (login page and
+ * download page). Hidden instances keep a static count, so no request to
+ * `api.github.com` ever leaves the deployment.
+ */
+export function githubStarsHidden(): boolean {
+  return envFlag(import.meta.env.VITE_HIDE_GITHUB_STARS);
+}

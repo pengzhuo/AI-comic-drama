@@ -2959,7 +2959,18 @@
     "scriptProcessStart": "Bắt đầu xử lý kịch bản",
     "scriptProcessRerun": "Chạy lại",
     "scriptProcessSummary": "{{characters}} nhân vật · {{scenes}} bối cảnh · {{gaps}} điểm chưa rõ",
-    "scriptProcessDegraded": "{{count}} đoạn bị chặn bởi kiểm duyệt nội dung, cần xem thủ công"
+    "scriptProcessDegraded": "{{count}} đoạn bị chặn bởi kiểm duyệt nội dung, cần xem thủ công",
+    "screenplayPreprocessTitle": "Tiền xử lý kịch bản",
+    "screenplayPreprocessIdle": "Đang chờ",
+    "screenplayPreprocessRunning": "Đang xử lý…",
+    "screenplayPreprocessDone": "Hoàn tất",
+    "screenplayPreprocessFailed": "Thất bại",
+    "screenplayPreprocessSummary": "Đã gộp {{merged}} tiêu đề tách dòng · {{headings}} tiêu đề cảnh",
+    "screenplayPreprocessUnchanged": "Kịch bản đã đúng chuẩn",
+    "screenplayPreprocessEpisodes": "Đã đồng bộ {{count}} tập",
+    "screenplayPreprocessRun": "Tiền xử lý",
+    "screenplayPreprocessRerun": "Chạy lại",
+    "screenplayPreprocessStartFailed": "Không khởi động được"
   },
   "video": {
     "voiceSelect": "Giọng đọc",

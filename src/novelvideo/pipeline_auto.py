@@ -94,6 +94,16 @@ async def dispatch_next_stage(
     next_step = str(data.get("next_step") or "")
     current_episode = int(data.get("current_episode") or episode or 1)
 
+    if next_step == "screenplay_preprocess":
+        return await _enqueue_once(
+            ctx,
+            attempted,
+            task_type="screenplay_preprocess",
+            queue_kind="default",
+            episode=0,
+            signature="dispatch:screenplay_preprocess",
+            payload={"output_dir": str(project_dir)},
+        )
     if next_step == "script_process":
         return await _enqueue_once(
             ctx,

@@ -87,6 +87,8 @@ export const queryKeys = {
     ["projects", p, "chapters", spineTemplate] as const,
   knowledgeGraph: (p: string) => ["projects", p, "knowledge-graph"] as const,
   scriptProcess: (p: string) => ["projects", p, "script-process"] as const,
+  screenplayPreprocess: (p: string) =>
+    ["projects", p, "screenplay-preprocess"] as const,
   script: (p: string, ep: number) =>
     ["projects", p, "episodes", ep, "script"] as const,
   beats: (p: string, ep: number) =>

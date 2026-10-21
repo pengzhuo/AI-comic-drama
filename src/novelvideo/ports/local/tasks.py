@@ -6,8 +6,10 @@ import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import partial
 import logging
+import os
 import random
 import threading
 import time
@@ -43,6 +45,40 @@ _AUTHZ_RETRY_SLEEP = asyncio.sleep
 _AUTHZ_RETRY_RANDOM = random.random
 
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+#: 「DB 说在途、本进程却没有对应 job」的任务行,超过它才允许回收/落失败。给并发
+#: 投递留出 reserve → 入队之间的窗口;真僵尸(接力入队落在已关闭的临时事件循环上)
+#: 的时间尺度远大于它。见 ``_reclaim_orphan_state`` 与 ``reap_orphan_tasks``。
+INLINE_TASK_ORPHAN_GRACE_SECONDS = _float_env(
+    "DRAMACLAW_INLINE_TASK_ORPHAN_GRACE_SECONDS", 120.0
+)
+#: 兜底清扫周期(秒);<=0 关闭。
+INLINE_TASK_REAP_INTERVAL_SECONDS = _float_env(
+    "DRAMACLAW_INLINE_TASK_REAP_INTERVAL_SECONDS", 300.0
+)
+INLINE_TASK_ORPHAN_MESSAGE = "任务未能进入执行队列,已中断,请重新发起"
+
+
+def _task_updated_at_age_seconds(updated_at: str | None) -> float | None:
+    """任务行 ``updated_at`` 距今秒数;解析不了就返回 None(按「不知道」处理)。"""
+    raw = str(updated_at or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+
 @dataclass
 class _InlineLaneJob:
     envelope: dict[str, Any]
@@ -71,7 +107,16 @@ class InlineTaskBackend:
     def __init__(self, *, producer=None, consumer=None) -> None:
         self._producer = producer
         self._consumer = consumer
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[Any] = set()
+        #: lane job 只允许派到的那个事件循环,由 ``bind_event_loop`` 在 startup 绑定。
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
+        #: 本进程持有在飞 job(排队中或执行中)的 task_id。
+        self._live_task_ids: set[str] = set()
+        self._live_lock = threading.Lock()
+        #: 本进程入队过的项目任务库,给低频兜底清扫用(有序去重)。
+        self._known_task_dbs: dict[str, None] = {}
+        self._reaper_started = False
+        self._reaper_lock = threading.Lock()
         self._lanes: dict[str, _InlineLane] = {
             lane: _InlineLane(
                 name=lane,
@@ -112,16 +157,39 @@ class InlineTaskBackend:
             lane_name,
             eligible_user_count=1,
         )
-        state, reserved = manager.reserve_task_for_project(
+        self._register_task_db(ctx)
+        state, reserved = self._reserve_project_task(
+            manager,
             ctx,
             task_type,
             episode,
             beat_num=beat_num,
             scope=scope,
-            metadata={},
-            queue_kind=lane_name,
+            lane_name=lane_name,
             project_lane_limit=project_lane_limit,
         )
+        if not reserved and state.status in ACTIVE_PROJECT_TASK_STATUSES:
+            # 「DB 说在途、本进程却没有 job」的假排队行必须回收:它会被幂等锁一直
+            # 挡住,之后每次重试都被原样吞掉,UI 永远停在「处理中 0%」。
+            if self._reclaim_orphan_state(
+                manager,
+                ctx,
+                task_type,
+                episode,
+                beat_num=beat_num,
+                scope=scope,
+                state=state,
+            ):
+                state, reserved = self._reserve_project_task(
+                    manager,
+                    ctx,
+                    task_type,
+                    episode,
+                    beat_num=beat_num,
+                    scope=scope,
+                    lane_name=lane_name,
+                    project_lane_limit=project_lane_limit,
+                )
         if not reserved and state.status in ACTIVE_PROJECT_TASK_STATUSES:
             existing_metadata = state.metadata or {}
             return QueuedTask(
@@ -211,6 +279,164 @@ class InlineTaskBackend:
         )
         return QueuedTask(task_state=state, backend="inline")
 
+    def bind_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """绑定 lane job 必须运行的那个应用事件循环。
+
+        任务 runner 在 worker 线程里执行,而且各自再套一层 ``asyncio.run``
+        (见 ``run_project_task_core_sync``),所以 runner 内部接力入队时「当前
+        循环」是一条马上要关闭的临时循环。若直接 ``create_task``,job 会被挂到
+        那条临时循环上,runner 一返回循环即被回收、job 被静默取消——任务行却永远
+        停在 ``queued``。派单必须跨线程回到这里绑定的主循环。
+        """
+        self._owner_loop = loop
+
+    def _owner_loop_or_current(self) -> asyncio.AbstractEventLoop:
+        loop = self._owner_loop
+        if loop is not None and not loop.is_closed():
+            return loop
+        current = asyncio.get_running_loop()
+        if loop is None and threading.current_thread() is threading.main_thread():
+            # 没有 startup 钩子的嵌入场景(测试):主线程首次派单时认领。
+            self._owner_loop = current
+        return current
+
+    def _mark_live(self, task_id: str) -> None:
+        with self._live_lock:
+            self._live_task_ids.add(task_id)
+
+    def _clear_live(self, task_id: str) -> None:
+        with self._live_lock:
+            self._live_task_ids.discard(task_id)
+
+    def live_task_ids(self) -> set[str]:
+        """本进程在飞 job 的快照,给假排队判定与兜底清扫用。"""
+        with self._live_lock:
+            return set(self._live_task_ids)
+
+    @staticmethod
+    def _reserve_project_task(
+        manager: Any,
+        ctx: Any,
+        task_type: str,
+        episode: int,
+        *,
+        beat_num: int | None,
+        scope: str | None,
+        lane_name: str,
+        project_lane_limit: int,
+    ) -> tuple[Any, bool]:
+        return manager.reserve_task_for_project(
+            ctx,
+            task_type,
+            episode,
+            beat_num=beat_num,
+            scope=scope,
+            metadata={},
+            queue_kind=lane_name,
+            project_lane_limit=project_lane_limit,
+        )
+
+    def _reclaim_orphan_state(
+        self,
+        manager: Any,
+        ctx: Any,
+        task_type: str,
+        episode: int,
+        *,
+        beat_num: int | None,
+        scope: str | None,
+        state: Any,
+    ) -> bool:
+        """清掉「DB 说在途、本进程没有 job」的行,让调用方重新 reserve。
+
+        只有既有活 job 之外、又超过宽限期的行才动,所以仍在 ``reserve`` 途中的
+        并发投递不会被误伤。
+        """
+        if str(getattr(state, "task_id", "") or "") in self.live_task_ids():
+            return False
+        age = _task_updated_at_age_seconds(getattr(state, "updated_at", ""))
+        if age is None or age < INLINE_TASK_ORPHAN_GRACE_SECONDS:
+            return False
+        logger.warning(
+            "reclaiming orphan inline task: project=%s task_type=%s task_id=%s "
+            "status=%s age_seconds=%s",
+            getattr(ctx, "project_id", ""),
+            task_type,
+            getattr(state, "task_id", ""),
+            getattr(state, "status", ""),
+            None if age is None else round(age, 1),
+        )
+        try:
+            cleared = manager.clear_task_for_project(
+                ctx, task_type, episode, beat_num=beat_num, scope=scope
+            )
+        except Exception:  # noqa: BLE001 - 回收失败就退回幂等语义
+            logger.exception("failed to clear orphan inline task row")
+            return False
+        return bool(cleared)
+
+    def _register_task_db(self, ctx: Any) -> None:
+        """记下本进程碰过的项目任务库,并确保兜底清扫线程在跑。"""
+        try:
+            from novelvideo.task_state import get_project_task_db_path_for_context
+
+            path = str(get_project_task_db_path_for_context(ctx).resolve())
+        except Exception:  # noqa: BLE001 - 记账失败不影响投递
+            return
+        if path in self._known_task_dbs:
+            return
+        self._known_task_dbs[path] = None
+        self._start_orphan_reaper()
+
+    def _start_orphan_reaper(self) -> None:
+        if INLINE_TASK_REAP_INTERVAL_SECONDS <= 0:
+            return
+        with self._reaper_lock:
+            if self._reaper_started:
+                return
+            self._reaper_started = True
+        threading.Thread(
+            target=self._orphan_reaper_loop,
+            name="inline-task-reaper",
+            daemon=True,
+        ).start()
+
+    def _orphan_reaper_loop(self) -> None:
+        while True:
+            # 下限保护:间隔被配成 0 或负数时也不至于变成忙循环。
+            time.sleep(max(INLINE_TASK_REAP_INTERVAL_SECONDS, 30.0))
+            try:
+                self.reap_orphan_tasks()
+            except Exception:  # noqa: BLE001 - 兜底线程绝不能死
+                logger.exception("inline orphan task reap failed")
+
+    def reap_orphan_tasks(self) -> int:
+        """把「DB 说在途、本进程没有 job」的行落为 failed(低频兜底)。
+
+        服务重启遗留的在途行由 ``_sweep_stale_tasks_on_connection`` 按进程启动时刻
+        回收;这一条补的是**进程存活期间**产生的假排队行(它晚于进程启动,原有的
+        清扫看不到它)。
+        """
+        manager = get_task_manager()
+        live = self.live_task_ids()
+        reaped = 0
+        for path in list(self._known_task_dbs):
+            if not os.path.isfile(path):
+                # 项目已删除:SQLite 连接会把这个文件重新造出来,直接忘掉它。
+                self._known_task_dbs.pop(path, None)
+                continue
+            try:
+                changed = manager.sweep_orphan_inline_tasks(
+                    path,
+                    live_task_ids=live,
+                    grace_seconds=INLINE_TASK_ORPHAN_GRACE_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - 单个库失败不影响其它库
+                logger.exception("inline orphan sweep failed for %s", path)
+                continue
+            reaped += int(changed or 0)
+        return reaped
+
     def lane_snapshot(self) -> dict[str, dict[str, int]]:
         return {
             name: {
@@ -244,17 +470,71 @@ class InlineTaskBackend:
                 queued=len(lane.queued),
             )
         lane.queued.append(job)
+        self._mark_live(job.run_task_id)
 
     def _start_lane_job(self, lane: _InlineLane, job: _InlineLaneJob) -> None:
         lane.active += 1
         lane.last_started_project_id = job.project_id
-        task = asyncio.create_task(self._run_inline(lane, job))
-        self._background_tasks.add(task)
-        task.add_done_callback(
-            lambda done, lane_name=lane.name: self._on_background_task_done(
-                done, lane_name
+        self._mark_live(job.run_task_id)
+        self._schedule_lane_job(lane, job)
+
+    def _schedule_lane_job(self, lane: _InlineLane, job: _InlineLaneJob) -> None:
+        """把 lane job 派到应用主循环上执行,不管当前在哪个循环/线程。"""
+        try:
+            owner = self._owner_loop_or_current()
+            try:
+                current: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+            except RuntimeError:
+                current = None
+
+            def _done(
+                task: Any,
+                lane_name: str = lane.name,
+                task_id: str = job.run_task_id,
+            ) -> None:
+                self._on_background_task_done(task, lane_name, task_id)
+
+            if current is owner:
+                handle: Any = owner.create_task(self._run_inline(lane, job))
+            else:
+                # 从 runner 的临时循环 / 普通线程入队:必须跨线程回到主循环,否则
+                # job 会随调用方那条马上关闭的循环一起被回收。
+                handle = asyncio.run_coroutine_threadsafe(
+                    self._run_inline(lane, job), owner
+                )
+            self._background_tasks.add(handle)
+            handle.add_done_callback(_done)
+        except Exception as exc:  # noqa: BLE001 - 派单失败必须落库,不能留假排队
+            logger.exception(
+                "failed to schedule inline lane job: project=%s task_type=%s",
+                job.project_id,
+                job.envelope.get("task_type"),
             )
-        )
+            lane.active = max(lane.active - 1, 0)
+            self._clear_live(job.run_task_id)
+            self._fail_unscheduled_job(job, exc)
+            self._drain_lane(lane.name)
+
+    def _fail_unscheduled_job(
+        self, job: _InlineLaneJob, exc: BaseException
+    ) -> None:
+        try:
+            job.manager.fail_task_for_project(
+                job.ctx,
+                str(job.envelope.get("task_type") or ""),
+                int(job.envelope.get("episode") or 0),
+                beat_num=job.envelope.get("beat_num"),
+                scope=job.envelope.get("scope"),
+                error=INLINE_TASK_ORPHAN_MESSAGE,
+                metadata={
+                    **dict(job.metadata or {}),
+                    "error_code": "INLINE_SCHEDULE_FAILED",
+                    "schedule_error": str(exc),
+                },
+                expected_task_id=job.run_task_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to mark unschedulable inline task as failed")
 
     def _pop_next_lane_job(self, lane: _InlineLane) -> _InlineLaneJob | None:
         if not lane.queued:
@@ -280,6 +560,7 @@ class InlineTaskBackend:
             for index, job in enumerate(lane.queued):
                 if job.run_task_id == task_id:
                     del lane.queued[index]
+                    self._clear_live(task_id)
                     return True
         return False
 
@@ -341,8 +622,12 @@ class InlineTaskBackend:
             ),
         )
 
-    def _on_background_task_done(self, task: asyncio.Task, lane_name: str) -> None:
+    def _on_background_task_done(
+        self, task: Any, lane_name: str, task_id: str = ""
+    ) -> None:
         self._background_tasks.discard(task)
+        if task_id:
+            self._clear_live(task_id)
         lane = self._lanes[lane_name]
         lane.active = max(lane.active - 1, 0)
         if task.cancelled():

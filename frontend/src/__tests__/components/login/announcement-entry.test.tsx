@@ -43,6 +43,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -274,5 +275,16 @@ describe("AnnouncementEntry", () => {
     await user.keyboard("{Escape}");
 
     await waitFor(() => expect(screen.queryByRole("dialog", DIALOG)).not.toBeInTheDocument());
+  });
+
+  it("renders nothing at all when the instance hides the notification center", () => {
+    // 实例级开关（VITE_HIDE_NOTIFICATION_CENTER）：登录页顶栏的入口不受其它开关
+    // 约束，关掉时必须连空铃铛一起消失。
+    vi.stubEnv("VITE_HIDE_NOTIFICATION_CENTER", "1");
+
+    const { container } = render(<AnnouncementEntry />);
+
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByRole("button", { name: "查看公告" })).not.toBeInTheDocument();
   });
 });

@@ -2,6 +2,8 @@
 // Copyright (c) 2026 ClaymoreLab
 import { useEffect, useState } from "react";
 
+import { githubStarsHidden } from "@/lib/ui-hide-flags";
+
 // GitHub 匿名 API 限速 60 次/小时/IP，登录页在共享出口 IP 下极易被限流（403）。
 // 把上次成功拿到的 star 数落地 localStorage：请求失败/限速时用本地值兜底，
 // 成功时刷新显示并写回本地，徽标不再因为一次 403 就消失。
@@ -37,6 +39,8 @@ export function useGithubStars(repo: string): number | null {
   const [stars, setStars] = useState<number | null>(() => readStoredStars());
 
   useEffect(() => {
+    // 私有实例可以关掉这次出网：徽标退回静态值（localStorage 里的上次值或无值）。
+    if (githubStarsHidden()) return;
     let active = true;
     fetch(`https://api.github.com/repos/${repo}`, {
       headers: { Accept: "application/vnd.github+json" },

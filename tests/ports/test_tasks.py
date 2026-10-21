@@ -1,8 +1,10 @@
 import asyncio
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
+import sqlite3
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -17,6 +19,7 @@ from novelvideo.ports.authz import (
     AuthzServiceUnavailable,
     BillingPrincipal,
 )
+from novelvideo.ports.local import tasks as tasks_module
 from novelvideo.ports.local.tasks import InlineTaskBackend, InMemoryCancellationStore
 from novelvideo.ports.model_credentials import CredentialReference
 from novelvideo.task_backend import cancel as cancel_module
@@ -28,7 +31,8 @@ from novelvideo.task_backend.envelope import (
     TaskAuthorityUnavailable,
 )
 from novelvideo.task_backend.registry import register_project_task_runner
-from novelvideo.task_state import get_task_manager
+from novelvideo.task_identity import project_task_state_key
+from novelvideo.task_state import get_project_task_db_path_for_context, get_task_manager
 
 SIGNING_KEY = b"t" * 32
 NOW = datetime(2026, 8, 3, 4, 5, 7, tzinfo=timezone.utc)
@@ -786,3 +790,170 @@ async def test_cancel_leaf_functions_delegate_to_registered_store(monkeypatch):
     await cancel_module.request_cancel(**fields)
     assert await cancel_module.is_cancel_requested(**fields) is True
     assert [call[0] for call in calls] == ["request", "is"]
+
+# ---------------------------------------------------------------------------
+# 接力入队的派单循环 + 假排队行回收
+# 回归 nn_1021_1：「剧本处理中 0%」——runner 在自己的临时事件循环里接力入队，
+# job 被静默取消，DB 行永远停在 queued，幂等锁又把之后每次重试都吞掉。
+# ---------------------------------------------------------------------------
+
+
+def _backdate_task(
+    ctx: ProjectContext,
+    task_type: str,
+    episode: int,
+    *,
+    seconds: float = 600.0,
+    scope: str | None = None,
+) -> None:
+    """把任务行的 updated_at 改老，模拟「进程启动之后产生的僵尸行」。"""
+    db_path = get_project_task_db_path_for_context(ctx)
+    key = project_task_state_key(task_type, ctx.project_id, episode, scope=scope)
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE task_states SET updated_at = ? WHERE task_key = ?", (stamp, key)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _reserve_row(ctx: ProjectContext, task_type: str, episode: int):
+    """像 runner 接力那样先落一条在途行，但本进程里没有对应 job。"""
+    return get_task_manager().reserve_task_for_project(
+        ctx,
+        task_type,
+        episode,
+        metadata={"backend": "inline"},
+        queue_kind="default",
+        project_lane_limit=12,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_background_reaper(monkeypatch):
+    """测试进程不需要兜底清扫线程（它会在后台按周期碰 tmp 库）。"""
+    monkeypatch.setattr(tasks_module, "INLINE_TASK_REAP_INTERVAL_SECONDS", 0.0)
+
+
+@pytest.mark.asyncio
+async def test_lane_job_chained_from_runner_loop_runs_on_owner_loop(monkeypatch, tmp_path):
+    ctx = _ctx(tmp_path)
+    backend = _inline_backend()
+    owner_loop = asyncio.get_running_loop()
+    backend.bind_event_loop(owner_loop)
+    ran_on: list[bool] = []
+
+    async def recording_run_inline(_lane, _job):
+        ran_on.append(asyncio.get_running_loop() is owner_loop)
+
+    monkeypatch.setattr(backend, "_run_inline", recording_run_inline)
+
+    failures: list[BaseException] = []
+
+    def runner_thread() -> None:
+        # runner 的形状：worker 线程 + 自己的临时 asyncio.run 循环。
+        try:
+            asyncio.run(
+                backend.enqueue_project_task(
+                    ctx,
+                    task_type="single_video",
+                    product_surface="mainline",
+                    episode=1,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+
+    thread = threading.Thread(target=runner_thread, name="fake-runner")
+    thread.start()
+    try:
+        deadline = time.monotonic() + 6
+        while not ran_on and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+    finally:
+        thread.join()
+
+    assert failures == []
+    assert ran_on == [True], "接力 job 必须在应用主循环上执行"
+
+
+@pytest.mark.asyncio
+async def test_stale_queued_row_without_live_job_is_reclaimed_on_retry(
+    monkeypatch, tmp_path
+):
+    ctx = _ctx(tmp_path)
+    backend = _inline_backend()
+    backend.bind_event_loop(asyncio.get_running_loop())
+    ran: list[str] = []
+
+    def fake_run_core(verified, *_args, **_kwargs):
+        ran.append("ran")
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "novelvideo.ports.local.tasks.run_project_task_core_sync", fake_run_core
+    )
+
+    zombie, reserved = _reserve_row(ctx, "script_process", 0)
+    assert reserved is True
+    _backdate_task(ctx, "script_process", 0)
+
+    queued = await backend.enqueue_project_task(
+        ctx,
+        task_type="script_process",
+        product_surface="mainline",
+        queue_kind="default",
+        episode=0,
+        payload={"output_dir": str(ctx.output_dir)},
+    )
+
+    deadline = time.monotonic() + 6
+    while not ran and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+
+    assert ran == ["ran"], "回收僵尸行之后任务必须真的被派单"
+    assert queued.task_state.task_id != zombie.task_id
+
+
+@pytest.mark.asyncio
+async def test_sweep_orphan_inline_tasks_only_fails_rows_without_live_job(tmp_path):
+    ctx = _ctx(tmp_path)
+    manager = get_task_manager()
+    db_path = get_project_task_db_path_for_context(ctx)
+
+    zombie, reserved = _reserve_row(ctx, "script_process", 0)
+    assert reserved is True
+    _backdate_task(ctx, "script_process", 0)
+    # 刚写下的行在宽限期内，不能被当成僵尸
+    _reserve_row(ctx, "single_video", 1)
+
+    assert (
+        manager.sweep_orphan_inline_tasks(
+            db_path, live_task_ids={zombie.task_id}, grace_seconds=120
+        )
+        == 0
+    )
+    assert manager.get_task_for_project(ctx, "script_process", 0).status in {
+        "submitting",
+        "queued",
+    }
+
+    assert (
+        manager.sweep_orphan_inline_tasks(
+            db_path, live_task_ids=set(), grace_seconds=120
+        )
+        == 1
+    )
+    failed = manager.get_task_for_project(ctx, "script_process", 0)
+    assert failed.status == "failed"
+    assert "已中断" in (failed.error or "")
+    # 宽限期内新写的行不受影响
+    assert manager.get_task_for_project(ctx, "single_video", 1).status in {
+        "submitting",
+        "queued",
+    }

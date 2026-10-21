@@ -397,6 +397,17 @@ def create_app() -> FastAPI:
             ensure_bootstrap()
             await get_port("lifecycle").on_startup(register_as_worker=True)
 
+            from novelvideo.ports import get_task_backend
+
+            # inline 后端的 lane job 必须派到这条主循环上：任务 runner 在 worker
+            # 线程里自带一条临时 asyncio.run 循环，runner 内部接力入队时若把 job
+            # 挂到那条临时循环上，runner 一返回它就被静默取消，任务行永远停在
+            # queued（见 InlineTaskBackend.bind_event_loop）。
+            bind_event_loop = getattr(get_task_backend(), "bind_event_loop", None)
+            if callable(bind_event_loop):
+                bind_event_loop(asyncio.get_running_loop())
+                logger.info("inline task backend bound to application event loop")
+
             from novelvideo.sqlite_pragmas import litestream_enabled
 
             if litestream_enabled():

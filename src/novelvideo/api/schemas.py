@@ -149,6 +149,14 @@ class ScriptProcessStart(BaseModel):
     spine_template: Optional[Literal["drama", "narrated"]] = None
 
 
+class ScreenplayPreprocessStart(BaseModel):
+    """导入后把剧本规范化成系统可消费的形式（确定性、无 LLM）。"""
+
+    force: bool = False
+    #: 是否把已存在的分集正文同步为规范化文本（只替换未被手工修改的集）。
+    apply_to_episodes: bool = True
+
+
 # ── 角色 ──────────────────────────────────────────────────────────────────────
 
 

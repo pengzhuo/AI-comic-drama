@@ -15,6 +15,7 @@ class TaskIdentitySpec:
 
 TASK_IDENTITY_SPECS: dict[str, TaskIdentitySpec] = {
     "ingest_fast": TaskIdentitySpec("ingest_fast"),
+    "screenplay_preprocess": TaskIdentitySpec("screenplay_preprocess"),
     "script_process": TaskIdentitySpec("script_process"),
     "build_characters": TaskIdentitySpec("build_chars"),
     "character_portrait": TaskIdentitySpec("character_portrait", scope_mode="raw"),

@@ -3073,7 +3073,18 @@
     "scriptProcessStart": "Start script processing",
     "scriptProcessRerun": "Re-run",
     "scriptProcessSummary": "{{characters}} characters · {{scenes}} scenes · {{gaps}} open questions",
-    "scriptProcessDegraded": "{{count}} segment(s) were blocked by content review and need a manual look"
+    "scriptProcessDegraded": "{{count}} segment(s) were blocked by content review and need a manual look",
+    "screenplayPreprocessTitle": "Screenplay preprocessing",
+    "screenplayPreprocessIdle": "Waiting",
+    "screenplayPreprocessRunning": "Processing…",
+    "screenplayPreprocessDone": "Completed",
+    "screenplayPreprocessFailed": "Failed",
+    "screenplayPreprocessSummary": "{{merged}} split heading(s) merged · {{headings}} scene heading(s)",
+    "screenplayPreprocessUnchanged": "The screenplay is already canonical",
+    "screenplayPreprocessEpisodes": "{{count}} episode(s) synced",
+    "screenplayPreprocessRun": "Preprocess",
+    "screenplayPreprocessRerun": "Re-run",
+    "screenplayPreprocessStartFailed": "Could not start"
   },
   "video": {
     "voiceSelect": "Voice",

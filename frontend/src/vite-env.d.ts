@@ -21,6 +21,8 @@ interface ImportMetaEnv {
   readonly VITE_HIDE_NOTIFICATION_CENTER?: string;
   /** Set to "1" on instance builds to drop the model configuration guide link. */
   readonly VITE_HIDE_MODEL_GUIDE?: string;
+  /** Set to "1" on instance builds to stop calling the GitHub API for star counts. */
+  readonly VITE_HIDE_GITHUB_STARS?: string;
 }
 
 interface ImportMeta {

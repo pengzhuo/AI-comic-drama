@@ -843,6 +843,100 @@ class TaskStateManager:
             self._save_on_connection(conn, task_key, state, self.COMPLETED_TTL)
             return True, state
 
+    def clear_task_for_project(
+        self,
+        ctx: ProjectContext,
+        task_type: str,
+        episode: int,
+        *,
+        beat_num: int | None = None,
+        scope: str | None = None,
+    ) -> bool:
+        """删除一条任务行,供「假排队行回收」使用。
+
+        与 ``cancel_queued_task_for_project`` 不同:这里不留 cancelled 终态——调用方
+        马上会用同一个 task_key 重新 reserve,残留终态行会被幂等锁当成已处理。
+        """
+        task_key = project_task_state_key(
+            task_type,
+            ctx.project_id,
+            episode,
+            beat_num=beat_num,
+            scope=scope,
+        )
+        with self._connect_context(ctx) as conn:
+            cursor = conn.execute(
+                "DELETE FROM task_states WHERE task_key = ? AND project_id = ?",
+                (task_key, ctx.project_id),
+            )
+            return bool(cursor.rowcount)
+
+    def sweep_orphan_inline_tasks(
+        self,
+        db_path: str | Path,
+        *,
+        live_task_ids: set[str],
+        grace_seconds: float = 120.0,
+        reason: str = "任务未能进入执行队列,已中断,请重新发起",
+    ) -> int | None:
+        """把「DB 说在途、本进程没有在飞 job」的 inline 行落为 failed。
+
+        ``inline`` 任务的排队与执行句柄都在 API 进程内存里,所以「行在途 + 本进程
+        没有对应 job」只可能是假排队(例如接力入队时 job 落在了调用方那条马上关闭
+        的临时事件循环上)。这类行会被幂等锁一直挡住重试,必须回收成 failed,UI 才
+        会显示「已中断,请重新发起」而不是永远「处理中 0%」。
+
+        ``updated_at`` 早于 ``grace_seconds`` 才算,给并发投递留下 reserve → 入队
+        之间的窗口,不会误伤刚写下的行。
+        """
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=max(float(grace_seconds), 0.0))
+        ).isoformat().replace("+00:00", "Z")
+        if "." not in cutoff:
+            # 同 _PROCESS_STARTED_AT 的补位:整秒时 isoformat 省略小数位,
+            # "...:56Z" 字典序大于 "...:56.4Z",会多扫掉同秒内的活任务。
+            cutoff = cutoff.replace("Z", ".000000Z")
+        now = utc_now_iso()
+        params = [reason, now, now, compute_expiry(self.COMPLETED_TTL), cutoff]
+        live_clause = ""
+        if live_task_ids:
+            # 同一事务内再挡一次「本进程有 job」的行,SELECT 与 UPDATE 之间新上任
+            # 的活任务不会被误杀。
+            live_clause = (
+                "AND task_id NOT IN (%s) " % ", ".join("?" for _ in live_task_ids)
+            )
+            params.extend(sorted(live_task_ids))
+        with self._connect_path(Path(db_path), skip_auto_sweep=True) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "UPDATE task_states SET status = 'failed', "
+                    "error = COALESCE(NULLIF(error, ''), ?), "
+                    "completed_at = ?, updated_at = ?, expires_at = ? "
+                    "WHERE status IN ('submitting', 'queued', 'running') "
+                    "AND updated_at < ? "
+                    "AND json_valid(result_json) "
+                    "AND json_extract(result_json, '$.task_metadata.backend') "
+                    "= 'inline' "
+                    + live_clause,
+                    tuple(params),
+                )
+                conn.commit()
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                logger.warning("orphan inline task sweep skipped: %s", exc)
+                return None
+        reaped = int(cursor.rowcount or 0)
+        if reaped:
+            logger.warning(
+                "reaped %d orphan inline task(s) in %s "
+                "(in-flight row without a live job in this process)",
+                reaped,
+                db_path,
+            )
+        return reaped
+
     def mark_task_enqueued_for_project(
         self,
         ctx: ProjectContext,

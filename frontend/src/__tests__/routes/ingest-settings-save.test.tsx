@@ -356,6 +356,18 @@ vi.mock("@/lib/queries/ingest", () => ({
     isPending: false,
     error: null,
   }),
+  // 剧本预处理卡片（导入后自动跑的确定性规范化阶段）
+  isScreenplayPreprocessRunning: () => false,
+  useScreenplayPreprocess: () => ({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+  }),
+  useStartScreenplayPreprocess: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+    isError: false,
+  }),
 }));
 
 vi.mock("@/lib/queries/characters", () => ({

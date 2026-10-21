@@ -19,6 +19,7 @@ describe("useGithubStars", () => {
     window.localStorage.clear();
   });
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -65,5 +66,16 @@ describe("useGithubStars", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     expect(result.current).toBeNull();
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("never calls the GitHub API when the instance hides upstream stars", () => {
+    vi.stubEnv("VITE_HIDE_GITHUB_STARS", "1");
+    const fetchMock = mockFetchOk(1500);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result } = renderHook(() => useGithubStars(REPO));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.current).toBeNull();
   });
 });

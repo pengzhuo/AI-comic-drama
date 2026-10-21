@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 AUTO_TASK_TYPES = frozenset({
     "ingest_fast",
+    "screenplay_preprocess",
     "script_process",
     "build_characters",
     "build_scenes",
@@ -820,6 +821,7 @@ def _task_label(task: TaskState) -> str:
         return f"第 {task.episode} 集 Beat {task.beat_num} 提示词"
     labels = {
         "ingest_fast": "项目摄入",
+        "screenplay_preprocess": "剧本预处理",
         "script_process": "剧本处理",
         "build_characters": "角色构建",
         "build_props": "道具构建",

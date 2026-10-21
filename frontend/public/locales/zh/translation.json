@@ -3073,7 +3073,18 @@
     "scriptProcessStart": "开始剧本处理",
     "scriptProcessRerun": "重新处理",
     "scriptProcessSummary": "{{characters}} 个角色 · {{scenes}} 个场景 · {{gaps}} 项未决",
-    "scriptProcessDegraded": "{{count}} 段未通过内容审核，需人工复核"
+    "scriptProcessDegraded": "{{count}} 段未通过内容审核，需人工复核",
+    "screenplayPreprocessTitle": "剧本预处理",
+    "screenplayPreprocessIdle": "等待处理",
+    "screenplayPreprocessRunning": "处理中…",
+    "screenplayPreprocessDone": "已完成",
+    "screenplayPreprocessFailed": "处理失败",
+    "screenplayPreprocessSummary": "合并分行场头 {{merged}} 处 · 场景头 {{headings}} 个",
+    "screenplayPreprocessUnchanged": "剧本已是规范格式，无需改动",
+    "screenplayPreprocessEpisodes": "已同步 {{count}} 集正文",
+    "screenplayPreprocessRun": "处理剧本",
+    "screenplayPreprocessRerun": "重新处理",
+    "screenplayPreprocessStartFailed": "启动失败"
   },
   "video": {
     "voiceSelect": "语音选择",

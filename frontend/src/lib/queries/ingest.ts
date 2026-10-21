@@ -289,3 +289,98 @@ export function useStartScriptProcess(project: string) {
     },
   });
 }
+
+/** One sample of the normalization applied to an imported scene heading. */
+export interface ScreenplayPreprocessSample {
+  kind?: string;
+  line_no?: number;
+  before?: string;
+  after?: string[];
+}
+
+/** Structured result of the deterministic screenplay preprocessing stage. */
+export interface ScreenplayPreprocessResult {
+  changed?: boolean;
+  episodes?: number;
+  scene_headings?: number;
+  stats?: {
+    split_headings_merged?: number;
+    headings_rewritten?: number;
+    notes_preserved?: number;
+  };
+  samples?: ScreenplayPreprocessSample[];
+  episodes_updated?: number;
+  episodes_skipped_edited?: number;
+  finished_at?: string;
+}
+
+export interface ScreenplayPreprocessTaskSummary {
+  status: string;
+  task_id: string;
+  progress: number;
+  current_task: string;
+}
+
+export interface ScreenplayPreprocessStatus {
+  ok: true;
+  has_result: boolean;
+  task: ScreenplayPreprocessTaskSummary;
+  result: ScreenplayPreprocessResult | null;
+  normalized_text?: string;
+}
+
+export function isScreenplayPreprocessRunning(
+  status: string | undefined,
+): boolean {
+  return !!status && _SCRIPT_PROCESS_LIVE_STATUSES.has(status);
+}
+
+export function useScreenplayPreprocess(
+  project: string,
+  enabled = true,
+  options: ScriptProcessQueryOptions = {},
+) {
+  const pollWhileWaitingMs = options.pollWhileWaitingMs ?? 0;
+  return useQuery({
+    queryKey: queryKeys.screenplayPreprocess(project),
+    queryFn: ({ signal }) =>
+      api
+        .get(p`api/v1/projects/${project}/screenplay/preprocess`, { signal })
+        .json<ScreenplayPreprocessStatus>(),
+    enabled: !!project && enabled,
+    // Same shape as the script-processing stage: it runs right after the import
+    // and is short-lived, so poll while it is live plus the caller's window.
+    refetchInterval: (query) => {
+      if (isScreenplayPreprocessRunning(query.state.data?.task?.status)) {
+        return 2000;
+      }
+      if (pollWhileWaitingMs > 0 && !query.state.data?.has_result) {
+        return pollWhileWaitingMs;
+      }
+      return false;
+    },
+  });
+}
+
+export function useStartScreenplayPreprocess(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { force?: boolean } = {}) => {
+      const response = await jsonWithBackendError<TaskResponse | ErrorResponse>(
+        api.post(p`api/v1/projects/${project}/screenplay/preprocess/start`, {
+          json: params,
+          throwHttpErrors: false,
+        }),
+      );
+      if (!response.ok) {
+        throw new Error(response.error);
+      }
+      return response;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.screenplayPreprocess(project),
+      });
+    },
+  });
+}

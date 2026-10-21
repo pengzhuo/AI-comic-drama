@@ -15,6 +15,7 @@ from starlette.concurrency import run_in_threadpool
 
 from novelvideo.asset_references import asset_reference_gaps_for_store
 from novelvideo.project_context import ProjectContext
+from novelvideo.screenplay_preprocess import has_preprocess_result
 from novelvideo.script_process import has_script_process_result
 from novelvideo.sqlite_store import SQLiteStore
 from novelvideo.task_state import get_task_manager
@@ -25,6 +26,7 @@ _log = logging.getLogger(__name__)
 
 STEP_MAP: dict[str, tuple[str | None, str]] = {
     "ingest": ("ingest_fast", "小说摄入"),
+    "screenplay_preprocess": ("screenplay_preprocess", "剧本预处理"),
     "script_process": ("script_process", "剧本处理"),
     "configure": (None, "配置项目"),
     "characters": ("build_characters", "角色提取"),
@@ -212,6 +214,39 @@ def incomplete_episodes(store: SQLiteStore, project_dir: Path) -> list[int]:
     return result
 
 
+def _ingest_artifact_digest_matches(
+    username: str, project_name: str, project_dir: Path
+) -> bool:
+    """摄入是否完成——按持久产物判断，而不是按会过期的任务行。
+
+    摄入完成时把当时 ``novel.txt`` 的内容指纹写进项目配置，比对上即视为已摄入。
+    存量项目没有这份标记，但脚本处理结果里记着它当初分析的文本指纹
+    （``source_sha256``，与 ``novel_source_digest`` 同一算法），指纹相同同样
+    证明当前文本已经摄入过。重新上传换了文本，两种比对都会失效，不会让自动
+    流程跳过真正需要的导入。
+    """
+    try:
+        from novelvideo.novel_source import novel_source_digest
+        from novelvideo.project_config import load_project_config
+
+        digest = novel_source_digest(project_dir)
+        if not digest:
+            return False
+        marked = str(
+            load_project_config(username, project_name).get("ingest_source_digest")
+            or ""
+        ).strip()
+        if marked:
+            return marked == digest
+        from novelvideo.script_process import load_script_process_result
+
+        result = load_script_process_result(project_dir) or {}
+        return str(result.get("source_sha256") or "").strip() == digest
+    except Exception:  # noqa: BLE001 - 状态计算不能因为读配置失败而报错
+        _log.debug("durable ingest status check failed", exc_info=True)
+        return False
+
+
 def character_needs_portrait(character: Any) -> bool:
     """Whether a character must own a ``portrait.png`` face anchor.
 
@@ -270,6 +305,10 @@ async def compute_pipeline_status(
         or bool(characters)
         or bool(episodes)
     )
+    if not ingested:
+        # 任务行只是瞬时记录（完成 1 小时后被惰性删除），所以还要问持久产物，
+        # 否则已导入的项目会退回「小说摄入」，自动流程也会白跑一次导入。
+        ingested = _ingest_artifact_digest_matches(username, project_name, project_dir)
     configured = _user_has_configured(username, project_name)
     portraits_done = bool(portrait_chars) and all(
         bool(compute_portrait_path(project_dir, c.name)) for c in portrait_chars
@@ -281,9 +320,18 @@ async def compute_pipeline_status(
     script_process_pending = (
         ingested and not script_processed and not episodes
     )
+    # 剧本预处理的产物是规范化文本 + screenplay/preprocess.json（确定性、无 LLM）。
+    # 和剧本处理一样不回灌存量项目：分集一旦建好就不再把它排回流程，存量项目仍可
+    # 用 /screenplay/preprocess 手动重跑。
+    screenplay_preprocessed = has_preprocess_result(project_dir)
+    screenplay_preprocess_pending = (
+        ingested and not screenplay_preprocessed and not episodes
+    )
 
     global_status = {
         "ingested": ingested,
+        "screenplay_preprocessed": screenplay_preprocessed,
+        "screenplay_preprocess_pending": screenplay_preprocess_pending,
         "script_processed": script_processed,
         "script_process_pending": script_process_pending,
         "configured": configured,
@@ -295,6 +343,8 @@ async def compute_pipeline_status(
     if not (ingested and configured and characters and episodes and portraits_done):
         if not ingested:
             next_step = "ingest"
+        elif screenplay_preprocess_pending:
+            next_step = "screenplay_preprocess"
         elif script_process_pending:
             next_step = "script_process"
         elif not configured:

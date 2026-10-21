@@ -142,6 +142,111 @@ def test_build_seedance2_strict_first_frame_rewrites_stale_image_refs():
     assert params["prompt"] == "参考图片1与首帧画面，锁住首帧。"
 
 
+def test_build_seedance2_first_frame_accepts_declared_absent_audio_reference():
+    """后置否定：`@音频1及以后编号均不存在`（nn_1021_1 ep2 beat 2 的真实提示词）。
+
+    否定语落在编号后面，前缀窗口里没有否定词；只按字面校验会把这个 0 音频的镜头
+    直接判失败（``提示词引用了 音频1，但当前请求只发送了 0 个音频素材``）。
+    """
+
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
+
+    params = build_seedance2_huimeng_params(
+        {
+            "mode": Seedance2I2VMode.FIRST_FRAME.value,
+            "final_prompt": (
+                "本镜不引用任何道具图与声音素材，@音频1及以后编号均不存在，不得虚构或新增编号。"
+            ),
+            "human_review": False,
+            "human_review_user_set": True,
+        },
+        first_frame="https://example.com/first.png",
+    )
+
+    assert "reference_audios" not in params
+    assert "音频1及以后编号均不存在" in params["prompt"]
+
+
+def test_build_seedance2_first_frame_accepts_negated_audio_number_after_prohibition():
+    """后置否定：`禁止使用@图片2…与@音频2及以后的任何编号`（ep2 beat 18 的真实提示词）。"""
+
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
+
+    params = build_seedance2_huimeng_params(
+        {
+            "mode": Seedance2I2VMode.FIRST_FRAME.value,
+            "final_prompt": (
+                "声音仅引用@音频1（阿雅 · 青年时期声线）作参考；"
+                "禁止使用@图片2及以后的任何编号与@音频2及以后的任何编号。"
+            ),
+            "human_review": False,
+            "human_review_user_set": True,
+        },
+        first_frame="https://example.com/first.png",
+        reference_audios=["https://example.com/voice.mp3"],
+    )
+
+    assert params["reference_audios"] == ["https://example.com/voice.mp3"]
+
+
+def test_build_seedance2_first_frame_accepts_number_spaced_after_negation():
+    """否定词与编号之间夹 ``@``/空格（``不引用 @图片2``）也一样放行。"""
+
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
+
+    params = build_seedance2_huimeng_params(
+        {
+            "mode": Seedance2I2VMode.FIRST_FRAME.value,
+            "final_prompt": "全片仅引用 @图片1，不引用 @音频2 及以后任何编号。",
+            "human_review": False,
+            "human_review_user_set": True,
+        },
+        first_frame="https://example.com/first.png",
+    )
+
+    assert params["image_url"] == "https://example.com/first.png"
+
+
+def test_build_seedance2_first_frame_still_rejects_positive_audio_reference():
+    """正向引用却只送了 0 条声线，仍要拦住（提示词与素材不一致，属真实缺陷）。"""
+
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
+
+    with pytest.raises(ValueError, match="音频1"):
+        build_seedance2_huimeng_params(
+            {
+                "mode": Seedance2I2VMode.FIRST_FRAME.value,
+                "final_prompt": "声音参考音频1（许知意 · 学生时期声线），仅作对白音色参考。",
+                "human_review": False,
+                "human_review_user_set": True,
+            },
+            first_frame="https://example.com/first.png",
+        )
+
+
+def test_build_seedance2_first_frame_still_rewrites_image_in_prohibition():
+    """越界「图片N」的保守改写保持不变：即使落在否定句里也照旧改写为首帧表述。"""
+
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
+
+    params = build_seedance2_huimeng_params(
+        {
+            "mode": Seedance2I2VMode.FIRST_FRAME.value,
+            "final_prompt": "全片仅引用 @图片1，不引用 @图片2 及以后任何编号。",
+            "human_review": False,
+            "human_review_user_set": True,
+        },
+        first_frame="https://example.com/first.png",
+    )
+
+    assert params["prompt"] == "全片仅引用 图片1，不引用 首帧画面 及以后任何编号。"
+
+
 def test_human_review_requires_http_media_urls():
     from novelvideo.seedance2_i2v.models import Seedance2I2VMode
     from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params

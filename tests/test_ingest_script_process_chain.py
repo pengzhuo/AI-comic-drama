@@ -1,8 +1,11 @@
-"""The import stage hands the imported script to the film-process pack.
+"""The import stage hands the imported script to the preprocessing stage.
 
 The hand-off lives in the ingest runner rather than in the REST handler so the
 automatic stage survives a closed browser tab.  It must be best effort: a
 rejected hand-off can never fail an import that already succeeded.
+
+剧本预处理 runs first and chains 剧本处理 itself, so the ingest runner never
+enqueues the film-process-pack stage directly.
 """
 
 from pathlib import Path
@@ -82,14 +85,14 @@ def _patch_ingest(
     has_result: bool = False,
     enqueue=None,
 ):
-    from novelvideo import cognee, script_process
+    from novelvideo import cognee, screenplay_preprocess
     from novelvideo.task_backend import client as task_backend_client
     from novelvideo.task_backend.runners import ingest
 
     monkeypatch.setattr(ingest, "get_task_manager", lambda: manager)
     monkeypatch.setattr(cognee, "CogneeStore", _FakeStore)
     monkeypatch.setattr(
-        script_process, "has_script_process_result", lambda _output_dir: has_result
+        screenplay_preprocess, "has_preprocess_result", lambda _output_dir: has_result
     )
 
     async def _record_enqueue(ctx, **kwargs):
@@ -102,7 +105,7 @@ def _patch_ingest(
     return ingest
 
 
-async def test_ingest_chains_script_processing(
+async def test_ingest_chains_screenplay_preprocessing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = _RecordingTaskManager()
@@ -114,14 +117,39 @@ async def test_ingest_chains_script_processing(
     )
 
     assert result == {"status": "graph_ready"}
-    assert manager.lookups == [("script_process", 0)]
+    assert manager.lookups == [("screenplay_preprocess", 0)]
     assert len(enqueued) == 1
-    assert enqueued[0]["task_type"] == "script_process"
+    assert enqueued[0]["task_type"] == "screenplay_preprocess"
     assert enqueued[0]["product_surface"] == "mainline"
     assert enqueued[0]["queue_kind"] == "default"
     assert enqueued[0]["episode"] == 0
     assert enqueued[0]["payload"]["output_dir"] == str(tmp_path / "output")
     assert _FakeStore.instance is not None and _FakeStore.instance.closed
+
+
+async def test_ingest_drops_stale_preprocessing_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh import must not keep reading the previous normalization result."""
+
+    from novelvideo import screenplay_preprocess
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    screenplay_preprocess.save_preprocess_result(
+        output_dir, payload={"changed": True}, normalized_text="1-1 车间 夜 内\n"
+    )
+    assert screenplay_preprocess.has_preprocess_result(output_dir)
+
+    ingest = _patch_ingest(
+        monkeypatch, manager=_RecordingTaskManager(), enqueued=[]
+    )
+    await ingest._run_ingest_fast(
+        {"payload": {"novel_path": str(tmp_path / "novel.txt")}}, _ctx(tmp_path)
+    )
+
+    assert screenplay_preprocess.has_preprocess_result(output_dir) is False
+    assert screenplay_preprocess.read_normalized_novel(output_dir) == ""
 
 
 async def test_ingest_skips_hand_off_when_result_exists(
