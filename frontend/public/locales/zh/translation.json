@@ -2847,6 +2847,7 @@
     },
     "pastePlaceholder": "在这里粘贴小说文本，最多 1000 字",
     "startIngest": "开始导入",
+    "startBlockedByFormat": "剧本格式未通过校验，暂时不能开始导入。请点「查看详情」按提示补写场景头，再重新上传。",
     "startOneClickFilm": "一键成片",
     "saveSettings": "保存设置",
     "settingsSaved": "项目设置已保存",
@@ -3997,7 +3998,18 @@
         "beatNarrationVoiceUpload": "上传本条音频",
         "beatNarrationVoiceUploaded": "本条解说音频已上传",
         "prereqHintCharacters": "。请到「角色」中上传解说主角声线。",
-        "prereqHintVoices": "。请到「资产 > 声线」上传或裁剪默认解说声线。"
+        "prereqHintVoices": "。请到「资产 > 声线」上传或裁剪默认解说声线。",
+        "prereqHintCharacterVoices": "。请到「角色」为缺声线的角色配置声线，或让捏导用系统声线补齐。"
+      },
+      "voicePrereq": {
+        "titleCharacters": "配音被阻断：角色声线缺失",
+        "titleVoices": "配音被阻断：解说声线缺失",
+        "charactersMissing": "缺少声线的角色：{{characters}}",
+        "moreErrors": "另有 {{count}} 条同类提示",
+        "configureAction": "去配置声线",
+        "askDirectorAction": "让捏导配系统声线",
+        "askDirectorRequest": "请用系统声线补齐本集缺失的角色声线（角色：{{characters}}），补齐后继续配音。",
+        "askDirectorRequestNoCharacters": "请用系统声线补齐本集缺失的声线，补齐后继续配音。"
       },
       "video": {
         "started": "Beat #{{n}} 视频已启动",

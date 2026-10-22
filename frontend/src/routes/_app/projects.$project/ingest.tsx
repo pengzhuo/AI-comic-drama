@@ -26,6 +26,7 @@ import {
 
 import { useProject, useUpdateProject } from "@/lib/queries/projects";
 import {
+  IngestFormatBlockedError,
   useChapters,
   useKnowledgeGraph,
   useStartIngest,
@@ -600,6 +601,7 @@ function UploadedFileCard({
   onViewFormatCheck,
   isIngesting,
   canStart,
+  blockedByFormatCheck,
   isStarting,
   sourceLocked,
   ingestCostDisplay,
@@ -622,6 +624,8 @@ function UploadedFileCard({
   onViewFormatCheck?: () => void;
   isIngesting: boolean;
   canStart: boolean;
+  /** 格式阻断时按钮保持可见但禁用：整块消失会让用户以为页面卡住。 */
+  blockedByFormatCheck: boolean;
   isStarting: boolean;
   sourceLocked: boolean;
   ingestCostDisplay?: string | null;
@@ -714,28 +718,37 @@ function UploadedFileCard({
             </Button>
           ) : (
             <>
-              {canStart && (
-                <Button
-                  size="sm"
-                  onClick={onStart}
-                  disabled={isStarting}
-                  className="gap-1.5"
+              {(canStart || blockedByFormatCheck) && (
+                <span
+                  className="inline-flex"
+                  title={
+                    blockedByFormatCheck
+                      ? t("ingest.startBlockedByFormat")
+                      : undefined
+                  }
                 >
-                  {isStarting ? (
-                    <Loader2 className="size-3.5 animate-spin" />
-                  ) : (
-                    <Play className="size-3.5 fill-current" />
-                  )}
-                  {isStarting
-                    ? t("ingest.processing")
-                    : status === "failed" || status === "stopped"
-                      ? t("common.retry")
-                      : t("ingest.startIngest")}
-                  <CreditCostInline
-                    display={ingestCostDisplay}
-                    promotion={ingestPromotion}
-                  />
-                </Button>
+                  <Button
+                    size="sm"
+                    onClick={onStart}
+                    disabled={!canStart || isStarting}
+                    className="gap-1.5"
+                  >
+                    {isStarting ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <Play className="size-3.5 fill-current" />
+                    )}
+                    {isStarting
+                      ? t("ingest.processing")
+                      : status === "failed" || status === "stopped"
+                        ? t("common.retry")
+                        : t("ingest.startIngest")}
+                    <CreditCostInline
+                      display={ingestCostDisplay}
+                      promotion={ingestPromotion}
+                    />
+                  </Button>
+                </span>
               )}
               <OneClickFilmButton
                 onClick={onStartOneClick}
@@ -877,19 +890,22 @@ function InputModeToggle({
 
 function IngestStartButton({
   disabled,
+  disabledReason,
   isBusy,
   costDisplay,
   promotion,
   onClick,
 }: {
   disabled: boolean;
+  /** 被格式校验禁用时给出原因：静默置灰等于「点了没反应」。 */
+  disabledReason?: string | null;
   isBusy: boolean;
   costDisplay?: string | null;
   promotion?: CreditPromotionDisplay | null;
   onClick: () => void;
 }) {
   const { t } = useTranslation();
-  return (
+  const button = (
     <Button
       type="button"
       onClick={onClick}
@@ -904,6 +920,13 @@ function IngestStartButton({
         <IngestCreditCostSlot display={costDisplay} promotion={promotion} />
       </span>
     </Button>
+  );
+  // 禁用的 button 不派发鼠标事件，native title 提示会失效，用外层 span 承载。
+  if (!disabled || !disabledReason) return button;
+  return (
+    <span className="inline-flex" title={disabledReason}>
+      {button}
+    </span>
   );
 }
 
@@ -1334,7 +1357,12 @@ export function IngestPageContent({ project }: { project: string }) {
   const spineTemplateLabel =
     SPINE_TEMPLATE_OPTIONS.find((opt) => opt.value === settingsValues.spine_template)
       ?.labelKey ?? "ingest.projectTypes.drama";
-  const spineTemplateLocked = ingestStarted || (hasImportedContent && !reimporting);
+  // 上传接口会把「预览章节」直接写进 chapters 缓存（preview_only:true），此时后端其实还没有
+  // 任何章节。若把它当成"已导入"就会锁死类型选择器：用户既被格式校验挡住不能开始导入，
+  // 又不能改项目类型，只能先删文件。只在真正导入完成（后端返回的章节不再带 preview_only）
+  // 或已在导入中才锁。
+  const spineTemplateLocked =
+    ingestStarted || (hasImportedContent && !reimporting && !isUploadOnlyPreview);
   // 解说风格（第一/第三人称）只对解说剧（narrated）有意义；精品剧（drama）不存在
   // 解说主角/旁白的人称概念，切到精品剧时隐藏入口并在保存时不落库该字段。
   const showNarrationStyle = settingsValues.spine_template === "narrated";
@@ -1529,6 +1557,10 @@ export function IngestPageContent({ project }: { project: string }) {
         const message = backendErrorToastMessage(error, t);
         setIngestError(message);
         toast.error(message);
+        // 格式闸门拒绝时把后端的 format_check 直接摊开，别让用户对着一句 toast 猜。
+        if (error instanceof IngestFormatBlockedError && error.formatCheck) {
+          setFormatCheckDetails({ formatCheck: error.formatCheck, filename });
+        }
       }
     },
     [
@@ -1965,6 +1997,11 @@ export function IngestPageContent({ project }: { project: string }) {
                       isStarting ||
                       ingestStarted
                     }
+                    disabledReason={
+                      formatCheckBlocksImport
+                        ? t("ingest.startBlockedByFormat")
+                        : null
+                    }
                     isBusy={isStarting || ingestStarted}
                     costDisplay={ingestFeatureCostDisplay}
                     promotion={ingestFeatureCostData?.promotion}
@@ -2005,6 +2042,9 @@ export function IngestPageContent({ project }: { project: string }) {
                       (!!reimportSourceFilename &&
                         (previewStatus === "failed" ||
                           previewStatus === "stopped")))
+                  }
+                  blockedByFormatCheck={
+                    formatCheckBlocksImport && !ingestStarted
                   }
                   isStarting={isStarting}
                   sourceLocked={!!reimportSourceFilename}

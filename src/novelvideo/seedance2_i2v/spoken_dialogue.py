@@ -9,6 +9,7 @@ from novelvideo.seedance2_i2v.voice_clone import (
     SCRIPT_LEADING_NOTE_RE as _LEADING_PERFORMANCE_NOTE_RE,
     SCRIPT_SPEAKER_PREFIX_RE as _SPEAKER_PREFIX_RE,
     dialogue_text,
+    looks_like_speaker_label,
     normalize_seedance2_audio_type,
     strip_leading_script_marks as _strip_leading_script_marks,
 )
@@ -36,6 +37,11 @@ def parse_seedance2_spoken_lines(beat: dict[str, Any]) -> list[Seedance2SpokenLi
 
     Only parses explicit literal-script lines such as ``角色（动作）：台词``.
     Ambiguous beat-level prose is left intact for the AI prompt composer.
+
+    ``名前：`` 的前缀同样要过 ``looks_like_speaker_label``：散文里的冒号
+    （``认定书上写着：违规操作…``）不是说话人，误判的代价是给一个不存在的角色
+    去要参考声线，整条 beat 直接卡在发请求之前。字幕剥离走的就是这条规则，
+    两处口径必须一致。
     """
 
     if normalize_seedance2_audio_type(beat) != "dialogue":
@@ -45,7 +51,11 @@ def parse_seedance2_spoken_lines(beat: dict[str, Any]) -> list[Seedance2SpokenLi
     if not raw:
         return []
 
-    matches = list(_SPEAKER_PREFIX_RE.finditer(raw))
+    matches = [
+        match
+        for match in _SPEAKER_PREFIX_RE.finditer(raw)
+        if looks_like_speaker_label(match.group("speaker"))
+    ]
     lines: list[Seedance2SpokenLine] = []
     for index, match in enumerate(matches):
         start = match.end()

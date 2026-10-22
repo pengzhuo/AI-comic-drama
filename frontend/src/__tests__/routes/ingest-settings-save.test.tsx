@@ -83,6 +83,7 @@ beforeAll(async () => {
             },
             pastePlaceholder: "Paste novel text here",
             startIngest: "Start Import",
+            startBlockedByFormat: "Format check blocked the import",
             processing: "Processing...",
             elapsed: "Elapsed {{time}}",
             status: {
@@ -302,6 +303,8 @@ vi.mock("@/lib/queries/projects", () => ({
 }));
 
 vi.mock("@/lib/queries/ingest", () => ({
+  // 页面用 instanceof 判断「被格式闸门拒绝」，mock 必须提供同名导出。
+  IngestFormatBlockedError: class IngestFormatBlockedError extends Error {},
   useChapters: () => ({ data: mocks.chaptersData, isFetching: false }),
   useKnowledgeGraph: (_project: string, enabled: boolean) => ({
     data: enabled
@@ -1494,5 +1497,129 @@ describe("IngestPage settings save", () => {
       await screen.findByText(SUPPORTED_FORMATS_LABEL),
     ).toBeInTheDocument();
     expect(screen.queryByText("Importing")).not.toBeInTheDocument();
+  });
+
+  it("keeps a disabled start button with its reason when the format check blocks the import", async () => {
+    // 精品剧 + 无场景头：前端把后端的 warning 升级为 blocking。旧的实现让「开始导入」
+    // 按钮整块消失，页面上只剩一条红字 —— 用户读起来就是「页面卡住了」。
+    const user = userEvent.setup();
+    mocks.uploadNovel.mockImplementation(async () => {
+      const chapters = [
+        { number: 1, title: "第一集 初遇", char_count: 12, scene_blocks: [] },
+      ];
+      mocks.chaptersData = {
+        ok: true,
+        data: {
+          total_chars: 12,
+          count: 1,
+          preview_only: true,
+          source_filename: "novel.txt",
+          chapters,
+        },
+      };
+      return {
+        ok: true,
+        data: {
+          filename: "novel.txt",
+          size: 12,
+          total_chars: 12,
+          count: 1,
+          chapters,
+          format_check: {
+            level: "warning",
+            summary: "Premium drama scripts require scene headers.",
+            summary_code: "format_risks",
+            scene_header_status: "missing",
+            issues: [],
+          },
+        },
+      };
+    });
+
+    const { container } = render(
+      <Wrapper>
+        <IngestPageContent project="demo" />
+      </Wrapper>,
+    );
+    const initialInput = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    await user.upload(
+      initialInput!,
+      new File(["第一集 初遇"], "novel.txt", { type: "text/plain" }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("第一集 初遇")).toBeInTheDocument(),
+    );
+
+    const startButtons = screen.getAllByRole("button", { name: /Start Import/ });
+    expect(startButtons.length).toBeGreaterThan(0);
+    for (const button of startButtons) {
+      expect(button).toBeDisabled();
+    }
+    // 原因挂在禁用按钮的外层（禁用的 button 不派发鼠标事件，title 会失效）。
+    expect(
+      screen.getAllByTitle("Format check blocked the import").length,
+    ).toBeGreaterThan(0);
+    // 被格式校验挡住不会误触导入。
+    expect(mocks.startIngest).not.toHaveBeenCalled();
+  });
+
+  it("unlocks the project type after deleting an upload-only preview", async () => {
+    // 上传接口会把预览章节写进缓存（preview_only:true），后端其实还没有章节。
+    // 把它当成「已导入」会锁死项目类型：用户既被格式校验挡住、又不能改类型。
+    const user = userEvent.setup();
+    mocks.uploadNovel.mockImplementation(async () => {
+      const chapters = [
+        { number: 1, title: "第一集 初遇", char_count: 12, scene_blocks: [] },
+      ];
+      mocks.chaptersData = {
+        ok: true,
+        data: {
+          total_chars: 12,
+          count: 1,
+          preview_only: true,
+          source_filename: "novel.txt",
+          chapters,
+        },
+      };
+      return {
+        ok: true,
+        data: {
+          filename: "novel.txt",
+          size: 12,
+          total_chars: 12,
+          count: 1,
+          chapters,
+        },
+      };
+    });
+
+    const { container } = render(
+      <Wrapper>
+        <IngestPageContent project="demo" />
+      </Wrapper>,
+    );
+    const initialInput = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    await user.upload(
+      initialInput!,
+      new File(["第一集 初遇"], "novel.txt", { type: "text/plain" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("第一集 初遇")).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+
+    expect(await screen.findByText(SUPPORTED_FORMATS_LABEL)).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: "Narrated" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByTitle("Project type is locked after import"),
+    ).not.toBeInTheDocument();
   });
 });

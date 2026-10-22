@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from novelvideo.egress_context import (
@@ -15,6 +16,8 @@ from novelvideo.task_backend.cancel import await_envelope_with_cancel_watch
 from novelvideo.task_backend.envelope import InvalidTaskEnvelope
 from novelvideo.task_backend.registry import register_project_task_runner
 from novelvideo.task_state import get_task_manager
+
+logger = logging.getLogger(__name__)
 
 INDEXTTS2_AUDIO_TASK_TYPE = "audio_generation_indextts2"
 SYSTEM_VOICE_SETUP_TASK_TYPE = "system_voice_setup"
@@ -79,9 +82,38 @@ async def _run_system_voice_setup(
             current_task="系统声线准备完成",
             logs=[f"已准备 {int(result.get('prepared_count') or 0)} 项系统声线"],
         )
+        _continue_voice_paused_director_auto(ctx)
         return result
     finally:
         await store.close()
+
+
+def _continue_voice_paused_director_auto(ctx: ProjectContext) -> None:
+    """Hand a voice-gate-paused 本集自动 run back to the coordinator.
+
+    The gate parks the run with ``pause()``, and nothing else resumes a
+    ``paused`` run: preparing the system voices is the user's own choice of that
+    policy, so the run has to be picked back up here or it stays parked forever.
+    Strictly best-effort — the voices are already prepared, and a failed hand-off
+    must not turn this task into a failure.
+    """
+
+    try:
+        from novelvideo.chat.director_auto import coordinator as director_auto_coordinator
+
+        project_id = str(getattr(ctx, "project_id", "") or "")
+        username = str(getattr(ctx, "owner_username", "") or "")
+        if not project_id or not username:
+            return
+        director_auto_coordinator.resume_after_system_voice_setup_from_thread(
+            username=username,
+            project_id=project_id,
+        )
+    except Exception:  # noqa: BLE001 - continuation is best-effort
+        logger.exception(
+            "failed to continue director auto after system voice setup: project_id=%s",
+            getattr(ctx, "project_id", ""),
+        )
 
 
 def _extract_trusted_egress_context(

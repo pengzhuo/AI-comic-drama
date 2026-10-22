@@ -9,6 +9,8 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 
 import { AudioPane } from "@/components/episode/beat-workbench/audio-pane";
+import { useDirectorPrefillStore } from "@/features/superchat/director-prefill";
+import { useAppStore } from "@/stores/app-store";
 import type { Beat } from "@/types/episode";
 
 const i18n = i18next.createInstance();
@@ -45,6 +47,20 @@ beforeAll(async () => {
                 configureVoiceAction: "去配置",
                 prereqHintCharacters: "。请到「角色」中上传解说主角声线。",
                 prereqHintVoices: "。请到「资产 > 声线」上传或裁剪默认解说声线。",
+                prereqHintCharacterVoices:
+                  "。请到「角色」为缺声线的角色配置声线，或让捏导用系统声线补齐。",
+              },
+              voicePrereq: {
+                titleCharacters: "配音被阻断：角色声线缺失",
+                titleVoices: "配音被阻断：解说声线缺失",
+                charactersMissing: "缺少声线的角色：{{characters}}",
+                moreErrors: "另有 {{count}} 条同类提示",
+                configureAction: "去配置声线",
+                askDirectorAction: "让捏导配系统声线",
+                askDirectorRequest:
+                  "请用系统声线补齐本集缺失的角色声线（角色：{{characters}}），补齐后继续配音。",
+                askDirectorRequestNoCharacters:
+                  "请用系统声线补齐本集缺失的声线，补齐后继续配音。",
               },
               video: {
                 seedance2Ready: "已配置",
@@ -149,6 +165,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
   audioPrereqErrors.current = [];
+  useDirectorPrefillStore.setState({ pending: null });
+  useAppStore.setState({ aiAssistantOpen: false });
   mutateRegenerate.mockResolvedValue({
     ok: true,
     scope: "ep001:beat_01:__narrator__",
@@ -364,5 +382,89 @@ describe("AudioPane", () => {
     expect(toastError).toHaveBeenCalledWith(
       "TTS 服务暂不可用",
     );
+  });
+
+  it("shows a persistent notice with both ways out when a character voice is missing", async () => {
+    audioPrereqErrors.current = ["Beat 08 角色声线缺失：伊卡"];
+    const user = userEvent.setup();
+
+    render(
+      <Wrapper>
+        <AudioPane
+          beat={makeBeat({ beat_number: 8 })}
+          project="demo"
+          episode={1}
+          state="missing"
+          spineTemplate="drama"
+        />
+      </Wrapper>,
+    );
+
+    expect(screen.getByText("配音被阻断：角色声线缺失")).toBeInTheDocument();
+    expect(screen.getByText("缺少声线的角色：伊卡")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "去配置声线" }));
+
+    expect(window.localStorage.getItem("supertale-asset-tab:demo")).toBe("characters");
+    expect(navigateMock).toHaveBeenCalledWith({
+      to: "/projects/$project/characters",
+      params: { project: "demo" },
+    });
+  });
+
+  it("hints the character-specific fix and keeps the toast jump on characters", async () => {
+    audioPrereqErrors.current = ["Beat 08 角色声线缺失：伊卡"];
+    const user = userEvent.setup();
+
+    render(
+      <Wrapper>
+        <AudioPane
+          beat={makeBeat({ beat_number: 8 })}
+          project="demo"
+          episode={1}
+          state="missing"
+          spineTemplate="drama"
+        />
+      </Wrapper>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "去配置" }));
+
+    expect(mutateRegenerate).not.toHaveBeenCalled();
+    expect(toastError).toHaveBeenCalledWith(
+      "Beat 08 角色声线缺失：伊卡。请到「角色」为缺声线的角色配置声线，或让捏导用系统声线补齐。",
+      expect.objectContaining({
+        action: expect.objectContaining({ label: "去配置" }),
+      }),
+    );
+
+    const action = toastError.mock.calls[0][1].action as { onClick: () => void };
+    action.onClick();
+
+    expect(window.localStorage.getItem("supertale-asset-tab:demo")).toBe("characters");
+  });
+
+  it("hands the missing-voice request to the director composer", async () => {
+    audioPrereqErrors.current = ["Beat 08 角色声线缺失：伊卡"];
+    const user = userEvent.setup();
+
+    render(
+      <Wrapper>
+        <AudioPane
+          beat={makeBeat({ beat_number: 8 })}
+          project="demo"
+          episode={1}
+          state="missing"
+          spineTemplate="drama"
+        />
+      </Wrapper>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "让捏导配系统声线" }));
+
+    expect(useDirectorPrefillStore.getState().pending).toBe(
+      "请用系统声线补齐本集缺失的角色声线（角色：伊卡），补齐后继续配音。",
+    );
+    expect(useAppStore.getState().aiAssistantOpen).toBe(true);
   });
 });

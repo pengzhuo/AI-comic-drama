@@ -8,6 +8,7 @@ import pytest
 
 from novelvideo.seedance2_i2v.voice_preflight import (
     beat_expects_speech,
+    ensure_speech_voice_mention,
     speech_reference_audio_gap,
 )
 from novelvideo.verification.video_consistency_gate import (
@@ -180,4 +181,97 @@ def test_both_speaking_audio_types_are_guarded(audio_type):
 
     assert speech_reference_audio_gap(
         beat=beat, beat_num=12, references=[], seedance2_config="{}"
+    )
+
+
+class _AudioAsset:
+    def __init__(
+        self,
+        *,
+        key: str = "voice:许知意",
+        label: str = "许知意 · 青年时期声线",
+        reference_label: str = "音频1",
+        exists: bool = True,
+        validation_error: str = "",
+        media_type: str = "audio",
+    ) -> None:
+        self.key = key
+        self.label = label
+        self.reference_label = reference_label
+        self.exists = exists
+        self.validation_error = validation_error
+        self.media_type = media_type
+
+
+def test_missing_voice_mention_is_appended_to_the_prompt():
+    """提示词漏写声线编号时补齐：否则挑选音频那一步会把必须发的声线丢掉。"""
+
+    repaired = ensure_speech_voice_mention(
+        "严格首帧生成，人物以图片1为准。",
+        beat=_DIALOGUE_BEAT,
+        assets=[_AudioAsset()],
+        seedance2_config="{}",
+    )
+
+    assert "@音频1" in repaired
+    assert "许知意 · 青年时期声线" in repaired
+    assert "严格首帧生成" in repaired
+
+
+def test_voice_mention_repair_is_idempotent():
+    once = ensure_speech_voice_mention(
+        "画面以图片1为准。", beat=_DIALOGUE_BEAT, assets=[_AudioAsset()]
+    )
+
+    assert (
+        ensure_speech_voice_mention(
+            once, beat=_DIALOGUE_BEAT, assets=[_AudioAsset()]
+        )
+        == once
+    )
+
+
+def test_prompt_that_already_mentions_the_voice_is_untouched():
+    prompt = "声音参考音频1（许知意 · 青年时期声线），仅作对白音色参考。"
+
+    assert (
+        ensure_speech_voice_mention(
+            prompt, beat=_DIALOGUE_BEAT, assets=[_AudioAsset()]
+        )
+        == prompt
+    )
+
+
+def test_silent_beat_is_never_rewritten():
+    prompt = "动作：他叹了口气。"
+    silent = {"audio_type": "silence", "narration_segment": "", "beat_number": 3}
+
+    assert (
+        ensure_speech_voice_mention(prompt, beat=silent, assets=[_AudioAsset()])
+        == prompt
+    )
+
+
+def test_voice_without_a_file_keeps_the_explicit_error():
+    """声线文件本身缺失时不补提示词：那要报「去配置声线」，不能靠补编号糊过去。"""
+
+    prompt = "台词：今天是我的生日。"
+    assert (
+        ensure_speech_voice_mention(
+            prompt, beat=_DIALOGUE_BEAT, assets=[_AudioAsset(exists=False)]
+        )
+        == prompt
+    )
+
+
+def test_beat_that_does_not_generate_audio_is_never_rewritten():
+    prompt = "台词：今天是我的生日。"
+    assert (
+        ensure_speech_voice_mention(
+            prompt,
+            beat=_DIALOGUE_BEAT,
+            assets=[_AudioAsset()],
+            seedance2_config='{"generate_audio": false, "generate_audio_user_set": true}',
+        )
+        == prompt
     )

@@ -221,6 +221,13 @@ describe("director episode auto mode", () => {
     expect(text).toContain("action='suspend'");
   });
 
+  it("asks the agent to continue a run paused on a cleared blocker", () => {
+    const text = directorAutoUserMessageTransportText("继续下一步");
+    expect(text).toContain("action='continue'");
+    expect(text).toContain("voice_policy");
+    expect(text).toContain("cannot be restarted with action='resume'");
+  });
+
   it("requires an explicit voice policy when preflight finds missing voices", () => {
     const text = directorAutoConfirmationTransportText("开始", {
       voiceChoiceRequired: true,

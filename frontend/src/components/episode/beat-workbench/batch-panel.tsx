@@ -53,6 +53,7 @@ import {
   BillingRuleNotConfiguredError,
 } from "@/lib/api-errors";
 import { RenderPlanDialog } from "./render-plan-dialog";
+import { VoicePrereqNotice } from "./voice-prereq-notice";
 import type { Beat } from "@/types/episode";
 import type { Task } from "@/types/task";
 import type { SketchAspectRatio } from "@/lib/queries/sketch-settings";
@@ -903,6 +904,13 @@ export function BatchPanel({
                 <Mic2 className="size-3" />
                 <span>{t("episode.workbench.batch.audio")}</span>
               </div>
+              {audioPrereqErrors.length > 0 && (
+                <VoicePrereqNotice
+                  errors={audioPrereqErrors}
+                  project={project}
+                  className="mb-1.5"
+                />
+              )}
               <Button
                 variant="outline"
                 size="sm"

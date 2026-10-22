@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import unicodedata
 from typing import Any
 
 from novelvideo.freezone.video_node import validate_omni_reference_audio_durations
@@ -27,6 +28,7 @@ from novelvideo.seedance2_i2v.models import (
 )
 from novelvideo.seedance2_i2v.spoken_dialogue import required_seedance2_dialogue_texts
 from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
+from novelvideo.seedance2_i2v.voice_preflight import ensure_speech_voice_mention
 
 SEEDANCE2_HUIMENG_BACKEND = "huimeng_seedance-2.0-fast"
 SEEDANCE2_NEWAPI_BACKEND = "newapi_seedance-2.0-fast"
@@ -149,6 +151,21 @@ def _compact_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").strip())
 
 
+def _dialogue_text_key(value: Any) -> str:
+    """台词比对键：忽略空白与标点，只比字。
+
+    最终提示词由上游模型重排，标点常被改写（源文 ``认定书上写着，`` 在提示词里成了
+    ``认定书上写着：``）。这道闸门要防的是「漏字改字」——标点差异不该把整条 beat
+    拦在发请求之前，但少字、改字仍然必须拦住。
+    """
+
+    return "".join(
+        char
+        for char in _compact_text(value)
+        if not unicodedata.category(char).startswith("P")
+    )
+
+
 def _validate_dialogue_final_prompt(
     *,
     beat: dict[str, Any],
@@ -159,11 +176,11 @@ def _validate_dialogue_final_prompt(
         return
 
     required_texts = required_seedance2_dialogue_texts(beat)
-    prompt_text = _compact_text(final_prompt)
+    prompt_text = _dialogue_text_key(final_prompt)
     missing_lines = [
         text
         for text in required_texts
-        if _compact_text(text) and _compact_text(text) not in prompt_text
+        if _dialogue_text_key(text) and _dialogue_text_key(text) not in prompt_text
     ]
     if missing_lines:
         raise ValueError(
@@ -227,6 +244,14 @@ def collect_seedance2_video_prereq_errors(
             assets,
             reference_image_paths=list(config.reference_image_paths),
             reference_audio_paths=list(config.reference_audio_paths),
+        )
+        # 与 prepare_seedance2_generation_inputs 同一口径：先补声线编号再挑音频，
+        # 免得「缺失素材」报告与实际要发的请求对不上。
+        final_prompt = ensure_speech_voice_mention(
+            final_prompt,
+            beat=beat,
+            assets=assets,
+            seedance2_config=config,
         )
         assets = apply_prompt_audio_selection(assets, final_prompt)
         beat_number = int(beat.get("beat_number") or index + 1)
@@ -314,6 +339,15 @@ async def prepare_seedance2_generation_inputs(
         raise ValueError(
             f"{prefix}Seedance 2.0 最终提示词为空，请先在 Seedance 2.0 Prompt 面板生成或填写最终提示词"
         )
+    config.final_prompt = final_prompt
+    # 提示词漏写声线编号时先补齐，再按编号挑音频：否则自动声线会被静默丢掉，
+    # 构建期再报「缺少参考声线」，与「发声 beat 必须有声线」的保证自相矛盾。
+    final_prompt = ensure_speech_voice_mention(
+        final_prompt,
+        beat=beat,
+        assets=assets,
+        seedance2_config=config,
+    )
     config.final_prompt = final_prompt
     assets = apply_prompt_audio_selection(assets, final_prompt)
 

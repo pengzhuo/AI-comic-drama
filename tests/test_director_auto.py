@@ -339,6 +339,7 @@ async def test_resume_only_restarts_persisted_running_sessions(tmp_path: Path) -
     await coordinator.resume()
 
     assert coordinator.resumed == ["running"]
+    await coordinator.shutdown()
 
 
 @pytest.mark.asyncio
@@ -834,6 +835,165 @@ async def test_hard_paused_auto_run_cannot_be_resumed_as_declined_change(tmp_pat
         await coordinator.resume_suspended(username="alice", project_id="project-1")
 
 
+@pytest.mark.asyncio
+async def test_paused_auto_run_can_be_continued_with_a_voice_policy(tmp_path: Path) -> None:
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.started: list[str] = []
+            self.statuses: list[str] = []
+
+        def _ensure_worker(self, run):
+            self.started.append(run.run_id)
+
+        async def _broadcast_status(self, run, **_kwargs):
+            self.statuses.append(run.status)
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    original = run_record(
+        tmp_path,
+        status="paused",
+        last_error=director_auto.VOICE_POLICY_REQUIRED_ERROR,
+        stage_key="selected_regen",
+        stage_attempts=2,
+        next_attempt_at=123.0,
+        handled_task_ids=("task-already-finished",),
+    )
+    store.upsert(original)
+    coordinator = RecordingCoordinator(store)
+
+    continued = await coordinator.resume_paused(
+        username="alice",
+        project_id="project-1",
+        voice_policy="system",
+    )
+
+    assert continued is not None
+    assert continued.status == "running"
+    assert continued.run_id == original.run_id
+    assert continued.voice_policy == "system"
+    assert continued.last_error == ""
+    assert continued.stage_key == ""
+    assert continued.stage_attempts == 0
+    assert continued.next_attempt_at == 0.0
+    # The work already dispatched before the pause is not forgotten.
+    assert continued.handled_task_ids == original.handled_task_ids
+    assert coordinator.started == [original.run_id]
+    assert coordinator.statuses == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_continue_keeps_the_existing_policy_and_rejects_terminal_runs(
+    tmp_path: Path,
+) -> None:
+    class QuietCoordinator(DirectorAutoCoordinator):
+        def _ensure_worker(self, run):
+            return None
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(tmp_path, status="paused", voice_policy="custom", last_error="生成失败")
+    )
+    coordinator = QuietCoordinator(store)
+
+    continued = await coordinator.resume_paused(username="alice", project_id="project-1")
+    assert continued is not None and continued.voice_policy == "custom"
+
+    for terminal in ("completed", "failed", "cancelled", "awaiting_confirmation"):
+        store.upsert(run_record(tmp_path, status=terminal))
+        with pytest.raises(ValueError, match="只有已暂停"):
+            await coordinator.resume_paused(username="alice", project_id="project-1")
+
+    assert await coordinator.resume_paused(username="alice", project_id="missing") is None
+
+
+@pytest.mark.asyncio
+async def test_continue_after_voice_setup_only_revives_the_voice_gate(tmp_path: Path) -> None:
+    class QuietCoordinator(DirectorAutoCoordinator):
+        def _ensure_worker(self, run):
+            return None
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    coordinator = QuietCoordinator(store)
+
+    store.upsert(
+        run_record(tmp_path, status="paused", last_error=director_auto.VOICE_POLICY_REQUIRED_ERROR)
+    )
+    revived = await coordinator._continue_paused_after_voice_setup(
+        username="alice", project_id="project-1"
+    )
+    assert revived is not None
+    assert revived.status == "running"
+    assert revived.voice_policy == "system"
+
+    # A pause with any other cause keeps its own reason and its own decision.
+    store.upsert(run_record(tmp_path, status="paused", last_error="生成内容涉及版权限制"))
+    untouched = await coordinator._continue_paused_after_voice_setup(
+        username="alice", project_id="project-1"
+    )
+    assert untouched is not None and untouched.status == "paused"
+    assert untouched.voice_policy == ""
+
+    # Nothing to do when no run exists.
+    assert (
+        await coordinator._continue_paused_after_voice_setup(
+            username="alice", project_id="missing"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_paused_from_thread_hands_off_to_the_application_loop(
+    tmp_path: Path,
+) -> None:
+    class QuietCoordinator(DirectorAutoCoordinator):
+        def _ensure_worker(self, run):
+            return None
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(tmp_path, status="paused", last_error=director_auto.VOICE_POLICY_REQUIRED_ERROR)
+    )
+    coordinator = QuietCoordinator(store)
+
+    # Without a captured loop the hand-off is refused rather than raising.
+    assert (
+        coordinator.resume_after_system_voice_setup_from_thread(
+            username="alice", project_id="project-1"
+        )
+        is False
+    )
+    assert store.get("alice", "project-1").status == "paused"  # type: ignore[union-attr]
+
+    coordinator._app_loop = asyncio.get_running_loop()
+    assert (
+        coordinator.resume_after_system_voice_setup_from_thread(
+            username="alice", project_id="project-1"
+        )
+        is True
+    )
+    for _ in range(100):
+        run = store.get("alice", "project-1")
+        if run is not None and run.status == "running":
+            break
+        await asyncio.sleep(0.01)
+
+    saved = store.get("alice", "project-1")
+    assert saved is not None
+    assert saved.status == "running"
+    assert saved.voice_policy == "system"
+
+
 def test_task_is_stalled_matches_timeout_error_codes() -> None:
     stalled = task("stalled", "failed")
     stalled.metadata = {"error_code": "TASK_TIMEOUT"}
@@ -952,4 +1112,132 @@ async def test_stalled_task_is_retried_before_suspending(
         assert "正在自动重试" in coordinator.notifications[0]
     finally:
         await coordinator.shutdown()
+
+
+def test_store_running_without_lease_only_matches_free_or_expired_runs(
+    tmp_path: Path,
+) -> None:
+    """巡检的查询面：只认「租约空闲」或「租约过期」的 running，paused 一律不算。"""
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path, run_id="free"))
+    store.upsert(run_record(tmp_path, run_id="held", project_id="project-2"))
+    store.upsert(run_record(tmp_path, run_id="expired", project_id="project-3"))
+    store.upsert(
+        run_record(tmp_path, run_id="paused", project_id="project-4", status="paused")
+    )
+    assert store.claim_lease("held", "worker-a", lease_seconds=200, now=1_000)
+    assert store.claim_lease("expired", "worker-b", lease_seconds=60, now=1_000)
+
+    stall_now = {run.run_id for run in store.running_without_lease(1_030)}
+    stall_later = {run.run_id for run in store.running_without_lease(1_070)}
+
+    assert stall_now == {"free"}
+    assert stall_later == {"free", "expired"}
+
+
+@pytest.mark.asyncio
+async def test_lease_heartbeat_tolerates_transient_renewal_failures_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """单次续租失败（SQLite 写锁／线程池被堵）不再把 worker 静默取消。"""
+
+    class FlakyStore:
+        def __init__(self, failures: int) -> None:
+            self.failures = failures
+            self.calls = 0
+
+        def renew_lease(self, run_id: str, owner_token: str) -> bool:
+            self.calls += 1
+            return self.calls > self.failures
+
+    async def heartbeat_verdict(store) -> tuple[bool, int]:
+        monkeypatch.setattr(director_auto, "HEARTBEAT_SECONDS", 0.01)
+        monkeypatch.setattr(director_auto, "LEASE_RENEW_ATTEMPTS", 3)
+        coordinator = DirectorAutoCoordinator(
+            DirectorAutoStore(tmp_path / "director-auto.db")
+        )
+        coordinator.store = store  # type: ignore[assignment]
+        parent = asyncio.create_task(asyncio.sleep(30))
+        beat = asyncio.create_task(coordinator._lease_heartbeat("run-1", parent))
+        try:
+            await asyncio.sleep(0.15)
+            coordinator._stopping = True
+            await asyncio.wait_for(beat, timeout=5)
+            # 让 parent.cancel() 真正落到任务上再判定
+            await asyncio.sleep(0.01)
+            return parent.cancelled(), store.calls
+        finally:
+            parent.cancel()
+            await asyncio.gather(parent, return_exceptions=True)
+
+    tolerant = FlakyStore(failures=2)
+    with caplog.at_level("WARNING", logger=director_auto.logger.name):
+        cancelled, calls = await heartbeat_verdict(tolerant)
+    assert cancelled is False
+    assert calls > 2
+    assert any("lease renew failed" in record.message for record in caplog.records)
+
+    dead = FlakyStore(failures=99)
+    cancelled, _ = await heartbeat_verdict(dead)
+    assert cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_reaper_rearms_stalled_run_and_leaves_a_driven_run_alone(
+    tmp_path: Path,
+) -> None:
+    """巡检把「running 但没人推进」的 run 重新 arm；有活 worker 的不碰。"""
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.armed: list[str] = []
+
+        def _ensure_worker(self, run):
+            self.armed.append(run.run_id)
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path, run_id="stalled"))
+    store.upsert(run_record(tmp_path, run_id="driven", project_id="project-2"))
+    store.upsert(
+        run_record(tmp_path, run_id="paused", project_id="project-3", status="paused")
+    )
+    coordinator = RecordingCoordinator(store)
+    driven = asyncio.create_task(asyncio.sleep(30))
+    coordinator._workers["driven"] = driven
+    try:
+        await coordinator._reap_stalled_runs()
+    finally:
+        driven.cancel()
+        await asyncio.gather(driven, return_exceptions=True)
+
+    assert coordinator.armed == ["stalled"]
+
+
+@pytest.mark.asyncio
+async def test_resume_starts_one_supervisor_and_shutdown_stops_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """巡检任务只能有一个，且必须随 shutdown 一起收掉。"""
+
+    coordinator = DirectorAutoCoordinator(
+        DirectorAutoStore(tmp_path / "director-auto.db")
+    )
+    monkeypatch.setattr(director_auto, "REAPER_SECONDS", 0.01)
+
+    await coordinator.resume()
+    first = coordinator._supervisor
+    await coordinator.resume()
+
+    assert first is not None
+    assert coordinator._supervisor is first
+    assert not first.done()
+
+    await coordinator.shutdown()
+
+    assert first.cancelled() is True
 

@@ -452,6 +452,12 @@ class DirectorAutoSuspendIn(BaseModel):
     reason: str = Field(default="等待用户确认是否修改", max_length=500)
 
 
+class DirectorAutoContinueIn(BaseModel):
+    """Optional voice-policy override when continuing a hard-paused run."""
+
+    voice_policy: str | None = Field(default=None, pattern="^(system|custom)$")
+
+
 #: Project-config keys a one-click run may persist up front. Mirrors the
 #: user-selectable fields of ``ProjectUpdate``; anything else is ignored.
 _AUTO_CONFIG_KEYS = frozenset(
@@ -601,6 +607,33 @@ async def resume_director_auto_run(
         run = await director_auto_coordinator.resume_suspended(
             username=str(user["username"]),
             project_id=ctx.project_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "data": _director_auto_payload(run)}
+
+
+@router.post("/projects/{project}/chat/director-auto/continue")
+async def continue_director_auto_run(
+    project: str,
+    payload: DirectorAutoContinueIn | None = None,
+    user: dict = Depends(get_api_user),
+) -> dict[str, Any]:
+    """Un-pause a run the coordinator parked itself (e.g. the voice gate).
+
+    ``/resume`` is reserved for the "user declined a proposed change" flow and
+    only accepts ``awaiting_confirmation``; this is the ``paused`` counterpart
+    so the outer 捏导 can keep a run going after the blocker is cleared.
+    """
+
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="editor"
+    )
+    try:
+        run = await director_auto_coordinator.resume_paused(
+            username=str(user["username"]),
+            project_id=ctx.project_id,
+            voice_policy=(payload.voice_policy if payload is not None else None),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

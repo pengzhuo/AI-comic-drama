@@ -2847,6 +2847,7 @@
     },
     "pastePlaceholder": "Paste novel text here, up to 1000 characters",
     "startIngest": "Start Import",
+    "startBlockedByFormat": "This script did not pass the format check, so importing is unavailable. Open “View details”, add the missing scene headers, then upload again.",
     "startOneClickFilm": "One-click Film",
     "saveSettings": "Save Settings",
     "settingsSaved": "Project settings saved",
@@ -3997,7 +3998,18 @@
         "beatNarrationVoiceUpload": "Upload beat audio",
         "beatNarrationVoiceUploaded": "Beat narration audio uploaded",
         "prereqHintCharacters": ". Go to Characters to upload the narrator voice.",
-        "prereqHintVoices": ". Go to Assets > Voices to upload or trim a default narrator voice."
+        "prereqHintVoices": ". Go to Assets > Voices to upload or trim a default narrator voice.",
+        "prereqHintCharacterVoices": ". Go to Characters to set a voice for the characters that are missing one, or ask Xia Director to fill them in with system voices."
+      },
+      "voicePrereq": {
+        "titleCharacters": "Audio generation blocked: character voice missing",
+        "titleVoices": "Audio generation blocked: narrator voice missing",
+        "charactersMissing": "Characters without a voice: {{characters}}",
+        "moreErrors": "{{count}} more similar notice(s)",
+        "configureAction": "Configure voices",
+        "askDirectorAction": "Ask Xia Director for system voices",
+        "askDirectorRequest": "Please fill in the missing character voices for this episode with system voices (characters: {{characters}}), then continue dubbing.",
+        "askDirectorRequestNoCharacters": "Please fill in the missing voices for this episode with system voices, then continue dubbing."
       },
       "video": {
         "started": "Beat #{{n}} video started",

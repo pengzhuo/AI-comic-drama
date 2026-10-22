@@ -1239,7 +1239,7 @@ def _handle_plan_episodes(args: dict[str, Any], **_: Any) -> str:
 
 
 def _handle_control_episode_auto(args: dict[str, Any], **_: Any) -> str:
-    """Suspend, resume, or stop the durable outer-director episode auto run."""
+    """Suspend, resume, continue, or stop the durable outer-director episode auto run."""
 
     try:
         project = _project_from_args(args)
@@ -1260,6 +1260,21 @@ def _handle_control_episode_auto(args: dict[str, Any], **_: Any) -> str:
                     f"/api/v1/projects/{project}/chat/director-auto/resume",
                 )
             )
+        if action == "continue":
+            # ``resume`` only answers a declined change
+            # (``awaiting_confirmation``); a run the coordinator parked itself
+            # — the missing-voice gate, for instance — is picked back up here.
+            body: dict[str, Any] = {}
+            voice_policy = str(args.get("voice_policy") or "").strip().lower()
+            if voice_policy in {"system", "custom"}:
+                body["voice_policy"] = voice_policy
+            return tool_result(
+                _request(
+                    "POST",
+                    f"/api/v1/projects/{project}/chat/director-auto/continue",
+                    body=body or None,
+                )
+            )
         if action == "pause":
             return tool_result(
                 _request(
@@ -1267,7 +1282,7 @@ def _handle_control_episode_auto(args: dict[str, Any], **_: Any) -> str:
                     f"/api/v1/projects/{project}/chat/director-auto/pause",
                 )
             )
-        raise ValueError("action must be one of: suspend, resume, pause")
+        raise ValueError("action must be one of: suspend, resume, continue, pause")
     except Exception as exc:
         return tool_error(str(exc))
 
@@ -3011,7 +3026,11 @@ TOOLS = (
             "Control the durable 本集自动 session in the outer 捏导. Use action='suspend' before "
             "asking the user to confirm a possible modification; this pauses only future automatic "
             "steps and never cancels queued/running media tasks. Use action='resume' when the user "
-            "declines the modification and wants automatic production to continue. Use action='pause' "
+            "declines the modification and wants automatic production to continue. Use "
+            "action='continue' when the run is paused on a blocker the user has now cleared — the "
+            "missing-voice gate being the common case — and pass voice_policy='system' when the "
+            "user just approved system voices; a 'paused' run can only be restarted this way, and "
+            "resume will reject it. Use action='pause' "
             "only when the user explicitly asks to stop or switch to manual mode.",
             {
                 "project_id": {
@@ -3020,11 +3039,16 @@ TOOLS = (
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["suspend", "resume", "pause"],
+                    "enum": ["suspend", "resume", "continue", "pause"],
                 },
                 "reason": {
                     "type": "string",
                     "description": "Short reason shown while awaiting modification confirmation.",
+                },
+                "voice_policy": {
+                    "type": "string",
+                    "enum": ["system", "custom"],
+                    "description": "Optional voice-policy decision applied by action='continue'.",
                 },
             },
             ["action"],

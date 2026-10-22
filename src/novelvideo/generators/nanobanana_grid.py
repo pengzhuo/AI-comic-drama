@@ -330,7 +330,18 @@ NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS = 900.0
 # ``NEWAPI_IMAGE_RETRY_ATTEMPTS=1`` to restore the old never-retry behaviour.
 NEWAPI_IMAGE_RETRY_ATTEMPTS = max(int(os.environ.get("NEWAPI_IMAGE_RETRY_ATTEMPTS", "3") or 1), 1)
 NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS = (5.0, 20.0)
-_NEWAPI_IMAGE_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+# 402 is in this set on purpose. The gateway answers 402 — not 401/403 — when
+# the *channel's* upstream balance is exhausted or its in-flight pre-consume
+# reservation is still held, with a body of
+# ``{"code":"insufficient_balance","message":"余额不足"}``. Observed on
+# 2026-10-19 against ``/images/edits`` (LingShan-G2). That is a per-channel
+# condition which clears by itself, not proof that our own account is empty
+# (that path never reaches the network: it raises ``InsufficientCreditsError``
+# before ``_call_newapi_image_api`` is entered). Because 402 is also a definite
+# no-cost rejection, repeating the identical request cannot double-charge —
+# a retry either lands on another channel or waits for the pre-consume race to
+# settle.
+_NEWAPI_IMAGE_RETRYABLE_STATUS = frozenset({402, 408, 425, 429, 500, 502, 503, 504})
 # Only transport failures raised *before* the request body is on the wire are
 # safe to repeat; a read timeout or protocol error may already have paid work.
 _NEWAPI_IMAGE_RETRYABLE_TRANSPORT = (

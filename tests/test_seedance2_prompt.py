@@ -331,6 +331,54 @@ def test_seedance2_dialogue_validation_keeps_plain_beat_dialogue_required():
         )
 
 
+def test_seedance2_dialogue_validation_tolerates_repunctuated_prompt():
+    """源文是「写着，」而提示词写成「写着：」——上游重排标点，不该拦住整条 beat。
+
+    现场问题：``nn_1021_1`` ep2 beat 8 就卡在这一个标点上（原文逗号、提示词冒号），
+    逐字比对让整条 beat 连请求都发不出去。
+    """
+
+    from novelvideo.seedance2_i2v.assets import Seedance2ResolvedAsset
+    from novelvideo.seedance2_i2v.pipeline import _validate_dialogue_final_prompt
+
+    beat = {
+        "audio_type": "dialogue",
+        "speaker": "班长_中年时期",
+        "narration": "（平淡）认定书上写着，违规操作，防护罩是他自己拆的。厂方没责任。",
+    }
+    assets = [
+        Seedance2ResolvedAsset(
+            key="voice:班长_中年时期",
+            label="班长 · 中年时期声线",
+            media_type="audio",
+            path=Path("squad.mp3"),
+            exists=True,
+            selected=True,
+            request_field="reference_audios",
+            reference_label="音频1",
+            identity_id="班长_中年时期",
+            audio_number=1,
+        )
+    ]
+
+    _validate_dialogue_final_prompt(
+        beat=beat,
+        final_prompt=(
+            "原文全文，逐字念出：认定书上写着：违规操作，防护罩是他自己拆的。"
+            "厂方没责任。参考音频1声线。"
+        ),
+        assets=assets,
+    )
+
+    # 少字、改字仍然必须拦住。
+    with pytest.raises(ValueError, match="Seedance2 最终提示词缺少台词内容"):
+        _validate_dialogue_final_prompt(
+            beat=beat,
+            final_prompt="原文全文：认定书上写着：违规操作。参考音频1声线。",
+            assets=assets,
+        )
+
+
 def test_seedance2_prompt_draft_can_use_narration_voice_reference():
     from novelvideo.seedance2_i2v.assets import Seedance2ResolvedAsset
     from novelvideo.seedance2_i2v.models import Seedance2I2VMode

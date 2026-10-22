@@ -1211,6 +1211,141 @@ def test_newapi_image_http_5xx_recovers_on_a_later_attempt(monkeypatch):
     assert payloads[0] == payloads[1]
 
 
+def test_newapi_image_http_402_insufficient_balance_retries(monkeypatch):
+    """A gateway 402 (channel balance) is transient and retried in place.
+
+    new-api reports an exhausted *channel* upstream balance as 402 with
+    ``insufficient_balance``, not as an authentication error. Treating it as a
+    hard beat failure used to sink the whole one-click episode for a condition
+    the channel recovers from on its own. 402 is a definite no-cost rejection,
+    so the retry reuses the reservation exactly like the 5xx path.
+    """
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+    from novelvideo.shared.provider_costs import is_definite_no_cost_http_rejection
+
+    # The retry is only billing-safe because the rejection cannot have cost us.
+    assert is_definite_no_cost_http_rejection(402) is True
+    assert 402 in nanobanana_grid._NEWAPI_IMAGE_RETRYABLE_STATUS
+
+    attempts = 0
+
+    class InsufficientBalanceResponse:
+        status_code = 402
+        text = '{"error":{"message":"余额不足","type":"insufficient_balance_error","code":"insufficient_balance"}}'
+        headers = {"x-oneapi-request-id": "req-402"}
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "payment required",
+                request=httpx.Request("POST", "http://newapi.test/v1/images/edits"),
+                response=self,
+            )
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            return InsufficientBalanceResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="retry prompt",
+            image_config={"aspect_ratio": "2:3", "image_size": "1K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes is None
+    assert "HTTP 402" in error
+    assert "insufficient_balance" in error
+    assert attempts == nanobanana_grid.NEWAPI_IMAGE_RETRY_ATTEMPTS == 3
+
+
+def test_newapi_image_http_402_recovers_on_a_later_attempt(monkeypatch):
+    """One 402 then success returns the image without surfacing an error."""
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+
+    attempts = 0
+    payloads: list[dict] = []
+
+    class InsufficientBalanceResponse:
+        status_code = 402
+        text = '{"error":{"message":"余额不足","code":"insufficient_balance"}}'
+        headers = {"x-oneapi-request-id": "req-402"}
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "payment required",
+                request=httpx.Request("POST", "http://newapi.test/v1/images/edits"),
+                response=self,
+            )
+
+    class OkResponse:
+        status_code = 200
+        headers = {"x-newapi-request-id": "req-ok"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": "resp-ok",
+                "data": [{"b64_json": base64.b64encode(b"recovered-402").decode()}],
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            payloads.append(json)
+            return InsufficientBalanceResponse() if attempts == 1 else OkResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="retry prompt",
+            image_config={"aspect_ratio": "2:3", "image_size": "1K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes == b"recovered-402"
+    assert error == ""
+    assert attempts == 2
+    assert payloads[0] == payloads[1]
+
+
 def test_newapi_image_http_400_still_does_not_retry(monkeypatch):
     """Client errors are not transient: exactly one attempt reaches the wire."""
 

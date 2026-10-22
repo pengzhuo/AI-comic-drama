@@ -131,6 +131,80 @@ class ChatScope:
         return data
 
 
+#: ``assistant.message_parts`` 事件是**整份 parts 快照**（不是增量），流式更新时每次都重写整份。
+#: 实测一个画布能攒到 53,062 条 / 2.78GB，而 ``scope.changed`` 会把历史一次性回给前端 ——
+#: 全量载入等于把进程直接撑爆（生产事故：内存 cgroup OOM → 容器被重启 → 浏览器重连再拉一次
+#: → 死循环，run 的重试预算也被打断耗尽）。历史渲染只需要每个 turn 的**最终状态**，
+#: 因此每个 turn 只保留最近几次快照供 ``_merge_message_parts_snapshots`` 合并。
+_UI_PARTS_SNAPSHOTS_PER_TURN = 3
+
+#: 兜底上限：即使单个 turn 的非快照事件再次失控，也不会把整份历史读进内存。
+_UI_EVENTS_MAX_ROWS = 1500
+
+#: 每个 turn 在库里保留的 ``assistant.message_parts`` 快照条数。前端在流式更新时
+#: **每次重写整份快照**（实测 8 次/秒 × 52KB ≈ 1.5GB/小时），没有上限时单个画布能涨到
+#: 2.8GB。读取端只合并最近 ``_UI_PARTS_SNAPSHOTS_PER_TURN`` 条，所以写入侧裁掉更早的
+#: 快照既不影响历史渲染，也能把表压回可控大小（下次写入即可清掉历史积压）。
+_UI_PARTS_SNAPSHOTS_RETAINED = 64
+
+#: 写侧裁剪：只保留同一 turn 最近的 ``_UI_PARTS_SNAPSHOTS_RETAINED`` 条快照。
+_UI_PARTS_PRUNE_SQL = """
+DELETE FROM chat_ui_events
+ WHERE turn_id = ?
+   AND event_type = 'assistant.message_parts'
+   AND id NOT IN (
+       SELECT id
+         FROM chat_ui_events
+        WHERE turn_id = ?
+          AND event_type = 'assistant.message_parts'
+        ORDER BY id DESC
+        LIMIT ?
+   )
+"""
+
+#: 只读「最近 ``limit`` 条可见消息所属 turn」的事件；快照按 turn 各取最近几次；整体再兜底截断。
+_UI_EVENTS_SQL = """
+WITH visible_turns AS (
+    SELECT DISTINCT turn_id
+      FROM (
+            SELECT turn_id
+              FROM chat_messages
+             WHERE role NOT IN ('trace', 'agent_notification')
+               AND turn_id IS NOT NULL
+               AND turn_id != ''
+             ORDER BY id DESC
+             LIMIT ?
+           )
+),
+recent_parts AS (
+    SELECT id
+      FROM (
+            SELECT e.id AS id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e.turn_id ORDER BY e.id DESC
+                   ) AS rn
+              FROM chat_ui_events AS e
+              JOIN visible_turns AS v ON v.turn_id = e.turn_id
+             WHERE e.event_type = 'assistant.message_parts'
+           )
+     WHERE rn <= ?
+)
+SELECT id, turn_id, event_type, payload_json, created_at
+  FROM (
+        SELECT id, turn_id, event_type, payload_json, created_at
+          FROM chat_ui_events
+         WHERE turn_id IN (SELECT turn_id FROM visible_turns)
+           AND (
+                event_type != 'assistant.message_parts'
+                OR id IN (SELECT id FROM recent_parts)
+           )
+         ORDER BY id DESC
+         LIMIT ?
+       )
+ ORDER BY id ASC
+"""
+
+
 class ChatStore:
     @staticmethod
     def _project_root(username: str, scope: ChatScope) -> Path:
@@ -825,6 +899,11 @@ class ChatStore:
                 """,
                 (turn_id, event_type, json.dumps(event, ensure_ascii=False), created_at),
             )
+            if event_type == "assistant.message_parts":
+                conn.execute(
+                    _UI_PARTS_PRUNE_SQL,
+                    (turn_id, turn_id, _UI_PARTS_SNAPSHOTS_RETAINED),
+                )
             conn.commit()
             return {
                 "id": int(cursor.lastrowid),
@@ -857,6 +936,11 @@ class ChatStore:
                 """,
                 (turn_id, event_type, json.dumps(event, ensure_ascii=False), created_at),
             )
+            if event_type == "assistant.message_parts":
+                await db.execute(
+                    _UI_PARTS_PRUNE_SQL,
+                    (turn_id, turn_id, _UI_PARTS_SNAPSHOTS_RETAINED),
+                )
             await db.commit()
             return {
                 "id": int(cursor.lastrowid),
@@ -871,44 +955,32 @@ class ChatStore:
     async def _load_ui_events_async(
         self,
         db: aiosqlite.Connection,
+        *,
+        limit: int,
     ) -> dict[str, list[dict[str, Any]]]:
         cursor = await db.execute(
-            """
-            SELECT id, turn_id, event_type, payload_json, created_at
-              FROM chat_ui_events
-             ORDER BY id ASC
-            """
+            _UI_EVENTS_SQL,
+            (limit, _UI_PARTS_SNAPSHOTS_PER_TURN, _UI_EVENTS_MAX_ROWS),
         )
         rows = await cursor.fetchall()
-        events_by_turn: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            turn_id = str(row["turn_id"] or "").strip()
-            if not turn_id:
-                continue
-            try:
-                payload = json.loads(row["payload_json"] or "{}")
-            except json.JSONDecodeError:
-                payload = {}
-            if not isinstance(payload, dict):
-                payload = {"value": payload}
-            payload = {
-                "id": int(row["id"]),
-                "type": str(row["event_type"] or payload.get("type") or "ui_event"),
-                "turn_id": turn_id,
-                "created_at": str(row["created_at"]),
-                **payload,
-            }
-            events_by_turn.setdefault(turn_id, []).append(payload)
-        return events_by_turn
+        return self._ui_events_by_turn(rows)
 
-    def _load_ui_events(self, conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
+    def _load_ui_events(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        limit: int,
+    ) -> dict[str, list[dict[str, Any]]]:
         rows = conn.execute(
-            """
-            SELECT id, turn_id, event_type, payload_json, created_at
-              FROM chat_ui_events
-             ORDER BY id ASC
-            """
+            _UI_EVENTS_SQL,
+            (limit, _UI_PARTS_SNAPSHOTS_PER_TURN, _UI_EVENTS_MAX_ROWS),
         ).fetchall()
+        return self._ui_events_by_turn(rows)
+
+    @staticmethod
+    def _ui_events_by_turn(
+        rows: list[Any],
+    ) -> dict[str, list[dict[str, Any]]]:
         events_by_turn: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             turn_id = str(row["turn_id"] or "").strip()
@@ -1090,7 +1162,7 @@ class ChatStore:
                 """,
                 (limit,),
             ).fetchall()
-            events_by_turn = self._load_ui_events(conn)
+            events_by_turn = self._load_ui_events(conn, limit=limit)
         finally:
             conn.close()
         messages: list[dict[str, Any]] = []
@@ -1165,7 +1237,7 @@ class ChatStore:
                 (limit,),
             )
             rows = await cursor.fetchall()
-            events_by_turn = await self._load_ui_events_async(db)
+            events_by_turn = await self._load_ui_events_async(db, limit=limit)
         finally:
             await db.close()
         messages: list[dict[str, Any]] = []

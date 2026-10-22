@@ -247,15 +247,15 @@ def _extract_tool_chat_error(value: Any, *, redact: Callable[[str], str]) -> str
         except ValueError:
             return None
 
-    def visit(node: Any) -> str | None:
+    def visit(node: Any, *, in_list: bool = False) -> str | None:
         if isinstance(node, str):
             decoded = parse_jsonish(node)
             if decoded is not None:
-                return visit(decoded)
+                return visit(decoded, in_list=in_list)
             return None
         if isinstance(node, list):
             for child in node:
-                found = visit(child)
+                found = visit(child, in_list=True)
                 if found:
                     return found
             return None
@@ -271,24 +271,29 @@ def _extract_tool_chat_error(value: Any, *, redact: Callable[[str], str]) -> str
             if mapped:
                 return mapped
 
-        status = str(node.get("status") or "").strip().lower()
-        failed_status = status in {"failed", "error", "cancelled", "canceled"}
-        ok_false = node.get("ok") is False
-        if failed_status or ok_false:
-            for key in ("error", "detail", "message"):
-                generic = generic_chat_error_from_text(node.get(key))
-                if generic:
-                    return generic
-            if failed_status:
-                return f"任务执行失败：当前状态为 {status}。"
-            return "任务执行失败：接口返回 ok=false，但没有提供具体错误原因。"
+        # ``status``/``ok`` describe *this call*. An entry inside a collection
+        # payload — the project task list, for instance — is data the call
+        # returned, not the outcome of the call, so an old ``failed`` row must
+        # never be reported as "任务执行失败" for the current turn.
+        if not in_list:
+            status = str(node.get("status") or "").strip().lower()
+            failed_status = status in {"failed", "error", "cancelled", "canceled"}
+            ok_false = node.get("ok") is False
+            if failed_status or ok_false:
+                for key in ("error", "detail", "message"):
+                    generic = generic_chat_error_from_text(node.get(key))
+                    if generic:
+                        return generic
+                if failed_status:
+                    return f"任务执行失败：当前状态为 {status}。"
+                return "任务执行失败：接口返回 ok=false，但没有提供具体错误原因。"
 
         for key in ("result", "message", "content", "data", "output"):
-            found = visit(node.get(key))
+            found = visit(node.get(key), in_list=in_list)
             if found:
                 return found
         for child in node.values():
-            found = visit(child)
+            found = visit(child, in_list=in_list)
             if found:
                 return found
         return None

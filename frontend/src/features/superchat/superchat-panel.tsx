@@ -174,6 +174,7 @@ import type { ErrorResponse, OkResponse, TaskResponse } from "@/types/api";
 import type { CanvasOntologyContext } from "@/features/canvas/ontology/canvasOntology";
 import { resolveNodeDisplayName } from "@/features/canvas/domain/nodeDisplay";
 import { useCanvasStore, type CanvasNode } from "@/stores/canvasStore";
+import { useDirectorPrefillStore } from "@/features/superchat/director-prefill";
 import {
   CANVAS_NODE_TYPES,
   type AudioVoiceRef,
@@ -12644,6 +12645,7 @@ export function SuperChatPanel({
   const queryClient = useQueryClient();
   const isFreezoneLayout = variant === "freezone";
   const displayName = useAuthStore((s) => s.displayName);
+  const pendingDirectorPrefill = useDirectorPrefillStore((s) => s.pending);
   const [draft, setDraft] = useState("");
   const [selectedHtmlReference, setSelectedHtmlReference] = useState<HtmlArtifactReference | null>(null);
   useEffect(() => {
@@ -14857,6 +14859,16 @@ export function SuperChatPanel({
     onPendingNodeMentionsConsumed?.();
     restoreDraftFocusRef.current = true;
   }, [pendingNodeMentions, canvasNodes, canvasEdges, onPendingNodeMentionsConsumed]);
+
+  // 工作台 CTA「让捏导配系统声线」：把 store 里攒着的那句话灌进 draft，等用户自己按发送
+  // （store 见 features/superchat/director-prefill.ts）。consume 是抢的，多个实例同挂也只有第一个拿到。
+  useEffect(() => {
+    if (pendingDirectorPrefill === null) return;
+    const pending = useDirectorPrefillStore.getState().consume();
+    if (pending === null) return;
+    setDraft((current) => (current.trim() ? `${current}\n${pending}` : pending));
+    restoreDraftFocusRef.current = true;
+  }, [pendingDirectorPrefill]);
 
   useEffect(() => {
     if (variant !== "freezone" || currentCanvasSelection.length > 0) return;

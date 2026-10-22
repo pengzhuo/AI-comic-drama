@@ -310,6 +310,60 @@ async def test_system_voice_setup_runner_reports_progress(monkeypatch, tmp_path)
     assert [update["progress"] for update in progress_updates] == [0.05, 1.0]
 
 
+@pytest.mark.asyncio
+async def test_system_voice_setup_hands_a_paused_auto_run_back(monkeypatch, tmp_path):
+    """声线补齐后必须把被声线闸门暂停的「本集自动」接回来，否则它永远停着。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.chat import director_auto
+    from novelvideo.task_backend.runners import audio
+    from novelvideo import sqlite_store
+
+    handoffs: list[dict] = []
+
+    class FakeCoordinator:
+        def resume_after_system_voice_setup_from_thread(self, **kwargs):
+            handoffs.append(kwargs)
+            return True
+
+    class FakeRunnerStore:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            pass
+
+        async def initialize(self):
+            return None
+
+        async def load_graph_state(self):
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeManager:
+        def update_progress_for_project(self, *args, **kwargs):  # noqa: ARG002
+            return None
+
+    async def fake_prepare(**_kwargs):
+        return {"ready": True, "prepared": [], "prepared_count": 0, "remaining_errors": []}
+
+    monkeypatch.setattr(sqlite_store, "SQLiteStore", FakeRunnerStore)
+    monkeypatch.setattr(system_voice_setup, "prepare_missing_system_voices", fake_prepare)
+    monkeypatch.setattr(audio, "get_task_manager", lambda: FakeManager())
+    monkeypatch.setattr(director_auto, "coordinator", FakeCoordinator())
+    ctx = SimpleNamespace(
+        project_id="project-1",
+        owner_project_label="alice/demo",
+        owner_username="alice",
+        project_name="demo",
+        output_dir=tmp_path,
+        state_dir=tmp_path / "state",
+    )
+
+    await audio._run_system_voice_setup({"episode": 3}, ctx)
+
+    assert handoffs == [{"username": "alice", "project_id": "project-1"}]
+
+
 def _write_gateway_sample(project_dir, voice: str) -> bytes:
     content = f"gateway:{voice}".encode()
     cache = project_dir / "assets" / "system_voices"
@@ -369,6 +423,68 @@ async def test_prepare_missing_system_voices_blocks_character_without_gender(
         "系统提示音" in detail and "性别" in detail
         for detail in result["remaining_errors"]
     )
+
+
+@pytest.mark.asyncio
+async def test_prepare_missing_system_voices_puts_actionable_reasons_first(
+    monkeypatch,
+    tmp_path,
+):
+    """可操作的原因排在最前：任务失败只带 errors[:5]，排后面等于看不见。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.audio import indextts2_beat_audio_task
+
+    narrator_updates: list[dict] = []
+
+    async def per_beat_errors(**kwargs):  # noqa: ARG001
+        return [f"Beat {number} 角色声线缺失：系统提示音" for number in range(1, 9)]
+
+    # 顺序要紧：``_patch_voice_setup_io`` 自己会把同一函数替换成「无报错」，
+    # 必须在它之后覆盖，否则逐 beat 报错压根不存在。
+    _patch_voice_setup_io(monkeypatch, system_voice_setup, narrator_updates)
+    monkeypatch.setattr(
+        indextts2_beat_audio_task,
+        "collect_indextts2_voice_prereq_errors",
+        per_beat_errors,
+    )
+
+    store = _FakeStore(tmp_path)
+    store.characters = [
+        NovelCharacter(name="系统提示音", gender="", age_group="youth", is_main=False)
+    ]
+    store.beats = [
+        {
+            "beat_number": number,
+            "audio_type": "dialogue",
+            "speaker": "系统提示音",
+            "narration_segment": "恭喜您已完成今日任务。",
+        }
+        for number in range(1, 9)
+    ] + [
+        {
+            "beat_number": 20,
+            "audio_type": "dialogue",
+            "speaker": "查无此人",
+            "narration_segment": "“你好。”",
+        }
+    ]
+
+    result = await system_voice_setup.prepare_missing_system_voices(
+        store=store,
+        username="alice",
+        project="demo",
+        project_dir=tmp_path,
+        episode=1,
+    )
+
+    errors = result["remaining_errors"]
+    assert result["ready"] is False
+    assert errors[0].startswith("角色「系统提示音」未设置性别")
+    assert errors[1] == "未找到说话身份对应角色：查无此人"
+    assert errors[2:] == [
+        f"Beat {number} 角色声线缺失：系统提示音" for number in range(1, 9)
+    ]
 
 
 @pytest.mark.asyncio

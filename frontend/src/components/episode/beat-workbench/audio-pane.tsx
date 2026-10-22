@@ -32,7 +32,13 @@ import { queryKeys } from "@/lib/query-keys";
 import { TASK_TYPES } from "@/lib/task-types";
 import type { BeatStageState } from "@/types/beat-state";
 import type { Beat } from "@/types/episode";
+import {
+  assetTabStorageKey,
+  voiceConfigTarget,
+  voicePrereqMessage,
+} from "@/lib/voice-prereq";
 import { MEDIA_PRIMARY_ACTION_BUTTON_CLASS } from "./media-styles";
+import { VoicePrereqNotice } from "./voice-prereq-notice";
 
 interface AudioPaneProps {
   beat: Beat;
@@ -41,33 +47,6 @@ interface AudioPaneProps {
   state: BeatStageState;
   spineTemplate?: "drama" | "narrated";
 }
-
-type VoiceConfigTarget = "characters" | "voices";
-
-const ASSET_TAB_STORAGE_KEY_PREFIX = "supertale-asset-tab:";
-
-function assetTabStorageKey(project: string): string {
-  return `${ASSET_TAB_STORAGE_KEY_PREFIX}${encodeURIComponent(project)}`;
-}
-
-// 下面两个函数比对的都是后端报错里的原文，不是界面文案，跟着界面语言走就认不出来了。
-// i18n-exempt-start
-function audioPrereqTarget(error: string): VoiceConfigTarget | null {
-  const message = String(error || "").trim();
-  if (!message.includes("解说声线缺失")) return null;
-  if (message.includes("解说主角") || message.includes("角色工作台")) return "characters";
-  return "voices";
-}
-
-function audioPrereqMessage(error: string, t: (key: string) => string): string {
-  const message = String(error || "").trim();
-  if (!message.includes("解说声线缺失")) return message;
-  if (message.includes("解说主角") || message.includes("角色工作台")) {
-    return `${message}${t("episode.workbench.audio.prereqHintCharacters")}`;
-  }
-  return `${message}${t("episode.workbench.audio.prereqHintVoices")}`;
-}
-// i18n-exempt-end
 
 /** 音频 sub-tab — per-beat IndexTTS2 task dispatch and playback. */
 export function AudioPane({
@@ -107,8 +86,8 @@ export function AudioPane({
   const src = beat.audio_url ? resolveMediaUrl(beat.audio_url) : null;
 
   const showAudioError = (error: string) => {
-    const target = audioPrereqTarget(error);
-    const message = audioPrereqMessage(error, t);
+    const target = voiceConfigTarget(error);
+    const message = voicePrereqMessage(error, t);
     if (!target) {
       toast.error(message);
       return;
@@ -163,6 +142,9 @@ export function AudioPane({
                   ? `⚠ ${t("episode.workbench.audio.genFailed")}`
                   : t("episode.workbench.audio.notGenerated")}
             </div>
+          )}
+          {audioPrereqError && (
+            <VoicePrereqNotice errors={[audioPrereqError]} project={project} />
           )}
           <Button
             size="xs"

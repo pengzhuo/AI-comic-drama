@@ -6821,6 +6821,40 @@ def test_extract_tool_chat_error_maps_generic_failed_task_error():
     assert "resp_123" not in chat_error
 
 
+def test_extract_tool_chat_error_ignores_a_failed_row_inside_a_task_list():
+    # The outer 捏导 reads the project task list to answer "现在做到哪了". An old
+    # failed row in that list is data the call returned, not this call failing,
+    # so it must not be appended to the reply as a task failure.
+    payload = {
+        "sessionUpdate": "tool_call_update",
+        "status": "completed",
+        "result": {
+            "ok": True,
+            "data": {
+                "tasks": [
+                    {"task_type": "single_video", "status": "failed"},
+                    {"task_type": "audio_generation", "status": "completed"},
+                ]
+            },
+        },
+    }
+
+    assert chat_service._extract_tool_chat_error(payload) is None
+
+
+def test_extract_tool_chat_error_keeps_the_calls_own_failed_status():
+    payload = {
+        "sessionUpdate": "tool_call_update",
+        "status": "completed",
+        "result": {"ok": True, "data": {"status": "failed"}},
+    }
+
+    assert (
+        chat_service._extract_tool_chat_error(payload)
+        == "任务执行失败：当前状态为 failed。"
+    )
+
+
 def test_extract_tool_chat_error_maps_ok_false_without_error_text():
     payload = {
         "sessionUpdate": "tool_call_update",

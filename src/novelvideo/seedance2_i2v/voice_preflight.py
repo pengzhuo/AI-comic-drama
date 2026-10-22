@@ -79,8 +79,62 @@ def speech_reference_audio_gap(
     )
 
 
+def ensure_speech_voice_mention(
+    prompt: str,
+    *,
+    beat: dict[str, Any],
+    assets: list[Any],
+    seedance2_config: Any = None,
+) -> str:
+    """发声 beat 的提示词必须点名声线编号，漏写时补一句（幂等）。
+
+    参考声线是这类 beat 的必须素材，而提示词是模型唯一能看到的映射说明：
+    ``apply_prompt_audio_selection`` 只发提示词里出现过的编号，所以提示词一旦漏写，
+    声线会被静默丢掉、随后在构建期报「缺少参考声线」——同一件事的两半口径不一致。
+    这里在挑音频之前把缺失的编号补进提示词，让「发什么」与「提示词怎么写」对齐。
+
+    只认自动声线（``voice:`` 开头且文件可用），静音/音效 beat 与不要求模型出声的
+    beat 一律不动，也不改写提示词里任何既有内容。
+    """
+
+    text = str(prompt or "")
+    if not beat_expects_speech(beat):
+        return text
+    if not _generate_audio_enabled(seedance2_config):
+        return text
+
+    clauses: list[str] = []
+    for asset in assets or []:
+        if str(getattr(asset, "media_type", "") or "") != "audio":
+            continue
+        if not str(getattr(asset, "key", "") or "").startswith("voice:"):
+            continue
+        if not getattr(asset, "exists", False):
+            continue
+        if getattr(asset, "validation_error", ""):
+            continue
+        label = str(getattr(asset, "reference_label", "") or "")
+        if not label.startswith("音频") or label in text:
+            continue
+        title = str(getattr(asset, "label", "") or "").strip()
+        clauses.append(f"声线参考 @{label}（{title}）" if title else f"声线参考 @{label}")
+    if not clauses:
+        return text
+    if not text.strip():
+        # 提示词为空时没有可对齐的对象，交给调用方报「提示词为空」，不要凭空造一句。
+        return text
+
+    sentence = (
+        "【声音参考】本镜"
+        + "、".join(clauses)
+        + "，仅用于约束本镜台词的音色与说话方式，不改变画内信息。"
+    )
+    return f"{text}\n\n{sentence}"
+
+
 __all__ = [
     "SPEECH_AUDIO_TYPES",
     "beat_expects_speech",
+    "ensure_speech_voice_mention",
     "speech_reference_audio_gap",
 ]

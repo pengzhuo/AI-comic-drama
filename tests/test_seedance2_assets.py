@@ -317,6 +317,128 @@ def test_multimodal_dialogue_assets_use_character_voice_reference_not_beat_audio
     assert audio_asset.label == "面馆男青年 · 青年时期声线"
 
 
+def test_dialogue_line_with_prose_colon_resolves_the_character_voice(tmp_path):
+    """台词里的冒号不能造出幽灵说话人，否则声线会指向一个不存在的角色。
+
+    现场问题：beat 台词「（平淡）认定书上写着：违规操作…」被解析成说话人
+    「认定书上写着」，声线资产于是指向 ``assets/characters/认定书上写着/...``，
+    构建期直接报「缺少参考声线：认定书上写着声线 还没有音频文件」。
+    """
+
+    from novelvideo.seedance2_i2v.assets import (
+        build_seedance2_project_assets,
+        selected_reference_paths,
+    )
+
+    project_dir = tmp_path / "project"
+    frame = project_dir / "frames" / "ep002" / "beat_08.png"
+    voice = project_dir / "assets" / "characters" / "班长" / "voices" / "voice_default.mp3"
+    _write_png(frame)
+    voice.parent.mkdir(parents=True)
+    voice.write_bytes(b"voice")
+    character = NovelCharacter(
+        name="班长",
+        reference_audio_path="assets/characters/班长/voices/voice_default.mp3",
+    )
+    character.identities = [
+        CharacterIdentity(
+            identity_id="班长_中年时期",
+            character_name="班长",
+            identity_name="中年时期",
+        )
+    ]
+
+    assets = build_seedance2_project_assets(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=2,
+        beat={
+            "beat_number": 8,
+            "audio_type": "dialogue",
+            "speaker": "班长_中年时期",
+            "detected_identities": ["班长_中年时期"],
+            "narration": "（平淡）认定书上写着：违规操作，防护罩是他自己拆的。厂方没责任。",
+        },
+        mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+        characters=[character],
+    )
+
+    audio_assets = [asset for asset in assets if asset.media_type == "audio"]
+    assert [asset.key for asset in audio_assets] == ["voice:班长_中年时期"]
+    assert audio_assets[0].exists is True
+    assert audio_assets[0].label == "班长 · 中年时期声线"
+    assert selected_reference_paths(assets, "reference_audios") == [str(voice)]
+
+
+async def test_prepare_dialogue_beat_with_prose_colon_keeps_the_voice_reference(tmp_path):
+    """端到端回归：冒号误判 + 提示词漏写编号，两处叠加会卡在发请求之前。
+
+    现场问题：``nn_1021_1`` ep2 beat 8 提示词里没有「音频1」，台词里又有散文冒号，
+    于是幽灵说话人把声线换成不存在的文件、漏写编号又把声线丢掉，
+    ``prepare`` 直接抛「缺少参考声线」，上游一个请求都没收到。
+    """
+
+    import json
+
+    from novelvideo.seedance2_i2v.pipeline import prepare_seedance2_generation_inputs
+
+    project_dir = tmp_path / "project"
+    _write_png(project_dir / "frames" / "ep002" / "beat_08.png")
+    voice = project_dir / "assets" / "characters" / "班长" / "voices" / "voice_default.mp3"
+    voice.parent.mkdir(parents=True)
+    voice.write_bytes(b"voice")
+    character = NovelCharacter(
+        name="班长",
+        reference_audio_path="assets/characters/班长/voices/voice_default.mp3",
+    )
+    character.identities = [
+        CharacterIdentity(
+            identity_id="班长_中年时期",
+            character_name="班长",
+            identity_name="中年时期",
+        )
+    ]
+    spoken = "认定书上写着，违规操作，防护罩是他自己拆的。厂方没责任。"
+    # 线上那条提示词：把源文的逗号写成了冒号，且整段没有「音频1」。
+    prompt_line = spoken.replace("，", "：", 1)
+
+    prepared = await prepare_seedance2_generation_inputs(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=2,
+        beat={
+            "beat_number": 8,
+            "audio_type": "dialogue",
+            "speaker": "班长_中年时期",
+            "detected_identities": ["班长_中年时期"],
+            "narration": f"（平淡）{spoken}",
+            # 提示词故意不写「音频1」：这就是线上那条提示词。
+            "seedance2_config_json": json.dumps(
+                {
+                    "mode": "multimodal_reference",
+                    "final_prompt": f"严格首帧生成，人物以图片1为准。原文全文，逐字念出：{prompt_line}",
+                    "generate_audio": True,
+                },
+                ensure_ascii=False,
+            ),
+        },
+        video_mode="first_frame",
+        prompt="",
+        duration=5.0,
+        resolution="720p",
+        ratio="9:16",
+        characters=[character],
+    )
+
+    config = json.loads(prepared.seedance2_config_json)
+    assert config["reference_audio_paths"] == [str(voice)]
+    assert [ref.role for ref in prepared.references if ref.type == "audio"] == ["音频1"]
+    # 补齐后的编号要落进最终提示词，模型才知道哪条音频是声线。
+    assert "@音频1" in prepared.prompt
+    assert "【声音参考】" in prepared.prompt
+    assert "班长 · 中年时期声线" in prepared.prompt
+
+
 def test_multimodal_dialogue_assets_follow_multi_speaker_text_order(tmp_path):
     from novelvideo.seedance2_i2v.assets import (
         build_seedance2_project_assets,

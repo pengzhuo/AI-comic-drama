@@ -2733,6 +2733,7 @@
     },
     "pastePlaceholder": "Dán nội dung truyện vào đây, tối đa 1000 ký tự",
     "startIngest": "Bắt đầu nhập",
+    "startBlockedByFormat": "Kịch bản chưa đạt kiểm tra định dạng nên chưa thể bắt đầu nhập. Hãy mở “Xem chi tiết”, bổ sung dòng đầu cảnh còn thiếu rồi tải lên lại.",
     "startOneClickFilm": "Làm phim một chạm",
     "saveSettings": "Lưu cài đặt",
     "settingsSaved": "Đã lưu cài đặt dự án",
@@ -3883,7 +3884,18 @@
         "beatNarrationVoiceUpload": "Tải âm thanh cho beat",
         "beatNarrationVoiceUploaded": "Đã tải âm thanh lời dẫn của beat lên",
         "prereqHintCharacters": ". Hãy sang trang Nhân vật để tải giọng người dẫn truyện lên.",
-        "prereqHintVoices": ". Hãy sang Asset > Giọng nói để tải lên hoặc cắt một giọng dẫn truyện mặc định."
+        "prereqHintVoices": ". Hãy sang Asset > Giọng nói để tải lên hoặc cắt một giọng dẫn truyện mặc định.",
+        "prereqHintCharacterVoices": ". Hãy sang trang Nhân vật để đặt giọng cho các nhân vật còn thiếu, hoặc nhờ Xia Director bổ sung bằng giọng hệ thống."
+      },
+      "voicePrereq": {
+        "titleCharacters": "Lồng tiếng bị chặn: thiếu giọng nhân vật",
+        "titleVoices": "Lồng tiếng bị chặn: thiếu giọng dẫn truyện",
+        "charactersMissing": "Nhân vật chưa có giọng: {{characters}}",
+        "moreErrors": "Còn {{count}} cảnh báo tương tự",
+        "configureAction": "Thiết lập giọng",
+        "askDirectorAction": "Nhờ Xia Director bổ sung giọng hệ thống",
+        "askDirectorRequest": "Hãy bổ sung giọng hệ thống cho các nhân vật còn thiếu giọng trong tập này (nhân vật: {{characters}}), rồi tiếp tục lồng tiếng.",
+        "askDirectorRequestNoCharacters": "Hãy bổ sung giọng hệ thống cho các giọng còn thiếu trong tập này, rồi tiếp tục lồng tiếng."
       },
       "video": {
         "started": "Đã bắt đầu tạo video cho Beat #{{n}}",

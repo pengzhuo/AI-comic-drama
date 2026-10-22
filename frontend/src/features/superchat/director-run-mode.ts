@@ -490,7 +490,11 @@ export function directorAutoUserMessageTransportText(text: string): string {
     "The durable backend already owns progression of the active outer 捏导 episode auto run. First " +
     "understand the user's actual intent; do not start the next mainline task merely because this " +
     "message arrived. For a question, explanation, result view, or progress/status request, answer or " +
-    "read only and leave automatic progression running. If the message may change, redo, replace, or " +
+    "read only and leave automatic progression running. If the run is actually paused on a blocker " +
+    "the user has now cleared — missing voices, for example — call " +
+    "dramaclaw_control_episode_auto(action='continue') with the user's voice_policy ('system' or " +
+    "'custom') once they have chosen one, and acknowledge that automatic production resumed; a " +
+    "'paused' run cannot be restarted with action='resume'. If the message may change, redo, replace, or " +
     "reconfigure project output, call dramaclaw_control_episode_auto(action='suspend', reason=...) " +
     "before asking for confirmation, and do not perform the mutation in this turn. If the user " +
     "explicitly asks to stop or switch to manual mode, call " +

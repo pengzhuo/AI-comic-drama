@@ -853,3 +853,32 @@ def test_dramaclaw_plugin_controls_episode_auto_without_cancelling_tasks(monkeyp
         ),
         ("POST", "/api/v1/projects/proj-1/chat/director-auto/resume", None),
     ]
+
+
+def test_dramaclaw_plugin_continues_a_hard_paused_episode_auto_run(monkeypatch):
+    plugin = _load_plugin_module()
+    calls = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs.get("body")))
+        return {"ok": True}
+
+    monkeypatch.setattr(plugin, "_request", fake_request)
+
+    # ``resume`` cannot revive a run the coordinator parked itself; the outer
+    # 捏导 has to reach for ``continue`` instead.
+    plugin._handle_control_episode_auto({"project_id": "proj-1", "action": "continue"})
+    plugin._handle_control_episode_auto({
+        "project_id": "proj-1",
+        "action": "continue",
+        "voice_policy": "system",
+    })
+
+    assert calls == [
+        ("POST", "/api/v1/projects/proj-1/chat/director-auto/continue", None),
+        (
+            "POST",
+            "/api/v1/projects/proj-1/chat/director-auto/continue",
+            {"voice_policy": "system"},
+        ),
+    ]

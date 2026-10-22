@@ -449,16 +449,21 @@ async def prepare_missing_system_voices(
         beat_numbers=None,
         mode="sync_changed",
     )
+    # 「怎么修」的原因必须排在逐 beat 的重复报错前面：任务失败只带 errors[:5]，
+    # 排在第六条就等于用户永远看不到补性别/认说话人这条真正的出口。
+    actionable: list[str] = []
+    for detail in gender_missing:
+        if detail not in actionable:
+            actionable.append(detail)
     for speaker in sorted(unresolved_speakers):
         detail = f"未找到说话身份对应角色：{speaker}"
-        if detail not in remaining:
-            remaining.append(detail)
-    for detail in gender_missing:
-        if detail not in remaining:
-            remaining.append(detail)
+        if detail not in actionable:
+            actionable.append(detail)
+    per_beat = [detail for detail in remaining if detail not in actionable]
+    ordered = actionable + per_beat
     return {
         "prepared": prepared,
         "prepared_count": len(prepared),
-        "remaining_errors": remaining,
-        "ready": not remaining,
+        "remaining_errors": ordered,
+        "ready": not ordered,
     }

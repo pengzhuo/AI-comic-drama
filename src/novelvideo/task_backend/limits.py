@@ -9,7 +9,7 @@ from novelvideo.task_backend.queues import normalize_queue_kind
 
 PROJECT_LANE_LIMIT_DEFAULTS = {
     "default": 12,
-    "video": 4,
+    "video": 3,
     "world": 3,
     "ffmpeg": 2,
 }
@@ -24,19 +24,25 @@ PROJECT_LANE_MIN_DEFAULTS = {
 #: 每用户每 lane 的在飞上限。``video`` 原本是 1，而项目级 lane 的「有效上限」是
 #: ``min(hard, max(min, users*user))`` —— 单用户项目下 user=1 会把视频吞吐硬压成
 #: **1 路**：实测 95 次生成、单次 p50 152s，整段视频阶段因此铺了 3.7h 墙钟。
-#: 与项目级 hard limit（4）对齐后才能真正并行。
+#: 与项目级 hard limit 对齐后才能真正并行（值随 hard limit 一起收到 3，见
+#: ``GLOBAL_LANE_CONCURRENCY_DEFAULTS`` 的内存说明）。
 PROJECT_USER_LANE_LIMIT_DEFAULTS = {
     "default": 3,
-    "video": 4,
+    "video": 3,
     "world": 3,
     "ffmpeg": 1,
 }
 
 #: CE inline 执行槽位。``video``/``world`` 原本分别只有 2/1，比项目级 hard limit
 #: 还低，等于「配了 4 路却只跑 2 路」。
+#:
+#: 上限从 default=8/video=4 收到 default=6/video=3：inline lane 是**同一个进程内**
+#: 跑的，视频任务各自持有解码帧/图片 payload，实测 video=4 时容器内存 30s 内从
+#: 4.4G 冲到 9.8G（主机 15.6G 且当时 Swap=0，直接把整机拖死）。少一路并发
+#: 换的是峰值内存，值得；真要提速请显式设 ``ST_CE_GLOBAL_MAX_ACTIVE_VIDEO_TASKS``。
 GLOBAL_LANE_CONCURRENCY_DEFAULTS = {
-    "default": 8,
-    "video": 4,
+    "default": 6,
+    "video": 3,
     "world": 3,
     "ffmpeg": 1,
 }

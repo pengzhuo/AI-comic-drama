@@ -75,13 +75,24 @@ AUTO_TASK_TYPES = frozenset({
 })
 ACTIVE_STATUSES = frozenset({"submitting", "queued", "pending", "running"})
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+#: Pause reason for "the next step needs a voice policy the user has not picked".
+#: Also the tag a completed system-voice preparation looks for when it hands the
+#: run back to the coordinator, so the two sites must share one string.
+VOICE_POLICY_REQUIRED_ERROR = "缺少配音声线，且未选择声线策略（系统声线／自定义声线）"
 POLL_SECONDS = 1.5
 #: 重叠派发的节流：在已有任务在飞时，最多每这么久试一次「下一批就绪阶段」。
 #: 太密只是白白重算 pipeline status，太疏又会留下成片的空转窗口。
 OVERLAP_DISPATCH_SECONDS = 5.0
 INITIAL_GRACE_SECONDS = 5.0
-LEASE_SECONDS = 45.0
+#: 续租要扛得住「一批任务把共享线程池/事件循环堵住几十秒」。续租走
+#: ``asyncio.to_thread``，45s 窗口下只要一次续租迟到，心跳就会把 worker 取消掉，
+#: run 便停在 ``running`` 而无人推进（任务行还在流，表面看不出问题）。
+LEASE_SECONDS = 120.0
 HEARTBEAT_SECONDS = 10.0
+#: 连续多少次续租失败才判定租约真丢了（每次间隔 ``HEARTBEAT_SECONDS``）。
+LEASE_RENEW_ATTEMPTS = 4
+#: 巡检间隔：发现「``status=running`` 但没有 worker 持有租约」就重新拉起。
+REAPER_SECONDS = 30.0
 _MISSING_CHARACTER_PORTRAIT_RE = re.compile(
     r"请先为角色[「“\"](?P<character>.+?)[」”\"]生成\s*Portrait（面部特写）"
 )
@@ -641,6 +652,20 @@ class DirectorAutoStore:
             ).fetchall()
         return [run for row in rows if (run := self._row(row)) is not None]
 
+    def running_without_lease(self, now: float) -> list[DirectorAutoRun]:
+        """运行中但没人驱动的 run：租约空闲或已过期。"""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM director_auto_runs
+                WHERE status='running'
+                  AND (owner_token='' OR lease_expires_at<=?)
+                """,
+                (float(now),),
+            ).fetchall()
+        return [run for row in rows if (run := self._row(row)) is not None]
+
     def claim_lease(
         self,
         run_id: str,
@@ -891,6 +916,12 @@ class DirectorAutoCoordinator:
         self.owner_token = uuid.uuid4().hex
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._stopping = False
+        #: Application event loop captured at startup.  Task runners execute in
+        #: lane pool threads that own a throw-away ``asyncio.run`` loop, so
+        #: ``resume_paused_from_thread`` has to fan work back out to this loop.
+        self._app_loop: asyncio.AbstractEventLoop | None = None
+        #: 巡检任务：把「没人持租约却还是 running」的 run 重新拉起来。
+        self._supervisor: asyncio.Task[None] | None = None
         #: Last continuation breadcrumb per run: ``(saw_write, last_tool_note)``.
         #: Used to tell "the agent only did reads" apart from "the agent wrote
         #: but produced no task" when the durable run has to pause.
@@ -1040,21 +1071,193 @@ class DirectorAutoCoordinator:
         await self._broadcast_status(updated)
         return updated
 
+    async def resume_paused(
+        self,
+        *,
+        username: str,
+        project_id: str,
+        voice_policy: str | None = None,
+    ) -> DirectorAutoRun | None:
+        """Continue a hard-paused run (unmet prerequisite or retryable failure).
+
+        ``resume_suspended`` answers a *declined change* and therefore only
+        accepts ``awaiting_confirmation``.  This is the explicit "继续" path for
+        a run the coordinator itself parked with ``pause()`` — the voice-setup
+        gate being the common case.  Terminal statuses stay terminal; the user
+        restarts those with a fresh auto run so a finished/failed run is never
+        silently replayed.
+        """
+
+        run = await asyncio.to_thread(self.store.get, username, project_id)
+        if run is None:
+            return None
+        if run.status == "running":
+            self._ensure_worker(run)
+            return run
+        if run.status != "paused":
+            raise ValueError("只有已暂停的本集自动任务可以继续")
+        normalized_policy = (
+            voice_policy if voice_policy in {"system", "custom"} else run.voice_policy
+        )
+        updated = DirectorAutoRun(
+            **{
+                **asdict(run),
+                "status": "running",
+                "updated_at": _utc_now(),
+                "last_error": "",
+                "voice_policy": normalized_policy,
+                # A user decision is a fresh start: do not hold the attempts
+                # spent before the pause against the next failure.
+                "stage_key": "",
+                "stage_attempts": 0,
+                "next_attempt_at": 0.0,
+            }
+        )
+        await asyncio.to_thread(self.store.upsert, updated)
+        self._ensure_worker(updated)
+        await self._broadcast_status(updated)
+        return updated
+
+    def resume_paused_from_thread(
+        self,
+        *,
+        username: str,
+        project_id: str,
+        voice_policy: str | None = None,
+    ) -> bool:
+        """Best-effort ``resume_paused`` from a task-runner worker thread.
+
+        Returns False when the application loop is unknown/closed or the call
+        could not be handed off, so callers can fall back to the manual
+        "继续" path.  Never raises: this runs on the tail of a task and must not
+        turn a successful task into a failure.
+        """
+
+        loop = self._app_loop
+        if loop is None or loop.is_closed():
+            logger.info(
+                "director auto resume skipped (no app loop): project_id=%s",
+                project_id,
+            )
+            return False
+        try:
+            handle = asyncio.run_coroutine_threadsafe(
+                self.resume_paused(
+                    username=username,
+                    project_id=project_id,
+                    voice_policy=voice_policy,
+                ),
+                loop,
+            )
+        except Exception:  # noqa: BLE001 - continuation is strictly best-effort
+            logger.exception(
+                "director auto resume hand-off failed: project_id=%s", project_id
+            )
+            return False
+        handle.add_done_callback(
+            lambda done, pid=project_id: self._log_detached_resume(done, pid)
+        )
+        return True
+
+    def resume_after_system_voice_setup_from_thread(
+        self,
+        *,
+        username: str,
+        project_id: str,
+    ) -> bool:
+        """Continue the run the *voice gate* paused, now that voices exist.
+
+        Only a run parked with :data:`VOICE_POLICY_REQUIRED_ERROR` is picked up,
+        so a pause caused by something else keeps its own reason and its own
+        decision.  The run adopts ``voice_policy="system"`` because preparing
+        system voices is itself the user's choice of that policy.
+        """
+
+        loop = self._app_loop
+        if loop is None or loop.is_closed():
+            logger.info(
+                "director auto voice continuation skipped (no app loop): project_id=%s",
+                project_id,
+            )
+            return False
+        try:
+            handle = asyncio.run_coroutine_threadsafe(
+                self._continue_paused_after_voice_setup(
+                    username=username,
+                    project_id=project_id,
+                ),
+                loop,
+            )
+        except Exception:  # noqa: BLE001 - continuation is strictly best-effort
+            logger.exception(
+                "director auto voice continuation hand-off failed: project_id=%s",
+                project_id,
+            )
+            return False
+        handle.add_done_callback(
+            lambda done, pid=project_id: self._log_detached_resume(done, pid)
+        )
+        return True
+
+    async def _continue_paused_after_voice_setup(
+        self,
+        *,
+        username: str,
+        project_id: str,
+    ) -> DirectorAutoRun | None:
+        run = await asyncio.to_thread(self.store.get, username, project_id)
+        if run is None or run.status != "paused":
+            return run
+        if str(run.last_error or "").strip() != VOICE_POLICY_REQUIRED_ERROR:
+            return run
+        return await self.resume_paused(
+            username=username,
+            project_id=project_id,
+            voice_policy=run.voice_policy or "system",
+        )
+
+    @staticmethod
+    def _log_detached_resume(done: Any, project_id: str) -> None:
+        try:
+            error = done.exception()
+        except Exception:  # noqa: BLE001 - cancelled/failed hand-off
+            return
+        if isinstance(error, ValueError):
+            # Run is no longer paused (already continued elsewhere): benign.
+            return
+        if error is not None:
+            logger.warning(
+                "director auto detached resume failed: project_id=%s error=%s",
+                project_id,
+                error,
+            )
+
     async def get(self, *, username: str, project_id: str) -> DirectorAutoRun | None:
         return await asyncio.to_thread(self.store.get, username, project_id)
 
     async def resume(self) -> None:
         self._stopping = False
+        try:
+            self._app_loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - always started from the loop
+            self._app_loop = None
         for run in await asyncio.to_thread(self.store.active):
             self._ensure_worker(run)
+        self._ensure_supervisor()
 
     async def shutdown(self) -> None:
         self._stopping = True
+        supervisor = self._supervisor
+        self._supervisor = None
         workers = list(self._workers.values())
         self._workers.clear()
         for worker in workers:
             worker.cancel()
+        if supervisor is not None:
+            supervisor.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
+        if supervisor is not None:
+            await asyncio.gather(supervisor, return_exceptions=True)
 
     def _ensure_worker(self, run: DirectorAutoRun) -> None:
         existing = self._workers.get(run.run_id)
@@ -1066,6 +1269,46 @@ class DirectorAutoCoordinator:
         )
         self._workers[run.run_id] = worker
         worker.add_done_callback(lambda _done, run_id=run.run_id: self._workers.pop(run_id, None))
+
+    def _ensure_supervisor(self) -> None:
+        """保证整个 app 生命周期里有一个巡检任务在跑。"""
+
+        existing = self._supervisor
+        if existing is not None and not existing.done():
+            return
+        self._supervisor = asyncio.create_task(
+            self._supervise_loop(), name="director-auto-supervisor"
+        )
+
+    async def _supervise_loop(self) -> None:
+        while not self._stopping:
+            try:
+                await self._reap_stalled_runs()
+            except Exception:  # noqa: BLE001 - 巡检自己绝不能死
+                logger.exception("director auto supervision pass failed")
+            await asyncio.sleep(REAPER_SECONDS)
+
+    async def _reap_stalled_runs(self) -> None:
+        """把「worker 悄悄没了」的 run 重新拉起来。
+
+        worker 可能在完全不碰 durable 行的前提下死掉：续租连续失败会让心跳
+        ``parent.cancel()`` 掉它，行还留在 ``running``；而任务行仍在流动，
+        所以直到这一批在飞任务排空才会看出「这一集停了」。除了这里没有任何
+        地方会把它重新 arm，所以必须巡检。
+        """
+
+        now = datetime.now(timezone.utc).timestamp()
+        for run in await asyncio.to_thread(self.store.running_without_lease, now):
+            worker = self._workers.get(run.run_id)
+            if worker is not None and not worker.done():
+                continue
+            logger.warning(
+                "director auto re-arming stalled run project_id=%s run_id=%s stage=%s",
+                run.project_id,
+                run.run_id,
+                run.stage_key,
+            )
+            self._ensure_worker(run)
 
     async def _run_with_lease(self, run_id: str, username: str, project_id: str) -> None:
         while not self._stopping:
@@ -1089,6 +1332,13 @@ class DirectorAutoCoordinator:
         )
         try:
             await self._run(run_id, username, project_id)
+        except asyncio.CancelledError:
+            logger.warning(
+                "director auto worker cancelled run_id=%s (run row untouched)", run_id
+            )
+            raise
+        except Exception:  # noqa: BLE001 - 死掉的 worker 不能没有日志
+            logger.exception("director auto worker crashed run_id=%s", run_id)
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
@@ -1103,15 +1353,43 @@ class DirectorAutoCoordinator:
         run_id: str,
         parent: asyncio.Task[None] | None,
     ) -> None:
+        """续租；瞬时失败重试若干次，只有连续失败才判定租约丢失。
+
+        续租走共享线程池（``asyncio.to_thread``），重批量任务会把线程池和事件
+        循环堵住几十秒，此时单次失败是正常的。旧实现「一次失败就 cancel」会让
+        worker 无声死掉、run 卡在 ``running``，所以这里必须容忍 + 留痕。
+        """
+
+        misses = 0
         while not self._stopping:
             await asyncio.sleep(HEARTBEAT_SECONDS)
-            renewed = await asyncio.to_thread(
-                self.store.renew_lease,
-                run_id,
-                self.owner_token,
-            )
+            try:
+                renewed = await asyncio.to_thread(
+                    self.store.renew_lease,
+                    run_id,
+                    self.owner_token,
+                )
+            except Exception:  # noqa: BLE001 - sqlite 写锁/超时都算瞬时
+                logger.warning(
+                    "director auto lease renew raised run_id=%s attempt=%s",
+                    run_id,
+                    misses + 1,
+                    exc_info=True,
+                )
+                renewed = False
             if renewed:
+                misses = 0
                 continue
+            misses += 1
+            logger.warning(
+                "director auto lease renew failed run_id=%s attempt=%s/%s",
+                run_id,
+                misses,
+                LEASE_RENEW_ATTEMPTS,
+            )
+            if misses < LEASE_RENEW_ATTEMPTS:
+                continue
+            logger.error("director auto lease lost, stopping worker run_id=%s", run_id)
             if parent is not None and not parent.done():
                 parent.cancel()
             return
@@ -1408,7 +1686,10 @@ class DirectorAutoCoordinator:
                 "The user chose uploaded/recorded custom voices. Never substitute system voices. "
                 "If required custom voices are still missing at voice_setup, call "
                 "dramaclaw_control_episode_auto(action='pause'), then explain the missing items and "
-                "ask the user to upload or record them in 捏塘. Do not start audio generation."
+                "ask the user to upload or record them in 捏塘. Do not start audio generation. "
+                "Once the user reports the voices are ready, call "
+                "dramaclaw_control_episode_auto(action='continue', voice_policy='custom') — the run "
+                "is 'paused', so action='resume' would be rejected."
                 "\n[/DRAMACLAW_VOICE_POLICY]"
             )
         turn_id = f"director-auto-{run.run_id}-{uuid.uuid4().hex[:10]}"
@@ -1497,7 +1778,7 @@ class DirectorAutoCoordinator:
             if close:
                 await close()
         if str(data.get("next_step") or "") == "voice_setup" and not run.voice_policy:
-            return "缺少配音声线，且未选择声线策略（系统声线／自定义声线）"
+            return VOICE_POLICY_REQUIRED_ERROR
         return None
 
     async def _dispatch_stage(

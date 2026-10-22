@@ -164,18 +164,43 @@ export function useStartIngest(project: string) {
       rebuild?: boolean;
       spine_template?: SpineTemplate;
     }) => {
-      const response = await jsonWithBackendError<TaskResponse | ErrorResponse>(
+      const response = await jsonWithBackendError<
+        TaskResponse | IngestFormatBlockedResponse
+      >(
         api.post(p`api/v1/projects/${project}/ingest/start`, {
           json: params,
           throwHttpErrors: false,
         }),
       );
       if (!response.ok) {
-        throw new Error(response.error);
+        // 剧本格式闸门（error_type: screenplay_format）会连 format_check 一起返回；丢掉它
+        // 就只剩一句 toast，用户不知道该改哪里。带上原始 payload 让页面直接弹详情。
+        throw new IngestFormatBlockedError(
+          response.error,
+          response.error_type === "screenplay_format"
+            ? response.format_check ?? null
+            : null,
+        );
       }
       return response;
     },
   });
+}
+
+/** `ingest/start` 被拒时携带的后端原始 `format_check`（仅格式闸门有值）。 */
+export class IngestFormatBlockedError extends Error {
+  readonly formatCheck: FormatCheck | null;
+
+  constructor(message: string, formatCheck: FormatCheck | null) {
+    super(message);
+    this.name = "IngestFormatBlockedError";
+    this.formatCheck = formatCheck;
+  }
+}
+
+interface IngestFormatBlockedResponse extends ErrorResponse {
+  error_type?: string;
+  format_check?: FormatCheck;
 }
 
 export interface ScriptProcessCharacter {
