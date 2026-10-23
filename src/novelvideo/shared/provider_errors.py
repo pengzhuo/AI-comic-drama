@@ -80,6 +80,10 @@ _CONTENT_MODERATION_MARKERS = (
     "output_moderation",
     "inputimagesensitivecontentdetected.policyviolation",
     "outputvideosensitivecontentdetected.policyviolation",
+    # DramaClawAPI 网关判「输出视频敏感」时只回一句英文自由文本，不带
+    # ``*Detected`` / ``VIDEO_*`` 枚举；缺这条就认不出，只能把网关原文
+    # （含 request id）原样丢给用户。
+    "output video may contain sensitive",
     "copyright restrictions",
 )
 
@@ -96,7 +100,9 @@ def content_moderation_message(exc: BaseException | None = None, message: str = 
     text = " ".join(part for part in (str(exc) if exc else "", message) if part).lower()
     if "inputimagesensitivecontentdetected.policyviolation" in text:
         return INPUT_IMAGE_POLICY_FAILED_MESSAGE
-    if "outputvideosensitivecontentdetected.policyviolation" in text:
+    if "outputvideosensitivecontentdetected.policyviolation" in text or (
+        "output video may contain sensitive" in text
+    ):
         return OUTPUT_VIDEO_POLICY_FAILED_MESSAGE
     if "copyright restrictions" in text:
         return COPYRIGHT_POLICY_FAILED_MESSAGE

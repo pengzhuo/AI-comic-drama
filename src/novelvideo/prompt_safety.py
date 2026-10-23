@@ -7,12 +7,15 @@
 
 本模块只做保守的**近义替换**：不改镜头、动作、道具、光线与一致性约束的语义，
 只把湿身/贴身/身体部位、以及「喘息 + 身体起伏」这类高敏表述换成中性说法，
-供两处复用：
+供三处复用：
 
 * ``verification/video_consistency_gate.py``：强化提示词注入前先中性化，
   避免把视觉模型对画面的自由描述（例如「吊带背心与短裤」）原样写回提示词；
 * ``generators/video_generator.py``：提交被文本审核拒绝后，用中性化提示词
-  再抢救一次。
+  再抢救一次；
+* ``chat/moderation_prompt_repair.py``：审核类失败后重投前改写提示词，
+  ``neutralize_sensitive_elements`` 把可辨识证件/文字/暴露/血腥等画面元素
+  一并中性化（这一类会动道具表述，所以单独一个函数）。
 """
 
 from __future__ import annotations
@@ -21,6 +24,15 @@ import re
 
 #: 上游文本内容审核的拒绝码（Volcengine Ark / Seedance 系列）。
 TEXT_MODERATION_CODE = "InputTextSensitiveContentDetected"
+
+#: 「输出视频（含版权）被拦」的标记。与 ``TEXT_MODERATION_CODE`` 的区别很关键：
+#: 命中这些标记时提示词文字**已经过审**，被拦的是画面内容，所以单靠近义替换救不回，
+#: 需要重新生成一版提示词（见 ``chat/moderation_prompt_repair.py``）。
+OUTPUT_VIDEO_MARKERS: tuple[str, ...] = (
+    "outputvideosensitivecontentdetected",
+    "output video may contain sensitive",
+    "copyright restrictions",
+)
 
 #: 先跑正则（能整段收掉啰嗦的修饰），再跑下面的字面替换。
 _REGEX_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -75,6 +87,70 @@ _LITERAL_RULES: tuple[tuple[str, str], ...] = (
     ("肩胛", "后背"),
 )
 
+#: ``neutralize_sensitive_elements`` 专用：先跑正则，再跑下面的字面替换。
+_SENSITIVE_ELEMENT_REGEX_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # 证件/工牌上的长数字（身份证号、工牌编号、银行卡号…）：画面里清晰可读时
+    # 最容易被判「敏感信息」。只在本补救路径里遮蔽。
+    (re.compile(r"(?<!\d)\d{6,}(?!\d)"), "〔编号略〕"),
+)
+
+#: ``neutralize_sensitive_elements`` 专用（长词在前）。规则只覆盖「画面元素」，
+#: 不动镜头、动作、光线与一致性约束。
+_SENSITIVE_ELEMENT_RULES: tuple[tuple[str, str], ...] = (
+    # —— 可辨识的证件 / 单据 / 文件 / 文字 ——
+    ("身份证特写", "手中卡片特写（画面不出现可辨识文字与号码）"),
+    ("身份证正面", "本人卡片（画面不出现可辨识文字与号码）"),
+    ("身份证", "本人卡片（画面不出现可辨识文字与号码）"),
+    ("护照特写", "手中封套特写（画面不出现可辨识文字与号码）"),
+    ("护照", "旅行卡片（画面不出现可辨识文字与号码）"),
+    ("驾驶证", "本人卡片（画面不出现可辨识文字与号码）"),
+    ("社保卡", "本人卡片（画面不出现可辨识文字与号码）"),
+    ("工牌特写", "胸前挂牌特写（文字模糊不可辨识）"),
+    ("员工卡", "胸前挂牌（文字模糊不可辨识）"),
+    ("工牌", "胸前挂牌（文字模糊不可辨识）"),
+    ("胸牌特写", "胸前挂牌特写（文字模糊不可辨识）"),
+    ("胸牌", "胸前挂牌（文字模糊不可辨识）"),
+    ("证件照", "本人近照（画面不出现可辨识文字与号码）"),
+    ("证件", "本人卡片（画面不出现可辨识文字与号码）"),
+    ("合同特写", "纸质材料特写（文字模糊不可辨识）"),
+    ("合同", "纸质材料"),
+    ("单据特写", "纸质材料特写（文字模糊不可辨识）"),
+    ("单据", "纸质材料"),
+    ("病历", "纸质材料"),
+    ("文件特写", "纸质材料特写（文字模糊不可辨识）"),
+    ("文件", "纸质材料"),
+    ("屏幕上清晰可读的文字", "屏幕亮面（文字模糊不可辨识）"),
+    ("屏幕上的文字清晰可读", "屏幕亮面（文字模糊不可辨识）"),
+    ("屏幕上的文字", "屏幕亮面（文字模糊不可辨识）"),
+    ("文字清晰可读", "文字模糊不可辨识"),
+    ("文字清晰可见", "文字模糊不可辨识"),
+    ("清晰可读的文字", "模糊到不可辨识的文字"),
+    ("清晰可辨的文字", "模糊到不可辨识的文字"),
+    ("清晰可辨的编号", "模糊到不可辨识的编号"),
+    ("可辨识的编号", "模糊到不可辨识的编号"),
+    ("编号清晰可见", "编号模糊不可辨识"),
+    ("文字特写", "画面局部特写（不出现可辨识文字）"),
+    # —— 血腥 / 伤口 ——
+    ("血迹", "深色痕迹"),
+    ("鲜血", "深色痕迹"),
+    ("带血", "沾着深色痕迹"),
+    ("血泊", "深色水痕"),
+    ("伤口", "擦痕"),
+    # —— 暴露 / 亲密 ——
+    ("全裸", "衣着完整"),
+    ("赤裸", "衣着完整"),
+    ("半裸", "衣着完整"),
+    ("裸露", "衣着完整"),
+    ("吻戏", "靠近"),
+    ("激吻", "相拥"),
+    ("拥吻", "相拥"),
+    ("接吻", "靠近"),
+    ("亲吻", "靠近"),
+    ("床戏", "同框"),
+    ("抚摸", "轻触"),
+    ("亲密接触", "靠近"),
+)
+
 
 def sanitize_prompt_for_moderation(text: str) -> str:
     """把提示词里的高敏表述换成中性说法；不改动其余语义。"""
@@ -94,3 +170,52 @@ def is_text_moderation_rejection(text: str) -> bool:
     """判断一段上游错误文本是否属于「提示词文本被内容审核拦截」。"""
 
     return TEXT_MODERATION_CODE in str(text or "")
+
+
+#: 提交层（``generators/video_generator.py``）已经用中性化提示词再抢救过一次、
+#: 或者本地根本没有可中性化的表述时，会把这句写进错误文本。审核补救看到它就不必
+#: 再做一次同样的确定性去敏——那一次必然还是被拒，只会白白烧掉一次生成。
+#: 字面量与 video_generator 的报错文案一一对应，测试里有防漂移断言。
+DESENSITIZE_ALREADY_TRIED_MARKERS: tuple[str, ...] = (
+    "已尝试中性化改写仍被拒",
+    "提示词已是中性文本，无可再降级",
+)
+
+
+def is_desensitize_exhausted(text: str) -> bool:
+    """提交层是否已经试过（或判定无需）确定性去敏。"""
+
+    raw = str(text or "")
+    return any(marker in raw for marker in DESENSITIZE_ALREADY_TRIED_MARKERS)
+
+
+def is_output_video_moderation_rejection(text: str) -> bool:
+    """判断一段上游错误文本是否属于「输出画面（含版权）被内容审核拦截」。"""
+
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in OUTPUT_VIDEO_MARKERS)
+
+
+def neutralize_sensitive_elements(text: str) -> str:
+    """完整的内容审核中性化：通用高敏表述 + 画面元素（审核补救专用）。
+
+    先用 :func:`sanitize_prompt_for_moderation` 处理湿身/身体部位/喘息这类通用高敏
+    表述，再把「可辨识证件/文字/编号、暴露、血腥」这些**画面元素**换成中性说法。
+
+    之所以单独一个函数（而不是往 ``sanitize_prompt_for_moderation`` 里加规则）：
+    本函数会改动**道具与画面元素**的表述（例如把「身份证特写」写成本人递出的卡片），
+    而一致性强化提示词那条通路必须保留道具语义。只有「上游审核已经拒过一次」的
+    补救路径才调用本函数。
+
+    仍然遵守两条底线：不改镜头/动作/光线与一致性约束，也不删句子——只做近义替换。
+    """
+
+    out = sanitize_prompt_for_moderation(text)
+    if not out:
+        return ""
+    for pattern, replacement in _SENSITIVE_ELEMENT_REGEX_RULES:
+        out = pattern.sub(replacement, out)
+    for needle, replacement in _SENSITIVE_ELEMENT_RULES:
+        if needle in out:
+            out = out.replace(needle, replacement)
+    return re.sub(r"[ \t]{2,}", " ", out)

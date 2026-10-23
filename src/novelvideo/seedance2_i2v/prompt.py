@@ -849,6 +849,7 @@ def build_seedance2_prompt_composer_task(
     request_params: dict[str, Any] | None = None,
     manual_prompt_reference: str = "",
     language: AssetLanguage = "zh",
+    moderation_repair_note: str = "",
 ) -> str:
     payload = {
         "mode": Seedance2I2VMode(mode).value,
@@ -940,6 +941,16 @@ def build_seedance2_prompt_composer_task(
                 "onto multiple lines, center every line individually inside the block - no left "
                 "alignment, no hanging indent, no space padding.\n"
             )
+    # 内容审核补救：上一版被上游判敏感时的附加硬性要求。只在自动补救路径注入，
+    # 不进任何用户可见字段，也不参与草稿生成（规则草稿仍照旧产出）。
+    repair_rule_zh = ""
+    repair_rule_en = ""
+    repair_note = _sentence_text(moderation_repair_note)
+    if repair_note:
+        repair_rule_zh = f"- 内容审核补救（本条优先于其它美化要求）：{repair_note}\n"
+        repair_rule_en = (
+            f"- Content-safety remediation (takes priority over styling): {repair_note}\n"
+        )
     if language == "en":
         return (
             "Write the final Seedance 2.0 image-to-video prompt from the JSON below.\n\n"
@@ -955,6 +966,7 @@ def build_seedance2_prompt_composer_task(
             f"- {language_rule}\n"
             f"{clock_rule_en}"
             f"{overlay_rule_en}"
+            f"{repair_rule_en}"
             "- Only output the final prompt.\n\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
         )
@@ -976,6 +988,7 @@ def build_seedance2_prompt_composer_task(
         f"{mode_rule_zh}"
         f"{clock_rule_zh}"
         f"{overlay_rule_zh}"
+        f"{repair_rule_zh}"
         "- 只输出最终 prompt，不要解释。\n\n"
         f"输出语言：{language_rule}\n\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
@@ -1020,6 +1033,7 @@ async def compose_seedance2_prompt_with_agent(
     request_params: dict[str, Any] | None = None,
     manual_prompt_reference: str = "",
     language: AssetLanguage = "zh",
+    moderation_repair_note: str = "",
 ) -> str:
     agent = create_seedance2_prompt_composer_agent(language)
     result = await agent.run(
@@ -1033,6 +1047,7 @@ async def compose_seedance2_prompt_with_agent(
             request_params=request_params,
             manual_prompt_reference=manual_prompt_reference,
             language=language,
+            moderation_repair_note=moderation_repair_note,
         )
     )
     prompt = normalize_seedance2_editor_prompt(result.output)
@@ -1053,6 +1068,7 @@ async def generate_seedance2_prompt(
     manual_prompt_reference: str = "",
     composer: Seedance2PromptComposer | None = None,
     language: AssetLanguage = "zh",
+    moderation_repair_note: str = "",
 ) -> Seedance2PromptGeneration:
     """Generate a Seedance 2.0 prompt, preferring AI and falling back to rules."""
 
@@ -1082,6 +1098,7 @@ async def generate_seedance2_prompt(
                 request_params=request_params or {},
                 manual_prompt_reference=manual_prompt_reference,
                 language=language,
+                moderation_repair_note=moderation_repair_note,
             )
             prompt = normalize_seedance2_editor_prompt(prompt)
             if not prompt:

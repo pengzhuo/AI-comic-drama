@@ -744,6 +744,51 @@ async def test_find_matching_scene_treats_independent_underscore_scene_as_base_c
     assert matched.name == "地下_主控室"
 
 
+@pytest.mark.asyncio
+async def test_find_matching_scene_resolves_location_heading_through_short_alias():
+    """nn_1021_1 ep7: the heading keeps a city prefix the scene name dropped."""
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    store = _FakeCogneeStore(
+        [
+            NovelScene(
+                name="苏尔约集团总部董事会会议室",
+                aliases=["董事会会议室"],
+                scene_type="interior",
+            ),
+            NovelScene(
+                name="私立医院病房",
+                aliases=["老太爷病房"],
+                scene_type="interior",
+            ),
+            NovelScene(
+                name="苏尔约集团总部阿尔迪办公室",
+                aliases=["阿尔迪办公室"],
+                scene_type="interior",
+            ),
+            NovelScene(
+                name="丹那阿邦小旅馆三楼走廊",
+                aliases=["雅加达 · 丹那阿邦 小旅馆 三楼走廊", "旅馆三楼走廊", "走廊"],
+                scene_type="interior",
+            ),
+        ]
+    )
+    compiler = asset_compiler.AssetCompiler(store)
+
+    assert (
+        await compiler._find_matching_scene("雅加达 · 苏尔约集团 董事会会议室")
+    ).name == "苏尔约集团总部董事会会议室"
+    assert (
+        await compiler._find_matching_scene("雅加达 · 私立医院 老太爷病房")
+    ).name == "私立医院病房"
+    assert (
+        await compiler._find_matching_scene("雅加达 · 集团总部 阿尔迪办公室")
+    ).name == "苏尔约集团总部阿尔迪办公室"
+
+    # A two-character alias is too generic to claim an unrelated heading.
+    assert await compiler._find_matching_scene("市立医院三楼走廊") is None
+
+
 def test_derived_scene_normalization_filters_plain_time_but_keeps_stable_light_plate():
     import novelvideo.agents.asset_compiler as asset_compiler
 

@@ -162,6 +162,32 @@ def test_celery_task_failure_maps_output_video_policy_violation(monkeypatch) -> 
         assert request_id in metadata["provider_error"]
 
 
+def test_celery_task_failure_maps_gateway_output_video_sensitive_text(monkeypatch) -> None:
+    """DramaClawAPI 判「输出视频敏感」时只回英文自由文本，也必须归一成人话。
+
+    线上实例：``nn_1021_1`` ep6 beat 12 的 ``single_video`` 任务失败时，``error``
+    就是这段网关原文的 Python repr——既没有 ``*Detected`` 枚举，也没有 ``VIDEO_*``
+    码，缺这条归类就只能把英文原文连同 request id 原样显示给用户。
+    """
+
+    celery_tasks = _import_celery_tasks(monkeypatch)
+
+    exc = RuntimeError(
+        "{'code': 'upstream_task_failed', 'message': 'The request failed because "
+        "the output video may contain sensitive information. "
+        "Request id: 02179272371111700000000000000000000ffffac1446b2ec1f50', "
+        "'retryable': False}"
+    )
+
+    error, metadata, handled = celery_tasks._project_task_failure_for_exception(exc)
+
+    assert handled is True
+    assert error == OUTPUT_VIDEO_POLICY_FAILED_MESSAGE
+    assert metadata["message"] == OUTPUT_VIDEO_POLICY_FAILED_MESSAGE
+    assert metadata["error_code"] == CONTENT_MODERATION_FAILED_CODE
+    assert "may contain sensitive information" in metadata["provider_error"]
+
+
 def test_celery_task_failure_maps_input_image_policy_violation(monkeypatch) -> None:
     celery_tasks = _import_celery_tasks(monkeypatch)
 

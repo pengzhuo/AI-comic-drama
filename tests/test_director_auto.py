@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from novelvideo.chat import director_auto
+from novelvideo.chat import moderation_prompt_repair
 from novelvideo.chat.director_auto import (
     DirectorAutoCoordinator,
     DirectorAutoRun,
@@ -858,6 +859,10 @@ async def test_paused_auto_run_can_be_continued_with_a_voice_policy(tmp_path: Pa
         stage_attempts=2,
         next_attempt_at=123.0,
         handled_task_ids=("task-already-finished",),
+        recovery_keys=(
+            "dispatch:selected_regen:1",
+            "missing-character-portrait:锦绣",
+        ),
     )
     store.upsert(original)
     coordinator = RecordingCoordinator(store)
@@ -876,6 +881,9 @@ async def test_paused_auto_run_can_be_continued_with_a_voice_policy(tmp_path: Pa
     assert continued.stage_key == ""
     assert continued.stage_attempts == 0
     assert continued.next_attempt_at == 0.0
+    # The dispatcher dedupe keys must go too, or the deterministic fast path
+    # would treat the paused stage as already attempted and never re-enqueue it.
+    assert continued.recovery_keys == ("missing-character-portrait:锦绣",)
     # The work already dispatched before the pause is not forgotten.
     assert continued.handled_task_ids == original.handled_task_ids
     assert coordinator.started == [original.run_id]
@@ -1240,4 +1248,280 @@ async def test_resume_starts_one_supervisor_and_shutdown_stops_it(
     await coordinator.shutdown()
 
     assert first.cancelled() is True
+
+
+def _moderation_task(
+    *,
+    task_type: str = "single_video",
+    beat_num: int | None = 12,
+    provider_error: str = "InputTextSensitiveContentDetected",
+) -> TaskState:
+    """一个被上游内容审核拒绝的失败任务。"""
+
+    failed = task("new-failed", "failed", task_type=task_type)
+    failed.beat_num = beat_num
+    failed.metadata = {
+        "error_code": "CONTENT_MODERATION_FAILED",
+        "message": "图片生成结果未通过内容审核，请调整提示词后重试",
+        "provider_error": provider_error,
+    }
+    return failed
+
+
+def test_moderation_kind_only_matches_content_moderation_failures() -> None:
+    assert (
+        director_auto._moderation_kind(_moderation_task())
+        == "input_text"
+    )
+    assert (
+        director_auto._moderation_kind(
+            _moderation_task(provider_error="The output video may contain sensitive content")
+        )
+        == "output_video"
+    )
+    assert (
+        director_auto._moderation_kind(
+            _moderation_task(provider_error="InputImageSensitiveContentDetected.PolicyViolation")
+        )
+        == "input_image"
+    )
+    transient = task("plain", "failed", error="upstream rejected")
+    assert director_auto._moderation_kind(transient) is None
+
+
+def test_moderation_repair_target_needs_a_single_beat() -> None:
+    run = run_record(Path("."))
+    assert director_auto._moderation_repair_target(_moderation_task(), run) == (1, 12)
+    # 批量 stage 的失败报文里没有「是哪一镜」的信息：不猜，交给调用方暂停。
+    batch = _moderation_task(task_type="sketch_grid_generation", beat_num=None)
+    assert director_auto._moderation_repair_target(batch, run) is None
+
+
+@pytest.mark.asyncio
+async def test_moderation_failure_rewrites_prompt_before_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """审核失败不许原样重投：先改提示词，改得出来才重投一次。"""
+
+    failed = _moderation_task()
+    notified = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [failed]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+            self.repairs: list[tuple[int, int, str]] = []
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            notified.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            return True
+
+        async def _repair_moderation_prompt(self, *, run, episode, beat_num, kind, raw_error=""):
+            self.repairs.append((episode, beat_num, kind))
+            return moderation_prompt_repair.PromptRepairOutcome(
+                repaired=True,
+                kind=kind,
+                detail="已对提示词做确定性去敏",
+            )
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(director_auto, "STAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        await asyncio.wait_for(notified.wait(), timeout=5)
+
+        assert coordinator.repairs == [(1, 12, "input_text")]
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "running"
+        assert "moderation-prompt-repair:1:12" in saved.recovery_keys
+        assert "已对提示词做确定性去敏" in coordinator.notifications[0]
+        # 通用重试预算不能被这次改写花掉：它有自己的限次（一把 key）。
+        assert saved.stage_attempts == 0
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_moderation_failure_pauses_when_prompt_was_already_rewritten(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """同一个 beat 只改一次词：第二次审核失败就停下，不再消耗预算。"""
+
+    failed = _moderation_task()
+    notified = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [failed]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+            self.repairs = 0
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            notified.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            return True
+
+        async def _repair_moderation_prompt(self, **_kwargs):
+            self.repairs += 1
+            return moderation_prompt_repair.PromptRepairOutcome(
+                repaired=True, kind="input_text", detail="已对提示词做确定性去敏"
+            )
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(tmp_path, recovery_keys=("moderation-prompt-repair:1:12",))
+    )
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        await asyncio.wait_for(notified.wait(), timeout=5)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "paused"
+        assert coordinator.repairs == 0
+        assert "已经自动改写过一次" in coordinator.notifications[0]
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_moderation_failure_on_batch_stage_pauses_without_guessing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """定位不到具体镜头时不猜：直接停下，而不是拿原样参数重投。"""
+
+    failed = _moderation_task(task_type="sketch_grid_generation", beat_num=None)
+    notified = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [failed]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+            self.repairs = 0
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            notified.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            return True
+
+        async def _repair_moderation_prompt(self, **_kwargs):
+            self.repairs += 1
+            return moderation_prompt_repair.PromptRepairOutcome(
+                repaired=True, kind="input_text", detail="已对提示词做确定性去敏"
+            )
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        await asyncio.wait_for(notified.wait(), timeout=5)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "paused"
+        assert coordinator.repairs == 0
+        assert "无法定位到具体镜头" in coordinator.notifications[0]
+        # 也没有偷偷走通用重试。
+        assert saved.stage_attempts == 0
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_moderation_failure_pauses_when_prompt_cannot_be_rewritten(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """改写不出不同参数时必须暂停，绝不允许原样重投。"""
+
+    failed = _moderation_task(provider_error="Output video may contain sensitive content")
+    notified = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [failed]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            notified.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            return True
+
+        async def _repair_moderation_prompt(self, *, kind, **_kwargs):
+            return moderation_prompt_repair.PromptRepairOutcome(
+                repaired=False, kind=kind, detail="重新生成提示词失败"
+            )
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        await asyncio.wait_for(notified.wait(), timeout=5)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "paused"
+        assert "无法自动改写提示词" in coordinator.notifications[0]
+        assert "重新生成提示词失败" in coordinator.notifications[0]
+        assert saved.stage_attempts == 0
+    finally:
+        await coordinator.shutdown()
 

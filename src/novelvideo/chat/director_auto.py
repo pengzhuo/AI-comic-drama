@@ -17,6 +17,12 @@ from typing import Any, Iterable
 
 from novelvideo.chat import service as chat_service
 from novelvideo.chat.live_events import broadcast_project_chat_event
+from novelvideo.chat.moderation_prompt_repair import (
+    PromptRepairOutcome,
+    classify_moderation_text,
+    moderation_repair_recovery_key,
+    repair_prompt_for_moderation,
+)
 from novelvideo.pipeline_timing import record_event
 from novelvideo.project_context import ProjectContext, resolve_project_context
 from novelvideo.shared.billing_errors import (
@@ -26,6 +32,10 @@ from novelvideo.shared.billing_errors import (
     FEATURE_BILLING_IDENTITY_INVALID_MESSAGE,
     INSUFFICIENT_CREDITS_CODE,
     INSUFFICIENT_CREDITS_MESSAGE,
+)
+from novelvideo.shared.provider_errors import (
+    CONTENT_MODERATION_FAILED_CODE,
+    is_content_moderation_error,
 )
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
 from novelvideo.task_diagnostics import summarize_failure
@@ -213,6 +223,65 @@ def _is_fatal_failure(task: TaskState) -> str | None:
     text = f"{task.error or ''} {task.current_task or ''}"[:600]
     if _FATAL_ERROR_TEXT_RE.search(text):
         return "上游拒绝且重试无法解决，请检查账号额度或权限"
+    return None
+
+
+#: 审核补救允许 composer 花多久（秒）。composer 自带重试，这里只兜住「卡死不返回」。
+MODERATION_REPAIR_TIMEOUT_SECONDS = 300.0
+
+
+def _task_moderation_text(task: TaskState) -> str:
+    """参与审核分档判断的文本：归一后的错误 + 上游原文（若有）。"""
+
+    parts = [str(getattr(task, "error", "") or "")]
+    metadata = getattr(task, "metadata", None)
+    if isinstance(metadata, dict):
+        for key in ("message", "provider_error"):
+            value = metadata.get(key)
+            if value:
+                parts.append(str(value))
+    result = getattr(task, "result", None)
+    if isinstance(result, dict):
+        nested = result.get("task_metadata")
+        if isinstance(nested, dict):
+            for key in ("message", "provider_error"):
+                value = nested.get(key)
+                if value:
+                    parts.append(str(value))
+    return " ".join(part for part in parts if part).strip()[:2000]
+
+
+def _moderation_kind(task: TaskState) -> str | None:
+    """命中内容审核类失败时返回分档（见 moderation_prompt_repair），否则 None。
+
+    内容审核失败既不该走通用重试（同一套参数再投一次必然再被拒），也不该像计费
+    那样直接停下——中间还留着一手「改写提示词后再试」。分档决定用哪一手。
+    """
+
+    text = _task_moderation_text(task)
+    code = _task_error_code(task)
+    if code != CONTENT_MODERATION_FAILED_CODE and not is_content_moderation_error(
+        message=text
+    ):
+        return None
+    return classify_moderation_text(text)
+
+
+def _moderation_repair_target(task: TaskState, run: DirectorAutoRun) -> tuple[int, int] | None:
+    """审核补救要改哪一镜的提示词；定位不到具体镜号就返回 None。
+
+    只有带 beat_num 的任务（单镜视频这类）能精确到一镜。批量 stage 的失败报文里
+    没有「是哪一镜被拒」的信息，宁可不猜——调用方会直接暂停，而不是拿原样参数重投。
+    """
+
+    beat_num = getattr(task, "beat_num", None)
+    try:
+        beat_num = int(beat_num) if beat_num is not None else 0
+    except (TypeError, ValueError):
+        beat_num = 0
+    episode = int(getattr(task, "episode", 0) or 0) or int(run.episode or 0)
+    if beat_num > 0 and episode > 0:
+        return episode, beat_num
     return None
 
 
@@ -1107,7 +1176,12 @@ class DirectorAutoCoordinator:
                 "last_error": "",
                 "voice_policy": normalized_policy,
                 # A user decision is a fresh start: do not hold the attempts
-                # spent before the pause against the next failure.
+                # spent before the pause against the next failure. The
+                # dispatcher's stage signatures go with them, otherwise the
+                # deterministic fast path still sees the paused stage as already
+                # attempted and refuses to re-enqueue it, silently degrading
+                # every "继续" into the slow agent fallback.
+                "recovery_keys": self._clear_stage_signatures(run),
                 "stage_key": "",
                 "stage_attempts": 0,
                 "next_attempt_at": 0.0,
@@ -1749,6 +1823,45 @@ class DirectorAutoCoordinator:
 
         return await make_sqlite_store_for_context(ctx)
 
+    async def _repair_moderation_prompt(
+        self,
+        *,
+        run: DirectorAutoRun,
+        episode: int,
+        beat_num: int,
+        kind: str,
+        raw_error: str = "",
+    ) -> PromptRepairOutcome:
+        """按失败分档改写某一镜的提示词；不改词就不允许重投。"""
+
+        ctx = run.context
+        store = await self._open_ctx_store(ctx)
+        try:
+            try:
+                return await asyncio.wait_for(
+                    repair_prompt_for_moderation(
+                        kind=kind,
+                        store=store,
+                        state_dir=ctx.state_dir,
+                        project_dir=ctx.output_dir,
+                        episode=episode,
+                        beat_num=beat_num,
+                        raw_error=raw_error,
+                    ),
+                    timeout=MODERATION_REPAIR_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "审核补救改写提示词超时（第 %s 集第 %s 镜）", episode, beat_num
+                )
+                return PromptRepairOutcome(
+                    repaired=False, kind=kind, detail="改写提示词超时"
+                )
+        finally:
+            close = getattr(store, "close", None)
+            if close:
+                await close()
+
     async def _pause_gate(self, run: DirectorAutoRun) -> str | None:
         """Return a human-facing reason to stop, or None to keep automating.
 
@@ -2071,6 +2184,94 @@ class DirectorAutoCoordinator:
                             f"本集自动已暂停：未能启动「{character}」肖像生成，请检查角色肖像配置。",
                         )
                         return
+                    moderation_kind = _moderation_kind(failed)
+                    if moderation_kind is not None:
+                        # 内容审核失败：不允许拿同一套参数再投一次（同一段提示词必然
+                        # 再被拒）。先改提示词，改得出来才重投一次；改不出来就停下，
+                        # 把决定权交回用户。
+                        if not await self._owns_run(run_id):
+                            return
+                        target = _moderation_repair_target(failed, updated)
+                        repair_key = (
+                            moderation_repair_recovery_key(*target) if target else ""
+                        )
+                        if not target or repair_key in set(updated.recovery_keys):
+                            blocked = (
+                                "本集的镜头已经自动改写过一次提示词仍未通过"
+                                if target
+                                else "无法定位到具体镜头"
+                            )
+                            await self._pause_owned(
+                                run_id=run_id,
+                                username=username,
+                                project_id=project_id,
+                                reason=f"内容审核未通过，{blocked}，需要人工处理",
+                                terminal_task_id=failed.task_id,
+                            )
+                            await self._notify(
+                                updated,
+                                f"本集自动已暂停：{_task_instruction(failed)} "
+                                f"未通过内容审核，{blocked}，请检查提示词或参考素材后重试。",
+                            )
+                            return
+                        outcome = await self._repair_moderation_prompt(
+                            run=updated,
+                            episode=target[0],
+                            beat_num=target[1],
+                            kind=moderation_kind,
+                            raw_error=_task_moderation_text(failed),
+                        )
+                        if not outcome.repaired:
+                            await self._pause_owned(
+                                run_id=run_id,
+                                username=username,
+                                project_id=project_id,
+                                reason=(
+                                    f"内容审核未通过且无法改写提示词（{outcome.detail}）"
+                                ),
+                                terminal_task_id=failed.task_id,
+                            )
+                            await self._notify(
+                                updated,
+                                f"本集自动已暂停：{_task_instruction(failed)} "
+                                f"未通过内容审核，且无法自动改写提示词（{outcome.detail}）。"
+                                "请手工调整该镜提示词或参考素材后重试。",
+                            )
+                            return
+                        repaired_run = DirectorAutoRun(
+                            **{
+                                **asdict(updated),
+                                "updated_at": _utc_now(),
+                                # 清掉 dispatch 签名才能让这个 stage 重新入队，
+                                # 同时把「已改过一次词」记进 recovery key。
+                                "recovery_keys": tuple(
+                                    sorted(
+                                        {
+                                            *self._clear_stage_signatures(updated),
+                                            repair_key,
+                                        }
+                                    )
+                                ),
+                                "next_attempt_at": datetime.now(
+                                    timezone.utc
+                                ).timestamp()
+                                + _stage_retry_delay(1),
+                                "last_error": (
+                                    f"{RETRY_REASON_PREFIX}1/1] "
+                                    f"内容审核未通过：{outcome.detail}"
+                                ),
+                            }
+                        )
+                        if not await self._update_owned(repaired_run):
+                            return
+                        await self._notify(
+                            repaired_run,
+                            f"{_task_instruction(failed)} 未通过内容审核"
+                            f"（{outcome.kind_label}）。{outcome.detail}，正在重试一次。",
+                        )
+                        taskless_continuations = 0
+                        await asyncio.sleep(POLL_SECONDS)
+                        continue
                     fatal = _is_fatal_failure(failed)
                     if fatal:
                         # Billing/permission/cancellation: a retry cannot change

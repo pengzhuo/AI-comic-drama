@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from novelvideo.prompt_safety import (
+    is_output_video_moderation_rejection,
+    neutralize_sensitive_elements,
     sanitize_prompt_for_moderation,
     is_text_moderation_rejection,
 )
@@ -59,3 +61,47 @@ def test_moderation_rejection_detection() -> None:
     )
     assert not is_text_moderation_rejection("HTTP 400 - InvalidParameter: ratio")
     assert not is_text_moderation_rejection("")
+
+
+#: 审核补救专用规则：可辨识证件/文字/编号、暴露、血腥这类**画面元素**。
+SENSITIVE_ELEMENT_CASES = {
+    "保安胸前工牌特写，编号030756清晰可见": ("胸前挂牌", "〔编号略〕"),
+    "画面出现身份证与合同特写": ("本人卡片", "纸质材料特写"),
+    "病历特写，屏幕上的文字清晰可读": ("纸质材料特写", "屏幕亮面"),
+    "血迹与伤口特写": ("深色痕迹", "擦痕"),
+    "两人在雨中接吻": ("靠近",),
+    "她半裸着靠在墙上": ("衣着完整",),
+}
+
+
+@pytest.mark.parametrize(("text", "expected"), SENSITIVE_ELEMENT_CASES.items())
+def test_sensitive_elements_are_neutralized(text: str, expected: tuple[str, ...]) -> None:
+    cleaned = neutralize_sensitive_elements(text)
+    assert cleaned != text
+    for fragment in expected:
+        assert fragment in cleaned
+
+
+def test_sensitive_element_rules_do_not_cascade() -> None:
+    """替换文本里不能出现更靠后的待替换词，否则会叠出「本人证件类道具（…）（…）」。"""
+
+    cleaned = neutralize_sensitive_elements("画面出现身份证特写")
+    assert cleaned.count("画面不出现可辨识文字与号码") == 1
+
+
+def test_sensitive_elements_leave_neutral_text_alone() -> None:
+    neutral = "雨夜旧巷中景，女孩背靠砖墙站立，双手抱着白色蛋糕盒。"
+    assert neutralize_sensitive_elements(neutral) == neutral
+
+
+def test_output_video_rejection_detection() -> None:
+    assert is_output_video_moderation_rejection(
+        "OutputVideoSensitiveContentDetected.PolicyViolation"
+    )
+    assert is_output_video_moderation_rejection(
+        "The output video may contain sensitive information"
+    )
+    assert is_output_video_moderation_rejection("copyright restrictions apply")
+    assert not is_output_video_moderation_rejection(
+        "InputTextSensitiveContentDetected: content[0]"
+    )

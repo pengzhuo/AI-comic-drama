@@ -37,6 +37,10 @@ from novelvideo.workflows.literal_script_writing import (
     split_literal_source_text,
 )
 
+# A scene token shorter than this is too generic to resolve a location heading by
+# containment (``走廊``、``大堂``、``台阶``); exact name/alias matches never use it.
+MIN_SPECIFIC_SCENE_TOKEN_LEN = 3
+
 
 class DerivedSceneRequirement(BaseModel):
     label: str = Field(description="派生场景后缀，如 '雪景'、'战后版'、'蒸汽弥漫'")
@@ -1683,6 +1687,9 @@ class AssetCompiler:
         return " ".join((value or "").replace("\u3000", " ").strip().lower().split())
 
     async def _find_matching_scene(self, name: str) -> Optional[NovelScene]:
+        name = str(name or "").strip()
+        if not name:
+            return None
         scene = await self.store.get_scene(name)
         if scene:
             return scene
@@ -1701,7 +1708,28 @@ class AssetCompiler:
             if name in item.name or item.name in name:
                 return item
 
-        return None
+        # A location heading keeps the city/site prefix that the canonical scene
+        # name and its short alias drop, e.g. the heading
+        # ``雅加达 · 私立医院 老太爷病房`` versus the scene ``私立医院病房`` with
+        # alias ``老太爷病房``. Exact matches above still win; here we accept a
+        # containment match on a token long enough to be specific and keep the
+        # longest one, so a generic alias such as ``走廊`` cannot claim a detailed
+        # heading it does not own.
+        best_item: Optional[NovelScene] = None
+        best_len = 0
+        for item in base_candidates:
+            tokens = [str(getattr(item, "name", "") or "").strip()]
+            tokens.extend(
+                str(alias or "").strip()
+                for alias in (getattr(item, "aliases", []) or [])
+            )
+            for token in tokens:
+                if len(token) < MIN_SPECIFIC_SCENE_TOKEN_LEN:
+                    continue
+                if token in name or name in token:
+                    if len(token) > best_len:
+                        best_item, best_len = item, len(token)
+        return best_item
 
     @staticmethod
     def _build_derived_scene(

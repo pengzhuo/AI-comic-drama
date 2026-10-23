@@ -296,6 +296,7 @@ async def generate_seedance2_prompt_for_panel(
     prompt_guidance_template_keys: list[str] | None = None,
     language: AssetLanguage | None = None,
     prop_menu: list[Any] | None = None,
+    moderation_repair_note: str = "",
 ) -> str:
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
     if prompt_guidance is not None:
@@ -342,9 +343,12 @@ async def generate_seedance2_prompt_for_panel(
         and config.prompt_source == "generated"
         and config.prompt_inputs_hash
         and config.prompt_inputs_hash == inputs_hash
+        and not str(moderation_repair_note or "").strip()
     ):
         # Inputs are unchanged and an AI prompt already exists for them, so reuse
-        # it instead of paying for another (often slow) composer round-trip.
+        # it instead of paying for another (often slow) composer round-trip. A
+        # content-safety remediation always forces a fresh composition: reusing
+        # the rejected prompt is exactly the "same parameters again" we forbid.
         saved_json = dump_seedance2_config(config)
         beat["seedance2_config_json"] = saved_json
         return saved_json
@@ -363,6 +367,7 @@ async def generate_seedance2_prompt_for_panel(
         manual_prompt_reference=reference_prompt,
         composer=composer,
         language=output_language,
+        moderation_repair_note=moderation_repair_note,
     )
     config.final_prompt = mark_seedance2_prompt_references_for_editor(result.prompt)
     config.prompt_source = "generated" if result.used_ai else "fallback"
