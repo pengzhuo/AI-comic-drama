@@ -57,6 +57,8 @@ from novelvideo.video_request_usage import (
     update_video_request_status,
 )
 from novelvideo.generators.anchor_moderation import (
+    describe_upstream_rejection,
+    is_privacy_information_rejection,
     plan_anchor_variants,
 )
 from novelvideo.shared.billing_errors import (
@@ -855,10 +857,11 @@ class SeedanceVideoGenerator(VideoGeneratorBase):
 #: 严格首帧被上游拒绝后改走多参考通路的日志标记。
 #:
 #: 写实人脸首帧在 ``image_url``（硬首帧）通路上会被上游内容审核拒绝
-#: （``InputImageSensitiveContentDetected.PrivacyInformation``），提交期 4xx
-#: 降级阶梯因此几乎每次都会生效：首帧退化为「参考图1」，不再是硬锁。运行器据此
-#: 把「严格首帧实际未生效」记进自检报告，避免静默降级。
-FALLBACK_MULTI_REFERENCE_LOG = "已按兜底方案提交：首帧改为参考图1（多参考通路）"
+#: （``InputImageSensitiveContentDetected.PrivacyInformation``）。降级阶梯通常能靠
+#: 降质把硬首帧保住，但少数写实正脸帧逐档降质也过不了，只能把首帧挪到参考位
+#: （多参考通路）：审核过关了，首帧却不再是硬锁，画面可能漂移。运行器据此把
+#: 「严格首帧实际未生效」记进自检报告，避免静默降级。
+FALLBACK_MULTI_REFERENCE_LOG = "首帧改为参考图1（多参考通路），严格首帧未生效"
 
 
 def _moderation_sanitized_candidate(candidate: dict) -> dict | None:
@@ -2187,7 +2190,12 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                             model=self.model,
                             request_id=request_id,
                             status="error",
-                            error=f"HTTP {resp.status}: {text[:200]}",
+                            # 存「人能看的摘要」（含最内层 code），而不是被截断的嵌套 JSON：
+                            # 诊断字段本身还有 300 字符上限，原始报文留在异常体里给上层。
+                            error=(
+                                f"HTTP {resp.status}: "
+                                f"{describe_upstream_rejection(text)}"
+                            ),
                         )
                         raise NewApiVideoError(
                             f"DramaClawAPI submit failed: HTTP {resp.status} - {text}",
@@ -2268,8 +2276,10 @@ class NewApiVideoGenerator(VideoGeneratorBase):
     ) -> tuple[dict, dict]:
         """按顺序提交候选请求体，遇到「明确的客户端拒绝」再降级重试。
 
-        降级只发生在 4xx：这种响应证明上游没有创建任务（不会重复计费/重复生成），
-        5xx、超时等不确定失败一律直接抛出，交给上层的重试与对账逻辑处理。
+        降级只发生在 4xx，且**只针对两种可解释的拒绝**：首帧真人隐私审核（换图片
+        通路）与提示词文本审核（换提示词）。其它 4xx（参数/几何/配额/其它审核子类）
+        降级也救不回来，直接抛出原始原因；5xx、超时等不确定失败同理，一律交上层重试
+        与对账处理。
 
         候选既可以是请求体 ``dict``，也可以是返回请求体的可调用对象（惰性候选：
         只有真正轮到它时才做本地图像变换与媒体上传，见首帧审核降级阶梯）。``labels``
@@ -2311,19 +2321,15 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                     )
             except NewApiVideoError as exc:
                 status_code = exc.status_code
-                can_fallback = (
-                    index < len(work) - 1
-                    and isinstance(status_code, int)
-                    and 400 <= status_code < 500
+                client_rejected = (
+                    isinstance(status_code, int) and 400 <= status_code < 500
                 )
-                if can_fallback:
-                    log(
-                        f"{label_for(index, '当前输入参数')}被上游拒绝"
-                        f"（HTTP {status_code}），自动降级重试…"
-                    )
-                    index += 1
-                    continue
-                text_moderated = is_text_moderation_rejection(str(exc))
+                reason = describe_upstream_rejection(str(exc))
+                # 先按拒绝原因分流：提示词审核换提示词，首帧隐私审核换图片通路。
+                # 只有明确的客户端拒绝（4xx）才可能降级。
+                text_moderated = client_rejected and is_text_moderation_rejection(
+                    str(exc)
+                )
                 if sanitized is None and text_moderated:
                     sanitized = _moderation_sanitized_candidate(candidate)
                     if sanitized is not None:
@@ -2346,6 +2352,20 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                         request_id=getattr(exc, "request_id", ""),
                         status_code=status_code,
                     ) from exc
+                # 只有「上游明确判定首帧图含真人隐私」才值得逐档降质重试；其它 4xx
+                # 降质也救不回来，只会白烧上传与往返、并把真实原因淹没在「已降级采用」里。
+                can_fallback = (
+                    index < len(work) - 1
+                    and client_rejected
+                    and is_privacy_information_rejection(str(exc))
+                )
+                if can_fallback:
+                    log(
+                        f"{label_for(index, '当前输入参数')}被上游拒绝"
+                        f"（HTTP {status_code}：{reason}），自动降级重试…"
+                    )
+                    index += 1
+                    continue
                 # 没有兜底方案时把上游原始拒绝原因抛出去，方便定位。
                 raise
             if index:

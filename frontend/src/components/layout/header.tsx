@@ -54,7 +54,6 @@ import { FREEZONE_DOCK_OFFSET_ANIMATED_STYLE } from "@/features/freezone/dockOff
 import {
   ProjectHeaderNavigation,
   ProjectSwitcher,
-  ProjectXiajiMenu,
 } from "@/components/layout/project-header-navigation";
 const ACCOUNT_PANEL_TRANSITION_MS = 350;
 
@@ -312,7 +311,7 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
       style={FREEZONE_DOCK_OFFSET_ANIMATED_STYLE}
     >
       <header className="relative flex h-[48px] items-center justify-between gap-3 px-4">
-        <div className="flex min-w-0 flex-1 items-center">
+        <div data-header-slot="left" className="flex min-w-0 flex-1 items-center">
           <TooltipProvider delay={80}>
             <Tooltip>
               <TooltipTrigger
@@ -344,7 +343,7 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
         {project ? <ProjectHeaderNavigation project={project} /> : null}
 
         {/* Actions */}
-        <div className="flex min-w-0 flex-1 shrink-0 items-center justify-end gap-1">
+        <div data-header-slot="right" className="flex min-w-0 flex-1 shrink-0 items-center justify-end gap-1">
           <div ref={settingsAnchorRef} className="relative">
             <Button
               type="button"
@@ -408,7 +407,6 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
           </div>
         </div>
       </header>
-      {project ? <ProjectXiajiMenu project={project} /> : null}
       {accountPanelOpen
         ? createPortal(
             <AccountPanel

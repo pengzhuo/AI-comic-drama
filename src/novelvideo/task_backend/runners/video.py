@@ -425,8 +425,9 @@ async def _run_single_video_async(
         gen_kwargs["resolution"] = str(single_resolution)
     video_gen = create_video_generator(backend=backend_str, **gen_kwargs)
 
-    # 严格首帧通路会被上游内容审核拒绝（写实人脸），提交期会静默降级为多参考通路。
-    # 这里捕获降级标记，让自检报告如实反映「硬首帧实际未生效」。
+    # 写实人脸首帧可能被上游真人隐私审核拒绝：提交期先逐档降质尽量保住硬首帧，
+    # 只有全部档位都被拒才降级为多参考通路。这里捕获降级标记，让自检报告如实反映
+    # 「硬首帧实际未生效」。
     strict_first_frame_degraded = {"value": False}
 
     def on_log(msg: str) -> None:

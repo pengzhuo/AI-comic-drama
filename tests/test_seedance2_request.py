@@ -1723,7 +1723,9 @@ async def test_submit_video_candidates_falls_back_on_client_rejection():
         posted.append(payload)
         if len(posted) == 1:
             raise NewApiVideoError(
-                "privacy", request_id="req-1", status_code=400
+                "InputImageSensitiveContentDetected.PrivacyInformation",
+                request_id="req-1",
+                status_code=400,
             )
         return {"id": "task-1"}
 
@@ -1738,7 +1740,7 @@ async def test_submit_video_candidates_falls_back_on_client_rejection():
     assert submitted == {"id": "task-1"}
     assert payload is fallback
     assert posted == [strict, fallback]
-    assert any("兜底" in message for message in logs)
+    assert any("多参考通路" in message for message in logs)
 
 
 async def test_submit_video_candidates_does_not_fall_back_on_server_error():
@@ -1786,8 +1788,12 @@ async def test_submit_video_candidates_raises_when_all_rejected():
     async def fake_post_json(_url: str, payload: dict, *, headers=None):
         posted.append(payload)
         if len(posted) == 1:
-            raise NewApiVideoError("strict rejected by policy", status_code=400)
-        raise NewApiVideoError("fallback also rejected", status_code=400)
+            raise NewApiVideoError(
+                "PrivacyInformation: strict rejected by policy", status_code=400
+            )
+        raise NewApiVideoError(
+            "PrivacyInformation: fallback also rejected", status_code=400
+        )
 
     generator._post_json = fake_post_json  # type: ignore[method-assign]
 

@@ -9,6 +9,33 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Header } from "@/components/layout/header";
 
 const runtimeState = vi.hoisted(() => ({ authRequired: true, isCe: false, phoneVisible: false }));
+const routerState = vi.hoisted(() => ({
+  pathname: "/",
+  project: undefined as string | undefined,
+}));
+const surfacesState = vi.hoisted(() => ({
+  data: undefined as
+    | undefined
+    | {
+        data: {
+          items: Array<{
+            surface_code: string;
+            label: string;
+            available: boolean;
+            unavailable_message: string;
+          }>;
+        };
+      },
+}));
+const navStoreState = vi.hoisted(() => ({
+  lastXiajiSectionByProject: {} as Record<string, string | undefined>,
+  rememberSection: vi.fn(),
+}));
+const episodeStoreState = vi.hoisted(() => ({
+  lastEpisodeLocationByProject: {} as Record<string, string | undefined>,
+  setLastEpisodeLocation: vi.fn(),
+  clearLastEpisodeLocation: vi.fn(),
+}));
 const authState = vi.hoisted(() => ({ username: "local", logout: vi.fn() }));
 const resetUserSessionStateMock = vi.hoisted(() => vi.fn());
 const securityState = vi.hoisted(() => ({
@@ -64,10 +91,42 @@ vi.mock("@tanstack/react-router", () => ({
     <a href={to} {...props}>{children}</a>
   ),
   useNavigate: () => vi.fn(),
-  useParams: () => ({}),
+  useParams: () => (routerState.project ? { project: routerState.project } : {}),
   useRouterState: ({ select }: { select: (state: { location: { pathname: string } }) => string }) =>
-    select({ location: { pathname: "/" } }),
+    select({ location: { pathname: routerState.pathname } }),
 }));
+
+vi.mock("@/lib/queries/product-surfaces", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/queries/product-surfaces")>();
+  return {
+    ...actual,
+    useProductSurfaces: () => ({ data: surfacesState.data, isPending: false }),
+  };
+});
+
+vi.mock("@/lib/queries/projects", () => ({
+  useAllProjectSummaries: () => ({ data: [] }),
+}));
+
+vi.mock("@/stores/project-nav-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/stores/project-nav-store")>();
+  return {
+    ...actual,
+    useProjectNavStore: (selector: (state: typeof navStoreState) => unknown) =>
+      selector(navStoreState),
+  };
+});
+
+vi.mock("@/stores/episode-workbench-store", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/stores/episode-workbench-store")>();
+  return {
+    ...actual,
+    useEpisodeWorkbenchStore: (selector: (state: typeof episodeStoreState) => unknown) =>
+      selector(episodeStoreState),
+  };
+});
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -85,6 +144,18 @@ vi.mock("react-i18next", () => ({
         "header.account.languageChinese": "Chinese",
         "header.account.languageEnglish": "English",
         "auth.logout": "Log out",
+        "nav.creationMode": "Creation Mode",
+        "nav.freezone": "Freezone",
+        "nav.xiaji": "Series",
+        "nav.xiajiMenu": "Series Menu",
+        "nav.more": "More",
+        "nav.ingest": "Story Source",
+        "nav.assets": "Asset Library",
+        "nav.episodes": "Episode Studio",
+        "nav.aiAssistant": "Xia Director",
+        "nav.styles": "Visual Style",
+        "nav.switchProject": "Switch project",
+        "project.dashboardReturn": "Back to dashboard",
       })[key] ?? key,
     i18n: {
       language: "en",
@@ -383,4 +454,62 @@ describe("Header runtime gating", () => {
     expect(authState.logout).toHaveBeenCalled();
   });
 
+});
+
+describe("Project header 捏集 sub-pages", () => {
+  beforeEach(() => {
+    routerState.pathname = "/projects/demo-project/ingest";
+    routerState.project = "demo-project";
+    surfacesState.data = {
+      data: {
+        items: [
+          { surface_code: "mainline", label: "Series", available: true, unavailable_message: "" },
+          { surface_code: "freezone", label: "Freezone", available: true, unavailable_message: "" },
+          {
+            surface_code: "assistant",
+            label: "Xia Director",
+            available: true,
+            unavailable_message: "",
+          },
+        ],
+      },
+    };
+  });
+
+  // 「捏集」子页原来挂在 header 之外另起一行；现在内联进顶栏，排在捏画/捏集胶囊右侧。
+  it("inlines the sub-pages in the header row, after the 捏集 tab", () => {
+    renderHeader();
+
+    const subNav = screen.getByRole("navigation", { name: "Series Menu" });
+    const modeTabs = screen.getByRole("tablist", { name: "Creation Mode" });
+    const group = document.querySelector("[data-header-nav-group]");
+
+    expect(group).not.toBeNull();
+    expect(group).toContainElement(subNav);
+    expect(group).toContainElement(modeTabs);
+    // 同一行、且排在胶囊之后 —— 结构上就是「捏集」右边。
+    expect(
+      modeTabs.compareDocumentPosition(subNav) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // 不再有 header 之外的第二行。
+    expect(subNav.closest("header")).not.toBeNull();
+
+    expect(screen.getByRole("link", { name: "Story Source" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Visual Style" })).toBeInTheDocument();
+  });
+
+  it("hides the sub-pages once 捏画 is selected", () => {
+    routerState.pathname = "/projects/demo-project/freezone";
+
+    renderHeader();
+
+    expect(screen.queryByRole("navigation", { name: "Series Menu" })).not.toBeInTheDocument();
+    expect(screen.getByRole("tablist", { name: "Creation Mode" })).toBeInTheDocument();
+  });
+
+  it("keeps the superchat search anchor inside the header", () => {
+    renderHeader();
+
+    expect(document.getElementById("superchat-search-anchor")?.closest("header")).not.toBeNull();
+  });
 });
