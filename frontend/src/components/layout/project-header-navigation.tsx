@@ -40,6 +40,7 @@ const xiajiMenuItems = [
   },
   { labelKey: "nav.aiAssistant", to: PROJECT_SECTION_ROUTES.assistant },
   { labelKey: "nav.styles", to: PROJECT_SECTION_ROUTES.styles },
+  { labelKey: "nav.reports", to: PROJECT_SECTION_ROUTES.reports },
 ] as const;
 
 function ProjectAvatar({ name }: { name: string }) {

@@ -121,6 +121,8 @@ export const queryKeys = {
   finalVideo: (p: string, ep: number) =>
     ["projects", p, "episodes", ep, "final-video"] as const,
   tasks: (p?: string) => (p ? (["projects", p, "tasks"] as const) : (["tasks"] as const)),
+  costReport: (p: string, episode?: number) =>
+    ["projects", p, "cost-report", episode ?? null] as const,
   freezoneCanvases: (p: string) =>
     ["projects", p, "freezone", "canvases"] as const,
   freezoneProjectAssets: (p: string) =>

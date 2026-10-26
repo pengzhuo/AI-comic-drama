@@ -578,6 +578,9 @@ async def run_indextts2_beat_audio_generation(
                 scope=_audio_usage_scope(episode, beat_num, speaker),
                 episode=episode,
                 speaker=speaker,
+                gateway_request_id=(
+                    getattr(generator, "_last_provider_request_id", "") or None
+                ),
             )
             if item_result is None:
                 update_audio_generation_attempt(

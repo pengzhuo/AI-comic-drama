@@ -22,6 +22,7 @@ import { Route as AppCreditsRouteImport } from './routes/_app/credits'
 import { Route as AppAccessUnavailableRouteImport } from './routes/_app/access-unavailable'
 import { Route as AppProjectsProjectTasksRouteImport } from './routes/_app/projects.$project/tasks'
 import { Route as AppProjectsProjectStylesRouteImport } from './routes/_app/projects.$project/styles'
+import { Route as AppProjectsProjectReportsRouteImport } from './routes/_app/projects.$project/reports'
 import { Route as AppProjectsProjectIngestRouteImport } from './routes/_app/projects.$project/ingest'
 import { Route as AppProjectsProjectEpisodesRouteImport } from './routes/_app/projects.$project/episodes'
 import { Route as AppProjectsProjectAssistantRouteImport } from './routes/_app/projects.$project/assistant'
@@ -136,6 +137,12 @@ const AppProjectsProjectStylesRoute =
     path: '/projects/$project/styles',
     getParentRoute: () => AppRoute,
   } as any)
+const AppProjectsProjectReportsRoute =
+  AppProjectsProjectReportsRouteImport.update({
+    id: '/projects/$project/reports',
+    path: '/projects/$project/reports',
+    getParentRoute: () => AppRoute,
+  } as any)
 const AppProjectsProjectIngestRoute =
   AppProjectsProjectIngestRouteImport.update({
     id: '/projects/$project/ingest',
@@ -248,6 +255,7 @@ export interface FileRoutesByFullPath {
   '/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
+  '/projects/$project/reports': typeof AppProjectsProjectReportsRoute
   '/projects/$project/styles': typeof AppProjectsProjectStylesRoute
   '/projects/$project/tasks': typeof AppProjectsProjectTasksRoute
   '/projects/$project/characters': typeof AppProjectsProjectCharactersLazyRoute
@@ -274,6 +282,7 @@ export interface FileRoutesByTo {
   '/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
+  '/projects/$project/reports': typeof AppProjectsProjectReportsRoute
   '/projects/$project/styles': typeof AppProjectsProjectStylesRoute
   '/projects/$project/tasks': typeof AppProjectsProjectTasksRoute
   '/projects/$project/characters': typeof AppProjectsProjectCharactersLazyRoute
@@ -302,6 +311,7 @@ export interface FileRoutesById {
   '/_app/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/_app/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/_app/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
+  '/_app/projects/$project/reports': typeof AppProjectsProjectReportsRoute
   '/_app/projects/$project/styles': typeof AppProjectsProjectStylesRoute
   '/_app/projects/$project/tasks': typeof AppProjectsProjectTasksRoute
   '/_app/projects/$project/characters': typeof AppProjectsProjectCharactersLazyRoute
@@ -330,6 +340,7 @@ export interface FileRouteTypes {
     | '/projects/$project/assistant'
     | '/projects/$project/episodes'
     | '/projects/$project/ingest'
+    | '/projects/$project/reports'
     | '/projects/$project/styles'
     | '/projects/$project/tasks'
     | '/projects/$project/characters'
@@ -356,6 +367,7 @@ export interface FileRouteTypes {
     | '/projects/$project/assistant'
     | '/projects/$project/episodes'
     | '/projects/$project/ingest'
+    | '/projects/$project/reports'
     | '/projects/$project/styles'
     | '/projects/$project/tasks'
     | '/projects/$project/characters'
@@ -383,6 +395,7 @@ export interface FileRouteTypes {
     | '/_app/projects/$project/assistant'
     | '/_app/projects/$project/episodes'
     | '/_app/projects/$project/ingest'
+    | '/_app/projects/$project/reports'
     | '/_app/projects/$project/styles'
     | '/_app/projects/$project/tasks'
     | '/_app/projects/$project/characters'
@@ -504,6 +517,13 @@ declare module '@tanstack/react-router' {
       path: '/projects/$project/styles'
       fullPath: '/projects/$project/styles'
       preLoaderRoute: typeof AppProjectsProjectStylesRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/projects/$project/reports': {
+      id: '/_app/projects/$project/reports'
+      path: '/projects/$project/reports'
+      fullPath: '/projects/$project/reports'
+      preLoaderRoute: typeof AppProjectsProjectReportsRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/projects/$project/ingest': {
@@ -630,6 +650,7 @@ interface AppRouteChildren {
   AppProjectsProjectAssistantRoute: typeof AppProjectsProjectAssistantRoute
   AppProjectsProjectEpisodesRoute: typeof AppProjectsProjectEpisodesRouteWithChildren
   AppProjectsProjectIngestRoute: typeof AppProjectsProjectIngestRoute
+  AppProjectsProjectReportsRoute: typeof AppProjectsProjectReportsRoute
   AppProjectsProjectStylesRoute: typeof AppProjectsProjectStylesRoute
   AppProjectsProjectTasksRoute: typeof AppProjectsProjectTasksRoute
   AppProjectsProjectCharactersLazyRoute: typeof AppProjectsProjectCharactersLazyRoute
@@ -644,6 +665,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppProjectsProjectAssistantRoute: AppProjectsProjectAssistantRoute,
   AppProjectsProjectEpisodesRoute: AppProjectsProjectEpisodesRouteWithChildren,
   AppProjectsProjectIngestRoute: AppProjectsProjectIngestRoute,
+  AppProjectsProjectReportsRoute: AppProjectsProjectReportsRoute,
   AppProjectsProjectStylesRoute: AppProjectsProjectStylesRoute,
   AppProjectsProjectTasksRoute: AppProjectsProjectTasksRoute,
   AppProjectsProjectCharactersLazyRoute: AppProjectsProjectCharactersLazyRoute,

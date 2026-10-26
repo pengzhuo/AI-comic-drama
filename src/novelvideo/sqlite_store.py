@@ -45,7 +45,7 @@ from novelvideo.novel_source import (
 )
 from novelvideo.official_defaults import DEFAULT_COGNEE_LLM_MODEL
 from novelvideo.sqlite_pragmas import configure_sqlite_connection_async
-from novelvideo.sqlite_schema import ensure_sqlite_schema
+from novelvideo.sqlite_schema import add_column_if_missing, ensure_sqlite_schema
 from novelvideo.utils.asset_names import (
     is_path_safe_asset_name,
     path_safe_asset_name,
@@ -413,23 +413,8 @@ def _add_column_if_missing(
     name: str,
     definition: str,
 ) -> None:
-    """Add a column while tolerating concurrent runtime schema bootstrap.
-
-    SQLite has no portable ``ADD COLUMN IF NOT EXISTS``. Multiple API/worker
-    processes can initialize the same project DB at once, so a column may be
-    added after our ``PRAGMA table_info`` read but before ``ALTER TABLE``.
-    """
-    if name in _table_columns(db, table):
-        return
-
-    try:
-        db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-    except sqlite3.OperationalError as exc:
-        if "duplicate column name" not in str(exc).lower():
-            raise
-        if name not in _table_columns(db, table):
-            raise
-        logger.debug("SQLite column already added concurrently: %s.%s", table, name)
+    """Add a column while tolerating concurrent runtime schema bootstrap."""
+    add_column_if_missing(db, table, name, definition)
 
 
 def _leased(method):

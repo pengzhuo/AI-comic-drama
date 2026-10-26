@@ -13,7 +13,7 @@ from pathlib import Path
 
 from novelvideo.config import OUTPUT_DIR, STATE_DIR
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
-from novelvideo.sqlite_schema import ensure_sqlite_schema
+from novelvideo.sqlite_schema import add_column_if_missing, ensure_sqlite_schema
 
 
 _SCHEMA_SQL = """
@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS video_request_usage (
     completed_at TEXT,
     downloaded_at TEXT,
     updated_at TEXT NOT NULL,
-    error_message TEXT
+    error_message TEXT,
+    gateway_request_id TEXT,
+    cost_quota INTEGER,
+    quota_checked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_video_request_usage_episode
 ON video_request_usage(episode, beat_num, accepted_at DESC);
@@ -39,7 +42,19 @@ ON video_request_usage(episode, beat_num, accepted_at DESC);
 
 _SCHEMA_COMPONENT = "video_request_usage"
 # MIGRATION CONTRACT: increment this whenever _SCHEMA_SQL changes.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+
+_ADDED_COLUMNS = (
+    ("gateway_request_id", "TEXT"),
+    ("cost_quota", "INTEGER"),
+    ("quota_checked_at", "TEXT"),
+)
+
+
+def _initialize(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA_SQL)
+    for name, definition in _ADDED_COLUMNS:
+        add_column_if_missing(conn, "video_request_usage", name, definition)
 
 
 def get_video_request_usage_db_path(project_output_dir: str | Path) -> Path:
@@ -68,7 +83,7 @@ def _connect(project_output_dir: str | Path):
         db_path,
         component=_SCHEMA_COMPONENT,
         version=_SCHEMA_VERSION,
-        initialize=lambda schema_conn: schema_conn.executescript(_SCHEMA_SQL),
+        initialize=_initialize,
     )
     conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
     configure_sqlite_connection(conn, set_journal_mode=False)
@@ -90,6 +105,7 @@ def record_video_request(
     task_type: str | None,
     duration_seconds: float | None,
     cost_estimate: float | None = None,
+    gateway_request_id: str | None = None,
 ) -> None:
     now = datetime.now().isoformat()
     with _connect(project_output_dir) as conn:
@@ -97,8 +113,9 @@ def record_video_request(
             """
             INSERT INTO video_request_usage (
                 request_id, provider, model_name, episode, beat_num, task_type,
-                duration_seconds, status, cost_estimate, accepted_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?)
+                duration_seconds, status, cost_estimate, accepted_at, updated_at,
+                gateway_request_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?)
             ON CONFLICT(request_id) DO NOTHING
             """,
             (
@@ -112,7 +129,30 @@ def record_video_request(
                 cost_estimate,
                 now,
                 now,
+                gateway_request_id or request_id,
             ),
+        )
+
+
+def update_video_request_cost(
+    *,
+    project_output_dir: str | Path,
+    request_id: str,
+    cost_quota: int | None,
+    quota_checked_at: str | None = None,
+) -> None:
+    """Write the gateway quota snapshot back onto a recorded request."""
+    now = datetime.now().isoformat()
+    with _connect(project_output_dir) as conn:
+        conn.execute(
+            """
+            UPDATE video_request_usage
+            SET cost_quota = ?,
+                quota_checked_at = ?,
+                updated_at = ?
+            WHERE request_id = ?
+            """,
+            (cost_quota, quota_checked_at or now, now, request_id),
         )
 
 

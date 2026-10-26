@@ -1778,7 +1778,8 @@
     "tasks": "Trung tâm tác vụ",
     "taskCenter": "Trung tâm tác vụ",
     "aiAssistant": "Xia Director",
-    "freezone": "Freezone"
+    "freezone": "Freezone",
+    "reports": "Sổ chi phí"
   },
   "characters": {
     "title": "Nhân vật",
@@ -4551,6 +4552,49 @@
     "dialogue": "Lời thoại",
     "silence": "Cảnh không lời",
     "action": "Cảnh hành động"
+  },
+  "reports": {
+    "subtitle": "Chi phí theo cổng thanh toán cho từng tập và từng model, kèm thời gian sản xuất thực tế của mỗi tập.",
+    "episodeFilter": "Lọc theo tập",
+    "allEpisodes": "Toàn bộ phim",
+    "episodeOption": "Tập {{number}}",
+    "projectLevel": "Cấp dự án (không theo tập)",
+    "noData": "Chưa có bản ghi sử dụng để thống kê",
+    "durationLegend": "Thời lượng tính từ lần gửi video đầu tiên đến lần hoàn tất cuối cùng",
+    "quotaRatio": "1 USD = {{ratio}} quota",
+    "unattributedHint": "{{count}} yêu cầu chưa được điền chi phí từ hóa đơn cổng và chưa được tính vào tổng.",
+    "stats": {
+      "totalCost": "Tổng chi phí",
+      "totalDuration": "Tổng thời lượng",
+      "requests": "Số yêu cầu",
+      "unattributed": "Chưa phân bổ"
+    },
+    "columns": {
+      "kind": "Loại",
+      "requests": "Số yêu cầu",
+      "quota": "Quota",
+      "cost": "Chi phí",
+      "duration": "Thời lượng",
+      "window": "Khoảng thời gian"
+    },
+    "kind": {
+      "video": "Video",
+      "image": "Hình ảnh",
+      "audio": "Âm thanh",
+      "llm": "Văn bản"
+    },
+    "byEpisode": {
+      "title": "Chi tiết theo tập",
+      "episode": "Tập"
+    },
+    "byModel": {
+      "title": "Theo model",
+      "model": "Model"
+    },
+    "byDay": {
+      "title": "Theo ngày",
+      "date": "Ngày"
+    }
   },
   "styles": {
     "createStyle": "Tạo phong cách",

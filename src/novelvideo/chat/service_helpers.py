@@ -12,17 +12,18 @@ import novelvideo.chat.service as _svc
 
 
 def _freezone_canvas_write_requested(prompt: str | None) -> bool:
-    """Legacy intent hint; never use this to enforce canvas receipt postconditions."""
+    """Recognize an explicit canvas mutation without matching negated actions."""
 
     raw_prompt = str(prompt or "")
     user_text = raw_prompt.split("[SUPERTALE_", 1)[0].strip()
     if not user_text:
         return False
-    has_action = bool(_svc._FREEZONE_CANVAS_WRITE_ACTION_RE.search(user_text))
-    has_canvas_object = bool(_svc._FREEZONE_CANVAS_WRITE_OBJECT_RE.search(user_text))
-    has_direct_media_write = bool(_svc._FREEZONE_DIRECT_MEDIA_WRITE_RE.search(user_text))
+    intent_text = _svc._FREEZONE_CANVAS_WRITE_NEGATION_RE.sub("", user_text)
+    has_action = bool(_svc._FREEZONE_CANVAS_WRITE_ACTION_RE.search(intent_text))
+    has_canvas_object = bool(_svc._FREEZONE_CANVAS_WRITE_OBJECT_RE.search(intent_text))
+    has_direct_media_write = bool(_svc._FREEZONE_DIRECT_MEDIA_WRITE_RE.search(intent_text))
     has_node_reference = "[SUPERTALE_CANVAS_NODE_REFERENCES]" in raw_prompt
-    standalone_clear = bool(_svc.re.search(r"(?:清空|clear)", user_text, _svc.re.IGNORECASE))
+    standalone_clear = bool(_svc.re.search(r"(?:清空|clear)", intent_text, _svc.re.IGNORECASE))
     if _svc._FREEZONE_CANVAS_KNOWLEDGE_QUESTION_RE.search(user_text):
         return False
     # Skill Studio authors catalog configuration. Media words inside a Skill
@@ -31,8 +32,7 @@ def _freezone_canvas_write_requested(prompt: str | None) -> bool:
     # same request explicitly asks to use/run the Skill, add it to canvas, or
     # perform another independent canvas mutation.
     if _svc._FREEZONE_SKILL_STUDIO_TRIGGER_RE.search(user_text):
-        runtime_text = _svc._FREEZONE_SKILL_RUNTIME_NEGATION_RE.sub("", user_text)
-        intent_text = _svc._FREEZONE_SKILL_CAPABILITY_RE.sub("", runtime_text)
+        intent_text = _svc._FREEZONE_SKILL_CAPABILITY_RE.sub("", intent_text)
         return bool(
             _svc._FREEZONE_SKILL_RUNTIME_REQUEST_RE.search(intent_text)
             or _svc._FREEZONE_INDEPENDENT_CANVAS_WRITE_RE.search(intent_text)

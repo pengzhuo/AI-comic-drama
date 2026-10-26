@@ -648,6 +648,13 @@ INDEXTTS2_TIMEOUT_SECONDS = float(os.environ.get("INDEXTTS2_TIMEOUT_SECONDS", "1
 NEWAPI_BASE_URL = os.environ.get("NEWAPI_BASE_URL", "")
 NEWAPI_API_KEY = os.environ.get("NEWAPI_API_KEY", "")
 
+# 捏驿/NewAPI 网关 SQLite 账单库。成本对账只读打开，绝不写入。
+NEWAPI_BILLING_DB_PATH = os.environ.get(
+    "NOVELVIDEO_NEWAPI_DB_PATH", "/newapi-data/one-api.db"
+)
+# 捏驿默认 QuotaPerUnit；USD = quota / QUOTA_PER_USD。
+QUOTA_PER_USD = _env_float("NOVELVIDEO_QUOTA_PER_USD", 500000.0)
+
 
 def get_effective_newapi_gateway_config():
     """Return the selected NewAPI runtime gateway credentials."""

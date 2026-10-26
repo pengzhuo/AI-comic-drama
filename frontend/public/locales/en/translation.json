@@ -1892,7 +1892,8 @@
     "tasks": "Task Center",
     "taskCenter": "Task Center",
     "aiAssistant": "Xia Director",
-    "freezone": "Freezone"
+    "freezone": "Freezone",
+    "reports": "Ledger"
   },
   "characters": {
     "title": "Characters",
@@ -4665,6 +4666,49 @@
     "dialogue": "Dialogue",
     "silence": "Silent shot",
     "action": "Action shot"
+  },
+  "reports": {
+    "subtitle": "Gateway-billed spend per episode and per model, plus each episode's actual production time.",
+    "episodeFilter": "Filter by episode",
+    "allEpisodes": "Whole series",
+    "episodeOption": "Episode {{number}}",
+    "projectLevel": "Project level (not per episode)",
+    "noData": "No usage records to report yet",
+    "durationLegend": "Duration spans from the first video submit to the last completion",
+    "quotaRatio": "$1 = {{ratio}} quota",
+    "unattributedHint": "{{count}} request(s) have no cost filled in from the gateway bill yet and are excluded from the totals.",
+    "stats": {
+      "totalCost": "Total cost",
+      "totalDuration": "Total duration",
+      "requests": "Requests",
+      "unattributed": "Unattributed"
+    },
+    "columns": {
+      "kind": "Kind",
+      "requests": "Requests",
+      "quota": "Quota",
+      "cost": "Cost",
+      "duration": "Duration",
+      "window": "Window"
+    },
+    "kind": {
+      "video": "Video",
+      "image": "Image",
+      "audio": "Audio",
+      "llm": "Text"
+    },
+    "byEpisode": {
+      "title": "Per-episode detail",
+      "episode": "Episode"
+    },
+    "byModel": {
+      "title": "By model",
+      "model": "Model"
+    },
+    "byDay": {
+      "title": "By day",
+      "date": "Date"
+    }
   },
   "styles": {
     "createStyle": "Create Style",

@@ -7,6 +7,7 @@ export const PROJECT_SECTION_ROUTES = {
   characters: "/projects/$project/characters",
   episodes: "/projects/$project/episodes",
   styles: "/projects/$project/styles",
+  reports: "/projects/$project/reports",
   tasks: "/projects/$project/tasks",
   assistant: "/projects/$project/assistant",
 } as const;

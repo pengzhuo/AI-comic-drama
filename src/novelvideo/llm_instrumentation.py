@@ -43,14 +43,19 @@ _ALLOWED_RESOURCE_KINDS = frozenset(
     {"portrait", "sketch", "render", "video", "tts", "script", "ingest"}
 )
 _PROVIDER_REQUEST_ID_HEADER_NAMES = (
-    "x-request-id",
-    "x-requestid",
-    "request-id",
-    "request_id",
+    # NewAPI/one-api gateway ids come first: they are what the gateway writes
+    # into its own billing log (``logs.request_id``), so preferring them lets
+    # cost reconciliation join a model call to its quota. The generic
+    # ``x-request-id`` seen behind a gateway is the *upstream* id and matches
+    # neither ``logs.request_id`` nor ``logs.upstream_request_id``.
     "x-newapi-request-id",
     "newapi-request-id",
     "x-oneapi-request-id",
     "oneapi-request-id",
+    "x-request-id",
+    "x-requestid",
+    "request-id",
+    "request_id",
     "x-goog-request-id",
 )
 

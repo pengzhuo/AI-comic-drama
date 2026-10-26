@@ -157,6 +157,35 @@ def mark_schema_component(
     )
 
 
+def add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    name: str,
+    definition: str,
+) -> None:
+    """Additive column migration tolerant of concurrent runtime bootstraps.
+
+    SQLite has no portable ``ADD COLUMN IF NOT EXISTS``. Multiple API/worker
+    processes can initialize the same project DB at once, so a column may be
+    added after our ``PRAGMA table_info`` read but before ``ALTER TABLE``.
+    """
+    if name in _table_columns(conn, table):
+        return
+
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+        if name not in _table_columns(conn, table):
+            raise
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {str(row[1]) for row in rows}
+
+
 def _journal_is_wal(conn: sqlite3.Connection) -> bool:
     row = conn.execute("PRAGMA journal_mode").fetchone()
     return row is not None and str(row[0]).lower() == "wal"

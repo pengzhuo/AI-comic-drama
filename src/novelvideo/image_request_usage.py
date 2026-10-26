@@ -10,7 +10,7 @@ from pathlib import Path
 
 from novelvideo.config import OUTPUT_DIR, STATE_DIR
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
-from novelvideo.sqlite_schema import ensure_sqlite_schema
+from novelvideo.sqlite_schema import add_column_if_missing, ensure_sqlite_schema
 
 
 _SCHEMA_SQL = """
@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS image_request_usage (
     accepted_at TEXT NOT NULL,
     completed_at TEXT,
     updated_at TEXT NOT NULL,
-    error_message TEXT
+    error_message TEXT,
+    gateway_request_id TEXT,
+    cost_quota INTEGER,
+    quota_checked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_image_request_usage_scope
 ON image_request_usage(task_type, scope, accepted_at DESC);
@@ -41,7 +44,19 @@ _NON_BILLABLE_FAILURE_PATTERNS = (
 
 _SCHEMA_COMPONENT = "image_request_usage"
 # MIGRATION CONTRACT: increment this whenever _SCHEMA_SQL changes.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+
+_ADDED_COLUMNS = (
+    ("gateway_request_id", "TEXT"),
+    ("cost_quota", "INTEGER"),
+    ("quota_checked_at", "TEXT"),
+)
+
+
+def _initialize(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA_SQL)
+    for name, definition in _ADDED_COLUMNS:
+        add_column_if_missing(conn, "image_request_usage", name, definition)
 
 
 def get_image_request_usage_db_path(project_output_dir: str | Path) -> Path:
@@ -103,7 +118,7 @@ def _connect(project_output_dir: str | Path):
         db_path,
         component=_SCHEMA_COMPONENT,
         version=_SCHEMA_VERSION,
-        initialize=lambda schema_conn: schema_conn.executescript(_SCHEMA_SQL),
+        initialize=_initialize,
     )
     conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
     configure_sqlite_connection(conn, set_journal_mode=False)
@@ -126,6 +141,7 @@ def record_image_request(
     beat_num: int | None = None,
     character_name: str | None = None,
     identity_name: str | None = None,
+    gateway_request_id: str | None = None,
 ) -> None:
     now = datetime.now().isoformat()
     with _connect(project_output_dir) as conn:
@@ -134,8 +150,8 @@ def record_image_request(
             INSERT INTO image_request_usage (
                 request_id, provider, model_name, task_type, scope,
                 episode, beat_num, character_name, identity_name,
-                status, accepted_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)
+                status, accepted_at, updated_at, gateway_request_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?)
             ON CONFLICT(request_id) DO NOTHING
             """,
             (
@@ -150,7 +166,49 @@ def record_image_request(
                 identity_name,
                 now,
                 now,
+                gateway_request_id or None,
             ),
+        )
+
+
+def update_image_request_gateway_id(
+    *,
+    project_output_dir: str | Path,
+    request_id: str,
+    gateway_request_id: str,
+) -> None:
+    """Attach the gateway request id once the response headers are known."""
+    if not gateway_request_id:
+        return
+    now = datetime.now().isoformat()
+    with _connect(project_output_dir) as conn:
+        conn.execute(
+            """
+            UPDATE image_request_usage
+            SET gateway_request_id = ?, updated_at = ?
+            WHERE request_id = ? AND COALESCE(gateway_request_id, '') = ''
+            """,
+            (gateway_request_id, now, request_id),
+        )
+
+
+def update_image_request_cost(
+    *,
+    project_output_dir: str | Path,
+    request_id: str,
+    cost_quota: int | None,
+    quota_checked_at: str | None = None,
+) -> None:
+    """Write the gateway quota snapshot back onto a recorded request."""
+    now = datetime.now().isoformat()
+    with _connect(project_output_dir) as conn:
+        conn.execute(
+            """
+            UPDATE image_request_usage
+            SET cost_quota = ?, quota_checked_at = ?, updated_at = ?
+            WHERE request_id = ?
+            """,
+            (cost_quota, quota_checked_at or now, now, request_id),
         )
 
 

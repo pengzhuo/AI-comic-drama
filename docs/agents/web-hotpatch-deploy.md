@@ -34,11 +34,23 @@ $env:VITE_APP_VERSION="dev"    # 与现网 version.json 的 version 保持一致
 npm run build:ce               # tsc -b && vite build --mode ce（自动加载 .env.ce.local）
 ```
 
-构建后先离线自检（应当 0 命中）：
+构建后先离线自检：
 
 ```powershell
-Select-String -Path dist\assets\*.js -Pattern "api\.github\.com","nfg-web\.cdnfg\.com" -List
+# 1) 星标请求必须 0 命中（漏载 .env.ce.local 时会出现）
+Select-String -Path dist\assets\*.js -Pattern "api\.github\.com" -List
+
+# 2) 公告必须指向本站空列表（覆盖生效）
+Select-String -Path dist\assets\*.js -Pattern "announcements\.empty\.json" -List
+Test-Path dist\announcements.empty.json        # 应为 True（26 B）
 ```
+
+> `nfg-web.cdnfg.com` 会有 **1 处**命中（`DEFAULT_ANNOUNCEMENTS_URL` 兜底常量），
+> 线上官方产物同样如此；它只在 `VITE_LOGIN_ANNOUNCEMENTS_URL` 未设置时才会被用到，
+> **不是**构建失败信号。同理 `dramaclaw-dl.cdnfg.com`（桌面端下载）、
+> `nfg-web-assets.cdnfg.com`（社区/更新素材）、`relayclaw.cdnfg.com`（设置里的外链）
+> 等官方静态链接常量会一直留在产物中，与本实例的隐藏开关无关 —— 所以**不能**再用
+> 「`cdnfg.com` 0 命中」做判据。
 
 ## 3. 部署（热补丁，绝不 `docker compose up -d`）
 
@@ -65,7 +77,8 @@ docker exec dramaclaw-web-1 sh -c 'ls -la /usr/share/nginx/html/assets | head'
 
 1. 状态栏无「PiKo一下」；2. 应用内右上无公告中心；3. 登录页无公告铃铛；
 4. 进站不弹更新公告；5. 设置 → 模型与渠道无官方渠道、无「配置手册」；
-6. 登录页星标数不再变化（且 DevTools 里没有对 `api.github.com` 的请求）。
+6. 登录页星标数不再变化（DevTools 里既没有对 `api.github.com` 的请求，也没有对
+   `nfg-web.cdnfg.com/dramaclaw/announcements.json` 的请求）。
 
 ## 5. 回滚
 

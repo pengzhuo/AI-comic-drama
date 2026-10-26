@@ -47,6 +47,7 @@ from novelvideo.api.routes import (  # noqa: E402
     chat,
     config,
     content,
+    cost_report,
     diagnostics,
     episodes,
     files,
@@ -116,6 +117,7 @@ api_router.include_router(scripts.router, tags=["scripts"])
 api_router.include_router(script_process.router, tags=["scripts"])
 api_router.include_router(screenplay.router, tags=["scripts"])
 api_router.include_router(content.router, tags=["content"])
+api_router.include_router(cost_report.router, tags=["cost-report"])
 api_router.include_router(generation.router, tags=["generation"])
 api_router.include_router(tasks.router, tags=["tasks"])
 api_router.include_router(files.router, tags=["files"])

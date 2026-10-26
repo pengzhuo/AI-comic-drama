@@ -25,7 +25,7 @@ from novelvideo.ports.local.lifecycle import NoOpLifecycle
 from novelvideo.ports.local.project import AllowAllProjectAccess, SQLiteProjectRegistry
 from novelvideo.ports.local.release_feed import LocalReleaseFeed
 from novelvideo.ports.local.tasks import InlineTaskBackend, InMemoryCancellationStore
-from novelvideo.ports.local.usage import NoOpProviderInstrumentation, NoOpUsageMeter
+from novelvideo.ports.local.usage import LocalUsageMeter, NoOpProviderInstrumentation
 from novelvideo.ports.product_surface_access import LocalProductSurfaceAccess
 from novelvideo.ports.registry import get_port, register_port
 from novelvideo.task_backend.producer import TaskEnvelopeProducer
@@ -132,7 +132,7 @@ def register_local_ports() -> None:
         ("auth_session", LocalAuthSession()),
         ("project_registry", SQLiteProjectRegistry()),
         ("project_access", AllowAllProjectAccess()),
-        ("usage_meter", NoOpUsageMeter()),
+        ("usage_meter", LocalUsageMeter()),
         ("provider_instrumentation", NoOpProviderInstrumentation()),
         ("credit_quote", LocalCreditQuote()),
         ("task_backend", task_backend),

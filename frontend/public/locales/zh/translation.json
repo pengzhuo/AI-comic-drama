@@ -1892,7 +1892,8 @@
     "tasks": "捏条",
     "taskCenter": "任务中心",
     "aiAssistant": "捏导",
-    "freezone": "捏画"
+    "freezone": "捏画",
+    "reports": "捏账"
   },
   "characters": {
     "title": "角色",
@@ -4665,6 +4666,49 @@
     "dialogue": "对白",
     "silence": "无声镜头",
     "action": "动作镜头"
+  },
+  "reports": {
+    "subtitle": "按捏驿口径统计每集、每个模型的消耗，以及每集的实际制作时长。",
+    "episodeFilter": "按集筛选",
+    "allEpisodes": "全剧",
+    "episodeOption": "第 {{number}} 集",
+    "projectLevel": "项目级（不分集）",
+    "noData": "还没有可统计的用量记录",
+    "durationLegend": "时长为该集视频最早提交到最晚完成",
+    "quotaRatio": "1 美元 = {{ratio}} 额度",
+    "unattributedHint": "有 {{count}} 条请求还没从网关账单回填到费用，暂不计入合计。",
+    "stats": {
+      "totalCost": "总费用",
+      "totalDuration": "总时长",
+      "requests": "请求数",
+      "unattributed": "未归因"
+    },
+    "columns": {
+      "kind": "类型",
+      "requests": "请求数",
+      "quota": "额度",
+      "cost": "费用",
+      "duration": "时长",
+      "window": "起止"
+    },
+    "kind": {
+      "video": "视频",
+      "image": "图片",
+      "audio": "音频",
+      "llm": "文本"
+    },
+    "byEpisode": {
+      "title": "每集明细",
+      "episode": "集"
+    },
+    "byModel": {
+      "title": "按模型",
+      "model": "模型"
+    },
+    "byDay": {
+      "title": "按天",
+      "date": "日期"
+    }
   },
   "styles": {
     "createStyle": "创建风格",

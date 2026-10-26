@@ -77,6 +77,7 @@ from novelvideo.image_request_usage import (
     infer_episode_from_path,
     infer_project_output_dir,
     record_image_request,
+    update_image_request_gateway_id,
     update_image_request_status,
 )
 from novelvideo.storage.media_relay import (
@@ -301,10 +302,13 @@ async def _mark_paid_image_attempt_accepted(
 def _newapi_request_id_from_headers(headers: Any) -> str:
     if not headers:
         return ""
+    # Gateway ids first: the gateway writes ``x-oneapi-request-id`` (older
+    # builds: ``x-newapi-request-id``) into its billing log, while the generic
+    # ``x-request-id`` is the upstream provider's id and never matches it.
     return (
-        headers.get("x-request-id")
+        headers.get("x-oneapi-request-id")
         or headers.get("x-newapi-request-id")
-        or headers.get("x-oneapi-request-id")
+        or headers.get("x-request-id")
         or ""
     )
 
@@ -4235,6 +4239,7 @@ async def _call_newapi_image_api_with_egress(
     delivery_path: str | Path | None = None,
     delivery_state: dict[str, bool | str] | None = None,
     read_copied_bytes: bool = True,
+    trace: dict[str, str] | None = None,
 ) -> tuple[bytes | None, str, str]:
     """grid 家族的出网闸门（OI-52）：把 `_generate_image` 已验证的形状装到叶子外围。
 
@@ -4258,6 +4263,7 @@ async def _call_newapi_image_api_with_egress(
             reference_images=reference_images,
             image_config=image_config,
             base_url=base_url,
+            trace=trace,
             delivery_path=delivery_path,
             delivery_state=delivery_state,
             read_copied_bytes=read_copied_bytes,
@@ -4300,7 +4306,7 @@ async def _call_newapi_image_api_with_egress(
             expected_version=state.claim.operation.version,
         )
 
-    trace: dict[str, str] = {}
+    trace = trace if trace is not None else {}
     try:
         image_bytes, text, error = await _call_newapi_image_api(
             api_key=state.credential.api_key,
@@ -5291,6 +5297,7 @@ class NanoBananaGridGenerator:
                     contents,
                     include_mime=True,
                 )
+                image_trace: dict[str, str] = {}
                 image_bytes, _text, newapi_error = await _call_newapi_image_api_with_egress(
                     capability="image.generate.grid",
                     api_key=self.api_key,
@@ -5311,12 +5318,23 @@ class NanoBananaGridGenerator:
                     base_url=self.base_url,
                     delivery_path=output_path,
                     delivery_state=(image_delivery_state := {}),
+                    trace=image_trace,
                 )
                 if not image_bytes:
                     message = "DramaClawAPI Images 未返回图像数据"
                     if newapi_error:
                         message = f"{message}: {newapi_error}"
                     return _usage_fail(message)
+                if project_output_dir and usage_recorded:
+                    update_image_request_gateway_id(
+                        project_output_dir=project_output_dir,
+                        request_id=usage_request_id,
+                        gateway_request_id=(
+                            image_trace.get("request_id")
+                            or image_trace.get("response_id")
+                            or ""
+                        ),
+                    )
             else:
                 # ===== Google 直连分支 =====
                 # 根据模型选择配置：gemini-3 支持 image_size，gemini-2.5 不支持

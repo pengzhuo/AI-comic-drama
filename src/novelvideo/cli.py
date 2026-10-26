@@ -582,6 +582,89 @@ def repair_asset_names_cmd(
         raise typer.Exit(1)
 
 
+@app.command("cost-reconcile")
+def cost_reconcile_cmd(
+    project_id: str = typer.Option("", "--project-id", help="control-plane 项目 ID"),
+    user: str = typer.Option("", "--user", help="项目所属用户，例如 local"),
+    project: str = typer.Option("", "--project", "-p", help="项目名，例如 nn_1021_1"),
+    state_dir: str = typer.Option("", "--state-dir", help="data.db 所在目录"),
+    output_dir: str = typer.Option("", "--output-dir", help="项目 output 目录"),
+    gateway_db: str = typer.Option(
+        "", "--gateway-db", help="捏驿账单库 one-api.db（只读）"
+    ),
+    all_projects: bool = typer.Option(
+        False, "--all", help="对账 state 下全部项目；默认只做单项目"
+    ),
+    apply: bool = typer.Option(False, "--apply", help="回写 cost_quota；默认只 dry-run"),
+    yes: bool = typer.Option(False, "--yes", help="确认 apply；必须与 --apply 同时使用"),
+):
+    """把捏驿网关 quota 对账回写到项目 usage 表（默认 dry-run）。"""
+    from novelvideo.gateway_cost_reconcile import reconcile
+    from novelvideo.config import QUOTA_PER_USD
+
+    if apply and not yes:
+        raise typer.BadParameter("apply requires --yes")
+
+    project_db: Path | None = None
+    if not all_projects:
+        if not project and not project_id and not state_dir and not output_dir:
+            raise typer.BadParameter(
+                "需要 --project / --project-id / --state-dir / --output-dir 之一，或 --all"
+            )
+        if project and not user and not state_dir and not output_dir:
+            # CE 只有本地用户；省掉每次都写 --user local。
+            user = os.environ.get("ST_LOCAL_USERNAME", "").strip() or "local"
+        db_dir, _asset_dir, label = asyncio.run(
+            _resolve_scene_migration_dirs(
+                project_id=project_id,
+                user=user,
+                project=project,
+                state_dir=state_dir,
+                output_dir=output_dir,
+            )
+        )
+        project_db = Path(db_dir) / "data.db"
+        console.print(f"[bold blue]Cost reconcile[/bold blue]: {label}")
+        console.print(f"  data.db: {project_db}")
+
+    report = reconcile(
+        gateway_db=gateway_db or None,
+        state_dir=state_dir or None,
+        project_db=project_db,
+        apply=apply,
+    )
+
+    console.print(f"  网关库: {report.gateway_db}")
+    console.print(f"  模式:   {'APPLY' if apply else 'DRY-RUN'}")
+    if report.errors:
+        for err in report.errors:
+            console.print(f"[red]  ✗ {err}[/red]")
+    total_quota = 0
+    for proj in report.projects:
+        if not proj.quota and not any(t.matched for t in proj.tables):
+            continue
+        console.print(
+            f"  [green]{proj.label}[/green]  "
+            f"{proj.quota:,} quota = ${proj.usd:,.2f}"
+        )
+        for table in proj.tables:
+            if not table.rows:
+                continue
+            console.print(
+                f"      {table.table}: {table.matched}/{table.rows} matched, "
+                f"${table.usd:,.2f}"
+            )
+            for missing in table.unmatched[:5]:
+                console.print(f"          [dim]unmatched: {missing}[/dim]")
+        total_quota += proj.quota
+    console.print(
+        f"[bold]TOTAL[/bold]: {total_quota:,} quota = "
+        f"${total_quota / QUOTA_PER_USD:,.2f}"
+    )
+    if not apply:
+        console.print("[dim]回写需显式添加: --apply --yes[/dim]")
+
+
 def main() -> None:
     app()
 

@@ -14,7 +14,7 @@ import type { ProjectSection } from "@/components/layout/project-navigation-rout
  *   顶部切到「捏集」时恢复到这里，而不是固定落到捏料。
  */
 
-/** 可被记忆的区块：捏画 + 捏集五个子页（tasks 等其它路由不参与记忆）。 */
+/** 可被记忆的区块：捏画 + 捏集六个子页（tasks 等其它路由不参与记忆）。 */
 const REMEMBERED_SECTIONS = new Set<ProjectSection>([
   "freezone",
   "ingest",
@@ -22,6 +22,7 @@ const REMEMBERED_SECTIONS = new Set<ProjectSection>([
   "episodes",
   "assistant",
   "styles",
+  "reports",
 ]);
 
 export type XiajiSection = Exclude<
