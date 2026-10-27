@@ -8,18 +8,22 @@ import { queryKeys } from "@/lib/query-keys";
 import type { OkResponse } from "@/types/api";
 
 /**
- * 捏驿口径的项目成本报表。
+ * 项目成本报表（捏驿「捏账」页）。
  *
- * `quota` 是网关（NewAPI）账单里的额度快照，`usd = quota / quota_per_usd`。
- * `cost_quota` 尚未回填（`novelvideo cost-reconcile` 未跑或没匹配上）的请求不算进
- * `quota`，而是计进 `unattributed_requests`。
+ * `quota` 是账单额度快照，`usd = quota / quota_per_usd`，`cny = usd * 汇率`。
+ * 费用以 `cost-reconcile --source relay` 回填的上游中转站真实账单为准：本地捏驿
+ * 网关对 DC-* / 媒体模型别名没有价格条目，会落到默认倍率而明显偏高。`cost_quota`
+ * 尚未回填（未跑对账或没匹配上）的请求不算进 `quota`，而是计进
+ * `unattributed_requests`。
  */
 export interface CostReportBucket {
   requests: number;
-  /** 未从网关账单回填到 `cost_quota` 的请求数（费用未知，不计入 quota/usd）。 */
+  /** 未从账单回填到 `cost_quota` 的请求数（费用未知，不计入 quota/usd）。 */
   unattributed_requests: number;
   quota: number;
   usd: number;
+  /** 人民币金额（中转站 `usd_exchange_rate` 折算）；旧后端缺省时前端兜底。 */
+  cny?: number;
   /** 制作时长：该集视频最早提交 → 最晚完成，缺时间戳时为 0。 */
   duration_seconds: number;
   duration_hours: number;
@@ -51,6 +55,10 @@ export interface CostReport {
   /** 非空表示这是一次单集查询，各分组的请求都只含这一集。 */
   episode: number | null;
   quota_per_usd: number;
+  /** 报表币种；中转站按 ¥ 展示时为 "CNY"。 */
+  currency?: string;
+  /** 美元 → 人民币汇率（中转站 `usd_exchange_rate`）。 */
+  usd_cny_rate?: number;
   project?: { id: string; name: string; owner: string };
   totals: CostReportBucket;
   by_kind: CostReportByKind[];

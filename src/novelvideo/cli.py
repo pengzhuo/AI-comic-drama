@@ -597,13 +597,57 @@ def cost_reconcile_cmd(
     ),
     apply: bool = typer.Option(False, "--apply", help="回写 cost_quota；默认只 dry-run"),
     yes: bool = typer.Option(False, "--yes", help="确认 apply；必须与 --apply 同时使用"),
+    source: str = typer.Option(
+        "gateway",
+        "--source",
+        help="quota 来源：gateway=本地捏驿账单库；relay=上游中转站真实账单",
+    ),
+    relay_base_url: list[str] = typer.Option(
+        [], "--relay-base-url", help="中转站地址，可重复；默认 aicf + aigc"
+    ),
+    relay_username: str = typer.Option(
+        "", "--relay-username", help="中转站账号（--source relay 必填）"
+    ),
+    relay_password: str = typer.Option(
+        "", "--relay-password", help="中转站密码（--source relay 必填）"
+    ),
+    relay_cache: str = typer.Option(
+        "", "--relay-cache", help="中转站账单缓存文件（默认 /data/runtime/...）"
+    ),
+    relay_workers: int = typer.Option(4, "--relay-workers", help="中转站并发查询数"),
 ):
-    """把捏驿网关 quota 对账回写到项目 usage 表（默认 dry-run）。"""
+    """把账单 quota 对账回写到项目 usage 表（默认 dry-run）。"""
     from novelvideo.gateway_cost_reconcile import reconcile
-    from novelvideo.config import QUOTA_PER_USD
+    from novelvideo.relay_billing import build_endpoints
+    from novelvideo.config import (
+        QUOTA_PER_USD,
+        RELAY_BILLING_BASE_URLS,
+        RELAY_BILLING_CACHE_PATH,
+        RELAY_BILLING_PASSWORD,
+        RELAY_BILLING_USERNAME,
+        REPORT_CURRENCY,
+        USD_CNY_RATE,
+    )
 
     if apply and not yes:
         raise typer.BadParameter("apply requires --yes")
+    if source not in {"gateway", "relay"}:
+        raise typer.BadParameter("--source 只能是 gateway 或 relay")
+
+    relay_endpoints = []
+    if source == "relay":
+        username = relay_username.strip() or RELAY_BILLING_USERNAME
+        password = relay_password.strip() or RELAY_BILLING_PASSWORD
+        if not username or not password:
+            raise typer.BadParameter(
+                "--source relay 需要 --relay-username / --relay-password"
+            )
+        base_urls = list(relay_base_url) or [
+            url.strip() for url in RELAY_BILLING_BASE_URLS.split(",") if url.strip()
+        ]
+        relay_endpoints = build_endpoints(
+            base_urls, username=username, password=password
+        )
 
     project_db: Path | None = None
     if not all_projects:
@@ -627,15 +671,36 @@ def cost_reconcile_cmd(
         console.print(f"[bold blue]Cost reconcile[/bold blue]: {label}")
         console.print(f"  data.db: {project_db}")
 
+    def _relay_progress(done: int, total: int) -> None:
+        console.print(f"      [dim]中转站账单 {done}/{total}[/dim]")
+
     report = reconcile(
         gateway_db=gateway_db or None,
         state_dir=state_dir or None,
         project_db=project_db,
         apply=apply,
+        source=source,
+        relay_endpoints=relay_endpoints,
+        relay_cache=relay_cache
+        or (RELAY_BILLING_CACHE_PATH if source == "relay" else None),
+        relay_workers=relay_workers,
+        progress=_relay_progress if source == "relay" else None,
     )
 
-    console.print(f"  网关库: {report.gateway_db}")
+    def _money(quota: int) -> str:
+        usd = quota / QUOTA_PER_USD if QUOTA_PER_USD else 0.0
+        if REPORT_CURRENCY.upper() == "CNY" and USD_CNY_RATE > 0:
+            return f"${usd:,.2f} ≈ ¥{usd * USD_CNY_RATE:,.2f}"
+        return f"${usd:,.2f}"
+
+    console.print(f"  账单库: {report.gateway_db}（来源: {report.source}）")
     console.print(f"  模式:   {'APPLY' if apply else 'DRY-RUN'}")
+    for status in report.relay_status:
+        rate = status.usd_exchange_rate or USD_CNY_RATE
+        console.print(
+            f"      [dim]中转站: quota_per_unit={status.quota_per_unit:,.0f}, "
+            f"汇率={rate}, 币种={status.currency_symbol or '¥'}[/dim]"
+        )
     if report.errors:
         for err in report.errors:
             console.print(f"[red]  ✗ {err}[/red]")
@@ -645,21 +710,20 @@ def cost_reconcile_cmd(
             continue
         console.print(
             f"  [green]{proj.label}[/green]  "
-            f"{proj.quota:,} quota = ${proj.usd:,.2f}"
+            f"{proj.quota:,} quota = {_money(proj.quota)}"
         )
         for table in proj.tables:
             if not table.rows:
                 continue
             console.print(
                 f"      {table.table}: {table.matched}/{table.rows} matched, "
-                f"${table.usd:,.2f}"
+                f"{_money(table.quota)}"
             )
             for missing in table.unmatched[:5]:
                 console.print(f"          [dim]unmatched: {missing}[/dim]")
         total_quota += proj.quota
     console.print(
-        f"[bold]TOTAL[/bold]: {total_quota:,} quota = "
-        f"${total_quota / QUOTA_PER_USD:,.2f}"
+        f"[bold]TOTAL[/bold]: {total_quota:,} quota = {_money(total_quota)}"
     )
     if not apply:
         console.print("[dim]回写需显式添加: --apply --yes[/dim]")

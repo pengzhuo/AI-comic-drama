@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from types import SimpleNamespace
+from urllib.parse import parse_qsl
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -282,6 +285,11 @@ def test_reconcile_dry_run_then_apply_and_report(tmp_path):
     assert report["totals"]["usd"] == 1250 / report["quota_per_usd"]
     assert report["unattributed"]["requests"] == 1
     assert report["unattributed"]["by_kind"]["audio"] == 1
+    assert report["currency"] == "CNY"
+    assert report["usd_cny_rate"] > 0
+    assert report["totals"]["cny"] == pytest.approx(
+        report["totals"]["usd"] * report["usd_cny_rate"]
+    )
     episode_one = next(item for item in report["by_episode"] if item["episode"] == 1)
     assert episode_one["quota"] == 1250
     assert episode_one["duration_seconds"] == 3600
@@ -403,3 +411,251 @@ def test_cost_report_route_contract(tmp_path, monkeypatch):
     filtered = client.get("/api/v1/projects/demo/cost-report", params={"episode": 1})
     assert filtered.status_code == 200
     assert filtered.json()["data"]["totals"]["requests"] == 4
+
+
+def _write_gateway_db_with_upstream_ids(path) -> None:
+    """Gateway DB that records the upstream ids (``private_data`` / ``upstream_request_id``).
+
+    The gateway quota is deliberately much higher than the relay's real charge:
+    the whole point of ``--source relay`` is to ignore it.
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY,
+            quota INTEGER,
+            private_data BLOB
+        );
+        CREATE TABLE logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT,
+            upstream_request_id TEXT,
+            quota INTEGER,
+            model_name TEXT,
+            type INTEGER
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (task_id, quota, private_data) VALUES (?, ?, ?)",
+        ("task-1", 46_875_000, json.dumps({"upstream_task_id": "up-task-1"}).encode()),
+    )
+    conn.execute(
+        "INSERT INTO logs (request_id, upstream_request_id, quota, model_name, type)"
+        " VALUES ('log-img-1', 'up-log-img', 80475, 'LingShan-G2', 2)"
+    )
+    conn.execute(
+        "INSERT INTO logs (request_id, upstream_request_id, quota, model_name, type)"
+        " VALUES ('log-llm-1', 'up-log-llm', 330000, 'DC-hermes-LLM', 2)"
+    )
+    conn.commit()
+    conn.close()
+
+
+class _FakeRelay:
+    """Minimal upstream NewAPI relay: login / status / task pages / log by request_id."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        tasks: dict[str, int],
+        logs: dict[str, int],
+        reject_first_authed_call: bool = False,
+    ) -> None:
+        self.base_url = base_url
+        self.tasks = dict(tasks)
+        self.logs = dict(logs)
+        self.calls: list[str] = []
+        self._reject_next = reject_first_authed_call
+
+    def __call__(self, method, url, headers, payload):
+        self.calls.append(f"{method} {url}")
+        path, _, query = url.partition("?")
+        path = path.removeprefix(self.base_url)
+        params = dict(parse_qsl(query))
+        if path == "/api/user/login":
+            return 200, json.dumps({"success": True, "data": {"access_token": "tok-1"}})
+        if path == "/api/status":
+            return 200, json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "quota_per_unit": 500000,
+                        "usd_exchange_rate": 7.3,
+                        "custom_currency_symbol": "¥",
+                        "display_in_currency": True,
+                    },
+                }
+            )
+        if not headers.get("Authorization"):
+            return 401, json.dumps({"success": False, "code": "AUTH_TOKEN_EXPIRED"})
+        if self._reject_next:
+            # access token 只有 15 分钟，过期一次应自动重登再重试。
+            self._reject_next = False
+            return 401, json.dumps({"success": False, "code": "AUTH_TOKEN_EXPIRED"})
+        if path == "/api/task/self":
+            page = int(params.get("p") or 0)
+            size = int(params.get("page_size") or 100)
+            items = [
+                {"task_id": task_id, "quota": quota}
+                for task_id, quota in sorted(self.tasks.items())
+            ]
+            return 200, json.dumps(
+                {
+                    "success": True,
+                    "data": {"items": items[page * size : page * size + size]},
+                }
+            )
+        if path == "/api/log/self":
+            request_id = params.get("request_id") or ""
+            items = (
+                [{"request_id": request_id, "quota": self.logs[request_id]}]
+                if request_id in self.logs
+                else []
+            )
+            return 200, json.dumps({"success": True, "data": {"items": items}})
+        return 404, json.dumps({"success": False, "message": "not found"})
+
+    def log_calls(self) -> list[str]:
+        return [call for call in self.calls if "/api/log/self" in call]
+
+
+def _relay_endpoints(base_url="https://aicf.example"):
+    from novelvideo.relay_billing import build_endpoints
+
+    return build_endpoints([base_url], username="hiaihub", password="secret")
+
+
+def test_reconcile_relay_source_uses_upstream_quota(tmp_path):
+    """``--source relay`` bridges local ids → upstream ids and bills the real charge."""
+    from novelvideo.gateway_cost_reconcile import reconcile
+
+    project_dir = _seed_project(tmp_path)
+    gateway_db = tmp_path / "one-api.db"
+    _write_gateway_db_with_upstream_ids(gateway_db)
+
+    relay = _FakeRelay(
+        base_url="https://aicf.example",
+        tasks={"up-task-1": 220_784},
+        logs={"up-log-img": 2_322, "up-log-llm": 10_213},
+        reject_first_authed_call=True,
+    )
+    cache_path = tmp_path / "relay_cache.json"
+
+    report = reconcile(
+        gateway_db=gateway_db,
+        project_db=project_dir / "data.db",
+        apply=True,
+        source="relay",
+        relay_endpoints=_relay_endpoints(),
+        relay_cache=cache_path,
+        relay_transport=relay,
+    )
+
+    assert not report.errors
+    assert report.source == "relay"
+    assert [status.quota_per_unit for status in report.relay_status] == [500000]
+    assert report.quota == 220_784 + 2_322 + 10_213
+
+    conn = sqlite3.connect(project_dir / "data.db")
+    quotas = {
+        "video": conn.execute(
+            "SELECT cost_quota FROM video_request_usage WHERE request_id = 'task-1'"
+        ).fetchone()[0],
+        "image": conn.execute(
+            "SELECT cost_quota FROM image_request_usage WHERE request_id = 'img-1'"
+        ).fetchone()[0],
+        "llm": conn.execute(
+            "SELECT cost_quota FROM llm_request_usage WHERE request_id = 'llm-1'"
+        ).fetchone()[0],
+    }
+    conn.close()
+    # The gateway's own (inflated) numbers must not leak through.
+    assert quotas == {"video": 220_784, "image": 2_322, "llm": 10_213}
+
+    from novelvideo.api.routes.cost_report import build_cost_report
+
+    built = build_cost_report(project_output_dir=project_dir)
+    assert built["totals"]["quota"] == report.quota
+    assert built["totals"]["cny"] == pytest.approx(built["totals"]["usd"] * 7.3)
+
+    # 缓存落盘后第二次运行不再查上游日志。
+    assert cache_path.is_file()
+    before = len(relay.log_calls())
+    again = reconcile(
+        gateway_db=gateway_db,
+        project_db=project_dir / "data.db",
+        source="relay",
+        relay_endpoints=_relay_endpoints(),
+        relay_cache=cache_path,
+        relay_transport=relay,
+    )
+    assert again.quota == report.quota
+    assert len(relay.log_calls()) == before
+
+
+def test_reconcile_relay_source_leaves_unknown_ids_unattributed(tmp_path):
+    from novelvideo.gateway_cost_reconcile import reconcile
+
+    project_dir = _seed_project(tmp_path)
+    gateway_db = tmp_path / "one-api.db"
+    _write_gateway_db_with_upstream_ids(gateway_db)
+
+    relay = _FakeRelay(
+        base_url="https://aicf.example",
+        tasks={"up-task-1": 220_784},
+        logs={"up-log-img": 2_322},  # 上游查不到 up-log-llm
+    )
+
+    report = reconcile(
+        gateway_db=gateway_db,
+        project_db=project_dir / "data.db",
+        apply=True,
+        source="relay",
+        relay_endpoints=_relay_endpoints(),
+        relay_transport=relay,
+    )
+
+    assert not report.errors
+    assert report.quota == 220_784 + 2_322
+
+    conn = sqlite3.connect(project_dir / "data.db")
+    assert (
+        conn.execute(
+            "SELECT cost_quota FROM llm_request_usage WHERE request_id = 'llm-1'"
+        ).fetchone()[0]
+        is None
+    )
+    conn.close()
+
+    from novelvideo.api.routes.cost_report import build_cost_report
+
+    built = build_cost_report(project_output_dir=project_dir)
+    assert built["unattributed"]["by_kind"]["llm"] == 1
+
+
+def test_reconcile_rejects_unknown_source(tmp_path):
+    from novelvideo.gateway_cost_reconcile import reconcile
+
+    with pytest.raises(ValueError):
+        reconcile(gateway_db=tmp_path / "one-api.db", source="nope")
+
+
+def test_relay_billing_client_relogins_on_expired_token():
+    from novelvideo.relay_billing import RelayBillingClient
+
+    relay = _FakeRelay(
+        base_url="https://aicf.example",
+        tasks={"up-task-1": 7},
+        logs={},
+        reject_first_authed_call=True,
+    )
+    client = RelayBillingClient(
+        _relay_endpoints()[0], transport=relay, page_size=100
+    )
+
+    assert client.task_quotas() == {"up-task-1": 7}
+    logins = [call for call in relay.calls if "/api/user/login" in call]
+    assert len(logins) == 2  # 首次登录 + 401 后重登

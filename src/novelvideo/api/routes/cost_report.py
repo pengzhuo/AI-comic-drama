@@ -1,13 +1,15 @@
-"""项目成本报表：捏驿（NewAPI）计费口径的消耗明细与制作时长。
+"""项目成本报表：按上游中转站账单口径的消耗明细与制作时长。
 
 数据来源是项目 ``data.db`` 里的四张用量表：
 
 - ``video_request_usage`` / ``image_request_usage`` / ``audio_request_usage``
 - ``llm_request_usage``
 
-费用字段 ``cost_quota`` 由 ``novelvideo cost-reconcile`` 从网关账单库回填，
-USD = ``cost_quota / QUOTA_PER_USD``（捏驿默认 500000）。报告只读，不触发任何
-网关调用；``cost_quota`` 为空的行归入 ``unattributed``。
+费用字段 ``cost_quota`` 由 ``novelvideo cost-reconcile`` 回填：默认 ``--source
+relay`` 取上游中转站（真正收钱的一方）的真实账单 quota，``--source gateway``
+则取本地捏驿网关账单库。USD = ``cost_quota / QUOTA_PER_USD``（捏驿默认
+500000）；中转站按 ¥ 展示，故同时给出 ``cny = usd * usd_cny_rate``。报告只读，
+不触发任何网关调用；``cost_quota`` 为空的行归入 ``unattributed``。
 
 时长口径：单条视频用应用侧 ``accepted_at``（提交网关、拿到 task id 的时刻）到
 ``completed_at``（观察到完成的时刻）；每集取该集视频的 ``min(accepted_at)`` 到
@@ -28,7 +30,7 @@ from fastapi import APIRouter, Depends, Query
 from novelvideo.api.auth import get_api_user
 from novelvideo.api.deps import resolve_project_scope
 from novelvideo.audio_request_usage import get_audio_request_usage_db_path
-from novelvideo.config import QUOTA_PER_USD
+from novelvideo.config import QUOTA_PER_USD, REPORT_CURRENCY, USD_CNY_RATE
 from novelvideo.image_request_usage import get_image_request_usage_db_path
 from novelvideo.llm_request_usage import get_llm_request_usage_db_path
 from novelvideo.video_request_usage import get_video_request_usage_db_path
@@ -215,11 +217,13 @@ def _span_seconds(started_at: str | None, finished_at: str | None) -> float:
 def _as_quota_row(bucket: _Bucket) -> dict[str, Any]:
     span = _span_seconds(bucket.started_at, bucket.finished_at) if bucket.started_at else 0.0
     duration = span or bucket.duration_seconds
+    usd = bucket.quota / QUOTA_PER_USD if QUOTA_PER_USD else 0.0
     return {
         "requests": bucket.requests,
         "unattributed_requests": bucket.unattributed_requests,
         "quota": bucket.quota,
-        "usd": bucket.quota / QUOTA_PER_USD if QUOTA_PER_USD else 0.0,
+        "usd": usd,
+        "cny": usd * USD_CNY_RATE,
         "duration_seconds": round(duration, 3),
         "duration_hours": round(duration / 3600, 3) if duration else 0.0,
         "started_at": bucket.started_at,
@@ -294,6 +298,8 @@ def build_cost_report(
         "generated_at": datetime.now().isoformat(),
         "episode": episode,
         "quota_per_usd": QUOTA_PER_USD,
+        "currency": REPORT_CURRENCY,
+        "usd_cny_rate": USD_CNY_RATE,
         "totals": _as_quota_row(totals),
         "by_kind": kinds,
         "by_model": models,
@@ -312,7 +318,7 @@ async def get_project_cost_report(
     episode: int | None = Query(None, ge=1, description="只看某一集；缺省为全剧"),
     user: dict = Depends(get_api_user),
 ):
-    """按捏驿口径返回项目消耗明细、每集时长与合计。"""
+    """按上游账单口径返回项目消耗明细、每集时长与合计。"""
     resolution = await resolve_project_scope(project, user, required_role="viewer")
     data = build_cost_report(
         project_output_dir=resolution.output_dir,

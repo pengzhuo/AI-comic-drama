@@ -588,3 +588,58 @@ def set_narrator_reference_audio_in_state_dir(
         "sha256": str(updated.get(NARRATOR_AUDIO_SHA256_KEY) or ""),
         "updated_at": str(updated.get(NARRATOR_AUDIO_UPDATED_AT_KEY) or ""),
     }
+
+
+#: 一键成片「角色图片指定」闸门的答案：True 表示用户已经上传过肖像或明确跳过。
+#: 闸门读它来避免在每个推进周期重复暂停；跳过的用户也一样写入，语义是「已答」。
+CHARACTER_IMAGES_CONFIRMED_KEY = "character_images_confirmed"
+#: 每集「身份图指定」闸门的答案，形如 ``{"1": true}``（键是集号）。
+#: 身份记录只在身份规划阶段产生，所以这个闸门是每集的，不能只用一个项目级布尔。
+IDENTITY_IMAGES_CONFIRMED_KEY = "identity_images_confirmed"
+
+
+def _confirmed_identity_episodes(config: dict) -> dict[str, bool]:
+    raw = config.get(IDENTITY_IMAGES_CONFIRMED_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): bool(value) for key, value in raw.items()}
+
+
+def character_images_confirmed(username: str, project: str) -> bool:
+    """一键成片是否可以越过「角色图片指定」闸门。"""
+
+    config = load_project_config_file(username, project)
+    return bool(config.get(CHARACTER_IMAGES_CONFIRMED_KEY))
+
+
+def identity_images_confirmed(username: str, project: str, episode: int) -> bool:
+    """第 ``episode`` 集的「身份图指定」闸门是否已经答过。"""
+
+    try:
+        episode_key = str(int(episode))
+    except (TypeError, ValueError):
+        return False
+    config = load_project_config_file(username, project)
+    return _confirmed_identity_episodes(config).get(episode_key, False)
+
+
+def confirm_character_images(username: str, project: str) -> None:
+    """记录「角色图片指定」的答案（上传或跳过都算已答）。"""
+
+    def _apply(config: dict) -> None:
+        config[CHARACTER_IMAGES_CONFIRMED_KEY] = True
+
+    update_project_config_file(username, project, _apply)
+
+
+def confirm_identity_images(username: str, project: str, episode: int) -> None:
+    """记录第 ``episode`` 集「身份图指定」的答案（上传或跳过都算已答）。"""
+
+    episode_key = str(int(episode))
+
+    def _apply(config: dict) -> None:
+        episodes = _confirmed_identity_episodes(config)
+        episodes[episode_key] = True
+        config[IDENTITY_IMAGES_CONFIRMED_KEY] = episodes
+
+    update_project_config_file(username, project, _apply)

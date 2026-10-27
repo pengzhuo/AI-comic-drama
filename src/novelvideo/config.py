@@ -655,6 +655,22 @@ NEWAPI_BILLING_DB_PATH = os.environ.get(
 # 捏驿默认 QuotaPerUnit；USD = quota / QUOTA_PER_USD。
 QUOTA_PER_USD = _env_float("NOVELVIDEO_QUOTA_PER_USD", 500000.0)
 
+# 中转站（上游 NewAPI 中继）真实账单，供 ``novelvideo cost-reconcile --source relay``
+# 使用。捏驿网关对 DC-* / 媒体模型别名没有价格条目，落到默认倍率会高出几十倍，
+# 因此费用以真正收钱的上游账单为准。凭据只用于 CLI 运行，不落库、不进 git。
+RELAY_BILLING_BASE_URLS = os.environ.get(
+    "NOVELVIDEO_RELAY_BILLING_BASE_URLS",
+    "https://aicf.nanie168.com,https://aigc.nanie168.com",
+)
+RELAY_BILLING_USERNAME = os.environ.get("NOVELVIDEO_RELAY_BILLING_USERNAME", "")
+RELAY_BILLING_PASSWORD = os.environ.get("NOVELVIDEO_RELAY_BILLING_PASSWORD", "")
+RELAY_BILLING_CACHE_PATH = os.environ.get(
+    "NOVELVIDEO_RELAY_BILLING_CACHE", "/data/runtime/relay_billing_cache.json"
+)
+# 报表币种：中转站按 ¥ 展示（``usd_exchange_rate``，默认 7.3）。
+USD_CNY_RATE = _env_float("NOVELVIDEO_USD_CNY_RATE", 7.3)
+REPORT_CURRENCY = os.environ.get("NOVELVIDEO_REPORT_CURRENCY", "CNY")
+
 
 def get_effective_newapi_gateway_config():
     """Return the selected NewAPI runtime gateway credentials."""

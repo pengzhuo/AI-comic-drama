@@ -12,7 +12,7 @@ import { useEpisodes } from "@/lib/queries/episodes";
 import { cn } from "@/lib/utils";
 
 /** 费用小数位随量级自适应：小额（单张图/单次文本）也要看得出差别。 */
-function usdFractionDigits(value: number): number {
+function costFractionDigits(value: number): number {
   const abs = Math.abs(value);
   if (abs === 0) return 2;
   if (abs < 0.01) return 6;
@@ -20,9 +20,20 @@ function usdFractionDigits(value: number): number {
   return 2;
 }
 
-function formatUsd(value: number): string {
-  const digits = usdFractionDigits(value);
-  return `$${value.toLocaleString("en-US", {
+/** 中转站按 ¥ 展示；后端 `usd_cny_rate` 缺省时用同一常数兜底。 */
+const FALLBACK_USD_CNY_RATE = 7.3;
+
+/**
+ * 报表费用（人民币）。后端回填的是中转站真实账单 quota，`cny = usd * 汇率`；
+ * 旧后端还没带 `cny` 时前端自己按 `usd_cny_rate`（或兜底汇率）折算。
+ */
+function bucketCny(bucket: CostReportBucket, rate: number): number {
+  return bucket.cny ?? bucket.usd * rate;
+}
+
+function formatCny(value: number): string {
+  const digits = costFractionDigits(value);
+  return `¥${value.toLocaleString("en-US", {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   })}`;
@@ -103,7 +114,7 @@ function SectionCard({
 }
 
 /** 请求数 / 额度 / 费用 三列，各组表复用，保证数字右对齐、等宽。 */
-function UsageCells({ bucket }: { bucket: CostReportBucket }) {
+function UsageCells({ bucket, rate }: { bucket: CostReportBucket; rate: number }) {
   return (
     <>
       <td className="px-4 py-3 text-right tabular-nums text-foreground/58">
@@ -113,7 +124,7 @@ function UsageCells({ bucket }: { bucket: CostReportBucket }) {
         {formatQuota(bucket.quota)}
       </td>
       <td className="px-4 py-3 text-right font-medium tabular-nums">
-        {formatUsd(bucket.usd)}
+        {formatCny(bucketCny(bucket, rate))}
       </td>
     </>
   );
@@ -144,6 +155,11 @@ function ReportsPage() {
     [episodesRes?.data],
   );
   const unattributedCount = report?.unattributed.requests ?? 0;
+  // 后端（重启后）会带上中转站汇率；旧进程还没生效时前端按同一汇率兜底。
+  const usdCnyRate =
+    report?.usd_cny_rate && report.usd_cny_rate > 0
+      ? report.usd_cny_rate
+      : FALLBACK_USD_CNY_RATE;
 
   return (
     <div className="-m-6 flex h-[calc(100%+3rem)] flex-col overflow-hidden">
@@ -212,7 +228,7 @@ function ReportsPage() {
               <StatItem
                 icon={Coins}
                 label={t("reports.stats.totalCost")}
-                value={formatUsd(totals.usd)}
+                value={formatCny(bucketCny(totals, usdCnyRate))}
               />
               <StatItem
                 icon={Clock}
@@ -274,7 +290,7 @@ function ReportsPage() {
                               ? t("reports.projectLevel")
                               : t("reports.episodeOption", { number: row.episode })}
                           </td>
-                          <UsageCells bucket={row} />
+                          <UsageCells bucket={row} rate={usdCnyRate} />
                           <td className="px-4 py-3 text-right tabular-nums text-foreground/58">
                             {formatDuration(row.duration_seconds)}
                           </td>
@@ -293,7 +309,10 @@ function ReportsPage() {
 
             <SectionCard
               title={t("reports.byModel.title")}
-              hint={t("reports.quotaRatio", { ratio: formatQuota(report.quota_per_usd) })}
+              hint={t("reports.quotaRatio", {
+                ratio: formatQuota(report.quota_per_usd),
+                rate: usdCnyRate,
+              })}
             >
               <div className="overflow-x-auto">
                 <table className="w-full min-w-[640px] text-left text-sm">
@@ -324,7 +343,7 @@ function ReportsPage() {
                           <td className="px-4 py-3 text-xs text-foreground/45">
                             {t(`reports.kind.${row.kind}`, { defaultValue: row.kind_label })}
                           </td>
-                          <UsageCells bucket={row} />
+                          <UsageCells bucket={row} rate={usdCnyRate} />
                         </tr>
                       ))
                     )}
@@ -357,7 +376,7 @@ function ReportsPage() {
                       report.by_day.map((row) => (
                         <tr key={row.date} className={TABLE_ROW_CLASS}>
                           <td className="px-4 py-3 tabular-nums">{row.date}</td>
-                          <UsageCells bucket={row} />
+                          <UsageCells bucket={row} rate={usdCnyRate} />
                         </tr>
                       ))
                     )}

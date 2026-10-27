@@ -4668,15 +4668,15 @@
     "action": "动作镜头"
   },
   "reports": {
-    "subtitle": "按捏驿口径统计每集、每个模型的消耗，以及每集的实际制作时长。",
+    "subtitle": "按上游账单统计每集、每个模型的消耗，以及每集的实际制作时长。",
     "episodeFilter": "按集筛选",
     "allEpisodes": "全剧",
     "episodeOption": "第 {{number}} 集",
     "projectLevel": "项目级（不分集）",
     "noData": "还没有可统计的用量记录",
     "durationLegend": "时长为该集视频最早提交到最晚完成",
-    "quotaRatio": "1 美元 = {{ratio}} 额度",
-    "unattributedHint": "有 {{count}} 条请求还没从网关账单回填到费用，暂不计入合计。",
+    "quotaRatio": "1 美元 = {{ratio}} 额度（按 ¥{{rate}}/美元 折算）",
+    "unattributedHint": "有 {{count}} 条请求还没从上游账单回填到费用，暂不计入合计。",
     "stats": {
       "totalCost": "总费用",
       "totalDuration": "总时长",

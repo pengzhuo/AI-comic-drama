@@ -117,6 +117,21 @@ STALL_REASON_TAG = "[stall]"
 #: pointing at the *cause* while the run is retrying, so a later pause on a
 #: different path (e.g. no task in several turns) can still report it.
 RETRY_REASON_PREFIX = "[retry "
+#: Stable markers prepended to the two 「角色图片指定」gate pause reasons. The
+#: reason is persisted on the durable run (``last_error``), so the marker is what
+#: the 捏导 matches on to restore the inline upload card after a page reload —
+#: the same convention ``STALL_REASON_TAG`` uses.
+CHARACTER_IMAGES_GATE_TAG = "[character_images]"
+IDENTITY_IMAGES_GATE_TAG = "[identity_images]"
+#: 一键成片 is about to render character portraits: this is the one chance for
+#: the user to hand over their own 角色肖像 images before AI generation runs.
+CHARACTER_IMAGES_REQUIRED_ERROR = (
+    f"{CHARACTER_IMAGES_GATE_TAG} 请为角色指定肖像图片：可上传本地图片后继续，或直接跳过由 AI 生成"
+)
+#: 本集身份规划刚产出身份，但还有身份没有身份图：先让用户指定，或跳过。
+IDENTITY_IMAGES_REQUIRED_ERROR = (
+    f"{IDENTITY_IMAGES_GATE_TAG} 本集还有身份没有身份图：可上传本地图片后继续，或直接跳过由 AI 生成"
+)
 #: Meta/bridge tools the agent uses to inspect its tool surface instead of
 #: operating on the project. Introspection must never count as a write: the
 #: bridge echoes the *described* tool name, so a turn that only described a
@@ -316,6 +331,21 @@ def _retry_pause_detail(run: DirectorAutoRun) -> str:
     if not run.last_error.startswith(RETRY_REASON_PREFIX):
         return ""
     return run.last_error.split("] ", 1)[-1].strip()
+
+
+def _pause_reason_display(reason: str) -> str:
+    """Human copy for the chat timeline: the gate markers are UI plumbing.
+
+    The marker has to stay on ``last_error`` (that is what survives a reload and
+    what the 捏导 matches), but the narration line the user reads should not show
+    it.
+    """
+
+    text = str(reason or "")
+    for tag in (CHARACTER_IMAGES_GATE_TAG, IDENTITY_IMAGES_GATE_TAG):
+        if text.startswith(tag):
+            return text[len(tag) :].strip()
+    return text
 
 
 def _event_tool_name(event: dict[str, Any]) -> str:
@@ -1872,6 +1902,10 @@ class DirectorAutoCoordinator:
         """
 
         from novelvideo.pipeline_status import _user_has_configured, compute_pipeline_status
+        from novelvideo.project_config import (
+            character_images_confirmed,
+            identity_images_confirmed,
+        )
 
         ctx = run.context
         if not _user_has_configured(run.username, ctx.project_name):
@@ -1890,8 +1924,22 @@ class DirectorAutoCoordinator:
             close = getattr(store, "close", None)
             if close:
                 await close()
-        if str(data.get("next_step") or "") == "voice_setup" and not run.voice_policy:
+        next_step = str(data.get("next_step") or "")
+        if next_step == "voice_setup" and not run.voice_policy:
             return VOICE_POLICY_REQUIRED_ERROR
+        # 角色图片指定：给用户一次交自己图片的机会，两档都停在自己的输入之前。
+        # 身份记录只在「身份规划」阶段产生，而身份规划是每集、且在肖像之后，所以
+        # 身份图那一档是每集的，必须跟在身份规划之后。
+        if next_step == "portraits" and not character_images_confirmed(
+            run.username, ctx.project_name
+        ):
+            return CHARACTER_IMAGES_REQUIRED_ERROR
+        if next_step == "identity_images":
+            gate_episode = int(data.get("current_episode") or 0) or int(run.episode or 0)
+            if gate_episode > 0 and not identity_images_confirmed(
+                run.username, ctx.project_name, gate_episode
+            ):
+                return IDENTITY_IMAGES_REQUIRED_ERROR
         return None
 
     async def _dispatch_stage(
@@ -2368,7 +2416,10 @@ class DirectorAutoCoordinator:
                             project_id=project_id,
                             reason=pause_reason,
                         )
-                        await self._notify(updated, f"自动成片已暂停：{pause_reason}。")
+                        await self._notify(
+                            updated,
+                            f"自动成片已暂停：{_pause_reason_display(pause_reason)}。",
+                        )
                         return
                 auto_label = "自动成片" if updated.is_project_scope else "本集自动"
                 await self._notify(updated, f"{summary}{auto_label}正在继续下一步。")

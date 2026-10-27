@@ -458,6 +458,17 @@ class DirectorAutoContinueIn(BaseModel):
     voice_policy: str | None = Field(default=None, pattern="^(system|custom)$")
 
 
+class DirectorAutoGateConfirmIn(BaseModel):
+    """Answer to one inline 「角色图片指定」card: 上传后继续, or an explicit skip.
+
+    Both cases mean "已答"; the only thing that matters is that the gate stops
+    pausing, so the payload carries the episode the answer belongs to (身份图
+    闸门是每集的) and nothing else.
+    """
+
+    episode: int = Field(default=0, ge=0)
+
+
 #: Project-config keys a one-click run may persist up front. Mirrors the
 #: user-selectable fields of ``ProjectUpdate``; anything else is ignored.
 _AUTO_CONFIG_KEYS = frozenset(
@@ -498,6 +509,27 @@ def _auto_run_driver(payload: DirectorAutoStartIn) -> str:
     return "deterministic" if payload.scope == "project" else "agent"
 
 
+def _director_auto_gate(reason: str) -> str | None:
+    """Which inline 一键成片 gate a pause is waiting on, if any.
+
+    The paused run only carries a human reason, so the marker inside it is what
+    the 捏导 keys the upload card on. Exposed as a field so the client does not
+    have to parse copy.
+    """
+
+    from novelvideo.chat.director_auto import (
+        CHARACTER_IMAGES_GATE_TAG,
+        IDENTITY_IMAGES_GATE_TAG,
+    )
+
+    text = str(reason or "")
+    if CHARACTER_IMAGES_GATE_TAG in text:
+        return "character_images"
+    if IDENTITY_IMAGES_GATE_TAG in text:
+        return "identity_images"
+    return None
+
+
 def _director_auto_payload(run: Any | None) -> dict[str, Any]:
     if run is None:
         return {"status": "manual", "episode": None, "run_id": None}
@@ -512,6 +544,7 @@ def _director_auto_payload(run: Any | None) -> dict[str, Any]:
         "scope": getattr(run, "scope", "episode"),
         "target_episodes": getattr(run, "target_episodes", 0),
         "driver": getattr(run, "driver", "agent"),
+        "gate": _director_auto_gate(run.last_error or "") if run.status == "paused" else None,
     }
 
 
@@ -638,6 +671,57 @@ async def continue_director_auto_run(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "data": _director_auto_payload(run)}
+
+
+@router.post("/projects/{project}/chat/director-auto/gates/{gate}/confirm")
+async def confirm_director_auto_gate(
+    project: str,
+    gate: str,
+    payload: DirectorAutoGateConfirmIn | None = None,
+    user: dict = Depends(get_api_user),
+) -> dict[str, Any]:
+    """Answer an inline 「角色图片指定」card, then let the run keep going.
+
+    一键成片 stops before 肖像生成 (and again before each episode's 身份图生成)
+    so the user can hand over their own images or skip. The answer is recorded in
+    the project config — the same place ``_pause_gate`` reads — and the paused run
+    is resumed in the same request, so one click in the card is enough.
+    """
+
+    from novelvideo.project_config import (
+        confirm_character_images,
+        confirm_identity_images,
+    )
+
+    normalized = str(gate or "").strip()
+    if normalized not in {"character_images", "identity_images"}:
+        raise HTTPException(status_code=400, detail="未知的成片门槛类型")
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="editor"
+    )
+    username = str(user["username"])
+    # The gate reads the config with the *run's* project name (see _pause_gate),
+    # so the answer must be written under the same key.
+    run = await director_auto_coordinator.get(
+        username=username, project_id=ctx.project_id
+    )
+    project_name = run.context.project_name if run is not None else ctx.project_id
+    if normalized == "character_images":
+        confirm_character_images(username, project_name)
+    else:
+        episode = int(getattr(payload, "episode", 0) or 0)
+        if episode <= 0:
+            episode = int(getattr(run, "episode", 0) or 0)
+        if episode <= 0:
+            raise HTTPException(status_code=400, detail="缺少集号")
+        confirm_identity_images(username, project_name, episode)
+    try:
+        resumed = await director_auto_coordinator.resume_paused(
+            username=username, project_id=ctx.project_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "data": _director_auto_payload(resumed)}
 
 
 @router.post("/chat/notifications")

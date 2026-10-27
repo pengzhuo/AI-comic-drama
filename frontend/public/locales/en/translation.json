@@ -4668,15 +4668,15 @@
     "action": "Action shot"
   },
   "reports": {
-    "subtitle": "Gateway-billed spend per episode and per model, plus each episode's actual production time.",
+    "subtitle": "Upstream-billed spend per episode and per model, plus each episode's actual production time.",
     "episodeFilter": "Filter by episode",
     "allEpisodes": "Whole series",
     "episodeOption": "Episode {{number}}",
     "projectLevel": "Project level (not per episode)",
     "noData": "No usage records to report yet",
     "durationLegend": "Duration spans from the first video submit to the last completion",
-    "quotaRatio": "$1 = {{ratio}} quota",
-    "unattributedHint": "{{count}} request(s) have no cost filled in from the gateway bill yet and are excluded from the totals.",
+    "quotaRatio": "$1 = {{ratio}} quota (converted at ¥{{rate}}/USD)",
+    "unattributedHint": "{{count}} request(s) have no cost filled in from the upstream bill yet and are excluded from the totals.",
     "stats": {
       "totalCost": "Total cost",
       "totalDuration": "Total duration",
