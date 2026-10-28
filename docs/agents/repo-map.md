@@ -55,6 +55,9 @@ with iterative `tsc -b` rather than a blind cut.
 | `structured_ingest.py`, `structured_extraction.py`, `structured_builders.py` | Structured (`structured_v1`) ingest + extraction |
 | `cognee/` | Legacy knowledge-graph pipeline (`store`, `pipeline`, `event_extractor`, `screenplay_normalizer`) |
 | `generators/` | Media generation (`video_composer`, `prompt_builder`, `nanobanana_grid`, image/video generators) |
+| `generators/anchor_moderation.py` | 首帧真人隐私审核的降质阶梯（`plan_anchor_variants`）——素材库不可用时的兜底 |
+| `storage/asset_library.py` | AICF 素材库：真人首帧登记成 `asset://` 引用（免输入档隐私拒绝）+ 台账 — 见 [`asset-library.md`](asset-library.md) |
+| `storage/media_relay.py` | 本地媒体 → 公网 URL（`upload_image_file` / `upload_media_bytes`） |
 | `seedance2_i2v/` | Seedance image-to-video pipeline |
 | `freezone/` | XiaHua canvas: `workflow_runs`, `agent_workflows/`, `agent_catalog/`, `text_node`/`image_node`/`video_node`, `recipe_runtime` |
 | `director_world/` | 3D previz/staging/voxel + spatial contracts |

@@ -38,6 +38,40 @@ def test_privacy_rejection_matches_the_upstream_error_string():
     )
 
 
+def _nested_upstream_error(code: str, message: str) -> str:
+    inner = {"error": {"code": code, "message": message}}
+    middle = json.dumps({"code": "fail_to_fetch_task", "message": json.dumps(inner)})
+    outer = json.dumps({"code": "fail_to_fetch_task", "message": middle})
+    return f"HTTP 400: {outer}"
+
+
+#: 线上应用通路的真实报文：首帧拒绝只剩光杆 code 与 "may contain sensitive
+#: information"（画面内容敏感类；同一批帧直连上游登记素材也回同样形态）。
+PRODUCTION_INPUT_REJECTION = _nested_upstream_error(
+    "InputImageSensitiveContentDetected",
+    "The request failed because the input image 'content[0]' may contain "
+    "sensitive information. Request id: 02179319573883791be90b70b1bfc30594",
+)
+
+#: 输出档拒绝：语义是成片敏感，改输入图救不回来。
+OUTPUT_VIDEO_REJECTION = (
+    '{"code":"upstream_task_failed","message":"The request failed because the '
+    "output video may contain sensitive information. Request id: 0217...'}"
+)
+
+
+def test_input_image_sensitive_predicate_covers_the_plain_production_form():
+    assert am.is_input_image_sensitive_rejection(PRODUCTION_INPUT_REJECTION)
+    # 隐私子类是它的真子集（子类信息还在时同样成立）。
+    assert am.is_input_image_sensitive_rejection(PRIVACY_REJECTION)
+    # 输出档拒绝不能被它吞进来，否则会拿成片审核去降质重跑。
+    assert not am.is_input_image_sensitive_rejection(OUTPUT_VIDEO_REJECTION)
+    assert not am.is_input_image_sensitive_rejection(
+        '{"code":"InvalidParameter","message":"ratio must be one of"}'
+    )
+    assert not am.is_input_image_sensitive_rejection("")
+
+
 def test_extract_upstream_code_unwraps_newapi_nesting():
     inner = {
         "error": {"code": "InputImageSensitiveContentDetected.PrivacyInformation"}

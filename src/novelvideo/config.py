@@ -830,6 +830,20 @@ CLOUDINARY_RELAY_API_KEY = os.environ.get("CLOUDINARY_RELAY_API_KEY", "")
 CLOUDINARY_RELAY_API_SECRET = os.environ.get("CLOUDINARY_RELAY_API_SECRET", "")
 CLOUDINARY_RELAY_FOLDER = os.environ.get("CLOUDINARY_RELAY_FOLDER", "")
 
+# AICF 素材库（火山方舟官方素材库）：真人输入图先登记，再用 asset:// 引用，
+# 以免被上游首帧真人隐私审核拒绝、也不必把首帧糊掉/降采样。详见
+# novelvideo/storage/asset_library.py 与 docs/agents/asset-library.md。
+AICF_ASSET_BASE_URL = os.environ.get("AICF_ASSET_BASE_URL", "").strip()
+AICF_ASSET_TOKEN = os.environ.get("AICF_ASSET_TOKEN", "").strip()
+AICF_ASSET_LIBRARY_ENABLED = os.environ.get("AICF_ASSET_LIBRARY_ENABLED", "").strip()
+AICF_ASSET_LIBRARY_CONFIG_PATH = os.environ.get(
+    "AICF_ASSET_LIBRARY_CONFIG_PATH", ""
+).strip()
+AICF_ASSET_LIBRARY_LEDGER_PATH = os.environ.get(
+    "AICF_ASSET_LIBRARY_LEDGER_PATH", ""
+).strip()
+AICF_ASSET_TIMEOUT_SECONDS = int(os.environ.get("AICF_ASSET_TIMEOUT_SECONDS", "60"))
+
 
 def get_style_labels() -> dict[str, str]:
     """获取风格 ID -> 显示标签的映射。

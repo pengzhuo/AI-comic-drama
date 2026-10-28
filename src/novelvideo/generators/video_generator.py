@@ -58,6 +58,7 @@ from novelvideo.video_request_usage import (
 )
 from novelvideo.generators.anchor_moderation import (
     describe_upstream_rejection,
+    is_input_image_sensitive_rejection,
     is_privacy_information_rejection,
     plan_anchor_variants,
 )
@@ -136,6 +137,10 @@ _VIDEO_EGRESS_ERROR_MESSAGES = {
     "EGRESS_OPERATION_REPLAYED": "video egress operation cannot be replayed",
     "EGRESS_OPERATION_TRANSITION_FAILED": "video egress operation transition failed",
 }
+
+# 「出片时长跟随输入视频」的厂商哨兵值（Seedance 视频编辑要求 duration 必须是 -1，
+# 配套 ratio=adaptive）。不是我们发明的魔法数，见 `_follows_source_video_output`。
+SOURCE_FOLLOWING_DURATION = -1
 
 
 class VideoEgressError(RuntimeError):
@@ -858,6 +863,29 @@ class SeedanceVideoGenerator(VideoGeneratorBase):
 #: （多参考通路）：审核过关了，首帧却不再是硬锁，画面可能漂移。运行器据此把
 #: 「严格首帧实际未生效」记进自检报告，避免静默降级。
 FALLBACK_MULTI_REFERENCE_LOG = "首帧改为参考图1（多参考通路），严格首帧未生效"
+
+#: 首帧改用素材库 ``asset://`` 引用后过审的日志标记。
+#:
+#: 上游对首帧位单独做真人隐私审核，但**把同一张图先登记进素材库再用 ``asset://``
+#: 引用就会放行**（2026-10-28 线上实测：同一张首帧直链 400
+#: ``InputImageSensitiveContentDetected.PrivacyInformation``，``asset://`` 一次通过）。
+#: 因此这一档排在降质阶梯之前：保住严格首帧、画质零损失。
+ASSET_LIBRARY_FIRST_FRAME_LOG = "首帧改用素材库引用（asset://），严格首帧已保住"
+
+
+@dataclass(frozen=True)
+class OptionalVideoCandidate:
+    """一档「锦上添花」的候选：被上游拒绝时必须继续降级，绝不让整镜失败。
+
+    素材库档位就是这种：它排在降质阶梯**之前**，成功则保住严格首帧与画质；一旦它
+    自己被拒（登记挂掉、网关不认 ``asset://``、上游给出别的 4xx/5xx……），都必须
+    退回后面既有的降质/多参考档位，而不是把「本来靠降质能过」的一镜直接打死。
+    """
+
+    build: Callable[[], Any]
+
+    def __call__(self) -> Any:
+        return self.build()
 
 
 def _moderation_sanitized_candidate(candidate: dict) -> dict | None:
@@ -1599,6 +1627,36 @@ class HuimengVideoGenerator(VideoGeneratorBase):
     def _is_happyhorse_model(self) -> bool:
         return self.model.strip().lower() == "happyhorse-1.0"
 
+    @staticmethod
+    def _relay_local_media_url(path: str) -> str | None:
+        """把本地媒体传到媒体中继，换一个上游能抓的 HTTP URL；失败返回 ``None``。
+
+        ``human_review`` 要求 HTTP(S) 媒体：本部署只配了 ``OSS_RELAY_*``（中继桶），
+        没有 ``OSS_ENDPOINT/OSS_BUCKET/OSS_ACCESS_KEY_*``，所以
+        :func:`presign_or_upload_output` 恒返回 ``None``。这里退回媒体中继。
+        """
+
+        from novelvideo.storage.media_relay import upload_media_bytes
+
+        local = Path(str(path))
+        try:
+            data = local.read_bytes()
+        except OSError as exc:
+            logger.debug("媒体中继上传失败（读文件）：%s（%s）", path, exc)
+            return None
+        ext = (local.suffix.lstrip(".") or "png").lower()
+        if ext in {"mp4", "mov", "webm", "mkv", "avi"}:
+            resource_type = "video"
+        elif ext in {"mp3", "wav", "m4a", "aac", "flac", "ogg"}:
+            resource_type = "audio"
+        else:
+            resource_type = "image"
+        try:
+            return upload_media_bytes(data, ext=ext, resource_type=resource_type)
+        except Exception as exc:  # noqa: BLE001 - 中继不可用只该回退，不该炸整条链路
+            logger.debug("媒体中继上传失败：%s（%s）", path, exc)
+            return None
+
     def _to_upload_url(
         self,
         value: str | None,
@@ -1625,14 +1683,21 @@ class HuimengVideoGenerator(VideoGeneratorBase):
             if require_http_url:
                 from novelvideo.utils.oss_client import presign_or_upload_output
 
-                oss_url = presign_or_upload_output(text)
-                if not oss_url:
+                http_url = presign_or_upload_output(text)
+                if http_url:
+                    log(f"{label}已上传/复用 OSS URL")
+                    return http_url
+                # 本部署只配了媒体中继（OSS_RELAY_*），没有 OSS_ENDPOINT/BUCKET/AK/SK，
+                # presign_or_upload_output 恒为 None；退回媒体中继，别把 human_review
+                # 卡成「本地文件一律不可用」。
+                http_url = self._relay_local_media_url(text)
+                if not http_url:
                     raise ValueError(
-                        "human_review requires OSS presigned HTTP media URLs. "
+                        "human_review requires HTTP/HTTPS media URLs. "
                         f"Failed to upload or presign local file: {text}"
                     )
-                log(f"{label}已上传/复用 OSS URL")
-                return oss_url
+                log(f"{label}已上传媒体中继（OSS 预签名不可用）")
+                return http_url
             log(f"{label}已转换为 data URL")
             return local_file_to_data_url(text)
         raise FileNotFoundError(f"{label} not found: {text}")
@@ -2260,6 +2325,65 @@ class NewApiVideoGenerator(VideoGeneratorBase):
 
         return _build
 
+    @staticmethod
+    def _asset_name_for_frame(image_path: str) -> str:
+        """从首帧路径派生一个可读的素材名（上游素材库里能一眼认出属于哪一镜）。"""
+
+        try:
+            parts = [part for part in Path(str(image_path)).parts[-4:] if part]
+        except (TypeError, ValueError):
+            parts = []
+        name = "-".join(parts)
+        suffix = Path(name).suffix
+        if suffix:
+            # 只去掉最后一段的扩展名；无扩展名时 suffix 为空串，
+            # ``endswith("")`` 恒真会把整个名字吞掉。
+            name = name[: -len(suffix)]
+        return (name or Path(str(image_path)).name or "first-frame")[:180]
+
+    @staticmethod
+    def _asset_library_first_frame_candidate_factory(
+        *,
+        image_path: str,
+        asset_name: str,
+        payload: dict,
+        metadata: dict,
+        wire: Callable[[dict, dict], dict],
+        log: Callable[[str], None],
+    ) -> Callable[[], Any]:
+        """构造一档**惰性**「首帧改用素材库 asset:// 引用」的候选。
+
+        惰性同样关键：登记会在上游账号里留下持久素材，不该为每一镜都做。只有前档
+        原图真的被上游按真人隐私拒绝、轮到这一档时才去登记。
+
+        登记失败一律回退：返回原样直链候选（会被再拒一次），后续降质阶梯与多参考
+        兜底照旧生效 —— 素材库是「优先档」，不是新的必失败点。
+        """
+
+        async def _build() -> dict:
+            from novelvideo.storage.asset_library import ensure_asset_uri
+
+            try:
+                relayed = await NewApiVideoGenerator._relay_frame_input(image_path)
+                asset_uri = await asyncio.to_thread(
+                    ensure_asset_uri,
+                    image_path,
+                    public_url=relayed,
+                    name=asset_name,
+                    log=log,
+                )
+            except Exception as exc:
+                log(f"素材库登记不可用（{exc}），回退首帧降质阶梯…")
+                return wire(dict(payload), metadata)
+
+            asset_metadata = dict(metadata)
+            asset_metadata["image_url"] = asset_uri
+            asset_payload = dict(payload)
+            asset_payload["metadata"] = asset_metadata
+            return wire(asset_payload, asset_metadata)
+
+        return OptionalVideoCandidate(_build)
+
     async def _submit_video_candidates(
         self,
         url: str,
@@ -2272,14 +2396,21 @@ class NewApiVideoGenerator(VideoGeneratorBase):
     ) -> tuple[dict, dict]:
         """按顺序提交候选请求体，遇到「明确的客户端拒绝」再降级重试。
 
-        降级只发生在 4xx，且**只针对两种可解释的拒绝**：首帧真人隐私审核（换图片
-        通路）与提示词文本审核（换提示词）。其它 4xx（参数/几何/配额/其它审核子类）
-        降级也救不回来，直接抛出原始原因；5xx、超时等不确定失败同理，一律交上层重试
-        与对账处理。
+        降级只发生在 4xx，且**只针对两种可解释的拒绝**：首帧图审核（先改用素材库
+        ``asset://`` 引用，再降质、最后换图片通路）与提示词文本审核（换提示词）。
+        其它 4xx（参数/几何/配额/其它审核子类）降级也救不回来，直接抛出原始原因；
+        5xx、超时等不确定失败同理，一律交上层重试与对账处理。
+
+        首帧图审核分两种：上游明说「含真人隐私」时逐档降质（``is_privacy_information_rejection``）；
+        线上更常见的是只剩光杆 ``InputImageSensitiveContentDetected`` 的**画面内容敏感**拒绝
+        —— 这种只允许前进到素材库 ``asset://`` 档（``is_input_image_sensitive_rejection``）：
+        糊一版并不能让「内容敏感」变得不敏感，却可能真的过审、拿画质换一次侥幸，所以不做降质。
 
         候选既可以是请求体 ``dict``，也可以是返回请求体的可调用对象（惰性候选：
         只有真正轮到它时才做本地图像变换与媒体上传，见首帧审核降级阶梯）。``labels``
         与候选一一对应，降级时用它说明「这一档为什么被换掉、换成了什么」。
+        :class:`OptionalVideoCandidate` 包起来的候选是「锦上添花」档：它自己被拒
+        （无论 4xx/5xx）都继续降级，不会让整镜失败。
 
         除图片通路降级外，若最后一档被「提示词文本内容审核」拒绝，再补一档
         **只换提示词**的候选（图片通路不变），避免同一段敏感表述把重跑必然打死。
@@ -2299,7 +2430,11 @@ class NewApiVideoGenerator(VideoGeneratorBase):
         sanitized: dict | None = None
         index = 0
         while index < len(work):
-            candidate = work[index]
+            entry = work[index]
+            # 「锦上添花」档（如素材库 asset://）：它自己被拒也必须继续降级，
+            # 不能因为它失败而把整镜打死。
+            optional_rung = isinstance(entry, OptionalVideoCandidate)
+            candidate = entry
             if callable(candidate):
                 candidate = candidate()
             if inspect.isawaitable(candidate):
@@ -2321,6 +2456,32 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                     isinstance(status_code, int) and 400 <= status_code < 500
                 )
                 reason = describe_upstream_rejection(str(exc))
+                privacy_rejected = is_privacy_information_rejection(str(exc))
+                # 输入图内容敏感（线上应用通路的真实报文就是这种光杆形态）：只有素材库
+                # asset:// 档值得试，降质阶梯对「内容本身敏感」没有意义。
+                input_image_rejected = (
+                    client_rejected and is_input_image_sensitive_rejection(str(exc))
+                )
+                # 「锦上添花」档（素材库 asset://）自身被拒时一律继续降级：登记挂掉、
+                # 网关不认 asset:// 给出别的 4xx、上游 5xx、甚至文本审核，都不能让
+                # 原本靠降质/多参考能过的一镜直接失败。
+                if optional_rung and index < len(work) - 1:
+                    if input_image_rejected and not privacy_rejected:
+                        # 素材库档自己也被判「输入图敏感」：再往下就是降质阶梯，糊一版
+                        # 并不能让敏感内容变得不敏感，只会拿画质换一次侥幸过审。
+                        raise NewApiVideoError(
+                            "首帧图被上游内容审核拒绝，素材库 asset:// 档也没被接受"
+                            "（降质救不了内容本身），请调整本 beat 的画面或首帧后重试。"
+                            f"原始错误：{str(exc)[:300]}",
+                            request_id=getattr(exc, "request_id", ""),
+                            status_code=status_code,
+                        ) from exc
+                    log(
+                        f"{label_for(index, '锦上添花档位')}被上游拒绝"
+                        f"（HTTP {status_code}：{reason}），继续降级重试…"
+                    )
+                    index += 1
+                    continue
                 # 先按拒绝原因分流：提示词审核换提示词，首帧隐私审核换图片通路。
                 # 只有明确的客户端拒绝（4xx）才可能降级。
                 text_moderated = client_rejected and is_text_moderation_rejection(
@@ -2353,12 +2514,27 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                 can_fallback = (
                     index < len(work) - 1
                     and client_rejected
-                    and is_privacy_information_rejection(str(exc))
+                    and privacy_rejected
                 )
                 if can_fallback:
                     log(
                         f"{label_for(index, '当前输入参数')}被上游拒绝"
                         f"（HTTP {status_code}：{reason}），自动降级重试…"
+                    )
+                    index += 1
+                    continue
+                # 线上更常见的一类首帧拒绝：只剩光杆 ``InputImageSensitiveContentDetected``
+                # 的「画面内容敏感」。这类只前进到素材库 asset:// 档（登记过的素材上游放行、
+                # 首帧与画质都不受影响），不降质。
+                if (
+                    input_image_rejected
+                    and index + 1 < len(work)
+                    and isinstance(work[index + 1], OptionalVideoCandidate)
+                ):
+                    log(
+                        f"{label_for(index, '当前输入参数')}被上游内容审核拒绝"
+                        f"（HTTP {status_code}：{reason}），"
+                        f"改用素材库 asset:// 引用重试…"
                     )
                     index += 1
                     continue
@@ -2696,6 +2872,55 @@ class NewApiVideoGenerator(VideoGeneratorBase):
     def _is_grok_video_channel_model(self) -> bool:
         return self.model.strip().lower() == "grok-video-channel"
 
+    def _follows_source_video_output(self, mode: object) -> bool:
+        """Seedance 视频编辑：出片的比例和时长由输入视频决定，不能自己指定。
+
+        厂商对这类任务硬校验，指定了就整单打回::
+
+            [InvalidParameter.TaskTypeConstraint] ... Seedance identified your task
+            as video editing based on your prompt. For this task type, the output
+            ratio and duration follow the input video ...
+            Issues: [0] `ratio` must be `adaptive`. [1] `duration` must be -1.
+
+        `adaptive` / `-1` 就是厂商用来表达「这两项不传、跟随原片」的写法，所以这里
+        不是塞两个魔法值上去，而是把用户在界面上选的比例 / 时长挡在外面。
+
+        只认 Seedance 系：HappyHorse 的视频编辑走它自己那套参数，照常带比例和时长。
+        """
+
+        if str(mode or "").strip() not in {"videoEdit", "video_edit"}:
+            return False
+        return self.model.strip().lower().startswith("seedance-")
+
+    def _apply_seedance_source_video_ratio(self, payload: dict) -> dict:
+        """Seedance 带输入视频时，「跟随输入」的比例要按厂商原词发 `adaptive`。
+
+        规范契约把跟随输入写成 `auto`，网关方舟适配器把 metadata.ratio 原样透传，
+        而 Seedance 的比例枚举里没有 `auto`。纯首帧任务厂商不深究，但它按提示词
+        把任务识别成视频编辑 / 视频延长（画布「智能续写」）时会硬校验::
+
+            Issues: [0] `ratio` must be `adaptive`.
+
+        所以只在「Seedance + 比例已是 auto + 带参考视频」时换成 `adaptive`；
+        用户明确选了比例、或没有视频输入的请求一律不动。必须放在所有契约规范化
+        之后调用，否则会被重新折回 `auto`。
+        """
+
+        if not self.model.strip().lower().startswith("seedance-"):
+            return payload
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return payload
+        if str(metadata.get("ratio") or "").strip().lower() != "auto":
+            return payload
+        videos = metadata.get("reference_videos")
+        if not isinstance(videos, list) or not any(
+            isinstance(url, str) and url.strip() for url in videos
+        ):
+            return payload
+        metadata["ratio"] = "adaptive"
+        return payload
+
     @staticmethod
     def _happyhorse_ratio(value: str | None) -> str:
         text = str(value or "").strip()
@@ -2812,6 +3037,10 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                     if duration_number.is_integer()
                     else duration_number
                 )
+            elif int(duration_number) == SOURCE_FOLLOWING_DURATION:
+                # 视频编辑的哨兵：必须**显式**发 -1。整个字段删掉的话网关会补一个默认
+                # 时长上去，厂商照样以 `duration` must be -1 打回。
+                payload["duration"] = SOURCE_FOLLOWING_DURATION
 
         first_frame = ""
         for key in ("first_frame_image", "image_url"):
@@ -3493,6 +3722,17 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             metadata["return_last_frame"] = bool(
                 seedance2_config.get("return_last_frame", False)
             )
+            if self._follows_source_video_output(requested_mode):
+                metadata["ratio"] = "adaptive"
+                # 走 payload["seconds"]，与上面的常规路径同一个入口；
+                # `_canonicalize_video_payload` 认得这个 -1 并原样发出去。
+                payload["seconds"] = str(SOURCE_FOLLOWING_DURATION)
+                log(
+                    lmsg(
+                        "tasks.log.videoGen.editFollowsSource",
+                        "视频编辑：比例与时长跟随原片（不下发用户所选值）",
+                    )
+                )
         elif self._is_happyhorse_model():
             if len(prompt) > 2500:
                 prompt = prompt[:2500]
@@ -3836,10 +4076,26 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                     body, media_type="video"
                 )
                 body = enforce_newapi_video_duration_contract(body)
-                return body
+                return self._apply_seedance_source_video_ratio(body)
 
             wire_candidates = [_wire_payload(payload, metadata)]
             wire_labels = ["首帧原图"]
+            from novelvideo.storage.asset_library import asset_library_enabled
+
+            if image_path and asset_library_enabled():
+                # 素材库优先于降质阶梯：登记过的素材走 asset:// 引用时上游放行真人
+                # 隐私审核，严格首帧与画质都不受影响。
+                wire_candidates.append(
+                    self._asset_library_first_frame_candidate_factory(
+                        image_path=image_path,
+                        asset_name=self._asset_name_for_frame(image_path),
+                        payload=payload,
+                        metadata=metadata,
+                        wire=_wire_payload,
+                        log=log,
+                    )
+                )
+                wire_labels.append(ASSET_LIBRARY_FIRST_FRAME_LOG)
             for variant in anchor_ladder_variants:
                 wire_candidates.append(
                     self._anchor_variant_candidate_factory(

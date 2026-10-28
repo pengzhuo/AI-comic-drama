@@ -83,6 +83,26 @@ def is_privacy_information_rejection(message: str) -> bool:
     return any(marker in text for marker in PRIVACY_REJECTION_MARKERS)
 
 
+def is_input_image_sensitive_rejection(message: str) -> bool:
+    """Return whether an upstream rejection is about the **input image** itself.
+
+    线上实测：应用链路看到的首帧审核拒绝全是光杆 ``InputImageSensitiveContentDetected``
+    与 ``input image 'content[0]' may contain sensitive information``；同一批帧直连上游
+    登记素材（不经网关）也是同样文案 —— 所以光杆形态不是网关抹掉子类的产物，而是 Ark
+    对「画面内容敏感」本来就回光杆，``.PrivacyInformation`` / 「may contain real person」
+    只在隐私分类器命中时出现。只认隐私子类的话，这一整类首帧拒绝在线上就走不进任何
+    兜底（素材库 asset:// 档、降质阶梯都挨不到）。
+
+    与输出档拒绝刻意区分：成片审核拒绝的 code 是 ``upstream_task_failed``，文案是
+    ``the output video ...``，语义是「生成结果敏感」，改输入图救不回来。
+    """
+
+    text = str(message or "")
+    if "output video" in text:
+        return False
+    return "InputImageSensitiveContentDetected" in text
+
+
 def _innermost_code(payload: object, _depth: int = 0) -> str:
     """从（可能多层 JSON 转义的）上游错误体里取最内层的 ``code``。"""
 
@@ -280,6 +300,7 @@ __all__ = [
     "AnchorVariant",
     "describe_upstream_rejection",
     "extract_upstream_code",
+    "is_input_image_sensitive_rejection",
     "is_privacy_information_rejection",
     "materialize_anchor_variant",
     "plan_anchor_variants",
