@@ -1076,7 +1076,9 @@ function DeleteDialog({
   );
 }
 
-function ProjectDashboard() {
+// 导出给双入口实例的 `/console`（`src/routes/_app/console.tsx`）复用：内部端
+// 首页只有一个实现，两个路径共用它，避免复制 1400 行。
+export function ProjectDashboard() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const router = useRouter();

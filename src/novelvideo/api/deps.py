@@ -140,14 +140,35 @@ def may_run_asset_repair(ctx: ProjectContext | None) -> bool:
     return role_allows(getattr(ctx, "effective_role", "") or "", PROJECT_ROLE_EDITOR)
 
 
+#: 项目名允许的字符：Unicode 字母/数字/下划线（含中文）。项目名会被直接用
+#: 作 ``OUTPUT_DIR/<user>/<name>`` 与 ``STATE_DIR/<user>/<name>`` 的目录名，
+#: 所以只放行对文件系统安全的字符。
+_PROJECT_NAME_ALLOWED_RE = re.compile(
+    r"^[\w\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+$", re.UNICODE
+)
+#: 双保险黑名单：任何可能改变路径语义的字符。``\w`` 已排除大部分，这里显式
+#: 挡掉路径分隔符、通配符、控制字符与 ``.``，避免「..」穿越与路径歧义。
+_PROJECT_NAME_FORBIDDEN = frozenset('/\\:*?"<>|. \t\n\r\x00\x7f')
+
+
 def validate_project_name(name: str):
-    """验证项目名称格式。"""
+    """验证项目名称格式（允许中文等 Unicode 字母）。
+
+    历史上只接受 ``[a-zA-Z0-9_]``；中文剧名会被直接拒掉。项目名同时是目录名
+    与展示名，URL 用的是项目 id，所以放开到 Unicode 字母/数字/下划线是安全的，
+    只要堵住路径分隔符、控制字符与 ``..``。
+    """
     if len(name) > 64:
         raise HTTPException(
             status_code=400,
             detail="Project name must be at most 64 characters long",
         )
-    if not name or not re.match(r"^[a-zA-Z0-9_]+$", name):
+    if (
+        not name
+        or not _PROJECT_NAME_ALLOWED_RE.match(name)
+        or any(char in _PROJECT_NAME_FORBIDDEN for char in name)
+        or ".." in name
+    ):
         raise HTTPException(
             status_code=400,
             detail="Project name must contain only letters, digits, and underscores",

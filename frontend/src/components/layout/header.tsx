@@ -35,6 +35,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@/stores/auth-store";
 import { useAppStore } from "@/stores/app-store";
 import { authRequired, isCeRuntime, phoneOtpEntryVisible } from "@/lib/runtime-config";
+import { internalHomePath } from "@/lib/app-mode";
 import { resetUserSessionState } from "@/lib/reset-region-state";
 import { useModelGatewayConfig } from "@/lib/queries/model-gateway";
 import { useOrgBranding } from "@/lib/queries/org-branding";
@@ -317,7 +318,7 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
               <TooltipTrigger
                 render={
                   <Link
-                    to="/"
+                    to={internalHomePath()}
                     aria-label={homeLinkLabel}
                     className="flex min-w-0 shrink-0 items-center"
                   />

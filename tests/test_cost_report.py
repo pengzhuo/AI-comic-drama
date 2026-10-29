@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -659,3 +660,209 @@ def test_relay_billing_client_relogins_on_expired_token():
     assert client.task_quotas() == {"up-task-1": 7}
     logins = [call for call in relay.calls if "/api/user/login" in call]
     assert len(logins) == 2  # 首次登录 + 401 后重登
+
+
+def _cost_report_client(tmp_path, monkeypatch, project_dir):
+    """带项目解析桩的 TestClient，state_dir 指向项目目录（即 data.db 所在处）。"""
+    from novelvideo.api.routes import cost_report
+
+    async def fake_resolve(project, user, *, required_role="viewer", media_read=False):
+        return SimpleNamespace(
+            ctx=SimpleNamespace(project_id="proj_demo"),
+            username="alice",
+            project_name="demo",
+            project_dir=project_dir,
+            output_dir=str(project_dir),
+            state_dir=str(project_dir),
+            runtime_dir=str(tmp_path / "runtime"),
+        )
+
+    monkeypatch.setattr(cost_report, "resolve_project_scope", fake_resolve)
+    cost_report._reconcile_last_run.clear()
+
+    app = FastAPI()
+    app.include_router(cost_report.router, prefix="/api/v1")
+    app.dependency_overrides[cost_report.get_api_user] = lambda: {"username": "alice"}
+    return TestClient(app), cost_report
+
+
+def test_cost_report_reconcile_route_backfills_gateway_quota(tmp_path, monkeypatch):
+    """POST .../cost-report/reconcile 增量回填 cost_quota 并返回刷新后的明细。"""
+    from novelvideo import gateway_cost_reconcile
+
+    project_dir = _seed_project(tmp_path)
+    gateway_db = tmp_path / "one-api.db"
+    _write_gateway_db(gateway_db)
+    monkeypatch.setattr(
+        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
+    )
+
+    client, _ = _cost_report_client(tmp_path, monkeypatch, project_dir)
+
+    before = client.get(
+        "/api/v1/projects/demo/cost-report", params={"episode": 1}
+    ).json()["data"]
+    assert before["totals"]["quota"] == 0
+    assert before["unattributed"]["requests"] == 4
+
+    response = client.post(
+        "/api/v1/projects/demo/cost-report/reconcile", params={"episode": 1}
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+
+    assert data["reconcile"]["applied"] is True
+    assert data["reconcile"]["skipped"] is False
+    assert data["reconcile"]["source"] == "gateway"
+    assert data["reconcile"]["matched"] == 3
+    assert data["reconcile"]["errors"] == []
+
+    # 视频 1000 + 图片 200 + 文本 50；音频无网关单号仍归入未归因。
+    assert data["totals"]["quota"] == 1250
+    assert data["totals"]["cny"] == pytest.approx(
+        data["totals"]["usd"] * data["usd_cny_rate"]
+    )
+    assert data["unattributed"]["requests"] == 1
+    assert data["unattributed"]["by_kind"]["audio"] == 1
+    models = {item["model"]: item["quota"] for item in data["by_model"]}
+    assert models["seedance-2.0-fast"] == 1000
+    assert models["LingShan-G2"] == 200
+    assert models["DC-hermes-LLM"] == 50
+
+    # 第二次调用命中去抖窗口：不再重复对账，但报表照样返回。
+    second = client.post(
+        "/api/v1/projects/demo/cost-report/reconcile", params={"episode": 1}
+    ).json()["data"]
+    assert second["reconcile"]["skipped"] is True
+    assert second["totals"]["quota"] == 1250
+
+    forced = client.post(
+        "/api/v1/projects/demo/cost-report/reconcile",
+        params={"episode": 1, "force": "true"},
+    ).json()["data"]
+    assert forced["reconcile"]["skipped"] is False
+
+
+def test_director_auto_episode_cost_hook_applies_quota(tmp_path, monkeypatch):
+    """一集成片落盘后 coordinator 自动结算，无需用户操作。"""
+    from novelvideo import gateway_cost_reconcile
+    from novelvideo.chat import director_auto
+    from novelvideo.chat.director_auto import (
+        DirectorAutoCoordinator,
+        DirectorAutoRun,
+        DirectorAutoStore,
+    )
+    from novelvideo.project_context import ProjectContext
+
+    project_dir = _seed_project(tmp_path)
+    gateway_db = tmp_path / "one-api.db"
+    _write_gateway_db(gateway_db)
+    monkeypatch.setattr(
+        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
+    )
+
+    ctx = ProjectContext(
+        project_id="proj_demo",
+        project_name="demo",
+        owner_type="user",
+        owner_id="user-1",
+        owner_username="alice",
+        requester_user_id="user-1",
+        requester_username="alice",
+        requester_principals=(("user", "user-1"),),
+        effective_role="owner",
+        home_node_id="local",
+        output_dir=project_dir,
+        state_dir=project_dir,
+        runtime_dir=tmp_path / "runtime",
+        is_home_node=True,
+    )
+    run = DirectorAutoRun(
+        run_id="run-1",
+        username="alice",
+        project_id="proj_demo",
+        episode=1,
+        status="running",
+        activated_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        context_json=director_auto._serialize_context(ctx),
+        baseline_task_ids=(),
+        handled_task_ids=(),
+        scope="project",
+        driver="deterministic",
+    )
+    coordinator = DirectorAutoCoordinator(
+        store=DirectorAutoStore(tmp_path / "director-auto.db")
+    )
+
+    asyncio.run(coordinator._reconcile_episode_cost(run))
+
+    conn = sqlite3.connect(project_dir / "data.db")
+    quota = conn.execute(
+        "SELECT cost_quota FROM video_request_usage WHERE request_id = 'task-1'"
+    ).fetchone()[0]
+    conn.close()
+    assert quota == 1000
+
+
+def test_director_auto_episode_cost_hook_never_raises(tmp_path, monkeypatch):
+    """网关账单库不可用时只记日志，绝不把成片流程拖垮。"""
+    from novelvideo import gateway_cost_reconcile
+    from novelvideo.chat import director_auto
+    from novelvideo.chat.director_auto import (
+        DirectorAutoCoordinator,
+        DirectorAutoRun,
+        DirectorAutoStore,
+    )
+    from novelvideo.project_context import ProjectContext
+
+    project_dir = _seed_project(tmp_path)
+    monkeypatch.setattr(
+        gateway_cost_reconcile,
+        "NEWAPI_BILLING_DB_PATH",
+        str(tmp_path / "missing-one-api.db"),
+    )
+
+    ctx = ProjectContext(
+        project_id="proj_demo",
+        project_name="demo",
+        owner_type="user",
+        owner_id="user-1",
+        owner_username="alice",
+        requester_user_id="user-1",
+        requester_username="alice",
+        requester_principals=(("user", "user-1"),),
+        effective_role="owner",
+        home_node_id="local",
+        output_dir=project_dir,
+        state_dir=project_dir,
+        runtime_dir=tmp_path / "runtime",
+        is_home_node=True,
+    )
+    run = DirectorAutoRun(
+        run_id="run-1",
+        username="alice",
+        project_id="proj_demo",
+        episode=1,
+        status="running",
+        activated_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        context_json=director_auto._serialize_context(ctx),
+        baseline_task_ids=(),
+        handled_task_ids=(),
+    )
+    coordinator = DirectorAutoCoordinator(
+        store=DirectorAutoStore(tmp_path / "director-auto.db")
+    )
+
+    # ``reconcile`` 把「账单库读取失败」记进 report.errors 而不是抛出，
+    # 所以这里既不能抛异常，也不该写坏项目库。
+    asyncio.run(coordinator._reconcile_episode_cost(run))
+
+    conn = sqlite3.connect(project_dir / "data.db")
+    quota = conn.execute(
+        "SELECT cost_quota FROM video_request_usage WHERE request_id = 'task-1'"
+    ).fetchone()[0]
+    conn.close()
+    assert quota is None
+

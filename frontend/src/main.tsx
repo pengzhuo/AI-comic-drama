@@ -3,7 +3,7 @@
 import { StrictMode } from "react";
 import { RouterProvider, createRouter } from "@tanstack/react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { routeTree } from "./routeTree.gen";
+import { routeTree } from "@/router-tree";
 import { ThemeProvider } from "./components/theme-provider";
 import { loadClusterConfig } from "@/lib/cluster-config";
 import { isCeRuntime, loadRuntimeConfig } from "@/lib/runtime-config";

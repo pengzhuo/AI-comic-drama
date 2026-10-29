@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { presentOrganizationAccess } from "@/lib/org-access-state";
+import { internalHomePath } from "@/lib/app-mode";
 import { useOrgMe } from "@/lib/queries/org";
 
 export function AccessUnavailable() {
@@ -60,7 +61,7 @@ export function AccessUnavailable() {
             {t(reasonKey)}
           </p>
           <Link className="text-sm font-medium text-primary hover:underline"
-            to="/">
+            to={internalHomePath()}>
             {t("organization.access.back")}
           </Link>
         </CardContent>

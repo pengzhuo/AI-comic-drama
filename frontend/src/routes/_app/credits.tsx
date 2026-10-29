@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ClaymoreLab
 import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 
+import { internalHomePath } from "@/lib/app-mode";
 import { CreditCenterDialog } from "@/components/credits/CreditCenterDialog";
 import { paymentOrderNumberFromSearch } from "@/lib/payment-navigation";
 import { surfaceAccess, useProductSurfaces } from "@/lib/queries/product-surfaces";
@@ -18,7 +19,7 @@ export function CreditsPage() {
       initialTab="usage"
       paymentAvailable={paymentAvailable}
       onOpenChange={(open) => {
-        if (!open) void navigate({ to: "/", replace: true });
+        if (!open) void navigate({ to: internalHomePath(), replace: true });
       }}
     />
   );
@@ -26,7 +27,7 @@ export function CreditsPage() {
 
 export const Route = createFileRoute("/_app/credits")({
   beforeLoad: ({ location }) => {
-    if (isCeRuntime()) throw redirect({ to: "/", replace: true });
+    if (isCeRuntime()) throw redirect({ to: internalHomePath(), replace: true });
     const orderNo = paymentOrderNumberFromSearch(location.searchStr);
     if (orderNo) {
       // Old payment links are navigation hints, never proof of payment.

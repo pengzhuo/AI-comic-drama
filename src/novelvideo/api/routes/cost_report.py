@@ -18,8 +18,10 @@ relay`` 取上游中转站（真正收钱的一方）的真实账单 quota，``-
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +33,7 @@ from novelvideo.api.auth import get_api_user
 from novelvideo.api.deps import resolve_project_scope
 from novelvideo.audio_request_usage import get_audio_request_usage_db_path
 from novelvideo.config import QUOTA_PER_USD, REPORT_CURRENCY, USD_CNY_RATE
+from novelvideo.gateway_cost_reconcile import ReconcileReport, reconcile
 from novelvideo.image_request_usage import get_image_request_usage_db_path
 from novelvideo.llm_request_usage import get_llm_request_usage_db_path
 from novelvideo.video_request_usage import get_video_request_usage_db_path
@@ -328,5 +331,87 @@ async def get_project_cost_report(
         "id": resolution.ctx.project_id if resolution.ctx else project,
         "name": resolution.project_name,
         "owner": resolution.username,
+    }
+    return {"ok": True, "data": data}
+
+
+#: 同一项目在这个窗口内不重复跑对账。一集有几条请求、前端可能连点「重新结算」，
+#: 而每次对账都要读一遍网关账单库（量级 10^4 行），去抖掉重复调用即可。
+RECONCILE_DEBOUNCE_SECONDS = 20.0
+_reconcile_gate = asyncio.Lock()
+_reconcile_last_run: dict[str, float] = {}
+
+
+def project_usage_db(state_dir: str | Path) -> Path:
+    """项目用量库：``<state_dir>/data.db``（与 ``discover_project_dbs`` 同口径）。"""
+    return Path(state_dir) / "data.db"
+
+
+async def reconcile_project_usage(
+    state_dir: str | Path,
+    *,
+    force: bool = False,
+) -> tuple[ReconcileReport | None, bool]:
+    """按本地捏驿账单增量回填一个项目的 ``cost_quota``。
+
+    返回 ``(report, skipped)``：``skipped=True`` 表示命中去抖窗口、这次没跑对账。
+    只读网关账单库、只写本项目 ``data.db``；失败以 ``report.errors`` 形式返回，
+    不抛给请求方（费用报表本身仍然可读）。
+    """
+    db_path = project_usage_db(state_dir)
+    key = str(db_path)
+    async with _reconcile_gate:
+        last = _reconcile_last_run.get(key, 0.0)
+        if not force and (time.monotonic() - last) < RECONCILE_DEBOUNCE_SECONDS:
+            return None, True
+        _reconcile_last_run[key] = time.monotonic()
+    try:
+        report = await asyncio.to_thread(
+            reconcile, project_db=db_path, apply=True, source="gateway"
+        )
+    except Exception as exc:  # noqa: BLE001 - 对账失败不影响报表可读
+        logger.warning("cost reconcile failed for %s: %s", db_path, exc)
+        report = ReconcileReport(gateway_db=db_path, applied=False)
+        report.errors.append(str(exc))
+    return report, False
+
+
+@router.post("/projects/{project}/cost-report/reconcile")
+async def reconcile_project_cost_report(
+    project: str,
+    episode: int | None = Query(None, ge=1, description="只看某一集；缺省为全剧"),
+    force: bool = Query(False, description="忽略去抖窗口，强制重新对账"),
+    user: dict = Depends(get_api_user),
+):
+    """按本地捏驿账单增量对账并返回刷新后的报表。
+
+    每集合成完成后由 ``director_auto`` 自动触发一次（best-effort），前端「重新
+    结算」按钮走同一条路径。只读网关账单库、只写本项目 ``data.db``，不触达上游
+    中转站；``unattributed`` 为无网关单号的请求（如 TTS），如实回报。
+    """
+    resolution = await resolve_project_scope(project, user, required_role="editor")
+    report, skipped = await reconcile_project_usage(resolution.state_dir, force=force)
+    data = build_cost_report(
+        project_output_dir=resolution.output_dir,
+        episode=episode,
+    )
+    data["project"] = {
+        "id": resolution.ctx.project_id if resolution.ctx else project,
+        "name": resolution.project_name,
+        "owner": resolution.username,
+    }
+    data["reconcile"] = {
+        "skipped": skipped,
+        "applied": bool(report.applied) if report else False,
+        "source": report.source if report else "gateway",
+        "quota": report.quota if report else 0,
+        "usd": report.usd if report else 0.0,
+        "matched": sum(table.matched for item in report.projects for table in item.tables)
+        if report
+        else 0,
+        "rows": sum(table.rows for item in report.projects for table in item.tables)
+        if report
+        else 0,
+        "errors": list(report.errors) if report else [],
     }
     return {"ok": True, "data": data}

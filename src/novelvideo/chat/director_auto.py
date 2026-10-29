@@ -2057,6 +2057,38 @@ class DirectorAutoCoordinator:
             episodes = [ep for ep in episodes if ep <= run.target_episodes]
         return episodes[0] if episodes else None
 
+    async def _reconcile_episode_cost(self, run: DirectorAutoRun) -> None:
+        """一集成片落盘后，按本地捏驿账单增量结算费用（best-effort）。
+
+        只读网关账单库、只写本项目 ``data.db``；不需要用户操作，也不依赖上游
+        中转站。失败绝不影响成片流程——费用报表仍可读，只是这一集的 ``cost_quota``
+        还空着，前端会显示「结算中 / 未归因」。
+        """
+        try:
+            from novelvideo.gateway_cost_reconcile import reconcile
+
+            project_db = Path(run.context.state_dir) / "data.db"
+            report = await asyncio.to_thread(
+                reconcile, project_db=project_db, apply=True, source="gateway"
+            )
+        except Exception:  # noqa: BLE001 - 结算失败不阻塞成片
+            logger.warning(
+                "episode cost reconcile failed (run %s, episode %s)",
+                run.run_id,
+                run.episode,
+                exc_info=True,
+            )
+            return
+        matched = sum(table.matched for item in report.projects for table in item.tables)
+        logger.info(
+            "episode %s cost reconciled (run %s): matched=%s quota=%s errors=%s",
+            run.episode,
+            run.run_id,
+            matched,
+            report.quota,
+            report.errors or "-",
+        )
+
     async def _run(self, run_id: str, username: str, project_id: str) -> None:
         taskless_continuations = 0
         last_overlap_at = 0.0
@@ -2371,6 +2403,9 @@ class DirectorAutoCoordinator:
                     summary = f"✅ 本批 {len(terminal)} 个任务已完成。"
                 if compose is not None:
                     await self._notify(updated, f"{summary}正在展示第 {run.episode} 集成片。")
+                    # 成片落盘后立刻按本地捏驿账单结算这一集的费用，用户不用点任何
+                    # 按钮就能在本集卡片上看到金额明细。
+                    await self._reconcile_episode_cost(updated)
                     if updated.is_project_scope:
                         next_episode = await self._next_incomplete_episode(updated)
                         if next_episode is not None:

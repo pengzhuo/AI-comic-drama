@@ -11,14 +11,18 @@
 import { createFileRoute } from '@tanstack/react-router'
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as StudioRouteImport } from './routes/studio'
 import { Route as RechargeRouteImport } from './routes/recharge'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as CheckoutRouteImport } from './routes/checkout'
 import { Route as AppRouteImport } from './routes/_app'
+import { Route as StudioIndexRouteImport } from './routes/studio/index'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as WatchWorkRouteImport } from './routes/watch.$work'
+import { Route as StudioProjectRouteImport } from './routes/studio/$project'
 import { Route as AppPaymentReturnRouteImport } from './routes/_app/payment-return'
 import { Route as AppCreditsRouteImport } from './routes/_app/credits'
+import { Route as AppConsoleRouteImport } from './routes/_app/console'
 import { Route as AppAccessUnavailableRouteImport } from './routes/_app/access-unavailable'
 import { Route as AppProjectsProjectTasksRouteImport } from './routes/_app/projects.$project/tasks'
 import { Route as AppProjectsProjectStylesRouteImport } from './routes/_app/projects.$project/styles'
@@ -62,6 +66,11 @@ const DownloadLazyRoute = DownloadLazyRouteImport.update({
   path: '/download',
   getParentRoute: () => rootRouteImport,
 } as any).lazy(() => import('./routes/download.lazy').then((d) => d.Route))
+const StudioRoute = StudioRouteImport.update({
+  id: '/studio',
+  path: '/studio',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const RechargeRoute = RechargeRouteImport.update({
   id: '/recharge',
   path: '/recharge',
@@ -81,6 +90,11 @@ const AppRoute = AppRouteImport.update({
   id: '/_app',
   getParentRoute: () => rootRouteImport,
 } as any)
+const StudioIndexRoute = StudioIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => StudioRoute,
+} as any)
 const AppIndexRoute = AppIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -91,6 +105,11 @@ const WatchWorkRoute = WatchWorkRouteImport.update({
   path: '/watch/$work',
   getParentRoute: () => rootRouteImport,
 } as any)
+const StudioProjectRoute = StudioProjectRouteImport.update({
+  id: '/$project',
+  path: '/$project',
+  getParentRoute: () => StudioRoute,
+} as any)
 const AppPaymentReturnRoute = AppPaymentReturnRouteImport.update({
   id: '/payment-return',
   path: '/payment-return',
@@ -99,6 +118,11 @@ const AppPaymentReturnRoute = AppPaymentReturnRouteImport.update({
 const AppCreditsRoute = AppCreditsRouteImport.update({
   id: '/credits',
   path: '/credits',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppConsoleRoute = AppConsoleRouteImport.update({
+  id: '/console',
+  path: '/console',
   getParentRoute: () => AppRoute,
 } as any)
 const AppAccessUnavailableRoute = AppAccessUnavailableRouteImport.update({
@@ -247,11 +271,15 @@ export interface FileRoutesByFullPath {
   '/checkout': typeof CheckoutRoute
   '/login': typeof LoginRoute
   '/recharge': typeof RechargeRoute
+  '/studio': typeof StudioRouteWithChildren
   '/download': typeof DownloadLazyRoute
   '/access-unavailable': typeof AppAccessUnavailableRoute
+  '/console': typeof AppConsoleRoute
   '/credits': typeof AppCreditsRoute
   '/payment-return': typeof AppPaymentReturnRoute
+  '/studio/$project': typeof StudioProjectRoute
   '/watch/$work': typeof WatchWorkRoute
+  '/studio/': typeof StudioIndexRoute
   '/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
@@ -275,10 +303,13 @@ export interface FileRoutesByTo {
   '/recharge': typeof RechargeRoute
   '/download': typeof DownloadLazyRoute
   '/access-unavailable': typeof AppAccessUnavailableRoute
+  '/console': typeof AppConsoleRoute
   '/credits': typeof AppCreditsRoute
   '/payment-return': typeof AppPaymentReturnRoute
+  '/studio/$project': typeof StudioProjectRoute
   '/watch/$work': typeof WatchWorkRoute
   '/': typeof AppIndexRoute
+  '/studio': typeof StudioIndexRoute
   '/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
@@ -302,12 +333,16 @@ export interface FileRoutesById {
   '/checkout': typeof CheckoutRoute
   '/login': typeof LoginRoute
   '/recharge': typeof RechargeRoute
+  '/studio': typeof StudioRouteWithChildren
   '/download': typeof DownloadLazyRoute
   '/_app/access-unavailable': typeof AppAccessUnavailableRoute
+  '/_app/console': typeof AppConsoleRoute
   '/_app/credits': typeof AppCreditsRoute
   '/_app/payment-return': typeof AppPaymentReturnRoute
+  '/studio/$project': typeof StudioProjectRoute
   '/watch/$work': typeof WatchWorkRoute
   '/_app/': typeof AppIndexRoute
+  '/studio/': typeof StudioIndexRoute
   '/_app/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/_app/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/_app/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
@@ -332,11 +367,15 @@ export interface FileRouteTypes {
     | '/checkout'
     | '/login'
     | '/recharge'
+    | '/studio'
     | '/download'
     | '/access-unavailable'
+    | '/console'
     | '/credits'
     | '/payment-return'
+    | '/studio/$project'
     | '/watch/$work'
+    | '/studio/'
     | '/projects/$project/assistant'
     | '/projects/$project/episodes'
     | '/projects/$project/ingest'
@@ -360,10 +399,13 @@ export interface FileRouteTypes {
     | '/recharge'
     | '/download'
     | '/access-unavailable'
+    | '/console'
     | '/credits'
     | '/payment-return'
+    | '/studio/$project'
     | '/watch/$work'
     | '/'
+    | '/studio'
     | '/projects/$project/assistant'
     | '/projects/$project/episodes'
     | '/projects/$project/ingest'
@@ -386,12 +428,16 @@ export interface FileRouteTypes {
     | '/checkout'
     | '/login'
     | '/recharge'
+    | '/studio'
     | '/download'
     | '/_app/access-unavailable'
+    | '/_app/console'
     | '/_app/credits'
     | '/_app/payment-return'
+    | '/studio/$project'
     | '/watch/$work'
     | '/_app/'
+    | '/studio/'
     | '/_app/projects/$project/assistant'
     | '/_app/projects/$project/episodes'
     | '/_app/projects/$project/ingest'
@@ -415,6 +461,7 @@ export interface RootRouteChildren {
   CheckoutRoute: typeof CheckoutRoute
   LoginRoute: typeof LoginRoute
   RechargeRoute: typeof RechargeRoute
+  StudioRoute: typeof StudioRouteWithChildren
   DownloadLazyRoute: typeof DownloadLazyRoute
   WatchWorkRoute: typeof WatchWorkRoute
 }
@@ -426,6 +473,13 @@ declare module '@tanstack/react-router' {
       path: '/download'
       fullPath: '/download'
       preLoaderRoute: typeof DownloadLazyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/studio': {
+      id: '/studio'
+      path: '/studio'
+      fullPath: '/studio'
+      preLoaderRoute: typeof StudioRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/recharge': {
@@ -456,6 +510,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/studio/': {
+      id: '/studio/'
+      path: '/'
+      fullPath: '/studio/'
+      preLoaderRoute: typeof StudioIndexRouteImport
+      parentRoute: typeof StudioRoute
+    }
     '/_app/': {
       id: '/_app/'
       path: '/'
@@ -470,6 +531,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof WatchWorkRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/studio/$project': {
+      id: '/studio/$project'
+      path: '/$project'
+      fullPath: '/studio/$project'
+      preLoaderRoute: typeof StudioProjectRouteImport
+      parentRoute: typeof StudioRoute
+    }
     '/_app/payment-return': {
       id: '/_app/payment-return'
       path: '/payment-return'
@@ -482,6 +550,13 @@ declare module '@tanstack/react-router' {
       path: '/credits'
       fullPath: '/credits'
       preLoaderRoute: typeof AppCreditsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/console': {
+      id: '/_app/console'
+      path: '/console'
+      fullPath: '/console'
+      preLoaderRoute: typeof AppConsoleRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/access-unavailable': {
@@ -644,6 +719,7 @@ const AppProjectsProjectEpisodesRouteWithChildren =
 
 interface AppRouteChildren {
   AppAccessUnavailableRoute: typeof AppAccessUnavailableRoute
+  AppConsoleRoute: typeof AppConsoleRoute
   AppCreditsRoute: typeof AppCreditsRoute
   AppPaymentReturnRoute: typeof AppPaymentReturnRoute
   AppIndexRoute: typeof AppIndexRoute
@@ -659,6 +735,7 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppAccessUnavailableRoute: AppAccessUnavailableRoute,
+  AppConsoleRoute: AppConsoleRoute,
   AppCreditsRoute: AppCreditsRoute,
   AppPaymentReturnRoute: AppPaymentReturnRoute,
   AppIndexRoute: AppIndexRoute,
@@ -674,11 +751,25 @@ const AppRouteChildren: AppRouteChildren = {
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
 
+interface StudioRouteChildren {
+  StudioProjectRoute: typeof StudioProjectRoute
+  StudioIndexRoute: typeof StudioIndexRoute
+}
+
+const StudioRouteChildren: StudioRouteChildren = {
+  StudioProjectRoute: StudioProjectRoute,
+  StudioIndexRoute: StudioIndexRoute,
+}
+
+const StudioRouteWithChildren =
+  StudioRoute._addFileChildren(StudioRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
   AppRoute: AppRouteWithChildren,
   CheckoutRoute: CheckoutRoute,
   LoginRoute: LoginRoute,
   RechargeRoute: RechargeRoute,
+  StudioRoute: StudioRouteWithChildren,
   DownloadLazyRoute: DownloadLazyRoute,
   WatchWorkRoute: WatchWorkRoute,
 }

@@ -31,5 +31,8 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src"]
+  "include": ["src"],
+  // 客户端路由树（`vite build --mode client`）与被排除的内部路由不同名也不同型，
+  // 两棵树放在同一个 tsc 程序里会撞 `FileRoutesByPath` 声明。客户端构建不跑 tsc。
+  "exclude": ["src/client"]
 }

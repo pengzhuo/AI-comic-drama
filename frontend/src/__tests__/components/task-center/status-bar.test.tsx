@@ -125,4 +125,26 @@ describe("TaskStatusBar", () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it("renders the instance brand attribution when the env var is set", () => {
+    vi.stubEnv("VITE_BRAND_ATTRIBUTION", "基于(Dramaclaw)开发");
+    try {
+      renderBar();
+      expect(screen.getByTestId("brand-attribution")).toHaveTextContent("基于(Dramaclaw)开发");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("omits the brand attribution when the env var is unset", () => {
+    // Vanilla upstream builds leave the variable undefined; a blank value must
+    // behave the same so a stray empty .env entry cannot leave a gap.
+    vi.stubEnv("VITE_BRAND_ATTRIBUTION", "   ");
+    try {
+      renderBar();
+      expect(screen.queryByTestId("brand-attribution")).toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });

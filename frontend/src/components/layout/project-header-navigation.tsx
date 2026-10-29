@@ -24,6 +24,7 @@ import { isRememberedSection, useProjectNavStore } from "@/stores/project-nav-st
 import { useAllProjectSummaries } from "@/lib/queries/projects";
 import { getProjectCover } from "@/lib/project-cover";
 import { beginRouteSwitch } from "@/lib/route-switch-transition";
+import { internalHomePath } from "@/lib/app-mode";
 import { cn } from "@/lib/utils";
 import { surfaceAccess, useProductSurfaces } from "@/lib/queries/product-surfaces";
 import { SlidingTabs, type SlidingTabItem } from "@/components/nav/sliding-tabs";
@@ -132,7 +133,7 @@ export function ProjectSwitcher({ current }: { current: string }) {
       >
         <DropdownMenuGroup>
           <DropdownMenuItem
-            onClick={() => navigate({ to: "/" })}
+            onClick={() => navigate({ to: internalHomePath() })}
             className="min-h-8 gap-2 rounded-sm px-2 py-1.5 text-xs focus:bg-black/8 focus:text-current"
           >
             <ArrowLeft className="size-3.5" />

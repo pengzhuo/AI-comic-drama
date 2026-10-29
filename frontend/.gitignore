@@ -39,3 +39,6 @@ graphify-out/
 # Local docs editor state
 docs/.obsidian/
 /acceptance-logs
+
+# 客户端产物的路由树：`npm run build:client` 生成，只被 src/client 使用（不入库）
+src/client/routeTree.client.gen.ts

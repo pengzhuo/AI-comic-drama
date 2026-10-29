@@ -14,6 +14,7 @@ import { displayLabel } from "@/task-center/derivations";
 import { RegionBadge } from "@/components/layout/region-badge";
 import { FREEZONE_DOCK_OFFSET_ANIMATED_STYLE } from "@/features/freezone/dockOffset";
 import { APP_VERSION } from "@/lib/app-version";
+import { brandAttribution } from "@/lib/brand-attribution";
 import { pikoEntryHidden } from "@/lib/ui-hide-flags";
 import { cn } from "@/lib/utils";
 import type { StreamHealth, TaskState } from "@/task-center/types";
@@ -48,6 +49,9 @@ type TaskStatusBarProps = {
 
 export function TaskStatusBar({ onOpenPikoStation }: TaskStatusBarProps) {
   const { t } = useTranslation();
+  // Instance-level attribution ("基于(Dramaclaw)开发" on this deployment).
+  // Build-time constant read once per render; null on upstream builds.
+  const attribution = brandAttribution();
   // Subscribe to the tasks Map itself (stable reference unless updated) and
   // derive running/leading/last-completion via useMemo so each render does
   // not allocate a fresh array and feed Zustand's equality check a new object,
@@ -217,6 +221,16 @@ export function TaskStatusBar({ onOpenPikoStation }: TaskStatusBarProps) {
           {APP_VERSION}
         </span>
         <RegionBadge />
+        {attribution ? (
+          // 纯 span：整条 footer 本身是 role="button"（点开任务面板），这里不能再放
+          // 交互元素。hidden sm:inline 是防窄窗把 shrink-0 的右段挤爆。
+          <span
+            className="hidden shrink-0 whitespace-nowrap text-muted-foreground/80 sm:inline"
+            data-testid="brand-attribution"
+          >
+            {attribution}
+          </span>
+        ) : null}
       </div>
     </footer>
   );

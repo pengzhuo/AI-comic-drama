@@ -20,6 +20,7 @@ import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { ensureAuthenticatedForAppRoute } from "@/lib/auth-mode";
+import { internalHomePath } from "@/lib/app-mode";
 import { useAllProjectSummaries } from "@/lib/queries/projects";
 import { FreezoneCanvasHost } from "@/features/freezone/FreezoneCanvasHost";
 import { canonicalProjectRouteParam } from "@/lib/project-route";
@@ -201,7 +202,7 @@ function AppLayout() {
 
   useEffect(() => {
     if (routeProject && !projectSummaries.isLoading && canonicalProject === null) {
-      navigate({ to: "/", replace: true });
+      navigate({ to: internalHomePath(), replace: true });
     }
   }, [canonicalProject, navigate, projectSummaries.isLoading, routeProject]);
 

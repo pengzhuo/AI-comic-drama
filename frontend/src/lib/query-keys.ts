@@ -123,6 +123,8 @@ export const queryKeys = {
   tasks: (p?: string) => (p ? (["projects", p, "tasks"] as const) : (["tasks"] as const)),
   costReport: (p: string, episode?: number) =>
     ["projects", p, "cost-report", episode ?? null] as const,
+  costReportAll: (p: string) => ["projects", p, "cost-report"] as const,
+  directorAutoRun: (p: string) => ["projects", p, "director-auto"] as const,
   freezoneCanvases: (p: string) =>
     ["projects", p, "freezone", "canvases"] as const,
   freezoneProjectAssets: (p: string) =>

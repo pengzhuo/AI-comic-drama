@@ -65,13 +65,42 @@ const APP_VERSION = resolveAppVersion();
 const BUILD_ID = resolveBuildId();
 const DEFAULT_API_TARGET = "http://127.0.0.1:8780";
 
+/**
+ * 客户端产物（`--mode client`）要排除的路由**文件名**。
+ *
+ * 生成器是按 `dirent.name` 逐个匹配的（`new RegExp(pattern, "g").test(name)`，
+ * 目录也参与匹配，命中即整棵子树跳过），所以写 basename 前缀就够：
+ * `_app`（捏料/捏塘/捏镜/捏画/捏条/捏账 那一整棵）、`recharge`、`checkout`、
+ * `download.lazy`、`watch.$work`。保留 `__root.tsx` / `login.tsx` / `studio*`。
+ */
+const CLIENT_ROUTE_IGNORE_PATTERN = "^(_app|recharge|checkout|download|watch\\.)";
+
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), "");
+  const isClientBuild = mode === "client";
+  const modeEnv = loadEnv(mode, process.cwd(), "");
+  // 客户端构建复用 CE 的实例配置 —— 后端地址、UI 隐藏开关、署名文案全在
+  // `.env.ce[.local]` 里。但 Vite 只会把**本次 mode 的 env 文件 + process.env**
+  // 灌进 `import.meta.env`：光在配置里读一遍 `.env.ce*` 只能拿到 dev 代理用的
+  // 后端地址，隐藏开关不会生效（产物里会漏出 `api.github.com` 这类常量）。所以
+  // 把 CE 的 VITE_* 回灌进 process.env —— Vite 的 env 解析对 process.env 优先级
+  // 最高，正好等价于「CE 的值 + 本次 mode 的增量」。已经显式设置过的不覆盖。
+  const ceEnv = isClientBuild ? loadEnv("ce", process.cwd(), "VITE_") : {};
+  for (const [key, value] of Object.entries(ceEnv)) {
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+  const env = { ...ceEnv, ...modeEnv };
   const apiTarget = env.VITE_API_URL || DEFAULT_API_TARGET;
 
   return {
     plugins: [
-      TanStackRouterVite(),
+      isClientBuild
+        ? TanStackRouterVite({
+            routeFileIgnorePattern: CLIENT_ROUTE_IGNORE_PATTERN,
+            // 生成到 `src/client/`（已排除出 tsconfig）：内部树与客户端树都躺在
+            // 磁盘上，但永不进入同一个 tsc 程序，也不会互相覆盖。
+            generatedRouteTree: "./src/client/routeTree.client.gen.ts",
+          })
+        : TanStackRouterVite(),
       react(),
       tailwindcss(),
       {
@@ -95,9 +124,19 @@ export default defineConfig(({ mode }) => {
       __BUILD_ID__: JSON.stringify(BUILD_ID),
     },
     resolve: {
-      alias: {
-        "@": path.resolve(__dirname, "./src"),
-      },
+      // 数组形式：`^@/router-tree$` 必须排在 `@` 前面（alias 按顺序取第一个
+      // 前缀命中），否则 `@` 会先把 `@/router-tree` 吃掉。
+      alias: [
+        ...(isClientBuild
+          ? [
+              {
+                find: /^@\/router-tree$/,
+                replacement: path.resolve(__dirname, "./src/client/router-tree.ts"),
+              },
+            ]
+          : []),
+        { find: "@", replacement: path.resolve(__dirname, "./src") },
+      ],
     },
     // Split heavy shared deps out of the main chunk so the initial payload is
     // mostly app code; vendor bundles cache across deploys.
