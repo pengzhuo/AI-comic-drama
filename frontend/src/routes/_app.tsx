@@ -20,6 +20,8 @@ import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { ensureAuthenticatedForAppRoute } from "@/lib/auth-mode";
+import { fetchAccessSession, useAccessSession } from "@/lib/access-session";
+import { InternalKeyGate } from "@/features/access/internal-key-gate";
 import { internalHomePath } from "@/lib/app-mode";
 import { useAllProjectSummaries } from "@/lib/queries/projects";
 import { FreezoneCanvasHost } from "@/features/freezone/FreezoneCanvasHost";
@@ -52,6 +54,10 @@ export function shouldRedirectMissingUsernameToLogin(): boolean {
 function AppLayout() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const access = useAccessSession();
+  // 访问验证启用后，只有内部身份能看内部页面（客户 cookie / 匿名一律先过口令门）。
+  const accessInternal = Boolean(access?.enabled) && access?.kind === "internal";
+  const accessLocked = Boolean(access?.enabled) && !accessInternal;
   // `username` stands in for the old `apiKey` gate — the SPA is cookie-backed,
   // JS can no longer read the credential, so the login marker is username.
   const username = useAuthStore((s) => s.username);
@@ -107,7 +113,7 @@ function AppLayout() {
   useLayoutEffect(() => {
     endRouteSwitch();
   }, [resolvedPathname]);
-  const productSurfaces = useProductSurfaces(Boolean(username && validated));
+  const productSurfaces = useProductSurfaces(Boolean((username && validated) || accessInternal));
   const requiredSurfaceCode: ProductSurfaceCode | null = routeProject
     ? isAssistantPage
       ? "assistant"
@@ -147,15 +153,19 @@ function AppLayout() {
   }, [username, refreshAvatar]);
 
   useEffect(() => {
+    if (accessLocked) return;
     useRegionStore.getState().sanitizeAgainstConfig();
     if (clusterConfig.mode === "multi-region") {
       initObservability();
       const teardown = initRegionTabSync();
       return teardown;
     }
-  }, []);
+  }, [accessLocked]);
 
   useEffect(() => {
+    // 内部身份由访问验证签发（`st_internal`），不依赖浏览器登录态：真去查
+    // `/auth/me` 反而会在 auth_required=true 的实例上被弹回 /login。
+    if (accessLocked || accessInternal) return;
     if (!username) {
       if (shouldRedirectMissingUsernameToLogin()) {
         validatedUsernameRef.current = null;
@@ -198,13 +208,26 @@ function AppLayout() {
     return () => {
       cancelled = true;
     };
-  }, [username, navigate, validateSession]);
+  }, [accessLocked, accessInternal, username, navigate, validateSession]);
 
   useEffect(() => {
+    if (accessLocked) return;
     if (routeProject && !projectSummaries.isLoading && canonicalProject === null) {
       navigate({ to: internalHomePath(), replace: true });
     }
-  }, [canonicalProject, navigate, projectSummaries.isLoading, routeProject]);
+  }, [accessLocked, canonicalProject, navigate, projectSummaries.isLoading, routeProject]);
+
+  if (accessLocked) {
+    return (
+      <InternalKeyGate
+        hint={
+          access?.kind === "client"
+            ? "当前浏览器持有的是客户身份；内部工作台需要内部访问口令。"
+            : undefined
+        }
+      />
+    );
+  }
 
   if (
     routeProject &&
@@ -218,7 +241,7 @@ function AppLayout() {
     );
   }
 
-  if (!username || !validated) {
+  if (!accessInternal && (!username || !validated)) {
     return (
       <div className="flex h-dvh items-center justify-center">
         <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
@@ -318,6 +341,13 @@ export const Route = createFileRoute("/_app")({
   beforeLoad: async () => {
     if (clusterConfig.mode === "multi-region" && !getRegionCookie()) {
       throw redirect({ to: "/login", replace: true });
+    }
+    const access = await fetchAccessSession();
+    if (access.enabled) {
+      // 访问验证启用后内部端凭内部口令进入：口令门由组件渲染，这里先跳过登录态
+      // 判断（匿名请求 /auth/me 只会拿到一个没有权限的空身份）。持内部 cookie 的
+      // 浏览器同样不该走登录态，否则 auth_required=true 的实例会把人弹回 /login。
+      return;
     }
     if (!(await ensureAuthenticatedForAppRoute())) {
       throw redirect({ to: "/login", replace: true });

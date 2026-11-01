@@ -12,6 +12,57 @@ PROJECT_ROLE_EDITOR = "editor"
 PROJECT_ROLE_ADMIN = "admin"
 PROJECT_ROLE_OWNER = "owner"
 
+# Owner namespaces. ``user``/``local`` is the single-user CE identity; studio
+# link holders are scoped per phone number under ``client``. Keeping the
+# mapping here (rather than in a provider) lets the registry, the access port
+# and the request identity all agree on one spelling.
+OWNER_TYPE_USER = "user"
+OWNER_TYPE_CLIENT = "client"
+LOCAL_USER_ID = "local"
+ANONYMOUS_USER_ID = "anonymous"
+CLIENT_USER_PREFIX = "client:"
+
+
+def client_user_id(phone: str) -> str:
+    return f"{CLIENT_USER_PREFIX}{phone}"
+
+
+def is_client_user_id(user_id: str | None) -> bool:
+    return str(user_id or "").startswith(CLIENT_USER_PREFIX)
+
+
+def phone_from_client_user_id(user_id: str | None) -> str:
+    text = str(user_id or "")
+    return text[len(CLIENT_USER_PREFIX) :] if text.startswith(CLIENT_USER_PREFIX) else ""
+
+
+def owner_pair_from_user_id(user_id: str | None) -> tuple[str, str] | None:
+    """Map an API user id to the ``(owner_type, owner_id)`` it owns.
+
+    ``local`` -> ``("user", "local")``; ``client:<phone>`` ->
+    ``("client", "<phone>")``; anything else (``anonymous``, missing) -> ``None``
+    because such a requester owns nothing.
+    """
+    text = str(user_id or "").strip()
+    if not text:
+        return None
+    if text == LOCAL_USER_ID:
+        return (OWNER_TYPE_USER, LOCAL_USER_ID)
+    if text.startswith(CLIENT_USER_PREFIX):
+        phone = text[len(CLIENT_USER_PREFIX) :]
+        return (OWNER_TYPE_CLIENT, phone) if phone else None
+    return None
+
+
+def is_scoped_user_id(user_id: str | None) -> bool:
+    """Whether the requester is bound to its own projects (client/anonymous).
+
+    Used to answer 404 instead of 403 for foreign projects so their existence
+    is not disclosed to link holders.
+    """
+    text = str(user_id or "").strip()
+    return text == ANONYMOUS_USER_ID or is_client_user_id(text)
+
 ROLE_ORDER = {
     PROJECT_ROLE_VIEWER: 10,
     PROJECT_ROLE_EDITOR: 20,

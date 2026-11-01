@@ -12,7 +12,16 @@ from pathlib import Path
 import aiosqlite
 from ulid import ULID
 
-from novelvideo.ports.project import Principal, ProjectRecord
+from novelvideo.ports.project import (
+    LOCAL_USER_ID,
+    OWNER_TYPE_CLIENT,
+    OWNER_TYPE_USER,
+    PROJECT_ROLE_OWNER,
+    Principal,
+    ProjectRecord,
+    owner_pair_from_user_id,
+    phone_from_client_user_id,
+)
 from novelvideo.shared.project_dirs import default_project_dirs
 
 
@@ -145,18 +154,20 @@ class SQLiteProjectRegistry:
         owner_user_id: str,
         name: str,
     ) -> ProjectRecord | None:
-        if owner_user_id != "local" or not name:
+        pair = owner_pair_from_user_id(owner_user_id)
+        if pair is None or not name:
             return None
+        owner_type, owner_id = pair
         db = await self._connect()
         try:
             row = await _fetchone(
                 db,
                 """
                 SELECT * FROM projects
-                WHERE owner_type = 'user' AND owner_id = 'local' AND name = ?
+                WHERE owner_type = ? AND owner_id = ? AND name = ?
                   AND purged_at IS NULL
                 """,
-                (name,),
+                (owner_type, owner_id, name),
             )
         finally:
             await db.close()
@@ -175,6 +186,14 @@ class SQLiteProjectRegistry:
     ) -> ProjectRecord:
         if not owner_user_id or not name:
             raise ValueError("owner_user_id and name are required")
+        pair = owner_pair_from_user_id(owner_user_id)
+        if pair is None:
+            # Fail closed: an unmappable id must not silently own a project in
+            # the shared ``local`` namespace.
+            raise ValueError("owner_user_id does not map to a project owner")
+        owner_type, owner_id = pair
+        if not owner_username:
+            owner_username = phone_from_client_user_id(owner_user_id)
         owner_username = owner_username.strip() if owner_username else _local_username()
         default_output, default_state, default_runtime = default_project_dirs(owner_username, name)
         now = _now_iso()
@@ -189,10 +208,12 @@ class SQLiteProjectRegistry:
                         id, owner_type, owner_id, owner_username, name, home_node_id,
                         output_dir, state_dir, runtime_dir, status, created_at, updated_at
                     )
-                    VALUES (?, 'user', 'local', ?, ?, 'local', ?, ?, ?, 'active', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'local', ?, ?, ?, 'active', ?, ?)
                     """,
                     (
                         project_id,
+                        owner_type,
+                        owner_id,
                         owner_username,
                         name,
                         output_dir or default_output,
@@ -222,18 +243,40 @@ class SQLiteProjectRegistry:
         self,
         principals: list[tuple[str, str]],
     ) -> list[ProjectRecord]:
-        if ("user", "local") not in principals:
+        pairs = {(str(pair_type), str(pair_id)) for pair_type, pair_id in principals}
+        if not pairs:
+            # Deny-by-default: a requester with no owner mapping sees nothing.
+            return []
+        internal = (OWNER_TYPE_USER, LOCAL_USER_ID) in pairs
+        client_ids = (
+            []
+            if internal
+            else sorted(owner_id for owner_type, owner_id in pairs if owner_type == OWNER_TYPE_CLIENT and owner_id)
+        )
+        if not internal and not client_ids:
             return []
         db = await self._connect()
         try:
-            rows = await _fetchall(
-                db,
-                """
-                SELECT * FROM projects
-                WHERE owner_type = 'user' AND owner_id = 'local'
-                ORDER BY updated_at DESC
-                """
-            )
+            if internal:
+                rows = await _fetchall(
+                    db,
+                    """
+                    SELECT * FROM projects
+                    ORDER BY updated_at DESC
+                    """,
+                )
+            else:
+                placeholders = ", ".join("?" for _ in client_ids)
+                rows = await _fetchall(
+                    db,
+                    f"""
+                    SELECT * FROM projects
+                    WHERE owner_type = '{OWNER_TYPE_CLIENT}'
+                      AND owner_id IN ({placeholders})
+                    ORDER BY updated_at DESC
+                    """,
+                    tuple(client_ids),
+                )
         finally:
             await db.close()
         return [_row_to_record(row) for row in rows]
@@ -292,10 +335,13 @@ class SQLiteProjectRegistry:
         return None
 
     async def resolve_username_by_user_id(self, user_id: str) -> str | None:
-        return _local_username() if user_id == "local" else None
+        if user_id == LOCAL_USER_ID:
+            return _local_username()
+        phone = phone_from_client_user_id(user_id)
+        return phone or None
 
     async def resolve_user_id_by_username(self, username: str) -> str | None:
-        return "local" if username else None
+        return LOCAL_USER_ID if username else None
 
 
 FileProjectRegistry = SQLiteProjectRegistry
@@ -303,21 +349,48 @@ FileProjectRegistry = SQLiteProjectRegistry
 
 class AllowAllProjectAccess:
     async def resolve_requester_principals(self, user_id: str) -> list[Principal]:
-        return [Principal("user", "local")] if user_id else []
+        pair = owner_pair_from_user_id(user_id)
+        return [Principal(pair[0], pair[1])] if pair else []
 
     async def effective_project_role(
         self,
         project: ProjectRecord,
         principals: list[Principal],
     ) -> str | None:
-        return "owner"
+        pairs = {(principal.type, principal.id) for principal in principals}
+        if (OWNER_TYPE_USER, LOCAL_USER_ID) in pairs:
+            # Internal console: full access to every project, including
+            # client-owned ones.
+            return PROJECT_ROLE_OWNER
+        if (project.owner_type, project.owner_id) in pairs:
+            return PROJECT_ROLE_OWNER
+        return None
 
     async def effective_project_role_by_id(
         self,
         project_id: str,
         principals: list[Principal],
     ) -> str | None:
-        return "owner"
+        pairs = {(principal.type, principal.id) for principal in principals}
+        if not pairs:
+            return None
+        if (OWNER_TYPE_USER, LOCAL_USER_ID) in pairs:
+            return PROJECT_ROLE_OWNER
+        record = await self._load_record(project_id)
+        if record is None:
+            return None
+        return await self.effective_project_role(record, principals)
+
+    @staticmethod
+    async def _load_record(project_id: str) -> ProjectRecord | None:
+        if not project_id:
+            return None
+        try:
+            from novelvideo.ports import get_project_registry
+
+            return await get_project_registry().get_project(project_id)
+        except Exception:
+            return None
 
     async def count_project_task_eligible_users(
         self,

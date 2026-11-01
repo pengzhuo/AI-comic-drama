@@ -224,3 +224,179 @@ PowerShell 的重定向会再转成 CRLF，所以用一段脚本落盘（`git sh
 版本是不是我改之前的那版」也靠这个 `md5sum` 对比：和 `HEAD~1` 一致才说明这是一次干净
 的增量补丁（否则说明镜像里已有别人的改动，别覆盖）。
 
+## 8. 客户入口访问验证（`?phone=&code=`）+ 内部口令
+
+现网形态：根地址给客户（`/studio`），内部端挂 `/console`。**只看路径分区不是访问控制**，
+所以本实例额外开了服务端访问验证：
+
+| 入口 | 凭据 | 结果 |
+| --- | --- | --- |
+| `/studio` | 专属链接 `?phone=<11位>&code=<32位hex>` | 换 `st_studio` cookie（7 天），**只看得到自己创建的项目** |
+| `/console`（及所有内部页 / 内部深链） | 内部访问口令 | 换 `st_internal` cookie（30 天），看全部项目（含客户的） |
+| 两者都没有 | — | 匿名：项目列表为空、单项目 404、建项目 403 |
+
+校验码 = `md5(手机号 + client_secret)`，**不带时间戳**（链接长期有效、可转发；作废靠轮换
+secret）。校验只在服务端做，前端拿不到 secret。隔离是**默认拒绝**：匿名请求连「项目存不
+存在」都拿不到（404 而不是 403），`client:<手机号>` 是项目归属，项目目录落在
+`/data/output/<手机号>/<项目>`。
+
+### 8.1 开关与密钥（**不要加环境变量**）
+
+加环境变量要重建容器，所以密钥放**可热补**的 secret 文件：
+
+```bash
+# 服务器上（api 容器挂载了 dramaclaw_ce-data → /data）
+cat > /data/studio-access.secret <<'EOF'
+client_secret=<客户密钥，只在运维处保存>
+internal_key=<32 位随机串>
+EOF
+chmod 600 /data/studio-access.secret    # 必须 owner-only，别给 group/other
+```
+
+- 文件格式是 `key=value` 行，`#` 开头是注释；行首尾空白会被去掉。
+- 读文件按 `(路径, mtime, size)` 缓存：**改一行即轮换**，所有既有会话下一次请求就失效，
+  不需要重启。删掉文件 = 彻底关掉访问验证（回到原来的单用户行为）。
+- 也可以走环境变量 `STUDIO_ACCESS_SECRET` / `STUDIO_INTERNAL_KEY`（优先级高于文件），
+  但改它们要重建容器；现网用文件。另有 `STUDIO_ACCESS_SECRET_FILE` 可换路径。
+- 日常轮换不用登服务器：内部端顶栏的**盾牌图标**进「访问设置」页改（见 §8.5）。网页写法
+  同样是「原子替换 + 0600 + 保留注释」，且**从不回明文**（只回 `ab12…yz89` 这类掩码）。
+
+第三个可写键是 `gate`：
+
+| 值 | 含义 |
+| --- | --- |
+| 缺省 / `gate=on` | 正常：访问验证生效 |
+| `gate=off` | **暂时关闭**：密钥全部保留，任何人可见全部项目（原单用户行为），内部口令在页面上还能一键恢复 |
+
+`gate=off` 与「删文件」的差别：前者是页面上的「关闭访问验证」开关（可逆，运营自己就能开回来），
+后者是运维兜底（密钥一起没了，必须重新写文件）。两者都不需要重启。
+
+Cookie 属性：`HttpOnly` + `SameSite=Lax` + `Path=/`，`Secure` 只在请求确实是 HTTPS 时加
+（纯 HTTP 上加 `Secure` 会被浏览器丢掉 → 门禁死循环，所以按请求判定而不是写死）。
+
+### 8.2 发链接
+
+```bash
+# 服务器上（默认读 /data/studio-access.secret）
+python3 scripts/studio_link.py --phone 13800000000 --base https://example.com
+
+# 一次多人
+python3 scripts/studio_link.py --phone 13800000000 --phone 13900000000 --base https://example.com
+```
+
+输出形如 `https://example.com/studio?phone=13800000000&code=<32位hex>`，每行一条。
+本地临时生成可显式 `--secret`（或 `STUDIO_ACCESS_SECRET`）。算法与后端
+`novelvideo.studio_access.expected_code` 一致，回归测试见 `tests/test_studio_link_script.py`。
+
+### 8.3 内部口令门
+
+内部入口没有有效 `st_internal` 时，整页显示口令输入框（`/console` 与所有内部页），
+口令正确 → 整页重载进入。**客户 cookie 进内部端也会被拦**（带提示），所以一台浏览器只有
+一个身份：想同时当客户和内部，用两个浏览器 / 无痕窗口。
+
+### 8.4 部署与自检
+
+后端是新增文件 + 改动，照第 7 节热补：
+
+```bash
+docker cp src/novelvideo/studio_access.py              dramaclaw-api-1:/app/src/novelvideo/studio_access.py
+docker cp src/novelvideo/api/routes/access.py          dramaclaw-api-1:/app/src/novelvideo/api/routes/access.py
+docker cp src/novelvideo/ports/project.py              dramaclaw-api-1:/app/src/novelvideo/ports/project.py
+docker cp src/novelvideo/ports/local/project.py        dramaclaw-api-1:/app/src/novelvideo/ports/local/project.py
+docker cp src/novelvideo/project_context.py            dramaclaw-api-1:/app/src/novelvideo/project_context.py
+docker cp src/novelvideo/api/auth.py                   dramaclaw-api-1:/app/src/novelvideo/api/auth.py
+docker cp src/novelvideo/api/__init__.py               dramaclaw-api-1:/app/src/novelvideo/api/__init__.py
+docker cp src/novelvideo/api/routes/projects.py        dramaclaw-api-1:/app/src/novelvideo/api/routes/projects.py
+docker cp src/novelvideo/api/routes/chat.py            dramaclaw-api-1:/app/src/novelvideo/api/routes/chat.py
+docker cp /root/studio-access.secret                    dramaclaw-api-1:/data/studio-access.secret   # 先在开发机写文件，scp 到服务器再 docker cp
+docker restart dramaclaw-api-1
+```
+
+自检（`cookie` 用登录/激活后从浏览器复制，或先 `POST /api/v1/access/client-session`）：
+
+```bash
+# 1) 匿名：列表空、单项目 404、建项目 403（注意**不是** 401，401 会被前端弹去 /login）
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8780/api/v1/projects            # 200 + data: []
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8780/api/v1/projects/<别人的id>  # 404
+
+# 2) 会话探测：无 cookie = none；带 cookie = client/internal
+curl -s http://127.0.0.1:8780/api/v1/access/session
+
+# 3) 拿客户 cookie（验证码用脚本生成的那条）
+curl -s -i -X POST http://127.0.0.1:8780/api/v1/access/client-session \
+  -H 'Content-Type: application/json' -d '{"phone":"13800000000","code":"<code>"}' | grep -i set-cookie
+
+# 4) 建项目归属正确：data.owner_type=client、data.owner_id=<手机号>、output_dir 在 /data/output/<手机号>/
+```
+
+浏览器侧（无痕窗口）：
+1. 打开 `https://<host>/studio?phone=...&code=...` → 地址栏里的 `phone/code` **立刻消失**
+   （`redirect({href, replace})`，后退也拿不回来），列表里只有自己的项目。
+2. 换发另一条链接给第二个手机号 → 两边互相看不到对方项目（同一项目名可以重复存在）。
+3. 打开 `https://<host>/console` → 口令门；输错有提示、输对整页重载进内部首页，能看到
+   **全部**项目（含客户的）。
+4. 篡改链接里的 `code`（或手机号）→ 工作台显示「需要专属访问链接」+「访问链接无效」。
+
+排查：`docker logs dramaclaw-api-1 | Select-String "studio|internal console"`（失败只在服务端
+记日志，手机号只打后 4 位，口令永不入库/入日志）。API 的 `8780` 已用
+`restrict-api-port.service` 收口（`DOCKER-USER`/`INPUT` 只放行 `172.16.0.0/12` 与
+`127.0.0.0/8`，外部直连超时），但**隔离本身仍由 API 负责**：直连 `127.0.0.1:8780` 一样是
+默认拒绝的。
+
+### 8.5 访问设置页（顶栏盾牌图标）
+
+内部身份（`st_internal` 有效）进顶栏的**盾牌图标** → `/access-settings`（客户身份会被送回
+`/console`，那里是口令门）。页面四张卡：内部口令、客户链接密钥、发客户链接、危险开关。
+
+接口（都挂在 `/api/v1`，`401` 一律不用，避免前端全局 401 → `/login`）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/access/config` | 掩码状态（`/data/studio-access.secret` 路径、最近更新时间、每个键的来源） |
+| `POST` | `/access/config` | `{internal_key?, client_secret?}`，空串 = 不改；返回新状态 + `notices` |
+| `POST` | `/access/config/link` | `{phone}` → `{phone, code, link}`（`STUDIO_BASE_URL` 优先，否则按 `X-Forwarded-Host` + scheme 拼） |
+| `POST` | `/access/gate` | `{enabled, confirm_key}`；关闭必须带当前内部口令，开启可一并带新密钥 |
+
+安全模型：
+
+- **GET 永不回明文**，只有掩码；随机口令由浏览器 `crypto.getRandomValues` 生成后显示在
+  输入框里，服务端只存提交值 —— 生成完必须当场保存，刷新拿不回来。
+- 改 `internal_key` 会**当场给操作者重签一张 `st_internal`**（不然轮换口令等于把自己踢出去），
+  其他设备上的内部登录立即失效；改 `client_secret` 则让此前发出的所有客户链接失效。
+- 键由环境变量提供时（`env_locked`）输入框和按钮禁用，并说明「改文件不生效」。
+- **关闭访问验证**要重输当前内部口令才能确认（`confirm_key`），写 `gate=off`，密钥保留；
+  重新开启一键恢复，旧客户链接继续有效。客户密钥缺失时「重新开启」按钮置灰。
+- 门禁开启时，访问设置接口只认内部身份（`403`）；门禁关闭（`gate=off`）时对外**只回 404**，
+  持内部 cookie 的操作者仍可读写 —— 这样关掉之后还能自己开回来，而掩码不会裸奔。
+- 暴力猜测有内存级限流：`internal-session` 与设置写接口同一 IP 5 分钟 8 次失败 → `429`
+  （成功即清零；api 是单进程 uvicorn，进程内计数足够）。计数按 `X-Forwarded-For` 首段，
+  伪造该头可绕过——它是减速带，真正的门槛是 32 位随机口令 + 掩码不回明文。
+
+服务器上不需要额外操作。想直接改也可以：
+
+```bash
+# 关闭（保留密钥，页面可恢复）
+docker exec dramaclaw-api-1 sh -c 'printf "gate=off\n" >> /data/studio-access.secret'
+# 恢复：把 gate=off 改成 gate=on（用 sed 或直接在设置页点「重新开启」）
+```
+
+宿主机保留一份**只读副本**（`/root` 是 0700，副本本身也是 0600），方便运维不用进容器就能看到
+当前值：`studio-access-sync.timer` 每 2 分钟把容器里的文件同步到
+`/root/.deploy/studio-access.secret`（`scripts/studio-access-sync.sh`，另有 `show` 子命令）。
+副本只读不写——改值一律走设置页或容器内文件，避免两边打架。
+
+自检（在服务器上，`curl` 直连本机 8780）：
+
+```bash
+# 匿名/客户一律 403；内部 200 且响应里没有任何明文密钥
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8780/api/v1/access/config
+curl -s -b "st_internal=<内部 cookie>" http://127.0.0.1:8780/api/v1/access/config   # mask 而非明文
+# 连错 9 次：前 8 次 400，第 9 次 429
+for i in $(seq 1 9); do curl -s -o /dev/null -w '%{http_code} ' -X POST \
+  http://127.0.0.1:8780/api/v1/access/internal-session \
+  -H 'Content-Type: application/json' -d '{"key":"wrong"}'; done; echo
+```
+
+浏览器侧（无痕窗口）：`/console` 输口令 → 点盾牌 → 改内部口令（本页自动续期）→ 用新口令在
+另一个无痕窗口重新进入；改客户密钥后用旧链接应报「访问链接无效」，用页面新生成的链接可进。
+

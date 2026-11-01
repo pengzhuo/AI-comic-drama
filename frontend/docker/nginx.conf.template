@@ -54,7 +54,7 @@ server {
         # /assets/* 不受影响，仍走下面 1 年 immutable 缓存。
         add_header Cache-Control "no-cache" always;
 
-        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-LvxLzCeWBZ/DC3ejUm4WcZpQNZXYDUz4p/53gA+dzKk='; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://novelvideo-assets-chengdu.oss-cn-chengdu.aliyuncs.com https://nfg-web-assets.cdnfg.com https://nfg-web.oss-cn-chengdu.aliyuncs.com; media-src 'self' blob: https://novelvideo-assets-chengdu.oss-cn-chengdu.aliyuncs.com https://nfg-web-assets.cdnfg.com; font-src 'self' data:; connect-src 'self' https://novelvideo-assets-chengdu.oss-cn-chengdu.aliyuncs.com https://nfg-web-assets.cdnfg.com https://nfg-web.cdnfg.com https://dramaclaw-dl.cdnfg.com https://api.github.com; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self' ${CSP_PAYMENT_FORM_ORIGINS}; object-src 'none'${csp_upgrade}" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-BLiIb4rMVKnSok1tuJAxIergReMnlM2H98CqDXhVRyM='; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://novelvideo-assets-chengdu.oss-cn-chengdu.aliyuncs.com https://nfg-web-assets.cdnfg.com https://nfg-web.oss-cn-chengdu.aliyuncs.com; media-src 'self' blob: https://novelvideo-assets-chengdu.oss-cn-chengdu.aliyuncs.com https://nfg-web-assets.cdnfg.com; font-src 'self' data:; connect-src 'self' https://novelvideo-assets-chengdu.oss-cn-chengdu.aliyuncs.com https://nfg-web-assets.cdnfg.com https://nfg-web.cdnfg.com https://dramaclaw-dl.cdnfg.com https://api.github.com; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self' ${CSP_PAYMENT_FORM_ORIGINS}; object-src 'none'${csp_upgrade}" always;
         add_header Strict-Transport-Security $hsts_value always;
         add_header X-Frame-Options "DENY" always;
         add_header X-Content-Type-Options "nosniff" always;
@@ -106,7 +106,11 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        # Pass the *edge* scheme through (empty when the SPA is served straight
+        # over plain HTTP) so the backend marks session cookies Secure only on
+        # real TLS requests. `$scheme` here is always http: this container only
+        # speaks http behind the TLS-terminating ingress.
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
 
         # SSE: never buffer or cache; long timeouts to keep the channel alive.
         proxy_buffering off;
@@ -129,7 +133,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Host $host;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
 
         proxy_buffering on;
         proxy_read_timeout 600s;

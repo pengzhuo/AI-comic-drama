@@ -3,6 +3,7 @@
 export const queryKeys = {
   currentUser: () => ["auth", "me"] as const,
   accountSecurity: () => ["account", "security"] as const,
+  accessConfig: () => ["access", "config"] as const,
   productSurfaces: () => ["product-surfaces", "me"] as const,
   creditSummary: () => ["credits", "summary"] as const,
   creditPromotions: () => ["credits", "promotions"] as const,

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from novelvideo.ports.local.project import AllowAllProjectAccess
@@ -23,7 +25,7 @@ def _project() -> ProjectRecord:
 async def test_allow_all_project_access_returns_owner_semantics() -> None:
     access = AllowAllProjectAccess()
 
-    principals = await access.resolve_requester_principals("u1")
+    principals = await access.resolve_requester_principals("local")
     role = await access.effective_project_role(_project(), principals)
     role_by_id = await access.effective_project_role_by_id("proj-1", principals)
     count = await access.count_project_task_eligible_users(
@@ -36,3 +38,19 @@ async def test_allow_all_project_access_returns_owner_semantics() -> None:
     assert role == "owner"
     assert role_by_id == "owner"
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_allow_all_project_access_scopes_client_and_anonymous() -> None:
+    access = AllowAllProjectAccess()
+
+    client = await access.resolve_requester_principals("client:13800000000")
+    anonymous = await access.resolve_requester_principals("anonymous")
+
+    assert client == [Principal("client", "13800000000")]
+    assert anonymous == []
+    # A client only owns its own project.
+    assert await access.effective_project_role(_project(), client) is None
+    assert await access.effective_project_role(_project(), anonymous) is None
+    own = replace(_project(), owner_type="client", owner_id="13800000000")
+    assert await access.effective_project_role(own, client) == "owner"

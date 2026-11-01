@@ -41,6 +41,7 @@ except Exception:
     pass
 
 from novelvideo.api.routes import (  # noqa: E402
+    access,
     assets,
     auth,
     characters,
@@ -99,6 +100,7 @@ OPENAPI_TAGS = [
 ]
 
 api_router.include_router(auth.router, tags=["auth"])
+api_router.include_router(access.router, tags=["access"])
 if not runtime_env.is_ce_effective():
     for ep in entry_points(group="novelvideo.api_routes"):
         ep.load()(api_router)

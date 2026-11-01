@@ -38,7 +38,8 @@ function StudioProjectPage() {
   const pipelineQuery = usePipelineStatus(project);
   const episodesQuery = useEpisodes(project);
   const tasksQuery = useTasks({ project });
-  const { data: summaries } = useAllProjectSummaries();
+  const summariesQuery = useAllProjectSummaries();
+  const summaries = summariesQuery.data;
   const startRun = useStartProjectAutoRun(project);
   const run = useStudioRun(project, { auto: true });
 
@@ -50,13 +51,22 @@ function StudioProjectPage() {
   const runActive =
     status === "running" || status === "awaiting_confirmation" || status === "paused";
 
+  // 真隔离：别人的项目在这里既不在自己的项目列表里，单项目接口也是 404。
+  // 两个信号同时成立才判定「不存在或不属于你」，避免把刚创建、列表还没刷新的
+  // 新项目误判成不可访问。
+  const projectUnavailable =
+    summaries !== undefined &&
+    !summariesQuery.isLoading &&
+    !summaries.some((item) => item.id === project) &&
+    (pipelineQuery.isError || episodesQuery.isError);
+
   useStudioPolling(project, { enabled: !importSettled || runActive });
 
   // 导入完成后自动开跑；跑起来就把 URL 参数清掉，刷新不会重复启动。
   const autostartFired = useRef(false);
   const startRunMutation = startRun.mutate;
   useEffect(() => {
-    if (!autostart || autostartFired.current) return;
+    if (!autostart || autostartFired.current || projectUnavailable) return;
     if (run.isLoading || pipelineQuery.isLoading) return;
     const clearParam = () =>
       void navigate({
@@ -83,10 +93,31 @@ function StudioProjectPage() {
     navigate,
     pipelineQuery.isLoading,
     project,
+    projectUnavailable,
     run.isLoading,
     startRunMutation,
     status,
   ]);
+
+  if (projectUnavailable) {
+    return (
+      <div className="space-y-4">
+        <Link
+          to="/studio"
+          className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ArrowLeft className="size-3.5" />
+          返回我的剧
+        </Link>
+        <div className="rounded-2xl border border-dashed border-border/60 bg-card px-4 py-10 text-center">
+          <h1 className="text-base font-semibold tracking-tight">项目不存在或不属于你</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            这个链接可能已经失效。请从「我的剧」里打开自己的项目。
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   const projectName =
     summaries?.find((item) => item.id === project)?.name ?? "制作中";

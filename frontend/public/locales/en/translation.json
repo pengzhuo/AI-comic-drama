@@ -458,6 +458,7 @@
     "partyFounding105": "庆祝建党105周年",
     "settings": "Settings",
     "settingsWithWarning": "Settings, missing configuration",
+    "accessSettings": "Access settings",
     "settingsWarningBubble": "Missing setup",
     "dismissSettingsWarningBubble": "Dismiss missing setup reminder",
     "notifications": "Announcement Center",

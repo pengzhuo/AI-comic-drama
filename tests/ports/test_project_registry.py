@@ -34,7 +34,7 @@ async def test_sqlite_project_registry_persists_and_reads_all_project_methods(
     registry = local_project.SQLiteProjectRegistry()
 
     created = await registry.create_project(
-        owner_user_id="ignored-user-id",
+        owner_user_id="local",
         owner_username="alice",
         name="demo",
     )

@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import AliasChoices, BaseModel, Field
 
+from novelvideo import studio_access
 from novelvideo.api.auth import (
     AGENT_WRITE_SCOPES,
     AUTH_COOKIE_NAME,
@@ -2092,6 +2093,10 @@ async def _authenticate_ws(websocket: WebSocket) -> dict[str, Any]:
         if not token:
             raise HTTPException(status_code=401, detail="invalid authorization")
         return await _verify_agent_bearer(token)
+
+    studio_user = studio_access.resolve_identity(websocket.cookies)
+    if studio_user is not None:
+        return studio_user
 
     cookie_value = websocket.cookies.get(AUTH_COOKIE_NAME)
     return await _verify_browser_session(cookie_value)

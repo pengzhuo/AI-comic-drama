@@ -15,6 +15,7 @@ import {
   Languages,
   LogOut,
   KeyRound,
+  ShieldCheck,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -36,6 +37,7 @@ import { useAuthStore } from "@/stores/auth-store";
 import { useAppStore } from "@/stores/app-store";
 import { authRequired, isCeRuntime, phoneOtpEntryVisible } from "@/lib/runtime-config";
 import { internalHomePath } from "@/lib/app-mode";
+import { useAccessSession } from "@/lib/access-session";
 import { resetUserSessionState } from "@/lib/reset-region-state";
 import { useModelGatewayConfig } from "@/lib/queries/model-gateway";
 import { useOrgBranding } from "@/lib/queries/org-branding";
@@ -137,6 +139,8 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
     hasSettingsWarning && !settingsOpen && !settingsWarningBubbleDismissed,
   );
   const project = params.project ?? null;
+  // 访问验证启用时，顶栏多一个「访问设置」盾牌入口，且只给内部身份看。
+  const access = useAccessSession();
 
   useEffect(() => {
     return () => {
@@ -345,6 +349,31 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
 
         {/* Actions */}
         <div data-header-slot="right" className="flex min-w-0 flex-1 shrink-0 items-center justify-end gap-1">
+          {access?.enabled && access.kind === "internal" ? (
+            <TooltipProvider delay={80}>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Link
+                      to="/access-settings"
+                      aria-label={t("header.accessSettings")}
+                      className="relative flex size-[32px] items-center justify-center rounded-[6px] text-sidebar-foreground/82 transition-colors duration-150 ease-[var(--ease-out-quint)] hover:bg-black/[0.05] hover:text-foreground"
+                    />
+                  }
+                >
+                  <ShieldCheck className="size-[17px]" />
+                </TooltipTrigger>
+                <TooltipContent
+                  side="bottom"
+                  sideOffset={10}
+                  showArrow={false}
+                  className="border border-black/10 bg-background/95 text-foreground shadow-none"
+                >
+                  {t("header.accessSettings")}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : null}
           <div ref={settingsAnchorRef} className="relative">
             <Button
               type="button"

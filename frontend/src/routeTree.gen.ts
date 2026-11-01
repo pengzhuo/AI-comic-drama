@@ -24,6 +24,7 @@ import { Route as AppPaymentReturnRouteImport } from './routes/_app/payment-retu
 import { Route as AppCreditsRouteImport } from './routes/_app/credits'
 import { Route as AppConsoleRouteImport } from './routes/_app/console'
 import { Route as AppAccessUnavailableRouteImport } from './routes/_app/access-unavailable'
+import { Route as AppAccessSettingsRouteImport } from './routes/_app/access-settings'
 import { Route as AppProjectsProjectTasksRouteImport } from './routes/_app/projects.$project/tasks'
 import { Route as AppProjectsProjectStylesRouteImport } from './routes/_app/projects.$project/styles'
 import { Route as AppProjectsProjectReportsRouteImport } from './routes/_app/projects.$project/reports'
@@ -128,6 +129,11 @@ const AppConsoleRoute = AppConsoleRouteImport.update({
 const AppAccessUnavailableRoute = AppAccessUnavailableRouteImport.update({
   id: '/access-unavailable',
   path: '/access-unavailable',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAccessSettingsRoute = AppAccessSettingsRouteImport.update({
+  id: '/access-settings',
+  path: '/access-settings',
   getParentRoute: () => AppRoute,
 } as any)
 const AppProjectsProjectFreezoneLazyRoute =
@@ -273,6 +279,7 @@ export interface FileRoutesByFullPath {
   '/recharge': typeof RechargeRoute
   '/studio': typeof StudioRouteWithChildren
   '/download': typeof DownloadLazyRoute
+  '/access-settings': typeof AppAccessSettingsRoute
   '/access-unavailable': typeof AppAccessUnavailableRoute
   '/console': typeof AppConsoleRoute
   '/credits': typeof AppCreditsRoute
@@ -302,6 +309,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/recharge': typeof RechargeRoute
   '/download': typeof DownloadLazyRoute
+  '/access-settings': typeof AppAccessSettingsRoute
   '/access-unavailable': typeof AppAccessUnavailableRoute
   '/console': typeof AppConsoleRoute
   '/credits': typeof AppCreditsRoute
@@ -335,6 +343,7 @@ export interface FileRoutesById {
   '/recharge': typeof RechargeRoute
   '/studio': typeof StudioRouteWithChildren
   '/download': typeof DownloadLazyRoute
+  '/_app/access-settings': typeof AppAccessSettingsRoute
   '/_app/access-unavailable': typeof AppAccessUnavailableRoute
   '/_app/console': typeof AppConsoleRoute
   '/_app/credits': typeof AppCreditsRoute
@@ -369,6 +378,7 @@ export interface FileRouteTypes {
     | '/recharge'
     | '/studio'
     | '/download'
+    | '/access-settings'
     | '/access-unavailable'
     | '/console'
     | '/credits'
@@ -398,6 +408,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/recharge'
     | '/download'
+    | '/access-settings'
     | '/access-unavailable'
     | '/console'
     | '/credits'
@@ -430,6 +441,7 @@ export interface FileRouteTypes {
     | '/recharge'
     | '/studio'
     | '/download'
+    | '/_app/access-settings'
     | '/_app/access-unavailable'
     | '/_app/console'
     | '/_app/credits'
@@ -564,6 +576,13 @@ declare module '@tanstack/react-router' {
       path: '/access-unavailable'
       fullPath: '/access-unavailable'
       preLoaderRoute: typeof AppAccessUnavailableRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/access-settings': {
+      id: '/_app/access-settings'
+      path: '/access-settings'
+      fullPath: '/access-settings'
+      preLoaderRoute: typeof AppAccessSettingsRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/projects/$project/freezone': {
@@ -718,6 +737,7 @@ const AppProjectsProjectEpisodesRouteWithChildren =
   )
 
 interface AppRouteChildren {
+  AppAccessSettingsRoute: typeof AppAccessSettingsRoute
   AppAccessUnavailableRoute: typeof AppAccessUnavailableRoute
   AppConsoleRoute: typeof AppConsoleRoute
   AppCreditsRoute: typeof AppCreditsRoute
@@ -734,6 +754,7 @@ interface AppRouteChildren {
 }
 
 const AppRouteChildren: AppRouteChildren = {
+  AppAccessSettingsRoute: AppAccessSettingsRoute,
   AppAccessUnavailableRoute: AppAccessUnavailableRoute,
   AppConsoleRoute: AppConsoleRoute,
   AppCreditsRoute: AppCreditsRoute,

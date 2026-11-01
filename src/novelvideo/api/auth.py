@@ -18,6 +18,7 @@ from urllib.parse import unquote
 
 from fastapi import Depends, HTTPException, Request
 
+from novelvideo import studio_access
 from novelvideo.ports import get_auth_port, get_auth_session_port
 from novelvideo.ports import registry as port_registry
 from novelvideo.ports.auth_contract import AuthError, AuthFailureReason
@@ -200,6 +201,13 @@ async def get_api_user(
 
     if _is_local_trusted_agent_request(request):
         return _local_trusted_agent_user()
+
+    studio_user = studio_access.resolve_identity(request.cookies)
+    if studio_user is not None:
+        # Studio link (/studio) and internal console (/console) identities.
+        # Deny-by-default while the gate is on: no cookie -> anonymous, which
+        # owns nothing.
+        return studio_user
 
     return await _verify_browser_session(request.cookies.get(AUTH_COOKIE_NAME))
 

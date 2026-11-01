@@ -11,6 +11,7 @@ from novelvideo.ports import get_project_access, get_project_registry
 from novelvideo.ports.project import (
     Principal,
     ProjectRecord,
+    is_scoped_user_id,
     require_role_value,
 )
 from novelvideo.ports.registry import PortNotRegistered
@@ -139,6 +140,10 @@ async def resolve_project_context(
         role = await media_resolver(record, principals)
     else:
         role = await access.effective_project_role(record, principals)
+    if role is None and is_scoped_user_id(requester_user_id):
+        # Studio link holders and unauthenticated requests must not learn that
+        # somebody else's project exists: 404, not 403.
+        raise HTTPException(status_code=404, detail="Project not found")
     require_role_value(role, required_role)
     return _ctx_from_record(
         project=record,

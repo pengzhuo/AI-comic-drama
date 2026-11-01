@@ -40,7 +40,7 @@ from novelvideo.knowledge_pipeline import KNOWLEDGE_PIPELINE_KEY, KNOWLEDGE_PIPE
 from novelvideo.novel_source import has_imported_novel
 from novelvideo.ports import get_project_access, get_project_registry
 from novelvideo.scene_prerequisites import scene_build_applies
-from novelvideo.ports.project import ProjectRecord, require_role_value
+from novelvideo.ports.project import ANONYMOUS_USER_ID, ProjectRecord, require_role_value
 from novelvideo.security import (
     ProjectStorageOwnershipError,
     assert_owned_project_storage,
@@ -711,6 +711,10 @@ async def create_project(
     logger.info("create_project: %s", body.name)
     validate_project_name(body.name)
     user_id = await user_id_from_api_user(user)
+    if user_id == ANONYMOUS_USER_ID:
+        # Studio gate is on and this browser holds no scoped identity. 403 (not
+        # 401) so the SPA's global 401 handler does not hijack the page.
+        raise HTTPException(status_code=403, detail="需要专属访问链接才能创建项目")
     registry = get_project_registry()
     try:
         record = await registry.create_project(
