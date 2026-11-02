@@ -240,6 +240,21 @@ secret）。校验只在服务端做，前端拿不到 secret。隔离是**默�
 存在」都拿不到（404 而不是 403），`client:<手机号>` 是项目归属，项目目录落在
 `/data/output/<手机号>/<项目>`。
 
+**项目可见范围**（`src/novelvideo/ports/local/project.py:242`）：
+
+- 内部身份 `user/local` → 全部项目（含所有客户的）；
+- 客户身份 `client:<手机号>` → 只有 `owner_type=client` 且 `owner_id` 等于自己手机号的项目；
+- 匿名 → 空。
+
+这里**没有「把项目分配给某个客户」的机制**：内部端控制台里替客户建的项目 owner 是 `local`，
+客户在自己的 `/studio` 里看不到它。客户要看到项目，得自己在 `/studio` 上传剧本（项目才归属到
+该手机号）。这是当前的设计取舍，不是 bug。
+
+**客户外壳（`/studio`）自带滚动容器**：全站基础样式把 `html/body/#root` 锁成
+`height:100%; overflow:hidden`（`frontend/src/index.css`），所以任何挂在 `_app` 之外的整页外壳
+都必须自己提供 `overflow-y-auto`（登录页、`/studio` 都是）。改 `/studio` 布局时别把
+`routes/studio.tsx` 的 `min-h-0 flex-1 overflow-y-auto` 去掉，否则内容一超一屏就被裁掉。
+
 ### 8.1 开关与密钥（**不要加环境变量**）
 
 加环境变量要重建容器，所以密钥放**可热补**的 secret 文件：
@@ -336,6 +351,14 @@ curl -s -i -X POST http://127.0.0.1:8780/api/v1/access/client-session \
 3. 打开 `https://<host>/console` → 口令门；输错有提示、输对整页重载进内部首页，能看到
    **全部**项目（含客户的）。
 4. 篡改链接里的 `code`（或手机号）→ 工作台显示「需要专属访问链接」+「访问链接无效」。
+
+> **踩坑（2026-11 已修）**：`/studio` 的 `beforeLoad` 必须用 `location.searchStr` +
+> `URLSearchParams` 读 `phone/code`，**不能**读 `location.search` —— TanStack Router 的默认
+> `parseSearch` 会对每个 query 值做 `JSON.parse`，11 位手机号到那里已是 number，
+> `typeof value === "string"` 会把它判成空串，于是兑换请求从不发出、客户端永远停在门禁页
+> （链接和校验码完全正确也一样，服务端日志里看不到任何 `POST /access/client-session`）。
+> 同类坑：`studio/$project.tsx` 的 `autostart`（`?autostart=1` 同样被解析成 number）。
+> 回归测试见 `frontend/src/__tests__/routes/studio-link-exchange.test.ts`（按真实 number 形态断言）。
 
 排查：`docker logs dramaclaw-api-1 | Select-String "studio|internal console"`（失败只在服务端
 记日志，手机号只打后 4 位，口令永不入库/入日志）。API 的 `8780` 已用

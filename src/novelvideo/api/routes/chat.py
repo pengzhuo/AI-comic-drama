@@ -520,6 +520,7 @@ def _director_auto_gate(reason: str) -> str | None:
 
     from novelvideo.chat.director_auto import (
         CHARACTER_IMAGES_GATE_TAG,
+        COST_ESTIMATE_GATE_TAG,
         IDENTITY_IMAGES_GATE_TAG,
     )
 
@@ -528,6 +529,8 @@ def _director_auto_gate(reason: str) -> str | None:
         return "character_images"
     if IDENTITY_IMAGES_GATE_TAG in text:
         return "identity_images"
+    if COST_ESTIMATE_GATE_TAG in text:
+        return "cost_estimate"
     return None
 
 
@@ -691,11 +694,12 @@ async def confirm_director_auto_gate(
 
     from novelvideo.project_config import (
         confirm_character_images,
+        confirm_cost_estimate,
         confirm_identity_images,
     )
 
     normalized = str(gate or "").strip()
-    if normalized not in {"character_images", "identity_images"}:
+    if normalized not in {"character_images", "identity_images", "cost_estimate"}:
         raise HTTPException(status_code=400, detail="未知的成片门槛类型")
     ctx = await resolve_project_context(
         user=user, project_id=project, required_role="editor"
@@ -715,7 +719,10 @@ async def confirm_director_auto_gate(
             episode = int(getattr(run, "episode", 0) or 0)
         if episode <= 0:
             raise HTTPException(status_code=400, detail="缺少集号")
-        confirm_identity_images(username, project_name, episode)
+        if normalized == "cost_estimate":
+            confirm_cost_estimate(username, project_name, episode)
+        else:
+            confirm_identity_images(username, project_name, episode)
     try:
         resumed = await director_auto_coordinator.resume_paused(
             username=username, project_id=ctx.project_id

@@ -25,9 +25,19 @@ function projectFromPathname(pathname = window.location.pathname): string | null
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+/**
+ * `?canvas=` 的归一化。路由的默认 `parseSearch` 会对每个 query 值做 `JSON.parse`，
+ * 所以纯数字 id（`?canvas=1`）到这里已是 number —— 字符串与有限数字都要认，
+ * 否则会被当成「没指定画布」，静默回退到上次打开的画布。
+ */
+export function normalizeCanvasParam(value: unknown): string | null {
+  if (typeof value === "string") return value.length > 0 ? value : null;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return null;
+}
+
 function canvasFromRouterSearch(router: NonNullable<ReturnType<typeof getAppRouter>>): string | null {
-  const canvas = (router.state.location.search as { canvas?: unknown }).canvas;
-  return typeof canvas === "string" && canvas.length > 0 ? canvas : null;
+  return normalizeCanvasParam((router.state.location.search as { canvas?: unknown }).canvas);
 }
 
 export function readUrl(): FreezoneUrl {

@@ -14,7 +14,7 @@ import {
 import { FreezoneShell } from "@/features/freezone/FreezoneShell";
 import { canvasIdForFreezoneEntry } from "@/features/freezone/projections";
 import { useAllProjectSummaries } from "@/lib/queries/projects";
-import { readLastCanvas, writeUrl } from "@/lib/url-params";
+import { normalizeCanvasParam, readLastCanvas, writeUrl } from "@/lib/url-params";
 import { useAuthStore } from "@/stores/auth-store";
 
 type FreezoneCanvasRootProps = {
@@ -44,10 +44,7 @@ export default function FreezoneCanvasRoot({
   // This subscription also re-renders the route when the canvas param changes,
   // replacing the old raw popstate listener.
   const canvasParam = useRouterState({
-    select: (s) => {
-      const canvas = (s.location.search as { canvas?: unknown }).canvas;
-      return typeof canvas === "string" && canvas.length > 0 ? canvas : null;
-    },
+    select: (s) => normalizeCanvasParam((s.location.search as { canvas?: unknown }).canvas),
   });
 
   useEffect(() => subscribeOpenGlobalErrorDialog(setGlobalError), []);

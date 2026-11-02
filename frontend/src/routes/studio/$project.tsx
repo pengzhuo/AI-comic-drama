@@ -22,8 +22,11 @@ import { useTasks } from "@/lib/queries/tasks";
 export const Route = createFileRoute("/studio/$project")({
   // `?autostart=1` 由上传页带过来：导入一完成就自动开跑「一键成片」。
   validateSearch: (search: Record<string, unknown>): { autostart?: boolean } => ({
+    // 路由的默认 `parseSearch` 会对值做 `JSON.parse`，所以 `?autostart=1` 到这里是
+    // number 1 而不是字符串 "1"：两种都要认，否则「上传完自动开跑」会静默失效。
     autostart:
       search.autostart === true ||
+      search.autostart === 1 ||
       search.autostart === "1" ||
       search.autostart === "true",
   }),

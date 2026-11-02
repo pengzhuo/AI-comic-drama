@@ -4,7 +4,26 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnyRouter } from "@tanstack/react-router";
 
 import { setAppRouter } from "@/lib/app-router";
-import { writeUrl } from "@/lib/url-params";
+import { normalizeCanvasParam, writeUrl } from "@/lib/url-params";
+
+describe("normalizeCanvasParam", () => {
+  it("keeps non-empty string ids", () => {
+    expect(normalizeCanvasParam("canvas-2")).toBe("canvas-2");
+  });
+
+  it("accepts the number the router's default parseSearch produces", () => {
+    // `?canvas=1` 经 JSON.parse 变成 number：不能当成「没指定画布」。
+    expect(normalizeCanvasParam(1)).toBe("1");
+  });
+
+  it("treats empty / missing / non-finite values as absent", () => {
+    expect(normalizeCanvasParam("")).toBeNull();
+    expect(normalizeCanvasParam(undefined)).toBeNull();
+    expect(normalizeCanvasParam(null)).toBeNull();
+    expect(normalizeCanvasParam(Number.NaN)).toBeNull();
+    expect(normalizeCanvasParam({})).toBeNull();
+  });
+});
 
 describe("freezone url params", () => {
   it("does not rewrite non-freezone routes when stale freezone code writes canvas state", () => {

@@ -643,3 +643,62 @@ def confirm_identity_images(username: str, project: str, episode: int) -> None:
         config[IDENTITY_IMAGES_CONFIRMED_KEY] = episodes
 
     update_project_config_file(username, project, _apply)
+
+
+#: 一键成片「制作成本预估」闸门的答案，形如 ``{"1": true}``（键是集号）。
+#: 闸门点在分镜（script）之后、第一批花钱的图/视频之前——此时才数得出分镜，
+#: 也正是用户第一次看到总价的时刻。
+COST_ESTIMATE_CONFIRMED_KEY = "cost_estimate_confirmed"
+#: 预估闸门总开关（``production_estimate_gate``）。缺省视为**开**：新项目默认在
+#: 分镜后停一次，让用户确认预算；运维可在项目配置里显式关掉。
+COST_ESTIMATE_GATE_KEY = "production_estimate_gate"
+
+
+def _confirmed_cost_episodes(config: dict) -> dict[str, bool]:
+    raw = config.get(COST_ESTIMATE_CONFIRMED_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): bool(value) for key, value in raw.items()}
+
+
+def cost_estimate_gate_enabled(username: str, project: str) -> bool:
+    """预估闸门是否启用（缺省启用）。"""
+
+    config = load_project_config_file(username, project)
+    value = config.get(COST_ESTIMATE_GATE_KEY)
+    if value is None:
+        return True
+    return bool(value)
+
+
+def set_cost_estimate_gate(username: str, project: str, enabled: bool) -> None:
+    """切换预估闸门开关。"""
+
+    def _apply(config: dict) -> None:
+        config[COST_ESTIMATE_GATE_KEY] = bool(enabled)
+
+    update_project_config_file(username, project, _apply)
+
+
+def cost_estimate_confirmed(username: str, project: str, episode: int) -> bool:
+    """第 ``episode`` 集的「制作成本预估」闸门是否已经答过。"""
+
+    try:
+        episode_key = str(int(episode))
+    except (TypeError, ValueError):
+        return False
+    config = load_project_config_file(username, project)
+    return _confirmed_cost_episodes(config).get(episode_key, False)
+
+
+def confirm_cost_estimate(username: str, project: str, episode: int) -> None:
+    """记录第 ``episode`` 集「制作成本预估」的答案（继续或先不生成都算已答）。"""
+
+    episode_key = str(int(episode))
+
+    def _apply(config: dict) -> None:
+        episodes = _confirmed_cost_episodes(config)
+        episodes[episode_key] = True
+        config[COST_ESTIMATE_CONFIRMED_KEY] = episodes
+
+    update_project_config_file(username, project, _apply)

@@ -22,7 +22,7 @@ export type DirectorAutoStatus =
   | "paused"
   | "completed";
 
-export type DirectorAutoGate = "character_images" | "identity_images";
+export type DirectorAutoGate = "character_images" | "identity_images" | "cost_estimate";
 export type DirectorVoicePolicy = "system" | "custom";
 
 export interface DirectorAutoRunPayload {

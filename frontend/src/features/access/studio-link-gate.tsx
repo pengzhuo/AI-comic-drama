@@ -16,10 +16,11 @@ export interface StudioLinkGateProps {
 
 export function StudioLinkGate({ notice, attribution, onLogout }: StudioLinkGateProps) {
   return (
-    <div className="flex min-h-dvh flex-col bg-background text-foreground">
+    <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
       <main
         id="main-content"
-        className="flex flex-1 items-center justify-center px-4 py-10"
+        tabIndex={-1}
+        className="ui-scrollbar flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-10 focus:outline-none"
       >
         <div className="w-full max-w-md rounded-2xl border border-border/60 bg-card p-6">
           <h1 className="text-lg font-semibold tracking-tight">需要专属访问链接</h1>
@@ -47,7 +48,7 @@ export function StudioLinkGate({ notice, attribution, onLogout }: StudioLinkGate
         </div>
       </main>
       {attribution ? (
-        <footer className="border-t border-border/60">
+        <footer className="shrink-0 border-t border-border/60">
           <div className="mx-auto w-full max-w-5xl px-4 py-3 text-right text-xs text-muted-foreground">
             {attribution}
           </div>

@@ -45,4 +45,14 @@ describe("<StudioLinkGate />", () => {
     rerender(<StudioLinkGate attribution="ClaymoreLab" />);
     expect(screen.getByText("ClaymoreLab")).toBeInTheDocument();
   });
+
+  it("exposes the main landmark as focusable for RouteFocusManager", () => {
+    render(<StudioLinkGate />);
+
+    // __root.tsx 的 RouteFocusManager 靠 document.getElementById("main-content")
+    // 把焦点搬到主内容区；没有 tabIndex={-1} 的元素 focus() 是空操作。
+    const main = document.getElementById("main-content");
+    expect(main).not.toBeNull();
+    expect(main).toHaveAttribute("tabindex", "-1");
+  });
 });

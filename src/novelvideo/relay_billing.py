@@ -274,6 +274,22 @@ class RelayBillingClient:
             display_in_currency=bool(data.get("display_in_currency")),
         )
 
+    def pricing(self) -> dict[str, Any]:
+        """上游公开价目（``/api/pricing``，免鉴权）的**原始** payload。
+
+        刻意不走 :meth:`_call`：那里会把 ``data`` 拆出来，而 ``pricing_version`` /
+        ``group_ratio`` 是它的兄弟字段，价目快照需要一起留档。
+        """
+
+        url = self.endpoint.base_url + "/api/pricing"
+        status, text = self._transport("GET", url, {"Accept": "application/json"}, None)
+        payload = _load_json(text)
+        if status != 200 or not isinstance(payload, dict):
+            raise RelayBillingError(
+                f"{self.endpoint.label}: /api/pricing HTTP {status} {text[:160]}"
+            )
+        return payload
+
     def task_quotas(self) -> dict[str, int]:
         """全部任务日志的 ``task_id → quota``（分页）。"""
         quotas: dict[str, int] = {}

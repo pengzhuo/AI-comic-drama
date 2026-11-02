@@ -123,6 +123,11 @@ RETRY_REASON_PREFIX = "[retry "
 #: the same convention ``STALL_REASON_TAG`` uses.
 CHARACTER_IMAGES_GATE_TAG = "[character_images]"
 IDENTITY_IMAGES_GATE_TAG = "[identity_images]"
+#: 分镜写完之后、第一批花钱的图/视频之前的「制作成本预估」闸门。这是用户第一次
+#: 能看到「这部片大概要花多少钱」的时刻，也是最该让他点头的时刻。
+COST_ESTIMATE_GATE_TAG = "[cost_estimate]"
+#: 触发预估闸门的 ``next_step``：分镜（``script``）已完成，下一步就要花钱。
+COST_ESTIMATE_GATE_STEPS = frozenset({"asset_references", "sketch_generation"})
 #: 一键成片 is about to render character portraits: this is the one chance for
 #: the user to hand over their own 角色肖像 images before AI generation runs.
 CHARACTER_IMAGES_REQUIRED_ERROR = (
@@ -131,6 +136,10 @@ CHARACTER_IMAGES_REQUIRED_ERROR = (
 #: 本集身份规划刚产出身份，但还有身份没有身份图：先让用户指定，或跳过。
 IDENTITY_IMAGES_REQUIRED_ERROR = (
     f"{IDENTITY_IMAGES_GATE_TAG} 本集还有身份没有身份图：可上传本地图片后继续，或直接跳过由 AI 生成"
+)
+#: 分镜已写完，接下来就是图/视频/配音这些真正花钱的步骤：先把预估价摆出来。
+COST_ESTIMATE_REQUIRED_ERROR = (
+    f"{COST_ESTIMATE_GATE_TAG} 分镜已完成，请先确认本集制作成本预估，再开始生成画面与视频"
 )
 #: Meta/bridge tools the agent uses to inspect its tool surface instead of
 #: operating on the project. Introspection must never count as a write: the
@@ -342,7 +351,7 @@ def _pause_reason_display(reason: str) -> str:
     """
 
     text = str(reason or "")
-    for tag in (CHARACTER_IMAGES_GATE_TAG, IDENTITY_IMAGES_GATE_TAG):
+    for tag in (CHARACTER_IMAGES_GATE_TAG, IDENTITY_IMAGES_GATE_TAG, COST_ESTIMATE_GATE_TAG):
         if text.startswith(tag):
             return text[len(tag) :].strip()
     return text
@@ -1940,6 +1949,23 @@ class DirectorAutoCoordinator:
                 run.username, ctx.project_name, gate_episode
             ):
                 return IDENTITY_IMAGES_REQUIRED_ERROR
+        # 制作成本预估：分镜写完之后、第一批图/视频开跑之前，让用户先看到总价。
+        # 这里只查配置（不跑预估），所以不会因为预估失败而卡住流水线。
+        if next_step in COST_ESTIMATE_GATE_STEPS:
+            from novelvideo.project_config import (
+                cost_estimate_confirmed,
+                cost_estimate_gate_enabled,
+            )
+
+            gate_episode = int(data.get("current_episode") or 0) or int(run.episode or 0)
+            if (
+                gate_episode > 0
+                and cost_estimate_gate_enabled(run.username, ctx.project_name)
+                and not cost_estimate_confirmed(
+                    run.username, ctx.project_name, gate_episode
+                )
+            ):
+                return COST_ESTIMATE_REQUIRED_ERROR
         return None
 
     async def _dispatch_stage(

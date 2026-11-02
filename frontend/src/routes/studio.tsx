@@ -46,15 +46,25 @@ export const Route = createFileRoute("/studio")({
       return;
     }
 
-    const search = location.search as Record<string, unknown>;
-    const phone = typeof search.phone === "string" ? search.phone.trim() : "";
-    const code = typeof search.code === "string" ? search.code.trim() : "";
+    // 必须从**原始 query** 读，不能读 `location.search`：TanStack Router 的默认
+    // `parseSearch` 会对每个值做 `JSON.parse`，`?phone=13000000000` 因此被解析成
+    // number，`typeof value === "string"` 会把手机号判成空串 —— 兑换被静默跳过，
+    // 客户端永远停在门禁页（链接里的校验码再对也没用）。见同目录 `$project.tsx` 的
+    // `autostart` 是同一类坑。
+    const params = new URLSearchParams(location.searchStr);
+    const phone = (params.get("phone") ?? "").trim();
+    const code = (params.get("code") ?? "").trim();
     if (phone && code) {
       const result = await activateClientSession(phone, code);
       setAccessNotice(result.ok ? null : (result.error ?? "访问链接无效"));
       // 校验码等价于密码：换到 cookie 之后立刻把 query 从地址栏与历史里抹掉
       // （replace，不留下一条能按「后退」拿回校验码的记录）。
       throw redirect({ href: `${location.pathname}${location.hash}`, replace: true });
+    }
+    if (phone || code) {
+      // 只带了一半参数（链接被截断、或被聊天软件改写）：明确提示，别静默回到门禁页，
+      // 否则用户只会看到「需要专属访问链接」，无从判断是链接坏了还是没权限。
+      setAccessNotice("访问链接不完整，请重新打开我们发给你的完整链接。");
     }
 
     if (access.kind === "client" || access.kind === "internal") {
@@ -90,8 +100,8 @@ function StudioLayout() {
   const identity = access.phone ? maskPhone(access.phone) : username;
 
   return (
-    <div className="flex min-h-dvh flex-col bg-background text-foreground">
-      <header className="border-b border-border/60 bg-card/60 backdrop-blur">
+    <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+      <header className="shrink-0 border-b border-border/60 bg-card/60 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-4">
           <Link to="/studio" className="text-sm font-semibold tracking-tight">
             拿捏漫剧工作台
@@ -112,12 +122,20 @@ function StudioLayout() {
           </div>
         </div>
       </header>
-      <main id="main-content" className="mx-auto w-full max-w-5xl flex-1 px-4 py-6">
-        <Outlet />
+      {/* 客户外壳自己提供滚动容器：全站 `html/body/#root` 锁了 `overflow: hidden`，
+          没有它内容一超一屏就被裁掉（顶栏/页脚固定，只滚中间）。 */}
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="ui-scrollbar min-h-0 flex-1 overflow-y-auto focus:outline-none"
+      >
+        <div className="mx-auto w-full max-w-5xl px-4 py-6">
+          <Outlet />
+        </div>
       </main>
       {attribution ? (
         // 纯文本、无交互：保持 `text-muted-foreground` 不降透明度，12px 也要过 AA。
-        <footer className="border-t border-border/60">
+        <footer className="shrink-0 border-t border-border/60">
           <div className="mx-auto max-w-5xl px-4 py-3 text-right text-xs text-muted-foreground">
             <span data-testid="studio-brand-attribution">{attribution}</span>
           </div>

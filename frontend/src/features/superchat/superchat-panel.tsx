@@ -149,6 +149,7 @@ import {
 import { ComposerWaitingStatus } from "@/features/superchat/composer-waiting-status";
 import { ChatTaskStatusBar } from "@/features/superchat/chat-task-status-bar";
 import { DirectorCharacterImagesCard } from "@/features/superchat/director-character-images-card";
+import { DirectorCostEstimateCard } from "@/features/superchat/director-cost-estimate-card";
 import { calculateTimelineContextDelta } from "@/features/superchat/timeline-scroll";
 import { useEventBus } from "@/task-center/event-bus-context";
 import { useTaskCenterStore } from "@/task-center/store";
@@ -11195,8 +11196,8 @@ type DirectorAutoServerResponse = {
     driver?: "agent" | "deterministic" | null;
     target_episodes?: number;
     last_error?: string | null;
-    /** Inline image gate a paused run is waiting on, when the pause is one. */
-    gate?: "character_images" | "identity_images" | null;
+    /** Inline gate a paused run is waiting on, when the pause is one. */
+    gate?: "character_images" | "identity_images" | "cost_estimate" | null;
   };
 };
 
@@ -11205,19 +11206,22 @@ const DIRECTOR_STALL_TAG = "[stall]";
 /** Marks the two 「角色图片指定」 pauses (mirrors the backend gate tags). */
 const DIRECTOR_CHARACTER_IMAGES_TAG = "[character_images]";
 const DIRECTOR_IDENTITY_IMAGES_TAG = "[identity_images]";
+/** Marks the 分镜后「制作成本预估」 pause: the user confirms the budget first. */
+const DIRECTOR_COST_ESTIMATE_TAG = "[cost_estimate]";
 
-type DirectorImageGate = "character_images" | "identity_images";
+type DirectorGate = "character_images" | "identity_images" | "cost_estimate";
 
-type DirectorImageGateNotice = {
-  gate: DirectorImageGate;
+type DirectorGateNotice = {
+  gate: DirectorGate;
   episode: number;
 };
 
-/** Which inline image gate a pause reason belongs to (``null`` when it is not one). */
-function directorImageGateFromReason(reason?: string | null): DirectorImageGate | null {
+/** Which inline gate a pause reason belongs to (``null`` when it is not one). */
+function directorGateFromReason(reason?: string | null): DirectorGate | null {
   if (!reason) return null;
   if (reason.includes(DIRECTOR_CHARACTER_IMAGES_TAG)) return "character_images";
   if (reason.includes(DIRECTOR_IDENTITY_IMAGES_TAG)) return "identity_images";
+  if (reason.includes(DIRECTOR_COST_ESTIMATE_TAG)) return "cost_estimate";
   return null;
 }
 
@@ -12787,7 +12791,7 @@ export function SuperChatPanel({
   const [directorStallNotice, setDirectorStallNotice] = useState<DirectorStallNotice | null>(null);
   const [directorStallBusy, setDirectorStallBusy] = useState(false);
   // Set while 一键成片 waits for the user to hand over 角色肖像 / 身份图 (or skip).
-  const [directorImageGate, setDirectorImageGate] = useState<DirectorImageGateNotice | null>(null);
+  const [directorGate, setDirectorGate] = useState<DirectorGateNotice | null>(null);
   const isChatInitializing = !chat.historyReady && chat.messages.length === 0 && (chat.connecting || chat.connected);
 
   useEffect(() => {
@@ -13203,9 +13207,9 @@ export function SuperChatPanel({
         saveDirectorRunState(directorRunProject, settled);
         const gate =
           server.status === "paused"
-            ? server.gate ?? directorImageGateFromReason(server.last_error)
+            ? server.gate ?? directorGateFromReason(server.last_error)
             : null;
-        setDirectorImageGate(
+        setDirectorGate(
           gate ? { gate, episode: server.episode ?? settled.episode ?? 1 } : null,
         );
       } else if (isDirectorEpisodeAutoSession(loaded)) {
@@ -13293,16 +13297,16 @@ export function SuperChatPanel({
           settledDirectorRunState(directorRunStateRef.current.mode),
         );
         if (detail.status === "completed") {
-          setDirectorImageGate(null);
+          setDirectorGate(null);
           toast.success(`第 ${detail.episode ?? "当前"} 集自动制作已完成`);
         } else if (detail.message && detail.message !== "用户切换为手动模式") {
-          const gate = directorImageGateFromReason(detail.message);
-          setDirectorImageGate(
+          const gate = directorGateFromReason(detail.message);
+          setDirectorGate(
             gate ? { gate, episode: detail.episode ?? 1 } : null,
           );
           toast.error("本集自动已暂停");
         } else {
-          setDirectorImageGate(null);
+          setDirectorGate(null);
         }
       }
     };
@@ -16500,13 +16504,21 @@ export function SuperChatPanel({
                 onSubmit={submitAssistantClarificationResponse}
               />
             )}
-            {!isFreezoneLayout && directorImageGate && params.project?.trim() && (
-              <DirectorCharacterImagesCard
-                project={directorRunProject}
-                gate={directorImageGate.gate}
-                episode={directorImageGate.episode}
-                onResolved={() => setDirectorImageGate(null)}
-              />
+            {!isFreezoneLayout && directorGate && params.project?.trim() && (
+              directorGate.gate === "cost_estimate" ? (
+                <DirectorCostEstimateCard
+                  project={directorRunProject}
+                  episode={directorGate.episode}
+                  onResolved={() => setDirectorGate(null)}
+                />
+              ) : (
+                <DirectorCharacterImagesCard
+                  project={directorRunProject}
+                  gate={directorGate.gate}
+                  episode={directorGate.episode}
+                  onResolved={() => setDirectorGate(null)}
+                />
+              )
             )}
             {!hasActiveComposerPrompt && showClearCommandSuggestion && (
               <button
