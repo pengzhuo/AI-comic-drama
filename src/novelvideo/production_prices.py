@@ -8,7 +8,9 @@
     1. ``rules``         手工规则（``/data/production-prices.json`` / 设置页），
                          永不被同步覆盖。
     2. ``actual_rules``  用已对账的真实账单反推出来的 ``¥/单位``（实测口径）。
-    3. ``synced``        上游中转站 ``/api/pricing`` 的定价表达式，本地求值。
+    3. ``synced``        上游中转站 ``/api/pricing`` 的定价表达式，本地求值；
+                         **只认上游声明了用量口径、且我们真喂得进值的变量**，
+                         否则降级为未定价（见 :func:`_price_synced`）。
     4. 未命中            进 ``unpriced`` 清单，**绝不静默按 0 计**。
 
 配置文件默认 ``<DATA_ROOT>/production-prices.json``（本部署 = ``/data/production-prices.json``），
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -130,6 +133,12 @@ class PricedAction:
 # ---------------------------------------------------------------------------
 
 
+#: 缺省加价倍率：每个客户默认 **1 倍**（不加价）。只有需要加价的客户才在设置页
+#: 配 ``client_markups``。1 倍写成常量而不是 ``None``：``None`` 会让售价算不出来，
+#: 付费闸门只能 400，制作就卡死了。
+DEFAULT_MARKUP = 1.0
+
+
 def _default_config() -> dict[str, Any]:
     """出厂默认：**不含任何单价**（未定价就如实进 unpriced）。
 
@@ -140,7 +149,7 @@ def _default_config() -> dict[str, Any]:
         "version": 1,
         "currency": "CNY",
         "contingency_pct": 15.0,
-        "markup_default": None,
+        "markup_default": DEFAULT_MARKUP,
         "client_markups": {},
         "assumptions": {
             "chars_per_beat": 60,
@@ -158,6 +167,19 @@ def _default_config() -> dict[str, Any]:
         "actual_rules": [],
         "synced": {"fetched_at": "", "relays": [], "models": {}},
     }
+
+
+def _normalize_markup_default(raw: dict[str, Any]) -> dict[str, Any]:
+    """把缺省加价倍率钉成 1 倍：缺失 / 显式 ``null`` / ≤0 一律按 ``DEFAULT_MARKUP``。
+
+    历史文件里存的是 ``"markup_default": null``（旧出厂值），而 ``_merge`` 对顶层键
+    不做 None 特判，所以必须在读表时归一，否则读出来还是 ``None`` —— 售价算不出来，
+    客户点「确认制作成本」只能拿到 400。放在读表处，设置页展示的也是真实的 1 倍。
+    """
+
+    if _as_positive_float(raw.get("markup_default")) is None:
+        return {**raw, "markup_default": DEFAULT_MARKUP}
+    return raw
 
 
 def config_path() -> Path:
@@ -209,6 +231,10 @@ class _Evaluator:
         self.tokens = tokens
         self.pos = 0
         self.variables = variables
+        #: 表达式引用到的变量名（含简写折算后的规范名）。
+        self.used: set[str] = set()
+        #: 引用了但我们没有值的变量名 —— 有值才敢计价。
+        self.missing: set[str] = set()
 
     # -- 词法游标 ---------------------------------------------------------
     def _peek(self) -> tuple[str, str] | None:
@@ -343,10 +369,18 @@ class _Evaluator:
 
     def _variable(self, name: str) -> Any:
         if name in self.variables:
+            self.used.add(name)
             return self.variables[name]
         shorthand = _EXPR_SHORTHANDS.get(name)
-        if shorthand and shorthand in self.variables:
-            return self.variables[shorthand]
+        if shorthand:
+            # 简写（p/c/cr/…）折算到规范名，按规范名与上游 usage_schema 对齐。
+            self.used.add(shorthand)
+            if shorthand in self.variables:
+                return self.variables[shorthand]
+            self.missing.add(shorthand)
+            return 0.0
+        self.used.add(name)
+        self.missing.add(name)
         return 0.0
 
 
@@ -385,13 +419,28 @@ def _compare(op: str, left: Any, right: Any) -> float:
     return 1.0 if table[op] else 0.0
 
 
-def evaluate_expr(expr: str, variables: dict[str, Any]) -> float:
-    """安全求值一条上游定价表达式；失败抛 :class:`ExprError`。"""
+def evaluate_expr_detailed(
+    expr: str, variables: dict[str, Any]
+) -> tuple[float, set[str], set[str]]:
+    """求值并回报「引用了哪些变量」「哪些变量没有值」。
+
+    预估阶段只喂得进我们真知道的量（时长、字数、明确的 token 数）；上游
+    表达式若依赖我们拿不到的用量，调用方应据此降级为 ``unpriced``，而不是
+    把缺失变量当 0 算出个假价格。
+    """
 
     tokens = _tokenize(expr)
     if not tokens:
         raise ExprError("空表达式")
-    return _Evaluator(tokens, variables).parse()
+    evaluator = _Evaluator(tokens, variables)
+    value = evaluator.parse()
+    return value, set(evaluator.used), set(evaluator.missing)
+
+
+def evaluate_expr(expr: str, variables: dict[str, Any]) -> float:
+    """安全求值一条上游定价表达式；失败抛 :class:`ExprError`。"""
+
+    return evaluate_expr_detailed(expr, variables)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +455,14 @@ class PriceBook:
     raw: dict[str, Any] = field(default_factory=_default_config)
     path: Path | None = None
     mtime: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.raw, dict):
+            self.raw = _default_config()
+        else:
+            # 缺省倍率恒为 1：任何构造路径（读表 / 测试 / 手工 PriceBook(...)）都不能
+            # 漏出 ``None``，否则售价算不出来，付费闸门又一次 400。
+            self.raw = _normalize_markup_default(self.raw)
 
     # -- 基础字段 ---------------------------------------------------------
     @property
@@ -471,8 +528,12 @@ class PriceBook:
         return 500000.0
 
     # -- 加价倍率 ---------------------------------------------------------
-    def resolve_markup(self, phone: str) -> tuple[float | None, str]:
-        """按客户手机号取加价倍率；返回 ``(倍率, 来源)``，没配就 ``(None, "")``。"""
+    def resolve_markup(self, phone: str) -> tuple[float, str]:
+        """按客户手机号取加价倍率；返回 ``(倍率, 来源)``。
+
+        客户专配 > 全局缺省 > ``DEFAULT_MARKUP``（1 倍）。**永不返回 ``None``**：
+        售价必须算得出来，否则「确认制作成本」闸门只能 400，制作就卡死了。
+        """
 
         clean = normalize_phone(phone)
         if clean:
@@ -488,7 +549,7 @@ class PriceBook:
         default = _as_positive_float(self.raw.get("markup_default"))
         if default is not None:
             return default, "default"
-        return None, ""
+        return DEFAULT_MARKUP, "default"
 
     # -- 定价 -------------------------------------------------------------
     def price(self, action: ActionRequest) -> PricedAction:
@@ -537,6 +598,8 @@ class PriceBook:
         return None
 
     def _price_synced(self, action: ActionRequest) -> PricedAction | None:
+        """按上游定价表达式定价；口径不明或用量缺失就落 ``unpriced``，绝不按 0 计。"""
+
         resolved = self._resolve_synced_model(action.model)
         if resolved is None:
             return None
@@ -562,9 +625,32 @@ class PriceBook:
                 )
             expr = str(entry.get("billing_expr") or "").strip()
             if expr:
-                usd = evaluate_expr(expr, variables)
+                schema = entry.get("usage_schema")
+                declared = {str(name) for name in schema} if isinstance(schema, dict) else set()
+                amount, used, missing = evaluate_expr_detailed(expr, variables)
                 unit, quantity = _synced_unit_quantity(action, entry, variables)
-                price_cny = usd * rate
+                undeclared = sorted(name for name in used if name not in declared)
+                if undeclared:
+                    # 上游没声明这些变量的口径（例如 TTS/LLM 的 p/c 是网关自己
+                    # 从响应里数出来的），预估阶段无从得知，宁可不计价。
+                    return _synced_unpriced(
+                        action,
+                        unit,
+                        quantity,
+                        f"上游按 {'/'.join(undeclared)} 计费但未声明用量口径，预估阶段不按此计价",
+                    )
+                if missing:
+                    return _synced_unpriced(
+                        action,
+                        unit,
+                        quantity,
+                        f"上游按 {'/'.join(sorted(missing))} 计费，预估阶段拿不到该用量",
+                    )
+                price_cny = amount * rate
+                if not math.isfinite(price_cny) or price_cny <= 0:
+                    return _synced_unpriced(
+                        action, unit, quantity, "上游定价表达式求出非正金额，改为待定价"
+                    )
                 return _priced(
                     action,
                     unit=unit,
@@ -621,6 +707,23 @@ def _priced(
     )
 
 
+def _synced_unpriced(
+    action: ActionRequest, unit: str, quantity: float, note: str
+) -> PricedAction:
+    """上游价目够不着 → 如实落进 ``unpriced``（金额 ``None``，绝不按 0 计）。"""
+
+    return PricedAction(
+        action=action,
+        unit=unit,
+        quantity=quantity,
+        unit_price=None,
+        cny=None,
+        rule_id=None,
+        source="unpriced",
+        note=note,
+    )
+
+
 def _fallback_rate() -> float:
     try:
         from novelvideo.config import USD_CNY_RATE
@@ -631,23 +734,37 @@ def _fallback_rate() -> float:
 
 
 def _synced_variables(action: ActionRequest) -> dict[str, Any]:
+    """只把**我们真知道**的量喂给上游表达式。
+
+    以前这里给 ``tokens``/``prompt_tokens`` 之类一律填 0，于是「按 token 计费」
+    的模型会被算成 ¥0（视频）或被我们自己编造的字数喂出天价（音频）。现在缺
+    什么就不填什么，求值时会记进 ``missing``，由 ``_price_synced`` 降级为未定价。
+    """
+
     variables: dict[str, Any] = {}
     for key, value in action.params.items():
+        if value is None or value == "":
+            continue
         variables[str(key)] = value
+
     metrics = action.metrics
-    variables["seconds"] = _as_number(
-        metrics.get("duration_seconds", metrics.get("output_duration_seconds", 0.0))
-    )
-    variables["tokens"] = _as_number(metrics.get("tokens", 0.0))
-    variables["videos"] = _as_number(metrics.get("call_count", action.quantity or 0))
-    variables["prompt_tokens"] = _as_number(metrics.get("prompt_tokens", 0.0))
-    variables["completion_tokens"] = _as_number(metrics.get("completion_tokens", 0.0))
-    variables["prompt_cached_tokens"] = _as_number(metrics.get("prompt_cached_tokens", 0.0))
-    variables["prompt_cache_creation_tokens"] = _as_number(
-        metrics.get("prompt_cache_creation_tokens", 0.0)
-    )
-    variables["image_tokens"] = _as_number(metrics.get("image_tokens", 0.0))
-    variables["image_cached_tokens"] = _as_number(metrics.get("image_cached_tokens", 0.0))
+
+    def take(name: str, *sources: str) -> None:
+        for source in sources:
+            if source in metrics and metrics[source] is not None:
+                variables[name] = _as_number(metrics[source])
+                return
+
+    take("seconds", "duration_seconds", "output_duration_seconds")
+    take("videos", "call_count")
+    take("chars", "billable_chars")
+    take("tokens", "tokens")
+    take("prompt_tokens", "prompt_tokens")
+    take("completion_tokens", "completion_tokens")
+    take("prompt_cached_tokens", "prompt_cached_tokens")
+    take("prompt_cache_creation_tokens", "prompt_cache_creation_tokens")
+    take("image_tokens", "image_tokens")
+    take("image_cached_tokens", "image_cached_tokens")
     return variables
 
 

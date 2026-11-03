@@ -272,6 +272,19 @@ describe("Header runtime gating", () => {
     expect(screen.getByRole("dialog")).toHaveTextContent("Settings dialog");
   });
 
+  it("drops the settings entry when the instance flag is set", () => {
+    vi.stubEnv("VITE_HIDE_HEADER_SETTINGS", "1");
+    try {
+      renderHeader();
+
+      // Only the 设置 bolt is gone; the rest of the header actions still render.
+      expect(screen.queryByRole("button", { name: "Settings" })).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Open account")).toBeInTheDocument();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("renders logout in the account panel when runtime requires auth", async () => {
     renderHeader();
 

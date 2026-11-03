@@ -25,6 +25,7 @@ import { InternalKeyGate } from "@/features/access/internal-key-gate";
 import { internalHomePath } from "@/lib/app-mode";
 import { useAllProjectSummaries } from "@/lib/queries/projects";
 import { FreezoneCanvasHost } from "@/features/freezone/FreezoneCanvasHost";
+import { useFreezoneCanvasRoute } from "@/features/freezone/canvas-route";
 import { canonicalProjectRouteParam } from "@/lib/project-route";
 import { useRegionStore } from "@/stores/region-store";
 import { clusterConfig } from "@/lib/cluster-config";
@@ -69,6 +70,8 @@ function AppLayout() {
   const params = useParams({ strict: false }) as { project?: string };
   const routeProject = params.project ?? null;
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  // 画布宿主只认 `{ project, active }`；这层 URL 解析留在内部壳里（见 canvas-route）。
+  const freezoneCanvasRoute = useFreezoneCanvasRoute();
   const isProjectDashboard = pathname === "/";
   const projectSummaries = useAllProjectSummaries();
   const canonicalProject = routeProject
@@ -307,7 +310,10 @@ function AppLayout() {
               {/* 必须挂在被 re-key 的 motion.div 外面：key 里带着 $section，
                   放进去就等于每次切换重建一遍画布，保活也就没了意义。作为
                   <main> 的后继兄弟绝对定位，在捏画时正好盖住它。 */}
-              <FreezoneCanvasHost />
+              <FreezoneCanvasHost
+                project={freezoneCanvasRoute.project}
+                active={freezoneCanvasRoute.active}
+              />
               {routeSwitchPending ? (
                 <div
                   role="status"

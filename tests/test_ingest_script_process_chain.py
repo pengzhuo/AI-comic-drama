@@ -67,7 +67,13 @@ class _FakeStore:
         return None
 
     async def ingest_novel_fast(
-        self, novel_path, rebuild=False, spine_template=None, on_progress=None, on_log=None
+        self,
+        novel_path,
+        rebuild=False,
+        spine_template=None,
+        require_scene_headers=True,
+        on_progress=None,
+        on_log=None,
     ):
         if on_progress:
             on_progress(1.0, "导入完成")

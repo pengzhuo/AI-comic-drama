@@ -61,6 +61,7 @@ from novelvideo.api.routes import (  # noqa: E402
     model_gateway,
     model_credits,
     pipeline,
+    points,
     product_surfaces,
     projects,
     props,
@@ -122,6 +123,7 @@ api_router.include_router(screenplay.router, tags=["scripts"])
 api_router.include_router(content.router, tags=["content"])
 api_router.include_router(cost_report.router, tags=["cost-report"])
 api_router.include_router(estimate.router, tags=["production-estimate"])
+api_router.include_router(points.router, tags=["points"])
 api_router.include_router(generation.router, tags=["generation"])
 api_router.include_router(tasks.router, tags=["tasks"])
 api_router.include_router(files.router, tags=["files"])

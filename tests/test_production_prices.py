@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -73,6 +72,23 @@ def test_expr_prompt_completion_shorthand():
 def test_expr_cache_shorthand_and_missing_vars_default_zero():
     assert evaluate_expr(DEEPSEEK_EXPR, {"p": 1000}) == pytest.approx(1000 * 0.59104478)
     assert evaluate_expr(DEEPSEEK_EXPR, {}) == 0.0
+
+
+def test_evaluate_expr_detailed_reports_used_and_missing():
+    value, used, missing = pp.evaluate_expr_detailed(
+        SEEDANCE_FAST_EXPR, {"video_input": "none", "tokens": 2_000_000}
+    )
+    assert value == pytest.approx(3.03731343 * 2)
+    assert used == {"video_input", "tokens"}
+    assert missing == set()
+
+    # 简写折算到规范名；没值就算 missing。
+    value, used, missing = pp.evaluate_expr_detailed(
+        AUDIO_EXPR, {"prompt_tokens": 10}
+    )
+    assert value == pytest.approx(10 * 17.910447761194)
+    assert used == {"prompt_tokens", "completion_tokens"}
+    assert missing == {"completion_tokens"}
 
 
 def test_expr_rejects_unsupported_syntax():
@@ -218,7 +234,26 @@ def test_synced_alias_resolution():
     assert priced.cny == pytest.approx(3.03731343 * 7.3)
 
 
-def test_synced_audio_uses_aigc_rate():
+def test_synced_video_without_token_usage_is_unpriced_not_zero():
+    """上游按 token 计费、而我们只知秒数时，宁可未定价也绝不出 ¥0。"""
+
+    book = _synced_book()
+    priced = book.price(
+        ActionRequest(
+            kind="video",
+            model="seedance-2.0-fast",
+            params={"video_input": "none"},
+            metrics={"duration_seconds": 300, "call_count": 60},
+        )
+    )
+    assert priced.source == "unpriced"
+    assert priced.cny is None
+    assert "tokens" in priced.note
+
+
+def test_synced_undeclared_usage_is_unpriced():
+    """TTS 的 p/c 是网关自己从响应里数的用量，上游没声明口径 → 不能瞎算。"""
+
     book = _synced_book()
     priced = book.price(
         ActionRequest(
@@ -227,7 +262,9 @@ def test_synced_audio_uses_aigc_rate():
             metrics={"prompt_tokens": 1000, "completion_tokens": 1000, "call_count": 1},
         )
     )
-    assert priced.cny == pytest.approx((1000 * 17.910447761194 + 1000 * 14.925373134328) * 6.7)
+    assert priced.source == "unpriced"
+    assert priced.cny is None
+    assert "未声明用量口径" in priced.note
 
 
 def test_manual_rule_beats_synced():
@@ -252,17 +289,21 @@ def test_manual_rule_beats_synced():
 # ---------------------------------------------------------------------------
 
 
-def test_markup_per_client_then_default_then_none():
+def test_markup_per_client_then_default_then_one_x():
     book = _book(
-        client_markups={"19174820303": {"markup": 2.5}},
+        client_markups={"13800138000": {"markup": 2.5}},
         markup_default=1.8,
     )
-    assert book.resolve_markup("19174820303") == (2.5, "client")
-    assert book.resolve_markup("191 7482 0303") == (2.5, "client")
+    assert book.resolve_markup("13800138000") == (2.5, "client")
+    assert book.resolve_markup("138 0013 8000") == (2.5, "client")
     assert book.resolve_markup("13800000000") == (1.8, "default")
 
+    # 没配客户倍率 → 默认 1 倍（永不返回 None，否则付费闸门只能 400）。
     empty = _book()
-    assert empty.resolve_markup("13800000000") == (None, "")
+    assert empty.resolve_markup("13800000000") == (1.0, "default")
+    # 显式 null / ≤0 与缺失同义：都按 1 倍。
+    assert _book(markup_default=None).resolve_markup("13800000000") == (1.0, "default")
+    assert _book(markup_default=0).resolve_markup("13800000000") == (1.0, "default")
 
 
 # ---------------------------------------------------------------------------

@@ -366,6 +366,35 @@ async def test_drama_import_chunks_by_scene(structured_project, tmp_path):
     assert result["chunks"] >= 3
 
 
+async def test_headerless_drama_is_allowed_when_gate_is_relaxed(
+    structured_project, tmp_path
+):
+    """``require_scene_headers=False``（工作室 warn 策略）放行无场景头剧本。
+
+    默认严格仍然拦截；显式放宽后按正文窗口切分并落盘，交由剧本处理阶段规范化，
+    否则工作室「开始制作」会在 ingest 任务里跑失败。
+    """
+    from novelvideo.structured_ingest import ingest_source_text_structured
+
+    store, _ = structured_project
+    novel = tmp_path / "script.txt"
+    novel.write_text("这是一段没有任何场景头的正文。\n" * 40, encoding="utf-8")
+    novel_txt = Path(store.project_dir) / "novel.txt"
+
+    with pytest.raises(ValueError):
+        await ingest_source_text_structured(
+            store, str(novel), spine_template="drama", require_scene_headers=True
+        )
+    assert not novel_txt.exists()
+
+    result = await ingest_source_text_structured(
+        store, str(novel), spine_template="drama", require_scene_headers=False
+    )
+    assert result["status"] == "source_ready"
+    assert result["chunks"] >= 1
+    assert novel_txt.exists()
+
+
 # ── evidence ────────────────────────────────────────────────────────────────
 
 

@@ -14,6 +14,8 @@ import {
  *
  * 服务端会在这些地方停下：
  * - 内联图片闸门（角色形象图 / 身份图）→ 自动确认，用生成图继续；
+ * - **成本闸门**（分镜写完之后）→ **不自动确认**：这时候图/视频还没开跑，先把报价
+ *   摆给客户看一眼，由客户点「继续制作」；
  * - 其它硬暂停（前置未满足、可重试失败、跑飞被兜底）→ 自动 `/continue`；
  * - `awaiting_confirmation`（Agent 提议改动，等用户点头）→ 不猜，交还给人。
  *
@@ -21,6 +23,9 @@ import {
  * 计数**——否则一个必然失败的阶段会被无限重试，把额度烧光。
  */
 export const MAX_AUTO_RECOVERIES = 8;
+
+/** 分镜后「制作成本预估」闸门：不自动确认（见文件头注释）。 */
+const COST_ESTIMATE_GATE = "cost_estimate";
 
 /** 看到暂停先等一会儿再动：服务端内部还会自己续跑，抢着调反而打断它。 */
 const REACT_DELAY_MS = 2500;
@@ -82,6 +87,11 @@ export function useStudioRun(
 
     const timer = window.setTimeout(() => {
       if (gate && episode > 0) {
+        // 成本闸门不自动确认：分镜已完成，先把报价交给客户点头再花钱。
+        if (gate === COST_ESTIMATE_GATE) {
+          setNeedsHuman("已完成分镜与制作报价，请确认报价后再继续生成画面与视频。");
+          return;
+        }
         const gateKey = `${runId}:${gate}:${episode}`;
         if (handledGateKeys.current.has(gateKey)) return;
         handledGateKeys.current.add(gateKey);

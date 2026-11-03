@@ -52,7 +52,10 @@ export interface AccessLinkResult {
   ok: boolean;
   error?: string;
   phone?: string;
+  /** 工作台入口 `/studio` 专属链接。 */
   link?: string;
+  /** 捏画入口 `/canvas` 专属链接（同一 code，只换路径）。 */
+  canvasLink?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -190,13 +193,21 @@ export function useSetAccessGate() {
   );
 }
 
+export interface GenerateAccessLinkInput {
+  phone: string;
+  /** 可选：捏画链接直达的项目 id（留空则落到 `/canvas` 项目列表）。 */
+  project?: string;
+}
+
 export function useGenerateAccessLink() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (phone: string): Promise<AccessLinkResult> => {
+    mutationFn: async (input: GenerateAccessLinkInput): Promise<AccessLinkResult> => {
       try {
         const body = await api
-          .post("/api/v1/access/config/link", { json: { phone } })
+          .post("/api/v1/access/config/link", {
+            json: { phone: input.phone, project: input.project ?? "" },
+          })
           .json<unknown>();
         const data = isRecord(body) && isRecord(body.data) ? body.data : null;
         const link = data && typeof data.link === "string" ? data.link : "";
@@ -204,7 +215,8 @@ export function useGenerateAccessLink() {
         return {
           ok: true,
           link,
-          phone: typeof data?.phone === "string" ? data.phone : phone,
+          canvasLink: data && typeof data.canvas_link === "string" ? data.canvas_link : undefined,
+          phone: typeof data?.phone === "string" ? data.phone : input.phone,
         };
       } catch (error) {
         return { ok: false, error: errorMessage(error, "生成链接失败") };

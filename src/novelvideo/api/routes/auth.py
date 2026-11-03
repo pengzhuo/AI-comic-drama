@@ -5,6 +5,7 @@ import logging
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
+from novelvideo import studio_access
 from novelvideo.api.auth import (
     AUTH_COOKIE_NAME,
     get_api_user,
@@ -46,6 +47,23 @@ def _clear_auth_cookie(response: Response) -> None:
     )
 
 
+def _clear_studio_access_cookies(response: Response) -> None:
+    """Logout must also drop the studio-gate identities (`st_studio`/`st_internal`).
+
+    Signing out used to clear only the login cookie, so the 30-day access cookie
+    survived and the browser could walk straight back into `/studio` (and keep
+    the console identity) without re-verifying. Clearing them here keeps every
+    exit path honest, whichever button the operator/user pressed.
+    """
+    for name in (studio_access.CLIENT_COOKIE_NAME, studio_access.INTERNAL_COOKIE_NAME):
+        response.delete_cookie(
+            key=name,
+            path="/",
+            samesite="lax",
+            secure=_cookie_secure(),
+        )
+
+
 @router.post("/auth/logout")
 async def logout(request: Request):
     """Best-effort revoke the session and always clear the browser cookie."""
@@ -61,6 +79,7 @@ async def logout(request: Request):
 
     response = JSONResponse({"ok": True})
     _clear_auth_cookie(response)
+    _clear_studio_access_cookies(response)
     return response
 
 

@@ -382,6 +382,7 @@ async def start_ingest(
     effective_spine_template = (
         "narrated" if requested_spine_template == "narrated" else "drama"
     )
+    format_advisory: dict | None = None
     if effective_spine_template == "drama":
         preview = build_chapter_preview(content)
         format_check = build_import_format_check(
@@ -403,10 +404,12 @@ async def start_ingest(
                 for key, value in format_check.get("metrics", {}).items()
                 if isinstance(value, (int, float)) and not isinstance(value, bool)
             }
+            blocked = body.format_policy == "block"
             logger.warning(
-                "screenplay_format_blocked project=%s filename=%s "
+                "screenplay_format_%s project=%s filename=%s "
                 "spine_template=%s level=%s issue_codes=%s metrics=%s "
                 "scene_header_status=%s",
+                "blocked" if blocked else "advisory",
                 project,
                 safe_name,
                 effective_spine_template,
@@ -415,16 +418,23 @@ async def start_ingest(
                 numeric_metrics,
                 format_check.get("scene_header_status", ""),
             )
-            return {
-                "ok": False,
-                "error": format_check["summary"],
-                "error_type": "screenplay_format",
-                "format_check": format_check,
-            }
+            if blocked:
+                return {
+                    "ok": False,
+                    "error": format_check["summary"],
+                    "error_type": "screenplay_format",
+                    "format_check": format_check,
+                }
+            # ``warn``：放行导入，把体检结果随成功响应带回，由调用方作为提示展示
+            # （工作室一键成片不拦用户，后续剧本处理阶段会整理成标准分场）。
+            format_advisory = format_check
 
     config = {
         "rebuild": body.rebuild,
         "spine_template": effective_spine_template,
+        # ``warn`` 不仅放行 API 预检，任务级门禁也必须放行：否则 ingest_fast 会在
+        # structured_ingest/cognee 里再次因缺场景头抛错，把刚建好的项目跑失败。
+        "require_scene_headers": body.format_policy != "warn",
     }
     # Persist the exact source used by this import. The ingest page can then
     # rebuild from the existing upload without forcing the user to upload again.
@@ -458,7 +468,7 @@ async def start_ingest(
                 },
             },
         )
-        return {
+        response: dict[str, Any] = {
             "ok": True,
             "task_type": "ingest_fast",
             "task_id": queued.task_state.task_id,
@@ -467,5 +477,10 @@ async def start_ingest(
             "queue": queued.queue,
             "message": f"导入任务已进入队列: {safe_name}",
         }
+        if format_advisory is not None:
+            # 只有 ``format_policy="warn"`` 会带值：格式问题不阻断导入，
+            # 交给客户端作为提示展示。
+            response["format_check"] = format_advisory
+        return response
 
     return {"ok": False, "error": "导入需要 project context"}

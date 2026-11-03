@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { createElement, type ComponentType } from "react";
 
 const accessMocks = vi.hoisted(() => ({
@@ -19,6 +19,8 @@ vi.mock("@/lib/access-session", () => accessMocks);
 vi.mock("@/lib/app-mode", () => ({
   isClientMode: () => false,
   internalEntryPath: () => "/console",
+  // ClientAccessShell 的品牌链接用 clientEntryPath()；缺了它渲染外壳会抛错。
+  clientEntryPath: () => "/studio",
 }));
 
 vi.mock("@/lib/auth-mode", () => ({
@@ -103,7 +105,7 @@ describe("/studio 客户链接兑换", () => {
     expect(accessMocks.activateClientSession).toHaveBeenCalledWith(PHONE, CODE);
   });
 
-  it("服务端拒绝时把错误文案交给门禁页，并照旧抹掉校验码", async () => {
+  it("服务端拒绝时把错误文案交给门禁页、清掉旧会话，并照旧抹掉校验码", async () => {
     accessMocks.activateClientSession.mockResolvedValue({
       ok: false,
       error: "访问链接无效，请使用收到的专属链接",
@@ -114,15 +116,30 @@ describe("/studio 客户链接兑换", () => {
     );
 
     expect(accessMocks.setAccessNotice).toHaveBeenCalledWith("访问链接无效，请使用收到的专属链接");
+    // 关键：坏链接不能回落到浏览器里已有的会话 cookie，否则门禁形同虚设。
+    expect(accessMocks.logoutAccessSession).toHaveBeenCalledTimes(1);
     expect(redirectOptions(error)).toMatchObject({ href: "/studio", replace: true });
   });
 
-  it("链接只有一半参数时给出「不完整」提示，而不是静默回到门禁页", async () => {
+  it("浏览器本来已是 client 会话时，坏链接仍然拦回门禁页（不回落旧 cookie）", async () => {
+    accessMocks.fetchAccessSession.mockResolvedValue({ enabled: true, kind: "client", phone: PHONE });
+    accessMocks.activateClientSession.mockResolvedValue({ ok: false, error: "访问链接无效" });
+
+    const error = await runBeforeLoad(
+      locationFor(`?phone=${PHONE}&code=${CODE}`, { phone: Number(PHONE), code: CODE }),
+    );
+
+    expect(accessMocks.logoutAccessSession).toHaveBeenCalledTimes(1);
+    expect(redirectOptions(error)).toMatchObject({ href: "/studio", replace: true });
+  });
+
+  it("链接只有一半参数时给出「不完整」提示并清掉旧会话，而不是静默放行", async () => {
     const error = await runBeforeLoad(locationFor(`?phone=${PHONE}`, { phone: Number(PHONE) }));
 
     expect(accessMocks.activateClientSession).not.toHaveBeenCalled();
     expect(accessMocks.setAccessNotice).toHaveBeenCalledWith(expect.stringContaining("不完整"));
-    expect(error).toBeNull();
+    expect(accessMocks.logoutAccessSession).toHaveBeenCalledTimes(1);
+    expect(redirectOptions(error)).toMatchObject({ href: "/studio", replace: true });
   });
 
   it("普通访问 /studio（无参数）不发兑换、也不打扰用户", async () => {
@@ -161,5 +178,15 @@ describe("/studio 客户外壳", () => {
     const main = document.getElementById("main-content");
     expect(main).not.toBeNull();
     expect(main).toHaveAttribute("tabindex", "-1");
+  });
+
+  it("纯内部身份（没有旧登录用户名）也给出退出入口", () => {
+    accessMocks.useAccessSession.mockReturnValue({ enabled: true, kind: "internal", phone: "" });
+
+    const Layout = Route.options.component as ComponentType;
+    render(createElement(Layout));
+
+    // 以前按钮只在 identity 非空时渲染，纯内部身份（username 为空）会连退出都没有。
+    expect(screen.getByRole("button", { name: "退出" })).toBeTruthy();
   });
 });

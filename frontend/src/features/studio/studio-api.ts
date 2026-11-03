@@ -9,6 +9,7 @@ import {
   type UploadResult,
 } from "@/lib/queries/ingest";
 import type { ErrorResponse, OkResponse, TaskResponse } from "@/types/api";
+import type { StudioRunConfig } from "@/lib/queries/director-auto";
 import type { SpineTemplate } from "@/types/project";
 
 /**
@@ -99,18 +100,47 @@ interface IngestStartBlocked extends ErrorResponse {
   format_check?: FormatCheck;
 }
 
+/**
+ * `ingest/start` 成功时的响应。
+ *
+ * `format_policy="warn"` 下后端会把「精品剧缺场景头」的体检结果一并带回
+ * （`format_check`），供工作室作为提示展示，而不是当成错误拦住导入。
+ */
+export interface StudioIngestStarted extends TaskResponse {
+  format_check?: FormatCheck | null;
+}
+
+export interface StartStudioIngestOptions {
+  /**
+   * 「精品剧」缺场景头时的策略。`warn`（默认）放行导入并把体检结果带回来展示，
+   * `block` 交给后端拦住（内部捏料页的严格门禁）。
+   */
+  formatPolicy?: "block" | "warn";
+}
+
 export async function startStudioIngest(
   project: string,
   filename: string,
   spineTemplate: SpineTemplate,
-): Promise<TaskResponse> {
+  { formatPolicy = "warn" }: StartStudioIngestOptions = {},
+): Promise<StudioIngestStarted> {
   // `ingest/start` 的失败是 HTTP 200 + `{ok:false}`（格式闸门、文件缺失…），所以
   // 必须看 body 里的 ok，而不是等 ky 抛错。
   const response = await jsonWithBackendError<
-    TaskResponse | IngestStartBlocked
+    StudioIngestStarted | IngestStartBlocked
   >(
     api.post(p`api/v1/projects/${project}/ingest/start`, {
-      json: { filename, spine_template: spineTemplate },
+      // 与内部导入页一致：带 ``spine_template`` 就必须带 ``rebuild``。后端
+      // （``ingest.py`` 的「项目类型只能在重新导入时修改」守卫）只放行 rebuild 的
+      // 改型请求，否则整条导入直接被拒、``ingest_fast`` 永远不入队，预处理也就
+      // 从来没有跑的机会。工作室每次都是新建项目后首导，rebuild 是空操作。
+      json: {
+        filename,
+        spine_template: spineTemplate,
+        rebuild: true,
+        // 缺场景头不拦：把格式问题降级为提示，导入照常入队并跑预处理。
+        format_policy: formatPolicy,
+      },
       throwHttpErrors: false,
     }),
   );
@@ -126,18 +156,68 @@ export async function startStudioIngest(
 }
 
 /**
- * 一键成片的预设：用户不需要回答「风格/语种/叙事人称」这类问题。
+ * 工作室的三个选项（项目类型 / 视觉风格 / 解说风格 / 默认未指定人群）。
  *
- * 这几个键同时承担两个作用：`visual_style` 决定画面风格；`narration_style` /
- * `ethnicity` 会让后端认为项目「已配置」（`pipeline_status._user_has_configured`），
- * 否则自动流程会卡在「等待配置」上。取值与内部导入页的默认选项一致。
+ * 这些值先经 `PATCH /projects/{id}` 落到项目配置，再由工作台的自动开跑读回：
+ * `visual_style` 决定画面风格；`narration_style` / `ethnicity` 会让后端认为项目
+ * 「已配置」（`pipeline_status._user_has_configured`），否则自动流程会卡在
+ * 「等待配置」上。取值与内部导入页的选项一致。
  */
-export const STUDIO_RUN_CONFIG = {
+export interface StudioChoices {
+  spine_template: SpineTemplate;
+  visual_style: string;
+  narration_style: string;
+  ethnicity: string;
+}
+
+/** 默认预设：用户不改也能直接开跑（项目类型默认精品剧）。 */
+export const DEFAULT_STUDIO_CHOICES: StudioChoices = {
   spine_template: "drama",
   visual_style: "chinese_period_drama",
   narration_style: "first_person",
   ethnicity: "Chinese",
-} as const;
+};
+
+/**
+ * 把用户选择（或项目配置）补成 `director-auto/start` 需要的运行配置；缺项回落
+ * 到默认预设。
+ */
+export function studioRunConfig(
+  choices: Partial<StudioChoices> | null | undefined,
+): StudioRunConfig {
+  return {
+    spine_template: choices?.spine_template ?? DEFAULT_STUDIO_CHOICES.spine_template,
+    visual_style: choices?.visual_style ?? DEFAULT_STUDIO_CHOICES.visual_style,
+    narration_style:
+      choices?.narration_style ?? DEFAULT_STUDIO_CHOICES.narration_style,
+    ethnicity: choices?.ethnicity ?? DEFAULT_STUDIO_CHOICES.ethnicity,
+  };
+}
+
+/**
+ * 把工作室选择的视觉风格 / 解说风格 / 人群写进项目配置。
+ *
+ * `spine_template` 与 `aspect_ratio` 留给 `ingest/start` 写（它带 `rebuild` 守卫），
+ * 这里只落「非导入型」设置，避免与那条守卫打架。
+ */
+export async function saveStudioProjectChoices(
+  project: string,
+  choices: Partial<StudioChoices>,
+): Promise<void> {
+  const body: Record<string, string> = {};
+  if (choices.visual_style !== undefined) body.visual_style = choices.visual_style;
+  if (choices.narration_style !== undefined) {
+    body.narration_style = choices.narration_style;
+  }
+  if (choices.ethnicity !== undefined) body.ethnicity = choices.ethnicity;
+  if (Object.keys(body).length === 0) return;
+  await jsonWithBackendError<OkResponse<unknown>>(
+    api.patch(p`api/v1/projects/${project}`, {
+      json: body,
+      throwHttpErrors: false,
+    }),
+  );
+}
 
 /** 导入链（ingest → 剧本预处理 → 剧本处理）是否已走完，可以开始一键成片。 */
 export function isImportSettled(

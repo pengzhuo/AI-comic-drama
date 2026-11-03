@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from novelvideo.config import STATE_DIR
 
@@ -45,8 +45,25 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 
+def _looks_like_project_id(value: str) -> bool:
+    """项目名是用户起的标签；26 位全大写字母数字几乎只可能是被误传的 project_id。"""
+
+    text = str(value or "")
+    return len(text) == 26 and text.isalnum() and text.upper() == text
+
+
 def get_project_config_path(username: str, project: str) -> Path:
     from novelvideo.utils.project_paths import ProjectPaths
+
+    if _looks_like_project_id(project):
+        # 兜底可见性：路径是纯拼的（root/username/project），错把 project_id 当项目名
+        # 会静默造出 state/<username>/<project_id>/ 幽灵目录（见 director_auto 闸门）。
+        _log.warning(
+            "project_config 路径收到疑似 project_id 的项目名：username=%s project=%s；"
+            "调用方应按项目归属解析，而不是把 id 当项目名",
+            username,
+            project,
+        )
 
     # Read the module-level OUTPUT_DIR (alias of STATE_DIR) so tests that
     # monkeypatch ``novelvideo.project_config.OUTPUT_DIR`` redirect the root.
@@ -702,3 +719,176 @@ def confirm_cost_estimate(username: str, project: str, episode: int) -> None:
         config[COST_ESTIMATE_CONFIRMED_KEY] = episodes
 
     update_project_config_file(username, project, _apply)
+
+
+#: 伴点预扣台账，形如 ``{"1": {"amount": 23081, "cny": 230.81, "phone": "138…"}}``
+#: （键是集号）。**同一集扣成功过一次就不再扣**——重复点「确认」不该重复收费，
+#: 所以扣费前先查这里，扣成功后再写。扣了不退（对账/退款走人工）。
+POINTS_CHARGES_KEY = "points_charges"
+
+
+def _points_charges(config: dict) -> dict[str, dict]:
+    raw = config.get(POINTS_CHARGES_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            out[str(key)] = dict(value)
+    return out
+
+
+def points_charge(username: str, project: str, episode: int) -> dict | None:
+    """第 ``episode`` 集已扣伴点的记录；没扣过返回 ``None``。"""
+
+    try:
+        episode_key = str(int(episode))
+    except (TypeError, ValueError):
+        return None
+    config = load_project_config_file(username, project)
+    return _points_charges(config).get(episode_key) or None
+
+
+def record_points_charge(
+    username: str,
+    project: str,
+    episode: int,
+    *,
+    amount: int,
+    cny: float | None = None,
+    phone: str = "",
+    message: str = "",
+) -> dict:
+    """记一笔扣费台账（**成功之后**才写），返回写入的这条。"""
+
+    episode_key = str(int(episode))
+    entry: dict = {
+        "amount": int(amount),
+        "phone": str(phone or ""),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    if cny is not None:
+        entry["cny"] = round(float(cny), 4)
+    if message:
+        entry["message"] = str(message)
+
+    def _apply(config: dict) -> None:
+        charges = _points_charges(config)
+        charges[episode_key] = entry
+        config[POINTS_CHARGES_KEY] = charges
+
+    update_project_config_file(username, project, _apply)
+    return entry
+
+
+#: 伴点结算台账（成片后按**实际用量**多退少补），键是集号。字段::
+#:
+#:     status      settled | owed | inflight | pending | refund_pending | settled_manual
+#:     prepaid     预扣伴点（来自 POINTS_CHARGES_KEY）
+#:     settlement  结算伴点（按 relay 真值折算的售价）
+#:     delta       settlement - prepaid（正=补扣，负=退还）
+#:     actual_cny  该集 relay 口径实际成本（¥）
+#:     quota       该集已对上的上游 quota 之和；matched/rows 是覆盖度
+#:     charged     实扣伴点；refunded 实退伴点
+#:     reason      owed 的原因：insufficient（余额不足）| unavailable（渠道不可用）
+#:     message     给客户看的一句话
+#:     at/by/action  最近一次写入时间 / 操作人 / 动作
+POINTS_SETTLEMENTS_KEY = "points_settlements"
+
+#: 已终态的结算状态（重复触发不该重复扣/退）。
+POINTS_SETTLEMENT_FINAL = frozenset({"settled", "refund_pending", "settled_manual"})
+
+
+def _points_settlements(config: dict) -> dict[str, dict]:
+    raw = config.get(POINTS_SETTLEMENTS_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            out[str(key)] = dict(value)
+    return out
+
+
+def points_settlement(username: str, project: str, episode: int) -> dict | None:
+    """第 ``episode`` 集的结算台账；没结算过返回 ``None``。"""
+
+    try:
+        episode_key = str(int(episode))
+    except (TypeError, ValueError):
+        return None
+    config = load_project_config_file(username, project)
+    return _points_settlements(config).get(episode_key) or None
+
+
+def record_points_settlement(
+    username: str,
+    project: str,
+    episode: int,
+    *,
+    status: str,
+    **fields: Any,
+) -> dict:
+    """写入/更新某集的结算台账，返回合并后的这一条。"""
+
+    episode_key = str(int(episode))
+    entry: dict[str, Any] = {
+        "status": str(status),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    entry.update({key: value for key, value in fields.items() if value is not None})
+
+    def _apply(config: dict) -> None:
+        settlements = _points_settlements(config)
+        settlements[episode_key] = entry
+        config[POINTS_SETTLEMENTS_KEY] = settlements
+
+    update_project_config_file(username, project, _apply)
+    return entry
+
+
+def points_charge_in_state_dir(state_dir: str | Path, episode: int) -> dict | None:
+    """按项目目录读预扣台账（读取路径只有 ``state_dir``，没有 username/project）。"""
+
+    try:
+        episode_key = str(int(episode))
+    except (TypeError, ValueError):
+        return None
+    config = load_project_config_file_from_state_dir(state_dir)
+    return _points_charges(config).get(episode_key) or None
+
+
+def points_settlement_in_state_dir(state_dir: str | Path, episode: int) -> dict | None:
+    """按项目目录读结算台账；没结算过返回 ``None``。"""
+
+    try:
+        episode_key = str(int(episode))
+    except (TypeError, ValueError):
+        return None
+    config = load_project_config_file_from_state_dir(state_dir)
+    return _points_settlements(config).get(episode_key) or None
+
+
+def record_points_settlement_in_state_dir(
+    state_dir: str | Path,
+    episode: int,
+    *,
+    status: str,
+    **fields: Any,
+) -> dict:
+    """按项目目录写入/更新结算台账，返回合并后的这一条。"""
+
+    episode_key = str(int(episode))
+    entry: dict[str, Any] = {
+        "status": str(status),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    entry.update({key: value for key, value in fields.items() if value is not None})
+
+    def _apply(config: dict) -> None:
+        settlements = _points_settlements(config)
+        settlements[episode_key] = entry
+        config[POINTS_SETTLEMENTS_KEY] = settlements
+
+    update_project_config_file_in_state_dir(state_dir, _apply)
+    return entry

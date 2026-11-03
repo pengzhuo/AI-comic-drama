@@ -468,10 +468,11 @@ def create_app() -> FastAPI:
         file_path: str,
         request: Request,
         st_thumb: str | None = None,
+        as_client: str = "",
         user: dict = Depends(get_api_user),
     ):
         return await preview_project_media_file(
-            project, file_path, user, st_thumb=st_thumb, request=request
+            project, file_path, user, st_thumb=st_thumb, request=request, as_client=as_client
         )
 
     @application.get("/static/{legacy_path:path}", include_in_schema=False)

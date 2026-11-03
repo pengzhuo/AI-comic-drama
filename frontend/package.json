@@ -10,6 +10,7 @@
     "build": "tsc -b && vite build",
     "build:ce": "tsc -b && vite build --mode ce",
     "build:client": "vite build --mode client",
+    "build:canvas": "vite build --mode canvas",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"

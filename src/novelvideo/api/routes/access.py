@@ -12,7 +12,7 @@ The internal console portals on this module for its settings page:
 
 * ``GET  /access/config``          — masked gate settings (never plaintext)
 * ``POST /access/config``          — rotate the client secret / internal key
-* ``POST /access/config/link``     — build a client link for a phone number
+* ``POST /access/config/link``     — build studio (/studio) + canvas (/canvas) links
 * ``POST /access/gate``            — turn the gate off (or back on)
 
 Verification is server-side only. Responses deliberately avoid 401 so the SPA's
@@ -25,6 +25,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
 import threading
 import time
 
@@ -62,9 +63,15 @@ def _set_scoped_cookie(
     *,
     name: str,
     value: str,
-    max_age: int,
+    max_age: int | None,
     request: Request,
 ) -> None:
+    """Set an HttpOnly access cookie; ``max_age=None`` issues a *session* cookie.
+
+    Session cookies die with the window, so closing the browser forces the holder
+    to re-open their link / re-enter the console key. The signed expiry inside
+    ``value`` still caps how long the cookie is honoured.
+    """
     response.set_cookie(
         key=name,
         value=value,
@@ -101,6 +108,8 @@ class AccessGateBody(BaseModel):
 
 class AccessLinkBody(BaseModel):
     phone: str = ""
+    # 可选：捏画链接要直达的项目 id（留空则落到 ``/canvas`` 项目列表）。
+    project: str = ""
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -213,9 +222,15 @@ def _studio_link_base(request: Request) -> str:
     return f"{scheme}://{host}"
 
 
-def _client_link(request: Request, phone: str) -> str:
+def _client_link(request: Request, phone: str, path: str = "/studio") -> str:
+    """专属链接本体：同一个 ``code`` 对任何路径都成立（链接与路径/项目无关）。"""
     code = studio_access.expected_code(phone)
-    return f"{_studio_link_base(request)}/studio?phone={phone}&code={code}"
+    return f"{_studio_link_base(request)}{path}?phone={phone}&code={code}"
+
+
+# 项目 id（当前是 ULID 形态的大写字母数字，也容忍常见的 ``-``/``_`` 连字符）。它要
+# 拼进 URL，所以先做白名单校验，避免生成一条能把客户带偏的链接。
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _verify_confirm_key(request: Request, confirm_key: str) -> bool:
@@ -239,8 +254,15 @@ async def create_client_session(body: ClientSessionBody, request: Request):
         response,
         name=studio_access.CLIENT_COOKIE_NAME,
         value=studio_access.create_client_cookie(phone),
-        max_age=studio_access.CLIENT_SESSION_TTL_SECONDS,
+        max_age=None,
         request=request,
+    )
+    # 链接为准：兑换成功的客户链接要这个浏览器当场变成客户身份。浏览器里若还留着
+    # 内部身份 cookie（例如运营刚在 /console 待过），``/access/session`` 会优先报
+    # internal（不带 phone），页头就回落到用户名（CE 上就是 local），客户会以为链接
+    # 没生效——必须先把它清掉。
+    _clear_scoped_cookie(
+        response, name=studio_access.INTERNAL_COOKIE_NAME, request=request
     )
     logger.info("studio session activated (phone ****%s)", phone[-4:])
     return response
@@ -265,7 +287,7 @@ async def create_internal_session(body: InternalSessionBody, request: Request):
         response,
         name=studio_access.INTERNAL_COOKIE_NAME,
         value=studio_access.create_internal_cookie(),
-        max_age=studio_access.INTERNAL_SESSION_TTL_SECONDS,
+        max_age=None,
         request=request,
     )
     logger.info("internal console session activated")
@@ -348,7 +370,7 @@ async def update_access_config(body: AccessConfigBody, request: Request):
             response,
             name=studio_access.INTERNAL_COOKIE_NAME,
             value=studio_access.create_internal_cookie(),
-            max_age=studio_access.INTERNAL_SESSION_TTL_SECONDS,
+            max_age=None,
             request=request,
         )
     _clear_failures(request, _RATE_SCOPE_SETTINGS)
@@ -358,7 +380,12 @@ async def update_access_config(body: AccessConfigBody, request: Request):
 
 @router.post("/access/config/link")
 async def create_access_link(body: AccessLinkBody, request: Request):
-    """Build the /studio link for one phone number (internal console only)."""
+    """Build the studio (/studio) and canvas (/canvas) links for one phone number.
+
+    Only the console may call this. Both links carry the same ``code``; the client
+    entry is path/project independent, so the canvas link is just the studio link
+    pointed at ``/canvas`` (optionally ``/canvas/<project>``).
+    """
     if _rate_limited(request, _RATE_SCOPE_SETTINGS):
         return _rate_limited_response()
     denied = _settings_access_error(request)
@@ -370,9 +397,21 @@ async def create_access_link(body: AccessLinkBody, request: Request):
     phone = studio_access.normalize_phone(body.phone)
     if not phone:
         return _error(400, "手机号需为 11 位数字")
-    link = _client_link(request, phone)
+    project = (body.project or "").strip()
+    if project and not _PROJECT_ID_RE.match(project):
+        return _error(400, "项目 ID 只能包含字母、数字、连字符与下划线")
+    canvas_path = f"/canvas/{project}" if project else "/canvas"
+    code = studio_access.expected_code(phone)
     logger.info("studio link generated (phone ****%s)", phone[-4:])
-    return {"ok": True, "data": {"phone": phone, "code": studio_access.expected_code(phone), "link": link}}
+    return {
+        "ok": True,
+        "data": {
+            "phone": phone,
+            "code": code,
+            "link": _client_link(request, phone),
+            "canvas_link": _client_link(request, phone, canvas_path),
+        },
+    }
 
 
 @router.post("/access/gate")

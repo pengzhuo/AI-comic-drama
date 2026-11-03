@@ -13,7 +13,7 @@ import { useTranslation } from "react-i18next";
 import { AppUpdateRequired } from "@/components/app-update-required";
 import { ConfirmDialogHost } from "@/components/confirm-dialog-host";
 import { ThemedToaster } from "@/components/themed-toaster";
-import { internalEntryPath, isClientMode } from "@/lib/app-mode";
+import { clientEntryPath, hasInternalRoutes, internalEntryPath } from "@/lib/app-mode";
 import { isChunkLoadError } from "@/lib/chunk-load-recovery";
 
 /**
@@ -68,28 +68,29 @@ function RootErrorComponent({ error }: ErrorComponentProps) {
 
 /**
  * 客户端产物里没有 `/`（内部首页 `_app/index.tsx` 被整棵排除），客户直接打开
- * 域名根路径时不该撞上「页面不存在」。这里把根路径送回工作室。
+ * 域名根路径时不该撞上「页面不存在」。这里把根路径送回客户入口首页（`clientEntryPath()`：
+ * 工作室产物是 `/studio`，画布产物是 `/canvas`）。
  *
  * 双入口实例（`VITE_INTERNAL_ENTRY_PATH`）也走这里：同一份产物里内部首页确实
  * 存在，但根地址是客户入口，内部端在 `/console` 之类的前缀上——`/` 仍然是
- * 「该去工作室」的信号。
+ * 「该去客户入口」的信号。
  */
 function ClientNotFoundRedirect() {
   const navigate = useNavigate();
   useEffect(() => {
-    void navigate({ to: "/studio", replace: true });
+    void navigate({ to: clientEntryPath(), replace: true });
   }, [navigate]);
   return (
     <div className="flex h-dvh items-center justify-center bg-background text-sm text-muted-foreground">
-      正在打开工作室…
+      正在打开工作台…
     </div>
   );
 }
 
-// 根地址归客户工作室的两种产物：纯客户端产物（没有内部首页）、双入口产物
-// （有内部首页，但内部入口在别的路径上）。内部产物里两者都是常量 false，分支被摇掉。
+// 根地址归客户入口的两种产物：纯客户产物（client / canvas，没有内部首页）、双入口
+// 产物（有内部首页，但内部入口在别的路径上）。内部产物里两者都是常量 false，分支被摇掉。
 function rootBelongsToStudio(): boolean {
-  return isClientMode() || internalEntryPath() !== "";
+  return !hasInternalRoutes() || internalEntryPath() !== "";
 }
 
 export const Route = createRootRoute({
@@ -97,7 +98,7 @@ export const Route = createRootRoute({
   errorComponent: RootErrorComponent,
   beforeLoad: ({ location }) => {
     if (rootBelongsToStudio() && location.pathname === "/") {
-      throw redirect({ to: "/studio", replace: true });
+      throw redirect({ to: clientEntryPath(), replace: true });
     }
   },
   notFoundComponent: rootBelongsToStudio() ? ClientNotFoundRedirect : undefined,

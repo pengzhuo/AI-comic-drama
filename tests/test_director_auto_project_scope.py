@@ -267,6 +267,7 @@ def test_pause_reason_display_strips_the_gate_marker() -> None:
     for tag, reason in (
         (director_auto.CHARACTER_IMAGES_GATE_TAG, director_auto.CHARACTER_IMAGES_REQUIRED_ERROR),
         (director_auto.IDENTITY_IMAGES_GATE_TAG, director_auto.IDENTITY_IMAGES_REQUIRED_ERROR),
+        (director_auto.COST_ESTIMATE_GATE_TAG, director_auto.COST_ESTIMATE_REQUIRED_ERROR),
     ):
         assert director_auto._pause_reason_display(reason) == reason[len(tag) :].strip()
 
@@ -278,8 +279,102 @@ def test_director_auto_payload_exposes_the_gate() -> None:
 
     assert _director_auto_gate(director_auto.CHARACTER_IMAGES_REQUIRED_ERROR) == "character_images"
     assert _director_auto_gate(director_auto.IDENTITY_IMAGES_REQUIRED_ERROR) == "identity_images"
+    assert _director_auto_gate(director_auto.COST_ESTIMATE_REQUIRED_ERROR) == "cost_estimate"
     assert _director_auto_gate("项目配置缺失（如视觉风格、叙事方式等），请先完成配置") is None
     assert _director_auto_gate("") is None
+
+
+def test_cost_estimate_gate_fires_on_the_steps_that_start_spending() -> None:
+    # 分镜写完之后、第一批花钱的图/视频之前的两个 next_step。
+    assert "asset_references" in director_auto.COST_ESTIMATE_GATE_STEPS
+    assert "sketch_generation" in director_auto.COST_ESTIMATE_GATE_STEPS
+    # 还没写完分镜时不该拦。
+    assert "script" not in director_auto.COST_ESTIMATE_GATE_STEPS
+    assert "render" not in director_auto.COST_ESTIMATE_GATE_STEPS
+
+
+async def _cost_gate_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    next_step: str,
+    gate_enabled: bool,
+    confirmed: bool,
+    episode: int = 1,
+) -> str | None:
+    """跑真实的 ``_pause_gate``，只把「下一步是什么」和「用户答过没」换成桩。"""
+
+    monkeypatch.setattr(pipeline_status_module, "_user_has_configured", lambda *_: True)
+    monkeypatch.setattr(project_config, "cost_estimate_gate_enabled", lambda *_a, **_k: gate_enabled)
+    monkeypatch.setattr(project_config, "cost_estimate_confirmed", lambda *_a, **_k: confirmed)
+
+    async def fake_status(**_kwargs):
+        return {"next_step": next_step, "current_episode": episode}
+
+    monkeypatch.setattr(pipeline_status_module, "compute_pipeline_status", fake_status)
+    coordinator = DirectorAutoCoordinator(DirectorAutoStore(tmp_path / "director-auto.db"))
+
+    async def fake_open(_ctx):
+        return object()
+
+    monkeypatch.setattr(coordinator, "_open_ctx_store", fake_open)
+    return await coordinator._pause_gate(run_record(tmp_path, episode=episode))
+
+
+@pytest.mark.asyncio
+async def test_cost_estimate_gate_stops_before_the_first_paid_step(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reason = await _cost_gate_reason(
+        monkeypatch, tmp_path, next_step="sketch_generation", gate_enabled=True, confirmed=False
+    )
+
+    assert reason is not None
+    assert reason.startswith(director_auto.COST_ESTIMATE_GATE_TAG)
+    assert "成本预估" in reason
+
+
+@pytest.mark.asyncio
+async def test_cost_estimate_gate_lets_the_run_go_after_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    assert (
+        await _cost_gate_reason(
+            monkeypatch, tmp_path, next_step="asset_references", gate_enabled=True, confirmed=True
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_estimate_gate_can_be_switched_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """无人值守项目：运维把闸门关掉，流水线不再停。"""
+
+    assert (
+        await _cost_gate_reason(
+            monkeypatch, tmp_path, next_step="asset_references", gate_enabled=False, confirmed=False
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_estimate_gate_does_not_fire_on_other_steps(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for next_step in ("script", "render", "compose", "voice_setup_ready"):
+        assert (
+            await _cost_gate_reason(
+                monkeypatch, tmp_path, next_step=next_step, gate_enabled=True, confirmed=False
+            )
+            is None
+        ), next_step
 
 
 @pytest.mark.asyncio

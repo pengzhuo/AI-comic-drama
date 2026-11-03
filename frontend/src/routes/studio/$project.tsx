@@ -6,17 +6,18 @@ import { ArrowLeft, Loader2 } from "lucide-react";
 
 import { StudioCostOverview } from "@/features/studio/studio-cost";
 import { StudioEpisodeList } from "@/features/studio/studio-episode-list";
+import { StudioQuoteCard } from "@/features/studio/studio-quote-card";
 import {
   StudioHumanNotice,
   StudioRunBanner,
   StudioStageChecklist,
 } from "@/features/studio/studio-run";
-import { STUDIO_RUN_CONFIG, isImportSettled } from "@/features/studio/studio-api";
+import { isImportSettled, studioRunConfig } from "@/features/studio/studio-api";
 import { useStudioPolling } from "@/features/studio/use-studio-polling";
 import { useStudioRun } from "@/features/studio/use-studio-run";
 import { useStartProjectAutoRun } from "@/lib/queries/director-auto";
 import { useEpisodes, usePipelineStatus } from "@/lib/queries/episodes";
-import { useAllProjectSummaries } from "@/lib/queries/projects";
+import { useAllProjectSummaries, useProject } from "@/lib/queries/projects";
 import { useTasks } from "@/lib/queries/tasks";
 
 export const Route = createFileRoute("/studio/$project")({
@@ -42,11 +43,19 @@ function StudioProjectPage() {
   const episodesQuery = useEpisodes(project);
   const tasksQuery = useTasks({ project });
   const summariesQuery = useAllProjectSummaries();
+  const projectQuery = useProject(project);
   const summaries = summariesQuery.data;
   const startRun = useStartProjectAutoRun(project);
   const run = useStudioRun(project, { auto: true });
 
   const [startError, setStartError] = useState<string | null>(null);
+  const [quoteDismissed, setQuoteDismissed] = useState(false);
+  // 换集或过闸门后重新给一次机会：上次「先不生成」只针对那一集的报价。
+  const gateEpisode =
+    run.run?.gate === "cost_estimate" ? (run.run?.episode ?? 0) : 0;
+  useEffect(() => {
+    setQuoteDismissed(false);
+  }, [gateEpisode]);
 
   const pipeline = pipelineQuery.data?.data;
   const importSettled = isImportSettled(pipeline?.global);
@@ -70,7 +79,7 @@ function StudioProjectPage() {
   const startRunMutation = startRun.mutate;
   useEffect(() => {
     if (!autostart || autostartFired.current || projectUnavailable) return;
-    if (run.isLoading || pipelineQuery.isLoading) return;
+    if (run.isLoading || pipelineQuery.isLoading || projectQuery.isLoading) return;
     const clearParam = () =>
       void navigate({
         to: "/studio/$project",
@@ -87,7 +96,12 @@ function StudioProjectPage() {
     autostartFired.current = true;
     clearParam();
     startRunMutation(
-      { voicePolicy: "system", config: { ...STUDIO_RUN_CONFIG } },
+      {
+        voicePolicy: "system",
+        // 一键成片读项目配置：用户在上传页选的风格/人群/项目类型在这里生效，而不是
+        // 覆盖成写死的默认值。
+        config: studioRunConfig(projectQuery.data?.data),
+      },
       { onError: (error) => setStartError(error.message) },
     );
   }, [
@@ -96,6 +110,8 @@ function StudioProjectPage() {
     navigate,
     pipelineQuery.isLoading,
     project,
+    projectQuery.data,
+    projectQuery.isLoading,
     projectUnavailable,
     run.isLoading,
     startRunMutation,
@@ -132,6 +148,11 @@ function StudioProjectPage() {
   const failedTask = (tasksQuery.data?.data ?? []).find(
     (task) => task.status === "failed",
   );
+  // 分镜后的成本闸门：客户工作台停在这里等客户点头，而不是自动确认（见 use-studio-run）。
+  const costGateEpisode =
+    run.run?.status === "paused" && run.run?.gate === "cost_estimate"
+      ? (run.run.episode ?? currentEpisode ?? 1)
+      : null;
 
   return (
     <div className="space-y-6">
@@ -161,7 +182,15 @@ function StudioProjectPage() {
       {startError ? (
         <StudioHumanNotice message={`启动制作失败：${startError}`} />
       ) : null}
-      {run.needsHuman ? <StudioHumanNotice message={run.needsHuman} /> : null}
+      {costGateEpisode && !quoteDismissed ? (
+        <StudioQuoteCard
+          project={project}
+          episode={costGateEpisode}
+          onDismiss={() => setQuoteDismissed(true)}
+        />
+      ) : run.needsHuman ? (
+        <StudioHumanNotice message={run.needsHuman} />
+      ) : null}
       {!run.needsHuman && failedTask?.error ? (
         <StudioHumanNotice message={`有任务失败：${failedTask.error}`} />
       ) : null}

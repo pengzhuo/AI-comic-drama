@@ -61,7 +61,13 @@ class _FakeStore:
         self.initialized = True
 
     async def ingest_novel_fast(
-        self, novel_path, rebuild=False, spine_template=None, on_progress=None, on_log=None
+        self,
+        novel_path,
+        rebuild=False,
+        spine_template=None,
+        require_scene_headers=True,
+        on_progress=None,
+        on_log=None,
     ):
         on_progress(0.02, "读取并校验原文...")
         on_log("文件读取完成")

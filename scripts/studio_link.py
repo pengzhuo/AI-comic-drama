@@ -9,6 +9,10 @@
 正因如此，这个脚本既能直接在服务器上跑（读 /data/studio-access.secret），
 也能在本地显式传 secret 生成同一条链接。
 
+同一个 `code` 对任何路径都成立（链接与路径/项目无关），所以工作台（`/studio`）与
+捏画（`/canvas`）用同一条专属链接，只是路径不同。`--entry canvas` 出捏画链接，
+`--project` 还能让捏画链接直达某个项目（`/canvas/<项目>`）。
+
 用法：
     # 服务器上（默认读 /data/studio-access.secret）
     python3 scripts/studio_link.py --phone 13800000000 --base https://example.com
@@ -16,6 +20,13 @@
     # 一条命令生成多个人的链接（每行一条，方便复制）
     python3 scripts/studio_link.py --phone 13800000000 --phone 13900000000 \\
         --base https://example.com
+
+    # 捏画链接（/canvas 项目列表），或直达某个项目
+    python3 scripts/studio_link.py --phone 13800000000 --entry canvas
+    python3 scripts/studio_link.py --phone 13800000000 --entry canvas --project 01M6GSBBZJ0ZTQ3XNFYSFNCE05
+
+    # 工作台 + 捏画两条一起出（每个人两行）
+    python3 scripts/studio_link.py --phone 13800000000 --entry all --base https://example.com
 
     # 本地临时生成（显式给 secret；base 也可以从 STUDIO_BASE_URL 读）
     STUDIO_ACCESS_SECRET=xxx python3 scripts/studio_link.py --phone 13800000000
@@ -32,6 +43,8 @@ import sys
 from pathlib import Path
 
 PHONE_RE = re.compile(r"^\d{11}$")
+# 项目 id 会拼进 URL，只放行字母/数字/连字符/下划线（与后端 create_access_link 一致）。
+PROJECT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 DEFAULT_SECRET_FILE = "/data/studio-access.secret"
 
 
@@ -75,14 +88,14 @@ def client_code(phone: str, secret: str) -> str:
     return hashlib.md5(f"{phone}{secret}".encode("utf-8")).hexdigest()
 
 
-def build_link(phone: str, code: str, base: str) -> str:
+def build_link(phone: str, code: str, base: str, path: str = "/studio") -> str:
     root = base.strip().rstrip("/")
-    return f"{root}/studio?phone={phone}&code={code}"
+    return f"{root}{path}?phone={phone}&code={code}"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="生成客户专属访问链接（/studio?phone=&code=）",
+        description="生成客户专属访问链接（/studio 或 /canvas?phone=&code=）",
     )
     parser.add_argument(
         "--phone",
@@ -90,6 +103,17 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         metavar="13800000000",
         help="11 位手机号；可重复传入以一次生成多条链接",
+    )
+    parser.add_argument(
+        "--entry",
+        choices=("studio", "canvas", "all"),
+        default="studio",
+        help="入口：studio（/studio，默认）、canvas（/canvas 捏画）或 all（两条都出）",
+    )
+    parser.add_argument(
+        "--project",
+        default="",
+        help="可选：捏画链接直达的项目 id（只在 --entry canvas/all 时生效）",
     )
     parser.add_argument(
         "--base",
@@ -114,6 +138,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
 
+    project = args.project.strip()
+    if project and not PROJECT_RE.match(project):
+        print(f"项目 id 只能包含字母、数字、连字符与下划线：{args.project}", file=sys.stderr)
+        return 2
+
     secret = resolve_secret(args.secret, args.secret_file)
     if not secret:
         print(
@@ -123,12 +152,19 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
+    entries = ("studio", "canvas") if args.entry == "all" else (args.entry,)
     for raw in args.phone:
         phone = normalize_phone(raw)
         if not phone:
             print(f"手机号必须是 11 位数字：{raw}", file=sys.stderr)
             return 2
-        print(build_link(phone, client_code(phone, secret), args.base))
+        code = client_code(phone, secret)
+        for entry in entries:
+            if entry == "canvas":
+                path = f"/canvas/{project}" if project else "/canvas"
+            else:
+                path = "/studio"
+            print(build_link(phone, code, args.base, path))
     return 0
 
 

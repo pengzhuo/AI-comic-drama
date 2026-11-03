@@ -75,8 +75,20 @@ const DEFAULT_API_TARGET = "http://127.0.0.1:8780";
  */
 const CLIENT_ROUTE_IGNORE_PATTERN = "^(_app|recharge|checkout|download|watch\\.)";
 
+/**
+ * 客户画布产物（`--mode canvas`）要排除的路由**文件名**。
+ *
+ * 与 `client` 同源，但再多排除 `studio` —— 画布产物里连「工作室」都不在，只保留
+ * `__root` / `login` / `canvas`（`canvas` 不在排除项里，所以整棵子树保留）。
+ */
+const CANVAS_ROUTE_IGNORE_PATTERN = "^(_app|recharge|checkout|download|watch\\.|studio)";
+
 export default defineConfig(({ mode }) => {
   const isClientBuild = mode === "client";
+  const isCanvasBuild = mode === "canvas";
+  // 两种客户产物（工作室 / 画布）共用同一条构建流水：都排除内部树、都读 `.env.ce*`
+  // 里的实例配置，只是路由白名单与 `@/router-tree` 指向不同。
+  const isClientLikeBuild = isClientBuild || isCanvasBuild;
   const modeEnv = loadEnv(mode, process.cwd(), "");
   // 客户端构建复用 CE 的实例配置 —— 后端地址、UI 隐藏开关、署名文案全在
   // `.env.ce[.local]` 里。但 Vite 只会把**本次 mode 的 env 文件 + process.env**
@@ -84,7 +96,7 @@ export default defineConfig(({ mode }) => {
   // 后端地址，隐藏开关不会生效（产物里会漏出 `api.github.com` 这类常量）。所以
   // 把 CE 的 VITE_* 回灌进 process.env —— Vite 的 env 解析对 process.env 优先级
   // 最高，正好等价于「CE 的值 + 本次 mode 的增量」。已经显式设置过的不覆盖。
-  const ceEnv = isClientBuild ? loadEnv("ce", process.cwd(), "VITE_") : {};
+  const ceEnv = isClientLikeBuild ? loadEnv("ce", process.cwd(), "VITE_") : {};
   for (const [key, value] of Object.entries(ceEnv)) {
     if (process.env[key] === undefined) process.env[key] = value;
   }
@@ -93,14 +105,21 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [
-      isClientBuild
+      isCanvasBuild
         ? TanStackRouterVite({
-            routeFileIgnorePattern: CLIENT_ROUTE_IGNORE_PATTERN,
-            // 生成到 `src/client/`（已排除出 tsconfig）：内部树与客户端树都躺在
-            // 磁盘上，但永不进入同一个 tsc 程序，也不会互相覆盖。
-            generatedRouteTree: "./src/client/routeTree.client.gen.ts",
+            routeFileIgnorePattern: CANVAS_ROUTE_IGNORE_PATTERN,
+            // 生成到 `src/client/`（整目录已排除出 tsconfig）：三种路由树（内部 /
+            // 工作室 / 画布）都躺在磁盘上，但永不进入同一个 tsc 程序，也不会互相覆盖。
+            generatedRouteTree: "./src/client/routeTree.canvas.gen.ts",
           })
-        : TanStackRouterVite(),
+        : isClientBuild
+          ? TanStackRouterVite({
+              routeFileIgnorePattern: CLIENT_ROUTE_IGNORE_PATTERN,
+              // 生成到 `src/client/`（已排除出 tsconfig）：内部树与客户端树都躺在
+              // 磁盘上，但永不进入同一个 tsc 程序，也不会互相覆盖。
+              generatedRouteTree: "./src/client/routeTree.client.gen.ts",
+            })
+          : TanStackRouterVite(),
       react(),
       tailwindcss(),
       {
@@ -127,11 +146,16 @@ export default defineConfig(({ mode }) => {
       // 数组形式：`^@/router-tree$` 必须排在 `@` 前面（alias 按顺序取第一个
       // 前缀命中），否则 `@` 会先把 `@/router-tree` 吃掉。
       alias: [
-        ...(isClientBuild
+        ...(isClientLikeBuild
           ? [
               {
                 find: /^@\/router-tree$/,
-                replacement: path.resolve(__dirname, "./src/client/router-tree.ts"),
+                replacement: path.resolve(
+                  __dirname,
+                  isCanvasBuild
+                    ? "./src/client/router-tree.canvas.ts"
+                    : "./src/client/router-tree.ts",
+                ),
               },
             ]
           : []),

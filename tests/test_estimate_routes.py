@@ -52,7 +52,7 @@ def price_file(tmp_path, monkeypatch):
                     {"id": "aud", "match": {"kind": "audio"}, "unit": "call", "price": 0.2},
                     {"id": "txt", "match": {"kind": "text"}, "unit": "1k_token", "price": 0.01},
                 ],
-                "client_markups": {"19174820303": {"markup": 2.0}},
+                "client_markups": {"13800138000": {"markup": 2.0}},
             },
             ensure_ascii=False,
         ),
@@ -130,7 +130,7 @@ def test_estimate_refined_contract(tmp_path, monkeypatch, price_file):
 
 def test_estimate_client_view_is_masked_over_http(tmp_path, monkeypatch, price_file):
     store = _FakeStore({1: [_beat(i, "s1") for i in range(1, 5)]})
-    user = {"user_id": "client:19174820303", "credential_kind": "studio_client", "phone": "19174820303"}
+    user = {"user_id": "client:13800138000", "credential_kind": "studio_client", "phone": "13800138000"}
     client, _ = _client(tmp_path, monkeypatch, store=store, user=user)
     response = client.get(
         "/api/v1/projects/demo/production-estimate", params={"episode": 1}
@@ -150,11 +150,45 @@ def test_estimate_internal_can_preview_client(tmp_path, monkeypatch, price_file)
     client, _ = _client(tmp_path, monkeypatch, store=store)
     response = client.get(
         "/api/v1/projects/demo/production-estimate",
-        params={"episode": 1, "as_client": "19174820303"},
+        params={"episode": 1, "as_client": "13800138000"},
     )
     data = response.json()["data"]
     assert data["view"] == "client"
     assert data["price"]["cny"] is not None
+
+
+def test_estimate_exposes_points_for_the_client_price(tmp_path, monkeypatch, price_file):
+    """伴点由售价换算（100 伴点 = ¥1）。
+
+    缺省倍率恒为 1 倍，所以任何视角都算得出售价、也就都有伴点；卡片只在客户
+    视角展示预扣提示（``studio-quote-card`` / ``director-cost-estimate-card``）。
+    """
+    from novelvideo import points_client
+
+    monkeypatch.setenv(points_client.ENV_CONFIG_PATH, str(tmp_path / "no-dopoints.json"))
+    points_client._CACHE.clear()
+
+    store = _FakeStore({1: [_beat(i, "s1") for i in range(1, 5)]})
+    user = {
+        "user_id": "client:13800138000",
+        "credential_kind": "studio_client",
+        "phone": "13800138000",
+    }
+    client, _ = _client(tmp_path, monkeypatch, store=store, user=user)
+    data = client.get(
+        "/api/v1/projects/demo/production-estimate", params={"episode": 1}
+    ).json()["data"]
+    assert data["price"]["cny"] is not None
+    assert data["price"]["points"] == round(data["price"]["cny"] * 100)
+
+    internal, _ = _client(tmp_path, monkeypatch, store=store)
+    internal_data = internal.get(
+        "/api/v1/projects/demo/production-estimate", params={"episode": 1}
+    ).json()["data"]
+    assert internal_data["view"] == "internal"
+    assert internal_data["price"]["cny"] is not None
+    assert internal_data["price"]["points"] == round(internal_data["price"]["cny"] * 100)
+    points_client._CACHE.clear()
 
 
 def test_quote_route_formats(tmp_path, monkeypatch, price_file):
@@ -186,6 +220,23 @@ def test_settings_requires_internal_session(tmp_path, monkeypatch, price_file):
     data = ok.json()["data"]
     assert data["rules"]
     assert "units" in data
+
+
+def test_settings_open_when_gate_disabled_but_denies_clients(tmp_path, monkeypatch, price_file):
+    """访问验证关闭的部署（上游 CE）没有内部会话可言：内部端照常可读写。"""
+    client, _ = _client(tmp_path, monkeypatch, internal=False, gate=False)
+    ok = client.get("/api/v1/settings/production-prices")
+    assert ok.status_code == 200
+
+    # 但明确以客户身份进来的一律拒绝。
+    user = {
+        "user_id": "client:13800138000",
+        "credential_kind": "studio_client",
+        "phone": "13800138000",
+    }
+    client2, _ = _client(tmp_path, monkeypatch, internal=False, gate=False, user=user)
+    denied = client2.get("/api/v1/settings/production-prices")
+    assert denied.status_code == 403
 
 
 def test_settings_put_updates_and_validates(tmp_path, monkeypatch, price_file):

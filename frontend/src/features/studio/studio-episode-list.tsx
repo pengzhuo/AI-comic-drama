@@ -6,7 +6,7 @@ import { ChevronDown, Download, Loader2 } from "lucide-react";
 import { StudioEpisodeCostDetail, reportRate } from "@/features/studio/studio-cost";
 import { bucketCny, formatCny } from "@/lib/cost-format";
 import { useCostReport } from "@/lib/queries/cost-report";
-import { useFinalVideo } from "@/lib/queries/video";
+import { useFinalVideo, useSettleEpisodePoints } from "@/lib/queries/video";
 import { cn } from "@/lib/utils";
 
 /**
@@ -49,8 +49,16 @@ function StudioEpisodeRow({
   const finalVideo = useFinalVideo(project, queryFinal ? episode : 0);
   const final = finalVideo.data?.data;
   const done = Boolean(final?.exists);
+  const blocked = Boolean(done && final?.blocked);
+  const owedPoints = blocked ? Math.max(0, Number(final?.owed_points ?? 0)) : 0;
+  const settle = useSettleEpisodePoints(project, queryFinal ? episode : 0);
 
-  const status = done ? "已完成" : active ? "制作中" : "未开始";
+  const status = done ? (blocked ? "待补缴" : "已完成") : active ? "制作中" : "未开始";
+
+  // 欠费被拦时直接展开：客户一眼就该看到补缴卡片，而不是一个没有预览的「已完成」行。
+  useEffect(() => {
+    if (blocked && !touched.current) setOpen(true);
+  }, [blocked]);
 
   return (
     <li className="overflow-hidden rounded-xl border border-border/60 bg-card">
@@ -74,11 +82,13 @@ function StudioEpisodeRow({
           <span
             className={cn(
               "text-xs",
-              done
-                ? "text-emerald-600 dark:text-emerald-400"
-                : active
-                  ? "text-primary"
-                  : "text-muted-foreground",
+              blocked
+                ? "text-amber-600 dark:text-amber-400"
+                : done
+                  ? "text-emerald-600 dark:text-emerald-400"
+                  : active
+                    ? "text-primary"
+                    : "text-muted-foreground",
             )}
           >
             {status}
@@ -91,6 +101,44 @@ function StudioEpisodeRow({
 
       {open ? (
         <div className="space-y-3 border-t border-border/40 bg-muted/10 px-3 py-3">
+          {blocked ? (
+            <div className="space-y-2 rounded-lg border border-amber-300/60 bg-amber-50 px-3 py-2.5 dark:border-amber-500/40 dark:bg-amber-950/30">
+              <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
+                {owedPoints > 0
+                  ? `待补缴 ${owedPoints} 伴点 · 补缴后解锁成片`
+                  : "正在核算本集实际用量"}
+              </p>
+              {final?.message ? (
+                <p className="text-xs text-amber-800/80 dark:text-amber-200/70">
+                  {final.message}
+                </p>
+              ) : null}
+              {owedPoints > 0 ? (
+                <button
+                  type="button"
+                  disabled={settle.isPending}
+                  onClick={() => settle.mutate()}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-amber-700 disabled:opacity-60"
+                >
+                  {settle.isPending ? <Loader2 className="size-3.5 animate-spin" /> : null}
+                  {settle.isPending ? "正在核对…" : "我已补缴，解锁成片"}
+                </button>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 text-xs text-amber-800/80 dark:text-amber-200/70">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  核算完成后自动解锁，稍后刷新本页即可
+                </span>
+              )}
+              {settle.data?.data.blocked && settle.data.data.message ? (
+                <p className="text-xs text-amber-800 dark:text-amber-200">
+                  {settle.data.data.message}
+                </p>
+              ) : null}
+              {settle.isError ? (
+                <p className="text-xs text-destructive">解锁失败，请稍后重试或联系客服</p>
+              ) : null}
+            </div>
+          ) : null}
           {done && final?.video_url ? (
             <div className="space-y-2">
               <video src={final.video_url} controls className="max-h-72 w-full rounded-lg bg-black" />

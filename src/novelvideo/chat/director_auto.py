@@ -753,6 +753,23 @@ class DirectorAutoStore:
             ).fetchone()
         return self._row(row)
 
+    def get_by_project(self, project_id: str) -> DirectorAutoRun | None:
+        """项目下最近更新的一条 run，不管归属者是谁。
+
+        闸门回答与「继续」必须作用在**项目自己的 run** 上：答案要落进 ``_pause_gate``
+        读的那份配置、恢复要唤醒同一个 run。之前按请求者 username 查，内部端
+        （username ``local``）既把答案写进了 ``state/local/<project_id>/``，又恢复失败并
+        静默返回 200，客户的项目就永远卡在闸门上了。
+        """
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM director_auto_runs WHERE project_id=? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+        return self._row(row)
+
     def active(self) -> list[DirectorAutoRun]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1347,6 +1364,11 @@ class DirectorAutoCoordinator:
 
     async def get(self, *, username: str, project_id: str) -> DirectorAutoRun | None:
         return await asyncio.to_thread(self.store.get, username, project_id)
+
+    async def get_by_project(self, project_id: str) -> DirectorAutoRun | None:
+        """项目自己的 run（不论归属者）——闸门回答与恢复都以它为准。"""
+
+        return await asyncio.to_thread(self.store.get_by_project, project_id)
 
     async def resume(self) -> None:
         self._stopping = False
@@ -2115,6 +2137,30 @@ class DirectorAutoCoordinator:
             report.errors or "-",
         )
 
+    def _settle_episode_points(self, run: DirectorAutoRun) -> None:
+        """成片落盘后**后台**结算这一集的伴点（多退少补）。
+
+        只做调度——真正的 relay 对账 + 补扣/退还在独立线程里跑，绝不拖慢成片、
+        也不能因为结算失败而卡住客户。只有走过预扣的项目才会真的动作。
+        """
+
+        try:
+            from novelvideo.points_settlement import schedule_settle
+
+            episode = int(run.episode or 0)
+            if episode <= 0:
+                return
+            context = run.context
+            schedule_settle(
+                state_dir=context.state_dir,
+                episode=episode,
+                projects_uuid=str(context.project_id or ""),
+            )
+        except Exception:  # noqa: BLE001 - 结算调度失败不影响成片
+            logger.warning(
+                "schedule episode points settlement failed (run %s)", run.run_id, exc_info=True
+            )
+
     async def _run(self, run_id: str, username: str, project_id: str) -> None:
         taskless_continuations = 0
         last_overlap_at = 0.0
@@ -2432,6 +2478,7 @@ class DirectorAutoCoordinator:
                     # 成片落盘后立刻按本地捏驿账单结算这一集的费用，用户不用点任何
                     # 按钮就能在本集卡片上看到金额明细。
                     await self._reconcile_episode_cost(updated)
+                    self._settle_episode_points(updated)
                     if updated.is_project_scope:
                         next_episode = await self._next_incomplete_episode(updated)
                         if next_episode is not None:

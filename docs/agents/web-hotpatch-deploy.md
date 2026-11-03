@@ -15,6 +15,7 @@ UI 隐藏开关弄丢（2026-10-21 出过一次：用不带 `.env.ce.local` 的�
 | --- | --- |
 | `VITE_HIDE_PIKO_ENTRY=1` | 去掉状态栏「PiKo一下」 |
 | `VITE_HIDE_NOTIFICATION_CENTER=1` | 去掉公告中心（应用内右上 + 登录页顶栏铃铛） |
+| `VITE_HIDE_HEADER_SETTINGS=1` | 去掉内部端右上「设置」入口（连带锚在它上面的缺失配置提醒气泡） |
 | `VITE_HIDE_RELEASE_POPUP=1` | 不自动弹更新公告 |
 | `VITE_HIDE_OFFICIAL_CHANNELS=1` | 设置里只留自定义/本地网关 |
 | `VITE_HIDE_MODEL_GUIDE=1` | 去掉「配置手册」引导链接 |
@@ -199,6 +200,50 @@ Select-String -Path src\client\routeTree.client.gen.ts -Pattern "id: '" | Select
 **底部**能看到「基于(Dramaclaw)开发」（署名原本挂在内部状态栏上，而状态栏属于 `_app`，
 所以客户端外壳自己渲染一次 —— 见 `src/routes/studio.tsx`）。
 
+### 6.3 客户画布专用产物（`build:canvas`，给「捏画」独立入口）
+
+比工作室产物还窄：只留 `__root` / `login` / `canvas` —— 内部树（`_app`）与 `studio`
+都在构建期被整棵排除（`vite.config.ts` 的 `CANVAS_ROUTE_IGNORE_PATTERN`）。适合
+「只把画布开给客户」的实例：域名根地址 `/` 自动落 `/canvas`（无有效会话时是门禁页，
+有会话是项目列表），`/canvas/<项目>` 是整屏画布，门禁沿用工作室的专属链接
+（`?phone=&code=` → `st_studio` cookie），所以只给客户一条 `/canvas/...` 链接即可。
+
+```powershell
+cd frontend
+$env:VITE_APP_VERSION="dev"    # 与现网 version.json 的 version 保持一致
+npm run build:canvas           # = vite build --mode canvas，**故意不跑 tsc**
+```
+
+与 `build:client` 的两点差别：
+
+1. 路由白名单更窄：`build:client` 保留 `studio`，`build:canvas` 连 `studio` 都排除；
+   两者都一样**保留 `/canvas`**（所以工作室实例也能直达客户画布）。
+2. 路由树落到 `src/client/routeTree.canvas.gen.ts`（同样构建时生成、不入库），
+   `@/router-tree` 在 `--mode canvas` 下指向 `src/client/router-tree.canvas.ts`；
+   内部树 `src/routeTree.gen.ts` 不会被改动。
+
+第 6.2 节的三个易踩点（不跑 `tsc`、复用 `.env.ce.local`、生成文件不入库）对画布产物
+**同样成立**，`.env.canvas` 也只放 `VITE_APP_MODE=canvas`。
+
+自检：
+
+```powershell
+# 路由树只有 __root__ / login / canvas
+Select-String -Path src\client\routeTree.canvas.gen.ts -Pattern "id: '" | Select-Object -First 12
+Select-String -Path src\client\routeTree.canvas.gen.ts -Pattern "/studio" -SimpleMatch -List  # 必须 0
+
+# 内部页必须 0 命中；客户画布的大 chunk 必须在
+Select-String -Path dist\assets\*.js -Pattern "/_app" -SimpleMatch -List
+Get-ChildItem dist\assets | Where-Object { $_.Name -match "FreezoneCanvasRoot" }
+```
+
+> 品牌文案「拿捏漫剧工作台」由客户外壳渲染，工作室与画布产物**都会**命中，不能当
+> 「工作室是否残留」的判据；判定看路由树里有没有 `studio`。
+
+部署后（无痕窗口）确认：`/` 自动进 `/canvas`；带 `?phone=&code=` 的专属链接能直接进
+`/canvas/<项目>`；画布里的「返回项目列表」落在 `/canvas`；直接敲 `/studio` 或
+`/projects/<id>/reports` 得到 404 → 自动回 `/canvas`。
+
 ## 7. 后端改动热补丁
 
 API 的 `/app/src` **不是挂载**，代码烤在镜像里，所以后端改动要单独铺：
@@ -369,7 +414,8 @@ curl -s -i -X POST http://127.0.0.1:8780/api/v1/access/client-session \
 ### 8.5 访问设置页（顶栏盾牌图标）
 
 内部身份（`st_internal` 有效）进顶栏的**盾牌图标** → `/access-settings`（客户身份会被送回
-`/console`，那里是口令门）。页面四张卡：内部口令、客户链接密钥、发客户链接、危险开关。
+`/console`，那里是口令门）。页面四张卡：内部口令、客户链接密钥、发客户链接（一次出工作台
+`/studio` + 捏画 `/canvas` 两条）、危险开关。
 
 接口（都挂在 `/api/v1`，`401` 一律不用，避免前端全局 401 → `/login`）：
 
@@ -377,7 +423,7 @@ curl -s -i -X POST http://127.0.0.1:8780/api/v1/access/client-session \
 | --- | --- | --- |
 | `GET` | `/access/config` | 掩码状态（`/data/studio-access.secret` 路径、最近更新时间、每个键的来源） |
 | `POST` | `/access/config` | `{internal_key?, client_secret?}`，空串 = 不改；返回新状态 + `notices` |
-| `POST` | `/access/config/link` | `{phone}` → `{phone, code, link}`（`STUDIO_BASE_URL` 优先，否则按 `X-Forwarded-Host` + scheme 拼） |
+| `POST` | `/access/config/link` | `{phone, project?}` → `{phone, code, link, canvas_link}`（`link`=`/studio`，`canvas_link`=`/canvas[/<项目>]`，同一 `code`；`STUDIO_BASE_URL` 优先，否则按 `X-Forwarded-Host` + scheme 拼） |
 | `POST` | `/access/gate` | `{enabled, confirm_key}`；关闭必须带当前内部口令，开启可一并带新密钥 |
 
 安全模型：

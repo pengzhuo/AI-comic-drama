@@ -96,9 +96,9 @@ describe("AccessSettings", () => {
     const user = userEvent.setup();
 
     renderSettings();
-    const input = await screen.findByLabelText("新的内部口令（留空表示不修改）");
+    const input = await screen.findByLabelText("新的控制台console端口令（留空表示不修改）");
     await user.type(input, "zyxwvutsrqponmlkjihgfedcba987654");
-    await user.click(screen.getByRole("button", { name: "保存口令" }));
+    await user.click(screen.getByRole("button", { name: "保存控制台console端口令" }));
 
     await waitFor(() => expect(seen.body).toEqual({
       internal_key: "zyxwvutsrqponmlkjihgfedcba987654",
@@ -114,7 +114,7 @@ describe("AccessSettings", () => {
     const user = userEvent.setup();
 
     renderSettings();
-    const input = await screen.findByLabelText("新的内部口令（留空表示不修改）");
+    const input = await screen.findByLabelText("新的控制台console端口令（留空表示不修改）");
     await user.click(screen.getAllByRole("button", { name: "随机生成" })[0]);
 
     expect((input as HTMLInputElement).value).toMatch(/^[A-Za-z0-9_-]{32}$/);
@@ -140,7 +140,7 @@ describe("AccessSettings", () => {
 
     const confirmButton = screen.getByRole("button", { name: "确认关闭" });
     expect(confirmButton).toBeDisabled();
-    await user.type(screen.getByLabelText("输入当前内部口令以确认关闭"), PLAINTEXT_INTERNAL_KEY);
+    await user.type(screen.getByLabelText("输入当前控制台console端口令以确认关闭"), PLAINTEXT_INTERNAL_KEY);
     expect(confirmButton).not.toBeDisabled();
     await user.click(confirmButton);
 
@@ -171,7 +171,7 @@ describe("AccessSettings", () => {
 
     const enable = await screen.findByRole("button", { name: "重新开启访问验证" });
     expect(enable).toBeDisabled();
-    expect(screen.getByText("请先在上方设置客户链接密钥，再开启访问验证。")).toBeTruthy();
+    expect(screen.getByText("请先在上方设置APP端口令，再开启访问验证。")).toBeTruthy();
   });
 
   it("disables editing when the key comes from an environment variable", async () => {
@@ -192,13 +192,13 @@ describe("AccessSettings", () => {
 
     renderSettings();
 
-    const input = await screen.findByLabelText("新的内部口令（留空表示不修改）");
+    const input = await screen.findByLabelText("新的控制台console端口令（留空表示不修改）");
     expect((input as HTMLInputElement).disabled).toBe(true);
-    expect(screen.getAllByRole("button", { name: "保存口令" })[0]).toBeDisabled();
+    expect(screen.getAllByRole("button", { name: "保存控制台console端口令" })[0]).toBeDisabled();
     expect(screen.getAllByText("（来自环境变量）").length).toBeGreaterThan(0);
   });
 
-  it("generates a client link for an 11-digit phone number", async () => {
+  it("generates studio and canvas links for an 11-digit phone number", async () => {
     const seen: { body?: unknown } = {};
     server.use(
       http.get(CONFIG_URL, () => HttpResponse.json(configPayload())),
@@ -210,6 +210,8 @@ describe("AccessSettings", () => {
             phone: "13800000000",
             code: "21f736a7c309a30a8f66a85cf1c1f5cb",
             link: "https://aistory.nanie168.com/studio?phone=13800000000&code=21f736a7c309a30a8f66a85cf1c1f5cb",
+            canvas_link:
+              "https://aistory.nanie168.com/canvas?phone=13800000000&code=21f736a7c309a30a8f66a85cf1c1f5cb",
           },
         });
       }),
@@ -220,11 +222,46 @@ describe("AccessSettings", () => {
     await user.type(await screen.findByLabelText("客户手机号（11 位）"), "13800000000");
     await user.click(screen.getByRole("button", { name: "生成链接" }));
 
-    await waitFor(() => expect(seen.body).toEqual({ phone: "13800000000" }));
+    await waitFor(() => expect(seen.body).toEqual({ phone: "13800000000", project: "" }));
     expect(
       await screen.findByText(
         "https://aistory.nanie168.com/studio?phone=13800000000&code=21f736a7c309a30a8f66a85cf1c1f5cb",
       ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "https://aistory.nanie168.com/canvas?phone=13800000000&code=21f736a7c309a30a8f66a85cf1c1f5cb",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("passes the optional project into the canvas link", async () => {
+    const seen: { body?: unknown } = {};
+    server.use(
+      http.get(CONFIG_URL, () => HttpResponse.json(configPayload())),
+      http.post(LINK_URL, async ({ request }) => {
+        seen.body = await request.clone().json();
+        return HttpResponse.json({
+          ok: true,
+          data: {
+            phone: "13800000000",
+            code: "abc",
+            link: "https://example.com/studio?phone=13800000000&code=abc",
+            canvas_link: "https://example.com/canvas/P1?phone=13800000000&code=abc",
+          },
+        });
+      }),
+    );
+    const user = userEvent.setup();
+
+    renderSettings();
+    await user.type(await screen.findByLabelText("客户手机号（11 位）"), "13800000000");
+    await user.type(screen.getByLabelText("项目 ID（可选）"), "P1");
+    await user.click(screen.getByRole("button", { name: "生成链接" }));
+
+    await waitFor(() => expect(seen.body).toEqual({ phone: "13800000000", project: "P1" }));
+    expect(
+      await screen.findByText("https://example.com/canvas/P1?phone=13800000000&code=abc"),
     ).toBeTruthy();
   });
 

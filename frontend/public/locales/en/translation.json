@@ -459,6 +459,7 @@
     "settings": "Settings",
     "settingsWithWarning": "Settings, missing configuration",
     "accessSettings": "Access settings",
+    "productionPrices": "Production price book",
     "settingsWarningBubble": "Missing setup",
     "dismissSettingsWarningBubble": "Dismiss missing setup reminder",
     "notifications": "Announcement Center",

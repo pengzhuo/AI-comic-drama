@@ -3,7 +3,7 @@
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from starlette.datastructures import URL
 
@@ -176,6 +176,37 @@ def _resolve_project_file(resolved: ProjectResolution, file_path: str) -> Path:
     return requested
 
 
+def _project_id_of(resolved: ProjectResolution, project: str) -> str:
+    ctx = getattr(resolved, "ctx", None)
+    return str(getattr(ctx, "project_id", "") or project or "")
+
+
+def _block_unpaid_final_video(
+    *,
+    resolved: ProjectResolution,
+    project: str,
+    file_path: str,
+    user: dict,
+    as_client: str = "",
+) -> None:
+    """成片欠费时挡住**预览 + 下载**（402）；非成片路径不受影响。"""
+
+    from novelvideo import points_settlement
+
+    episode = points_settlement.final_video_episode(file_path)
+    if episode is None:
+        return
+    block = points_settlement.gate_delivery(
+        user=user,
+        state_dir=resolved.state_dir,
+        episode=episode,
+        projects_uuid=_project_id_of(resolved, project),
+        as_client=as_client,
+    )
+    if block is not None:
+        raise HTTPException(status_code=402, detail=block.message)
+
+
 def _serve_or_redirect_to_oss(requested: Path, *, as_download: bool):
     """Serve a resolved project file, preferring a 302 to a presigned OSS URL.
 
@@ -220,6 +251,7 @@ def _serve_or_redirect_to_oss(requested: Path, *, as_download: bool):
 async def download_file(
     project: str,
     file_path: str,
+    as_client: str = Query("", description="内部端预览客户视角：手机号或 1"),
     user: dict = Depends(get_api_user),
 ):
     """下载项目内的生成文件。
@@ -228,6 +260,9 @@ async def download_file(
     自动防止目录遍历攻击。
     """
     resolved = await resolve_project_scope(project, user, required_role="viewer")
+    _block_unpaid_final_video(
+        resolved=resolved, project=project, file_path=file_path, user=user, as_client=as_client
+    )
     requested = _resolve_project_file(resolved, file_path)
 
     return _serve_or_redirect_to_oss(requested, as_download=True)
@@ -239,6 +274,7 @@ async def preview_file(
     file_path: str,
     request: Request,
     st_thumb: str | None = None,
+    as_client: str = Query("", description="内部端预览客户视角：手机号或 1"),
     user: dict = Depends(get_api_user),
 ):
     """预览项目内媒体文件。
@@ -250,6 +286,9 @@ async def preview_file(
     未知值等同于没传，回落原图。
     """
     resolved = await resolve_project_scope(project, user, required_role="viewer", media_read=True)
+    _block_unpaid_final_video(
+        resolved=resolved, project=project, file_path=file_path, user=user, as_client=as_client
+    )
     requested = _resolve_project_file(resolved, file_path)
     thumbnail = _maybe_thumbnail_response(
         resolved.project_dir, requested, st_thumb, request
@@ -265,9 +304,13 @@ async def preview_project_media_file(
     user: dict,
     st_thumb: str | None = None,
     request: Request | None = None,
+    as_client: str = "",
 ):
     """Serve a project media file for non-/api routes such as /static/projects."""
     resolved = await resolve_project_scope(project, user, required_role="viewer", media_read=True)
+    _block_unpaid_final_video(
+        resolved=resolved, project=project, file_path=file_path, user=user, as_client=as_client
+    )
     requested = _resolve_project_file(resolved, file_path)
     thumbnail = _maybe_thumbnail_response(
         resolved.project_dir, requested, st_thumb, request

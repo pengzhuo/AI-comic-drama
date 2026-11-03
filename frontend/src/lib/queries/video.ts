@@ -195,6 +195,11 @@ export interface FinalVideoData {
   exists: boolean;
   filename: string;
   video_url?: string;
+  /** 成片欠费被拦：预览与下载一起挡，补缴后解锁。 */
+  blocked?: boolean;
+  settle_status?: string;
+  owed_points?: number;
+  message?: string;
 }
 
 // Hydrates the compose page on mount so a previously-composed episode shows
@@ -207,6 +212,31 @@ export function useFinalVideo(project: string, episode: number) {
         .get(p`api/v1/projects/${project}/episodes/${episode}/final`, { signal })
         .json<OkResponse<FinalVideoData>>(),
     enabled: !!project && episode > 0,
+  });
+}
+
+export interface PointsSettlementData {
+  status: string;
+  blocked: boolean;
+  owed_points: number;
+  prepaid?: number;
+  settlement?: number;
+  delta?: number;
+  message: string;
+}
+
+/** 客户补缴后重试这一集的伴点结算；成功即解锁成片。 */
+export function useSettleEpisodePoints(project: string, episode: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api
+        .post(p`api/v1/projects/${project}/episodes/${episode}/points/settle`)
+        .json<OkResponse<PointsSettlementData>>(),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.finalVideo(project, episode) });
+      qc.invalidateQueries({ queryKey: queryKeys.costReportAll(project) });
+    },
   });
 }
 

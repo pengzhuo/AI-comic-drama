@@ -45,6 +45,7 @@ async def ingest_source_text_structured(
     novel_path: str,
     *,
     spine_template: str | None = None,
+    require_scene_headers: bool = True,
     on_progress: Optional[Callable[[float, str], None]] = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> dict:
@@ -52,6 +53,10 @@ async def ingest_source_text_structured(
 
     ``store`` is a SQLiteStore (or anything exposing the same content and
     analysis-run methods).
+
+    ``require_scene_headers=False`` downgrades the 精品剧 scene-header gate to a
+    warning, so a headerless screenplay is chunked by prose windows and handed to
+    the screenplay-processing stages for normalization instead of failing here.
     """
 
     def report(progress: float, task: MessageLike) -> None:
@@ -83,7 +88,11 @@ async def ingest_source_text_structured(
         from novelvideo.utils.screenplay_quality import assess_screenplay_scene_headers
 
         if assess_screenplay_scene_headers(content).status == "missing":
-            raise ValueError("精品剧必须包含场景头，请补充后重新导入")
+            if require_scene_headers:
+                raise ValueError("精品剧必须包含场景头，请补充后重新导入")
+            # ``warn``(工作室一键成片)在任务里也必须放行：场景头缺失只提示，
+            # 原文按正文窗口切分，交由剧本处理阶段规范化分场。
+            log("未检测到场景头，放行导入并交由剧本处理阶段规范化")
     report(
         _PROGRESS["validated"],
         lmsg("tasks.progress.ingest.validated", "原文校验完成"),

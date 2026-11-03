@@ -12,6 +12,7 @@ import {
   useUploadPortrait,
 } from "@/lib/queries/characters";
 import { usePipelineStatus } from "@/lib/queries/episodes";
+import type { DirectorAutoGate } from "@/lib/queries/director-auto";
 import { cn } from "@/lib/utils";
 import type { Character } from "@/types/character";
 
@@ -30,7 +31,7 @@ export function characterNeedsPortrait(character: Character): boolean {
 /** 记住用户的答案（上传或跳过）并让暂停的成片继续跑。 */
 export async function confirmDirectorGate(
   project: string,
-  gate: DirectorGateKind,
+  gate: DirectorAutoGate,
   episode: number,
 ): Promise<void> {
   await api

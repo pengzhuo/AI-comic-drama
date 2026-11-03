@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-// Parse + push freezone URL params for /projects/<project_id>/freezone?canvas=<id>.
-// Mutating these routes through tanstack-router when it is registered (see
-// getAppRouter). Falling back to the raw History API is only for non-router
-// contexts (unit tests, pre-mount).
+// Parse + push freezone URL params (`?canvas=<id>`). The address shape itself
+// belongs to lib/freezone-entry: internal `/projects/<id>/freezone` or client
+// canvas `/canvas/<id>`. Mutating these routes through tanstack-router when it
+// is registered (see getAppRouter). Falling back to the raw History API is only
+// for non-router contexts (unit tests, pre-mount).
 
 import { getAppRouter } from "@/lib/app-router";
+import {
+  freezoneEntryFromPath,
+  freezoneLeavePathFor,
+  freezoneLeaveTarget,
+  freezoneNavTarget,
+  freezonePathFor,
+  freezoneProjectFromPath,
+} from "@/lib/freezone-entry";
 
 export interface FreezoneUrl {
   /** SuperTale project_id. Display names are not accepted by project-scoped APIs. */
@@ -19,11 +28,6 @@ export interface WriteUrlOptions {
 }
 
 const LAST_CANVAS_PREFIX = "supertale.freezone.lastCanvas.";
-
-function projectFromPathname(pathname = window.location.pathname): string | null {
-  const match = pathname.match(/^\/projects\/([^/]+)\/freezone(?:\/|$)/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
 
 /**
  * `?canvas=` 的归一化。路由的默认 `parseSearch` 会对每个 query 值做 `JSON.parse`，
@@ -43,7 +47,7 @@ function canvasFromRouterSearch(router: NonNullable<ReturnType<typeof getAppRout
 export function readUrl(): FreezoneUrl {
   const params = new URLSearchParams(window.location.search);
   return {
-    project: projectFromPathname() ?? params.get("p"),
+    project: freezoneProjectFromPath(window.location.pathname) ?? params.get("p"),
     canvas: params.get("canvas"),
   };
 }
@@ -58,11 +62,15 @@ export function writeUrl(next: Partial<FreezoneUrl>, options: WriteUrlOptions = 
   // stray canvas-sync write here navigate the user BACK to Freezone, trapping
   // them on 捏画. Read the pathname/canvas from the router so a write that
   // fires after the route has moved off Freezone simply no-ops.
-  const currentPathname = router?.state.location.pathname;
-  const pathProject = currentPathname
-    ? projectFromPathname(currentPathname)
-    : projectFromPathname();
-  if (!pathProject) return;
+  const currentPathname =
+    router?.state.location.pathname
+    ?? (typeof window !== "undefined" ? window.location.pathname : "");
+  // The scheme (internal `/projects/<id>/freezone` vs canvas `/canvas/<id>`) is
+  // read from where the user actually is, so switching canvases stays on the
+  // same entry instead of bouncing between the two.
+  const entry = freezoneEntryFromPath(currentPathname);
+  if (!entry) return;
+  const pathProject = entry.project;
 
   const current: FreezoneUrl = router
     ? { project: pathProject, canvas: canvasFromRouterSearch(router) }
@@ -80,11 +88,11 @@ export function writeUrl(next: Partial<FreezoneUrl>, options: WriteUrlOptions = 
     // a pending navigation, so a raw write + synthetic popstate can leave the
     // URL and the rendered route out of sync (navigate to /ingest but still
     // render the canvas).
+    const target = merged.project
+      ? freezoneNavTarget(entry.scheme, pathProject)
+      : freezoneLeaveTarget(entry.scheme, pathProject);
     router.navigate({
-      to: merged.project
-        ? "/projects/$project/freezone"
-        : "/projects/$project/ingest",
-      params: { project: pathProject },
+      ...target,
       search: merged.canvas ? { canvas: merged.canvas } : {},
       replace: options.replace ?? false,
       resetScroll: false,
@@ -95,10 +103,9 @@ export function writeUrl(next: Partial<FreezoneUrl>, options: WriteUrlOptions = 
   const params = new URLSearchParams();
   if (merged.canvas) params.set("canvas", merged.canvas);
   const search = params.toString();
-  const pathname =
-    pathProject && merged.project
-      ? `/projects/${encodeURIComponent(merged.project)}/freezone`
-      : `/projects/${encodeURIComponent(pathProject)}/ingest`;
+  const pathname = merged.project
+    ? freezonePathFor(entry.scheme, merged.project)
+    : freezoneLeavePathFor(entry.scheme, pathProject);
   const newUrl = `${pathname}${search ? `?${search}` : ""}`;
   if (options.replace) {
     window.history.replaceState({}, "", newUrl);

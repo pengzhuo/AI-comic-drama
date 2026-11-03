@@ -71,6 +71,53 @@ def test_main_supports_multiple_phones(link_script, capsys, monkeypatch):
     assert lines[1].startswith("https://example.com/studio?phone=13900000000&code=")
 
 
+def test_main_canvas_entry_uses_same_code(link_script, capsys, monkeypatch):
+    monkeypatch.setenv("STUDIO_ACCESS_SECRET", SECRET)
+    monkeypatch.setenv("STUDIO_BASE_URL", "https://example.com")
+
+    assert link_script.main(["--phone", PHONE, "--entry", "canvas"]) == 0
+    out = capsys.readouterr().out.strip()
+    assert out == (
+        f"https://example.com/canvas?phone={PHONE}"
+        f"&code={link_script.client_code(PHONE, SECRET)}"
+    )
+
+
+def test_main_canvas_entry_can_target_project(link_script, capsys, monkeypatch):
+    monkeypatch.setenv("STUDIO_ACCESS_SECRET", SECRET)
+    monkeypatch.setenv("STUDIO_BASE_URL", "https://example.com")
+
+    assert (
+        link_script.main(
+            ["--phone", PHONE, "--entry", "canvas", "--project", "01M6GSBBZJ0ZTQ3XNFYSFNCE05"]
+        )
+        == 0
+    )
+    assert capsys.readouterr().out.strip().startswith(
+        "https://example.com/canvas/01M6GSBBZJ0ZTQ3XNFYSFNCE05?phone=13800000000&code="
+    )
+
+
+def test_main_all_entry_prints_both_paths(link_script, capsys, monkeypatch):
+    monkeypatch.setenv("STUDIO_ACCESS_SECRET", SECRET)
+    monkeypatch.setenv("STUDIO_BASE_URL", "https://example.com")
+
+    assert link_script.main(["--phone", PHONE, "--entry", "all"]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("https://example.com/studio?phone=13800000000&code=")
+    assert lines[1].startswith("https://example.com/canvas?phone=13800000000&code=")
+
+
+def test_main_rejects_bad_project(link_script, capsys, monkeypatch):
+    monkeypatch.setenv("STUDIO_ACCESS_SECRET", SECRET)
+
+    exit_code = link_script.main(["--phone", PHONE, "--entry", "canvas", "--project", "../x"])
+
+    assert exit_code == 2
+    assert "项目 id" in capsys.readouterr().err
+
+
 def test_main_rejects_bad_phone(link_script, capsys, monkeypatch):
     monkeypatch.setenv("STUDIO_ACCESS_SECRET", SECRET)
 

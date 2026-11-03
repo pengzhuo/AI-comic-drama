@@ -12,6 +12,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { FreezoneCanvasHost } from "@/features/freezone/FreezoneCanvasHost";
+import { useFreezoneCanvasRoute } from "@/features/freezone/canvas-route";
 
 vi.mock("@/features/freezone/FreezoneCanvasRoot", () => ({
   default: ({ active }: { active: boolean }) => (
@@ -19,12 +20,21 @@ vi.mock("@/features/freezone/FreezoneCanvasRoot", () => ({
   ),
 }));
 
+/**
+ * 内部壳的接线：URL → `{ project, active }` 由 `useFreezoneCanvasRoute()` 负责，
+ * 宿主只吃 props。这里照 _app.tsx 的用法还原一遍。
+ */
+function WiredFreezoneCanvasHost() {
+  const route = useFreezoneCanvasRoute();
+  return <FreezoneCanvasHost project={route.project} active={route.active} />;
+}
+
 function renderAt(pathname: string) {
   const rootRoute = createRootRoute({
     component: () => (
       <>
         <Outlet />
-        <FreezoneCanvasHost />
+        <WiredFreezoneCanvasHost />
       </>
     ),
   });

@@ -18,7 +18,14 @@ import uuid
 from dataclasses import replace
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import AliasChoices, BaseModel, Field
 
 from novelvideo import studio_access
@@ -552,6 +559,26 @@ def _director_auto_payload(run: Any | None) -> dict[str, Any]:
     }
 
 
+async def _director_auto_target(ctx: Any) -> tuple[Any | None, str, str]:
+    """定位这个项目的一键成片 run，**不问请求者是谁**。
+
+    闸门回答与恢复必须作用在*项目自己的* run 上：答案要落进 ``_pause_gate`` 读的那份
+    配置，恢复要唤醒协调器停下的那个 run。按请求者 username 查时，内部端（username
+    ``local``）既把答案写进了 ``state/local/<project_id>/project_config.json``，又恢复
+    失败却返回 200，客户的项目就永远卡在闸门上了。
+
+    返回 ``(run, owner_username, project_name)``；没有 run 时回落到项目注册的归属者
+    与项目名，让调用方能干净地报 404/409，而不是静默成功。
+    """
+
+    run = await director_auto_coordinator.get_by_project(ctx.project_id)
+    if run is not None:
+        return run, run.username, run.context.project_name
+    owner = str(getattr(ctx, "owner_username", "") or "")
+    name = str(getattr(ctx, "project_name", "") or ctx.project_id)
+    return None, owner, name
+
+
 @router.get("/projects/{project}/chat/director-auto")
 async def get_director_auto_run(
     project: str,
@@ -560,10 +587,7 @@ async def get_director_auto_run(
     ctx = await resolve_project_context(
         user=user, project_id=project, required_role="viewer"
     )
-    run = await director_auto_coordinator.get(
-        username=str(user["username"]),
-        project_id=ctx.project_id,
-    )
+    run, _owner, _name = await _director_auto_target(ctx)
     return {"ok": True, "data": _director_auto_payload(run)}
 
 
@@ -604,8 +628,11 @@ async def pause_director_auto_run(
     ctx = await resolve_project_context(
         user=user, project_id=project, required_role="editor"
     )
+    run, owner, _name = await _director_auto_target(ctx)
+    if run is None:
+        raise HTTPException(status_code=404, detail="该项目没有一键成片任务")
     run = await director_auto_coordinator.pause(
-        username=str(user["username"]),
+        username=owner,
         project_id=ctx.project_id,
         reason="用户切换为手动模式",
     )
@@ -621,9 +648,12 @@ async def suspend_director_auto_run(
     ctx = await resolve_project_context(
         user=user, project_id=project, required_role="editor"
     )
+    run, owner, _name = await _director_auto_target(ctx)
+    if run is None:
+        raise HTTPException(status_code=404, detail="该项目没有一键成片任务")
     try:
         run = await director_auto_coordinator.suspend_for_confirmation(
-            username=str(user["username"]),
+            username=owner,
             project_id=ctx.project_id,
             reason=payload.reason.strip() or "等待用户确认是否修改",
         )
@@ -640,9 +670,12 @@ async def resume_director_auto_run(
     ctx = await resolve_project_context(
         user=user, project_id=project, required_role="editor"
     )
+    run, owner, _name = await _director_auto_target(ctx)
+    if run is None:
+        raise HTTPException(status_code=404, detail="该项目没有一键成片任务")
     try:
         run = await director_auto_coordinator.resume_suspended(
-            username=str(user["username"]),
+            username=owner,
             project_id=ctx.project_id,
         )
     except ValueError as exc:
@@ -666,21 +699,111 @@ async def continue_director_auto_run(
     ctx = await resolve_project_context(
         user=user, project_id=project, required_role="editor"
     )
+    run, owner, _name = await _director_auto_target(ctx)
+    if run is None:
+        raise HTTPException(status_code=404, detail="该项目没有一键成片任务")
     try:
         run = await director_auto_coordinator.resume_paused(
-            username=str(user["username"]),
+            username=owner,
             project_id=ctx.project_id,
             voice_policy=(payload.voice_policy if payload is not None else None),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail="该项目没有一键成片任务")
     return {"ok": True, "data": _director_auto_payload(run)}
+
+
+async def _charge_points_for_episode(
+    *,
+    request: Request,
+    user: dict,
+    project_id: str,
+    username: str,
+    project_name: str,
+    episode: int,
+) -> None:
+    """「制作成本预估」闸门确认前，把这一集的**售价**折算成伴点预扣掉。
+
+    口径与客户看到的报价卡完全一致（``estimate.client_price_cny``，100 伴点 = ¥1），
+    成功才让调用方继续写闸门答案 + 恢复成片；任何一步不通过都**保持暂停**：
+
+    - 内部端 / 没有客户手机号 → 跳过（内部制作不扣伴点）。
+    - 同一集已扣过 → 跳过（重复点「确认」不该重复收费）。
+    - 开关关 / 折算为 0 → 跳过。
+    - 算不出售价 → 400（缺省倍率恒为 1 倍，正常不会发生，属防御分支）。
+    - 业务失败（``code != 0``）→ 402，接口 ``message`` 原样交给客户。
+    - 网络/超时/5xx/坏 JSON → 502 fail-closed。
+    """
+
+    from novelvideo import points_client
+    from novelvideo.api.routes import estimate as estimate_routes
+    from novelvideo.project_config import points_charge, record_points_charge
+
+    kind = str(user.get("credential_kind") or "")
+    phone = studio_access.normalize_phone(user.get("phone"))
+    if kind != studio_access.CREDENTIAL_KIND_CLIENT or not phone:
+        return
+    if points_charge(username, project_name, episode) is not None:
+        return
+    config = points_client.load()
+    if not config.enabled:
+        return
+    price = await estimate_routes.client_price_cny(
+        project=project_id,
+        request=request,
+        user=user,
+        episode=episode,
+        phone=phone,
+    )
+    if price is None:
+        raise HTTPException(
+            status_code=400,
+            detail="该客户尚未配置制作报价，请联系客服后再继续生成",
+        )
+    amount = points_client.points_for_cny(price, config)
+    if amount <= 0:
+        return
+    client = points_client.PointsClient(config)
+    try:
+        client.charge(phone=phone, amount=amount, projects_uuid=project_id)
+    except points_client.PointsNotEnough as exc:
+        raise HTTPException(
+            status_code=402, detail=str(exc) or "伴点不足，请先充值"
+        ) from exc
+    except points_client.PointsUnavailable as exc:
+        logger.warning(
+            "伴点服务不可用，已拦下闸门 project=%s episode=%s: %s",
+            project_id,
+            episode,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502, detail="伴点服务暂时不可用，请稍后重试"
+        ) from exc
+    record_points_charge(
+        username,
+        project_name,
+        episode,
+        amount=amount,
+        cny=price,
+        phone=phone,
+    )
+    logger.info(
+        "伴点预扣成功 project=%s episode=%s amount=%s (¥%.2f)",
+        project_id,
+        episode,
+        amount,
+        price,
+    )
 
 
 @router.post("/projects/{project}/chat/director-auto/gates/{gate}/confirm")
 async def confirm_director_auto_gate(
     project: str,
     gate: str,
+    request: Request,
     payload: DirectorAutoGateConfirmIn | None = None,
     user: dict = Depends(get_api_user),
 ) -> dict[str, Any]:
@@ -690,6 +813,11 @@ async def confirm_director_auto_gate(
     so the user can hand over their own images or skip. The answer is recorded in
     the project config — the same place ``_pause_gate`` reads — and the paused run
     is resumed in the same request, so one click in the card is enough.
+
+    ``cost_estimate`` is the paid gate: only the owning client may answer it.
+    An internal console operator confirming for a client used to write the answer
+    into ``state/local/<project_id>/`` (a phantom copy of the project), skip the
+    prepay and still get a 200 — the client's run stayed paused forever.
     """
 
     from novelvideo.project_config import (
@@ -704,15 +832,20 @@ async def confirm_director_auto_gate(
     ctx = await resolve_project_context(
         user=user, project_id=project, required_role="editor"
     )
-    username = str(user["username"])
-    # The gate reads the config with the *run's* project name (see _pause_gate),
-    # so the answer must be written under the same key.
-    run = await director_auto_coordinator.get(
-        username=username, project_id=ctx.project_id
-    )
-    project_name = run.context.project_name if run is not None else ctx.project_id
+    # Act on the project's own run, not the requester's: the answer must land in
+    # the config ``_pause_gate`` reads and the resume must wake this run.
+    run, owner_username, project_name = await _director_auto_target(ctx)
+    if run is None:
+        raise HTTPException(status_code=404, detail="该项目没有正在运行的一键成片任务")
+    if normalized == "cost_estimate" and str(getattr(ctx, "owner_type", "") or "") == "client":
+        # 确认收费只能客户本人：内部端代点会绕过预扣（历史上还把答案写错了目录）。
+        if str(user.get("credential_kind") or "") != studio_access.CREDENTIAL_KIND_CLIENT:
+            raise HTTPException(
+                status_code=403,
+                detail="本集制作成本需由客户本人在客户工作台确认",
+            )
     if normalized == "character_images":
-        confirm_character_images(username, project_name)
+        confirm_character_images(owner_username, project_name)
     else:
         episode = int(getattr(payload, "episode", 0) or 0)
         if episode <= 0:
@@ -720,15 +853,25 @@ async def confirm_director_auto_gate(
         if episode <= 0:
             raise HTTPException(status_code=400, detail="缺少集号")
         if normalized == "cost_estimate":
-            confirm_cost_estimate(username, project_name, episode)
+            await _charge_points_for_episode(
+                request=request,
+                user=user,
+                project_id=ctx.project_id,
+                username=owner_username,
+                project_name=project_name,
+                episode=episode,
+            )
+            confirm_cost_estimate(owner_username, project_name, episode)
         else:
-            confirm_identity_images(username, project_name, episode)
+            confirm_identity_images(owner_username, project_name, episode)
     try:
         resumed = await director_auto_coordinator.resume_paused(
-            username=username, project_id=ctx.project_id
+            username=owner_username, project_id=ctx.project_id
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if resumed is None:
+        raise HTTPException(status_code=404, detail="该项目没有正在运行的一键成片任务")
     return {"ok": True, "data": _director_auto_payload(resumed)}
 
 

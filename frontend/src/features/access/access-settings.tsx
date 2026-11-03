@@ -169,6 +169,46 @@ function SecretCard({
   );
 }
 
+function LinkRow({
+  label,
+  hint,
+  url,
+  copied,
+  onCopy,
+}: {
+  label: string;
+  hint: string;
+  url: string;
+  copied: boolean;
+  onCopy: () => void;
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span className="text-sm text-foreground">{label}</span>
+        <span className="text-xs text-muted-foreground">{hint}</span>
+      </div>
+      <div className="flex items-start gap-2 rounded-[12px] border border-border bg-background p-2.5">
+        <code className="min-w-0 flex-1 break-all font-mono text-xs text-foreground">{url}</code>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          aria-label={`复制${label}`}
+          onClick={onCopy}
+        >
+          {copied ? (
+            <Check className="size-3" aria-hidden="true" />
+          ) : (
+            <Copy className="size-3" aria-hidden="true" />
+          )}
+          {copied ? "已复制" : "复制"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function AccessSettings() {
   const configQuery = useAccessConfig();
   const saveMutation = useSaveAccessConfig();
@@ -178,8 +218,10 @@ export function AccessSettings() {
   const [internalDraft, setInternalDraft] = useState("");
   const [clientDraft, setClientDraft] = useState("");
   const [phone, setPhone] = useState("");
-  const [link, setLink] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [project, setProject] = useState("");
+  const [studioLink, setStudioLink] = useState<string | null>(null);
+  const [canvasLink, setCanvasLink] = useState<string | null>(null);
+  const [copied, setCopied] = useState<"studio" | "canvas" | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmKey, setConfirmKey] = useState("");
   const [feedback, setFeedback] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
@@ -194,7 +236,7 @@ export function AccessSettings() {
       return;
     }
     setInternalDraft("");
-    setFeedback({ kind: "ok", text: ["内部口令已更新。", ...result.notices].join(" ") });
+    setFeedback({ kind: "ok", text: ["控制台console端口令已更新。", ...result.notices].join(" ") });
   };
 
   const saveClientSecret = async () => {
@@ -205,25 +247,30 @@ export function AccessSettings() {
       return;
     }
     setClientDraft("");
-    setFeedback({ kind: "ok", text: ["客户密钥已更新。", ...result.notices].join(" ") });
+    setFeedback({ kind: "ok", text: ["APP端口令已更新。", ...result.notices].join(" ") });
   };
 
   const generateLink = async () => {
     setFeedback(null);
-    const result = await linkMutation.mutateAsync(phone.trim());
+    setStudioLink(null);
+    setCanvasLink(null);
+    setCopied(null);
+    const result = await linkMutation.mutateAsync({
+      phone: phone.trim(),
+      project: project.trim(),
+    });
     if (!result.ok || !result.link) {
       setFeedback({ kind: "error", text: result.error ?? "生成链接失败" });
       return;
     }
-    setLink(result.link);
-    setCopied(false);
+    setStudioLink(result.link);
+    setCanvasLink(result.canvasLink ?? null);
   };
 
-  const copyLink = async () => {
-    if (!link) return;
+  const copyLink = async (kind: "studio" | "canvas", url: string) => {
     try {
-      await navigator.clipboard?.writeText(link);
-      setCopied(true);
+      await navigator.clipboard?.writeText(url);
+      setCopied(kind);
     } catch {
       // 剪贴板可能被浏览器策略拒绝；链接本身已经显示在页面上，选中复制即可。
       setFeedback({ kind: "error", text: "自动复制失败，请手动选中链接复制。" });
@@ -264,7 +311,7 @@ export function AccessSettings() {
           <CardHeader>
             <CardTitle>无法读取访问设置</CardTitle>
             <CardDescription>
-              访问验证可能未启用，或这台浏览器没有内部身份。先通过内部口令进入一次，再回到本页。
+              访问验证可能未启用，或这台浏览器没有内部身份。先通过控制台console端口令进入一次，再回到本页。
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -297,7 +344,7 @@ export function AccessSettings() {
       </header>
       <p className="text-sm text-muted-foreground">
         客户入口 <span className="font-mono text-xs text-foreground">/studio</span> 用专属链接进入；内部入口{" "}
-        <span className="font-mono text-xs text-foreground">/console</span> 用内部口令进入。改动立即生效，
+        <span className="font-mono text-xs text-foreground">/console</span> 用控制台console端口令进入。改动立即生效，
         不需要重启服务。
       </p>
 
@@ -305,32 +352,32 @@ export function AccessSettings() {
 
       <SecretCard
         idPrefix="internal-key"
-        title="内部访问口令"
-        description="进入内部工作台（/console）的口令，可随时更换。"
-        hint="更新后其他设备上的内部登录会失效；本机浏览器会自动续期。口令只在输入框里显示，请当场保存好。"
+        title="控制台console端口令"
+        description="进入内部工作台（/console）的控制台console端口令，可随时更换。"
+        hint="更新后其他设备上的控制台登录会失效；本机浏览器会自动续期。口令只在输入框里显示，请当场保存好。"
         state={config.internal_key}
         draft={internalDraft}
         onDraftChange={setInternalDraft}
-        fieldLabel="新的内部口令（留空表示不修改）"
+        fieldLabel="新的控制台console端口令（留空表示不修改）"
         placeholder="留空则不修改"
         pending={saving}
         onSave={() => void saveInternalKey()}
-        saveLabel="保存口令"
+        saveLabel="保存控制台console端口令"
       />
 
       <SecretCard
         idPrefix="client-secret"
-        title="客户专属链接密钥"
-        description="客户链接里校验码的签名密钥（md5(手机号+密钥)）。"
+        title="APP端口令"
+        description="APP端口令是客户链接校验码的签名密钥（md5(手机号+APP端口令)）。"
         hint="更新后此前发出的所有客户链接立即失效，需要重新发送链接。"
         state={config.client_secret}
         draft={clientDraft}
         onDraftChange={setClientDraft}
-        fieldLabel="新的客户链接密钥（留空表示不修改）"
+        fieldLabel="新的APP端口令（留空表示不修改）"
         placeholder="留空则不修改"
         pending={saving}
         onSave={() => void saveClientSecret()}
-        saveLabel="保存密钥"
+        saveLabel="保存APP端口令"
       />
 
       <Card size="sm">
@@ -339,55 +386,80 @@ export function AccessSettings() {
             <Link2 className="size-4 text-muted-foreground" aria-hidden="true" />
             发客户链接
           </CardTitle>
-          <CardDescription>输入客户手机号，生成专属访问链接后发送给对方。</CardDescription>
+          <CardDescription>
+            输入客户手机号，生成工作台与捏画两条专属链接后发送给对方。
+          </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-2">
-          <Label htmlFor="access-link-phone" className="text-sm text-muted-foreground">
-            客户手机号（11 位）
-          </Label>
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              id="access-link-phone"
-              inputMode="numeric"
-              value={phone}
-              onChange={(event) => {
-                setPhone(event.target.value);
-                setLink(null);
-              }}
-              placeholder="13800000000"
-              className="h-9 min-w-[12rem] flex-1"
-            />
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={linkMutation.isPending || phone.trim().length === 0}
-              onClick={() => void generateLink()}
-            >
-              {linkMutation.isPending ? "生成中…" : "生成链接"}
-            </Button>
-          </div>
-          {link ? (
-            <div className="flex items-start gap-2 rounded-[12px] border border-border bg-background p-2.5">
-              <code className="min-w-0 flex-1 break-all font-mono text-xs text-foreground">{link}</code>
+        <CardContent className="space-y-3">
+          <div className="space-y-1">
+            <Label htmlFor="access-link-phone" className="text-sm text-muted-foreground">
+              客户手机号（11 位）
+            </Label>
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                id="access-link-phone"
+                inputMode="numeric"
+                value={phone}
+                onChange={(event) => {
+                  setPhone(event.target.value);
+                  setStudioLink(null);
+                  setCanvasLink(null);
+                }}
+                placeholder="13800000000"
+                className="h-9 min-w-[12rem] flex-1"
+              />
+              <Input
+                id="access-link-project"
+                value={project}
+                onChange={(event) => {
+                  setProject(event.target.value);
+                  setCanvasLink(null);
+                }}
+                placeholder="项目 ID（可选，捏画链接直达）"
+                aria-label="项目 ID（可选）"
+                autoComplete="off"
+                spellCheck={false}
+                className="h-9 min-w-[12rem] flex-1 font-mono text-xs"
+              />
               <Button
                 type="button"
-                variant="ghost"
-                size="xs"
-                aria-label="复制链接"
-                onClick={() => void copyLink()}
+                variant="outline"
+                size="sm"
+                disabled={linkMutation.isPending || phone.trim().length === 0}
+                onClick={() => void generateLink()}
               >
-                {copied ? (
-                  <Check className="size-3" aria-hidden="true" />
-                ) : (
-                  <Copy className="size-3" aria-hidden="true" />
-                )}
-                {copied ? "已复制" : "复制"}
+                {linkMutation.isPending ? "生成中…" : "生成链接"}
               </Button>
+            </div>
+          </div>
+          {studioLink ? (
+            <div className="space-y-3">
+              <LinkRow
+                label="工作台链接"
+                hint="一键成片 / 进度 / 每集费用（/studio）"
+                url={studioLink}
+                copied={copied === "studio"}
+                onCopy={() => void copyLink("studio", studioLink)}
+              />
+              {canvasLink ? (
+                <LinkRow
+                  label="捏画链接"
+                  hint={
+                    project.trim()
+                      ? `直达该项目的捏画（/canvas/${project.trim()}）`
+                      : "打开捏画项目列表（/canvas）"
+                  }
+                  url={canvasLink}
+                  copied={copied === "canvas"}
+                  onCopy={() => void copyLink("canvas", canvasLink)}
+                />
+              ) : null}
             </div>
           ) : null}
           <p className="text-xs text-muted-foreground">
-            链接本身永久有效、可转发；客户浏览器记住 7 天。开启访问验证前需要先设置客户密钥。
+            两条链接是同一个客户、同一个校验码，只有入口路径不同（/studio 与 /canvas），
+            且都不绑定项目 —— 换入口或换项目，把路径改掉即可。链接永久有效、可转发；
+            客户浏览器记住 7 天。开启访问验证前需要先设置APP端口令。
           </p>
         </CardContent>
       </Card>
@@ -403,8 +475,8 @@ export function AccessSettings() {
           </CardTitle>
           <CardDescription>
             {config.enabled
-              ? "关闭后任何人都能直接看到全部项目（回到单用户行为）；内部口令与客户密钥会保留，可随时重新开启。"
-              : "当前已关闭：任何人都能直接看到全部项目。重新开启后会沿用现有的内部口令与客户密钥。"}
+              ? "关闭后任何人都能直接看到全部项目（回到单用户行为）；控制台console端口令与APP端口令会保留，可随时重新开启。"
+              : "当前已关闭：任何人都能直接看到全部项目。重新开启后会沿用现有的控制台console端口令与APP端口令。"}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -412,7 +484,7 @@ export function AccessSettings() {
             confirming ? (
               <div className="space-y-2 rounded-[12px] border border-destructive/40 bg-destructive/10 p-3">
                 <Label htmlFor="access-confirm-key" className="text-sm text-foreground">
-                  输入当前内部口令以确认关闭
+                  输入当前控制台console端口令以确认关闭
                 </Label>
                 <div className="flex flex-wrap items-center gap-2">
                   <Input
@@ -467,7 +539,7 @@ export function AccessSettings() {
                 {gatePending ? "处理中…" : "重新开启访问验证"}
               </Button>
               {config.client_secret.configured ? null : (
-                <p className="text-xs text-muted-foreground">请先在上方设置客户链接密钥，再开启访问验证。</p>
+                <p className="text-xs text-muted-foreground">请先在上方设置APP端口令，再开启访问验证。</p>
               )}
             </div>
           )}

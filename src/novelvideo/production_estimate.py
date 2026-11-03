@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any, Iterable, Sequence
 
 from novelvideo.production_prices import (
@@ -48,7 +47,7 @@ DEFAULT_ASSUMPTIONS: dict[str, float] = {
     "audio_tokens_per_char": 1.0,
     "image_calls_per_beat": 1.0,
     "text_calls_per_episode": 30.0,
-    "render_passes_per_grid": 1.0,
+    "render_calls_per_beat": 1.0,
     "sketch_passes_per_grid": 1.0,
 }
 
@@ -194,8 +193,10 @@ def plan_refined(
 
     shots = _shot_beats(beats)
     grids = _grid_count(beats)
+    # 素描是「格子图」（多镜头拼一张，按场景分批）；上色是**每镜头一张**
+    # （实测：render_grid 每条分镜一次，1x1）。别把两者都按格子数算。
     sketch_calls = int(round(grids * _assumption(book, "sketch_passes_per_grid")))
-    render_calls = int(round(grids * _assumption(book, "render_passes_per_grid")))
+    render_calls = int(round(len(shots) * _assumption(book, "render_calls_per_beat")))
 
     actions: list[ActionRequest] = []
     image_params: dict[str, Any] = {}
@@ -464,7 +465,7 @@ def build_estimate(
     grand = cost_total + contingency
 
     markup, markup_source = book.resolve_markup(phone)
-    price_total = grand * markup if markup else None
+    price_total = grand * markup if markup is not None else None
 
     by_kind: list[dict[str, Any]] = []
     for kind in KIND_ORDER:
@@ -558,6 +559,13 @@ def _mask_for_client(result: dict[str, Any]) -> dict[str, Any]:
         for item in result.get("items") or []
     ]
     masked["actual"] = {"cny": None, "delta_pct": None}
+    # 倍率也不能给客户：售价 ÷ 倍率 = 我们的成本，等于把成本泄露出去。
+    price = result.get("price") or {}
+    masked["price"] = {
+        "cny": price.get("cny"),
+        "markup": None,
+        "markup_source": "",
+    }
     return masked
 
 
@@ -577,29 +585,37 @@ def render_quote(payload: dict[str, Any], fmt: str = "md", *, title: str = "") -
     price = payload.get("price") or {}
     items = payload.get("items") or []
     unpriced = payload.get("unpriced") or []
+    # 客户版只有售价：不出现单价/金额列，也不暴露加价倍率（售价÷倍率=成本）。
+    is_client = payload.get("view") == "client"
 
     def money(value: Any) -> str:
         if value is None:
             return "—"
         return f"¥{float(value):.2f}"
 
+    def total_line() -> str:
+        value = float(price["cny"])
+        if is_client:
+            return f"报价合计：{money(value)}"
+        return f"售价（成本 × {price.get('markup')}）：{money(value)}"
+
     if fmt == "csv":
-        lines = ["种类,项目,数量,单位,单价,金额"]
+        lines = ["种类,项目,数量,单位"] if is_client else ["种类,项目,数量,单位,单价,金额"]
         for item in items:
-            lines.append(
-                ",".join(
-                    [
-                        _csv_cell(item.get("kind_label") or KIND_LABELS.get(item.get("kind"), "")),
-                        _csv_cell(item.get("label")),
-                        f"{float(item.get('quantity') or 0):g}",
-                        _csv_cell(item.get("unit")),
-                        "" if item.get("unit_price") is None else f"{float(item['unit_price']):.4f}",
-                        "" if item.get("cny") is None else f"{float(item['cny']):.2f}",
-                    ]
+            cells = [
+                _csv_cell(item.get("kind_label") or KIND_LABELS.get(item.get("kind"), "")),
+                _csv_cell(item.get("label")),
+                f"{float(item.get('quantity') or 0):g}",
+                _csv_cell(item.get("unit")),
+            ]
+            if not is_client:
+                cells.append(
+                    "" if item.get("unit_price") is None else f"{float(item['unit_price']):.4f}"
                 )
-            )
+                cells.append("" if item.get("cny") is None else f"{float(item['cny']):.2f}")
+            lines.append(",".join(cells))
         lines.append("")
-        if payload.get("view") != "client":
+        if not is_client:
             lines.append(f"成本小计,,,,,{float(cost.get('cny') or 0):.2f}")
             lines.append(
                 f"预留 {payload.get('contingency_pct')}%,,,,"
@@ -607,69 +623,98 @@ def render_quote(payload: dict[str, Any], fmt: str = "md", *, title: str = "") -
             )
             lines.append(f"成本合计,,,,,{float(cost.get('total_cny') or 0):.2f}")
         if price.get("cny") is not None:
-            lines.append(f"售价（×{price.get('markup')}）,,,,,{float(price['cny']):.2f}")
+            if is_client:
+                lines.append(f"报价合计,{float(price['cny']):.2f}")
+            else:
+                lines.append(f"售价（×{price.get('markup')}）,,,,,{float(price['cny']):.2f}")
         return f"{safe_title}-quote-{stamp}.csv", "\n".join(lines) + "\n"
 
     if fmt == "txt":
+        heading = "制作报价单" if is_client else "制作成本预估"
         rows = [
-            f"制作成本预估（{scope}，{stage}）",
+            f"{heading}（{scope}，{stage}）",
             "=" * 36,
         ]
         for item in items:
-            rows.append(
-                f"  {item.get('label') or item.get('kind')}  {money(item.get('cny'))}"
-            )
+            label = item.get("label") or item.get("kind")
+            rows.append(f"  {label}" if is_client else f"  {label}  {money(item.get('cny'))}")
         rows.append("")
-        if payload.get("view") != "client":
+        if not is_client:
             rows.append(f"  成本小计：{money(cost.get('cny'))}")
             rows.append(f"  预留 {payload.get('contingency_pct')}%：{money(cost.get('contingency_cny'))}")
             rows.append(f"  成本合计：{money(cost.get('total_cny'))}")
         if price.get("cny") is not None:
-            rows.append(f"  售价（×{price.get('markup')}）：{money(price.get('cny'))}")
-        if unpriced:
+            rows.append(f"  {total_line()}")
+        elif is_client:
+            rows.append("  报价合计：待定（尚未配置加价倍率）")
+        if unpriced and not is_client:
             rows.append("")
             rows.append(f"  未定价项：{len(unpriced)}（暂不计入合计）")
         return f"{safe_title}-quote-{stamp}.txt", "\n".join(rows) + "\n"
 
-    heading = "制作成本预估" if payload.get("view") != "client" else "制作报价单"
-    lines = [
-        f"# {heading} — {title or safe_title}",
-        "",
-        f"- 范围：{scope}",
-        f"- 档位：{stage}",
-        "",
-        "## 分项明细",
-        "",
-        "| 种类 | 项目 | 数量 | 单位 | 单价 | 金额 |",
-        "| --- | --- | ---: | --- | ---: | ---: |",
-    ]
+    heading = "制作报价单" if is_client else "制作成本预估"
+    if is_client:
+        lines = [
+            f"# {heading} — {title or safe_title}",
+            "",
+            f"- 范围：{scope}",
+            f"- 档位：{stage}",
+            "",
+            "## 创作规模",
+            "",
+            "| 种类 | 项目 | 数量 | 单位 |",
+            "| --- | --- | ---: | --- |",
+        ]
+    else:
+        lines = [
+            f"# {heading} — {title or safe_title}",
+            "",
+            f"- 范围：{scope}",
+            f"- 档位：{stage}",
+            "",
+            "## 分项明细",
+            "",
+            "| 种类 | 项目 | 数量 | 单位 | 单价 | 金额 |",
+            "| --- | --- | ---: | --- | ---: | ---: |",
+        ]
     for item in items:
-        lines.append(
-            "| {kind} | {label} | {qty:g} | {unit} | {unit_price} | {cny} |".format(
-                kind=item.get("kind_label") or KIND_LABELS.get(item.get("kind"), item.get("kind")),
-                label=str(item.get("label") or "").replace("|", "/"),
-                qty=float(item.get("quantity") or 0),
-                unit=item.get("unit") or "",
-                unit_price="—" if item.get("unit_price") is None else f"{float(item['unit_price']):.4f}",
-                cny=money(item.get("cny")),
+        kind_label = item.get("kind_label") or KIND_LABELS.get(item.get("kind"), item.get("kind"))
+        label = str(item.get("label") or "").replace("|", "/")
+        quantity = float(item.get("quantity") or 0)
+        unit = item.get("unit") or ""
+        if is_client:
+            lines.append(f"| {kind_label} | {label} | {quantity:g} | {unit} |")
+        else:
+            lines.append(
+                "| {kind} | {label} | {qty:g} | {unit} | {unit_price} | {cny} |".format(
+                    kind=kind_label,
+                    label=label,
+                    qty=quantity,
+                    unit=unit,
+                    unit_price=(
+                        "—"
+                        if item.get("unit_price") is None
+                        else f"{float(item['unit_price']):.4f}"
+                    ),
+                    cny=money(item.get("cny")),
+                )
             )
-        )
     lines.append("")
     lines.append("## 合计")
     lines.append("")
-    if payload.get("view") != "client":
+    if not is_client:
         lines.append(f"- 成本小计：{money(cost.get('cny'))}")
         lines.append(f"- 预留（{payload.get('contingency_pct')}%）：{money(cost.get('contingency_cny'))}")
         lines.append(f"- **成本合计：{money(cost.get('total_cny'))}**")
     if price.get("cny") is not None:
-        lines.append(f"- **售价（成本 × {price.get('markup')}）：{money(price.get('cny'))}**")
-    elif payload.get("view") == "client":
-        lines.append("- 售价：待定（该客户尚未配置加价倍率）")
-    if unpriced:
+        lines.append(f"- **{total_line()}**")
+    elif is_client:
+        lines.append("- 报价合计：待定（该客户尚未配置加价倍率）")
+    if unpriced and not is_client:
         lines += ["", f"> 有 {len(unpriced)} 项尚未定价，未计入合计："]
         for item in unpriced:
             lines.append(f"> - {item.get('label') or item.get('kind')}（{item.get('model') or ''}）")
-    if payload.get("view") != "client" and payload.get("assumptions"):
+    if not is_client and payload.get("assumptions"):
         lines += ["", "## 估算假设", ""]
         for key, value in sorted(payload["assumptions"].items()):
             lines.append(f"- {key} = {value}")
@@ -689,7 +734,7 @@ def _slug(value: str) -> str:
 
 
 def display_safety_check(payload: dict[str, Any]) -> bool:
-    """自检：``view=client`` 的载荷里不能出现任何金额。纯函数，便于测试。"""
+    """自检：``view=client`` 的载荷里不能出现任何金额（也不能出现加价倍率）。纯函数，便于测试。"""
 
     if payload.get("view") != "client":
         return True
@@ -697,6 +742,9 @@ def display_safety_check(payload: dict[str, Any]) -> bool:
         return False
     if payload.get("price") is None:
         return True
+    # 售价 ÷ 倍率 = 成本，所以倍率同样不能出现在客户载荷里。
+    if (payload.get("price") or {}).get("markup") is not None:
+        return False
     for item in payload.get("items") or []:
         if item.get("cny") is not None or item.get("unit_price") is not None:
             return False

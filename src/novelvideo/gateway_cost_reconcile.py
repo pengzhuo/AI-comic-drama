@@ -30,7 +30,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from novelvideo.config import NEWAPI_BILLING_DB_PATH, QUOTA_PER_USD, STATE_DIR
 from novelvideo.relay_billing import (
@@ -388,6 +388,91 @@ def reconcile_project_db(
     finally:
         conn.close()
     return report
+
+
+def episode_quota(
+    db_path: str | Path,
+    episode: int,
+    *,
+    task_quota: Mapping[str, int] | None = None,
+    log_quota: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """单集 ``quota`` 汇总（只读，不写库）。
+
+    - 不传 ``task_quota`` / ``log_quota``：直接汇总库里已写入的 ``cost_quota``。
+    - 传了 maps：**只统计能在中转站账单里对上的行**（``quota``/``matched``），
+      ``rows`` 是这一集在四张表里的总行数——调用方据此判断口径是否完整
+      （``matched < rows`` 说明还有行对不上，按集结算应当只按已知部分算，宁可
+      少收也不能把网关侧虚高的默认倍率算给客户）。
+
+    返回 ``{"quota", "rows", "matched", "priced"}``；``quota`` 是 quota 之和，
+    换算成 ¥ 用 ``quota / QUOTA_PER_USD * USD_CNY_RATE``（线性，与
+    :func:`novelvideo.production_prices.calibrate_from_project` 同口径）。
+    """
+
+    result = {"quota": 0, "rows": 0, "matched": 0, "priced": 0}
+    path = Path(db_path)
+    if not path.is_file():
+        return result
+    try:
+        ep = int(episode)
+    except (TypeError, ValueError):
+        return result
+
+    use_maps = task_quota is not None or log_quota is not None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error:
+        return result
+    conn.row_factory = sqlite3.Row
+    try:
+        for table, key_column, _space in _USAGE_TABLES:
+            if not _table_exists(conn, table):
+                continue
+            columns = _columns(conn, table)
+            if "episode" not in columns:
+                continue
+            if key_column is None:
+                key_expr = (
+                    "COALESCE(NULLIF(gateway_request_id, ''), request_id)"
+                    if "gateway_request_id" in columns
+                    else "request_id"
+                )
+            else:
+                if key_column not in columns:
+                    continue
+                key_expr = f"NULLIF({key_column}, '')"
+            quota_expr = "cost_quota" if "cost_quota" in columns else "NULL"
+            query = (
+                f"SELECT {key_expr} AS gid, {quota_expr} AS cost_quota "
+                f"FROM {table} WHERE episode = ?"
+            )
+            for row in conn.execute(query, (ep,)):
+                result["rows"] += 1
+                if not use_maps:
+                    quota = row["cost_quota"]
+                    if quota is None:
+                        continue
+                    result["priced"] += 1
+                    result["matched"] += 1
+                    result["quota"] += int(quota)
+                    continue
+                gid = str(row["gid"] or "").strip()
+                quota = None
+                if gid:
+                    if task_quota:
+                        quota = task_quota.get(gid)
+                    if quota is None and log_quota:
+                        quota = log_quota.get(gid)
+                if quota is None:
+                    continue
+                result["matched"] += 1
+                result["quota"] += int(quota)
+    except sqlite3.Error as exc:  # noqa: BLE001 - 汇总失败按未知处理
+        logger.warning("单集 quota 汇总失败 %s: %s", path, exc)
+    finally:
+        conn.close()
+    return result
 
 
 def discover_project_dbs(state_dir: str | Path | None = None) -> list[Path]:

@@ -540,3 +540,182 @@ async def test_project_config_reports_whether_a_scene_build_applies(
     assert await _read({**structured, "spine_template": "narrated"}) is False
     # Legacy keeps its build whatever the template.
     assert await _read({"spine_template": "narrated"}) is True
+
+
+@pytest.mark.asyncio
+async def test_start_ingest_warn_policy_lets_headerless_drama_through(
+    monkeypatch, tmp_path, caplog
+):
+    """工作室一键成片：精品剧缺场景头不再阻断导入，改为降级提示。"""
+
+    from novelvideo.api.routes import ingest
+
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "novel.txt").write_text(
+        "第一集\n孙悟空走进寝房，看见师父正在休息。",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ingest, "resolve_project_scope", _project_scope_resolver(tmp_path))
+
+    with caplog.at_level(logging.WARNING, logger="novelvideo.api.ingest"):
+        response = await ingest.start_ingest(
+            "demo",
+            IngestStart(
+                filename="novel.txt",
+                rebuild=True,
+                spine_template="drama",
+                format_policy="warn",
+            ),
+            {"username": "alice"},
+        )
+
+    # 格式不再是阻断理由：请求继续走到入队环节（此桩没有 project context）。
+    assert response["ok"] is False
+    assert response.get("error_type") != "screenplay_format"
+    assert "project context" in response["error"]
+    assert "screenplay_format_advisory" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_start_ingest_warn_policy_returns_format_advisory_on_success(
+    monkeypatch, tmp_path
+):
+    """放行成功后，格式体检结果随成功响应带回给客户端展示。"""
+
+    from novelvideo.api.routes import ingest
+    from novelvideo.project_context import ProjectContext
+
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "novel.txt").write_text(
+        "第一集\n孙悟空走进寝房，看见师父正在休息。",
+        encoding="utf-8",
+    )
+
+    ctx = ProjectContext(
+        project_id="project-1",
+        project_name="demo",
+        owner_type="user",
+        owner_id="user-alice",
+        owner_username="alice",
+        requester_user_id="user-alice",
+        requester_username="alice",
+        requester_principals=(("user", "user-alice"),),
+        effective_role="owner",
+        home_node_id="local",
+        is_home_node=True,
+        output_dir=tmp_path,
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "runtime",
+    )
+    resolved = _legacy_resolution(tmp_path)
+    resolved.ctx = ctx
+
+    async def resolve(*args, **kwargs):
+        return resolved
+
+    enqueued: dict = {}
+
+    class Backend:
+        async def enqueue_project_task(self, queued_ctx, **kwargs):
+            enqueued.update(kwargs)
+            return SimpleNamespace(
+                task_state=SimpleNamespace(task_id="ingest-1"),
+                backend="inline",
+                queue="default",
+            )
+
+    monkeypatch.setattr(ingest, "resolve_project_scope", resolve)
+    monkeypatch.setattr(ingest, "get_task_backend", lambda: Backend())
+    monkeypatch.setattr(ingest, "save_project_config_in_state_dir", lambda *a, **k: None)
+
+    response = await ingest.start_ingest(
+        "demo",
+        IngestStart(
+            filename="novel.txt",
+            rebuild=True,
+            spine_template="drama",
+            format_policy="warn",
+        ),
+        {"username": "alice"},
+    )
+
+    assert response["ok"] is True
+    assert response["task_id"] == "ingest-1"
+    # 格式问题没有拦住导入，只是被当成提示带回来。
+    assert response["format_check"]["level"] == "blocking"
+    assert response["format_check"]["scene_header_status"] == "missing"
+    assert enqueued["task_type"] == "ingest_fast"
+    # 任务级门禁同样放行：否则 ingest_fast 会在 structured_ingest/cognee 里
+    # 再次因缺场景头抛错，把刚建好的项目跑失败。
+    assert enqueued["payload"]["config"]["require_scene_headers"] is False
+
+
+@pytest.mark.asyncio
+async def test_start_ingest_block_policy_keeps_task_gate_strict(
+    monkeypatch, tmp_path
+):
+    """默认 block 策略下，任务级门禁保持严格（require_scene_headers=True）。"""
+
+    from novelvideo.api.routes import ingest
+    from novelvideo.project_context import ProjectContext
+
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "script.txt").write_text(
+        "第一集\n1-1 菩提寝房 夜 内\n孙悟空：师父。",
+        encoding="utf-8",
+    )
+
+    ctx = ProjectContext(
+        project_id="project-1",
+        project_name="demo",
+        owner_type="user",
+        owner_id="user-alice",
+        owner_username="alice",
+        requester_user_id="user-alice",
+        requester_username="alice",
+        requester_principals=(("user", "user-alice"),),
+        effective_role="owner",
+        home_node_id="local",
+        is_home_node=True,
+        output_dir=tmp_path,
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "runtime",
+    )
+    resolved = _legacy_resolution(tmp_path)
+    resolved.ctx = ctx
+
+    async def resolve(*args, **kwargs):
+        return resolved
+
+    enqueued: dict = {}
+
+    class Backend:
+        async def enqueue_project_task(self, queued_ctx, **kwargs):
+            enqueued.update(kwargs)
+            return SimpleNamespace(
+                task_state=SimpleNamespace(task_id="ingest-1"),
+                backend="inline",
+                queue="default",
+            )
+
+    monkeypatch.setattr(ingest, "resolve_project_scope", resolve)
+    monkeypatch.setattr(ingest, "get_task_backend", lambda: Backend())
+    monkeypatch.setattr(ingest, "save_project_config_in_state_dir", lambda *a, **k: None)
+
+    response = await ingest.start_ingest(
+        "demo",
+        IngestStart(
+            filename="script.txt",
+            rebuild=True,
+            spine_template="drama",
+            format_policy="block",
+        ),
+        {"username": "alice"},
+    )
+
+    assert response["ok"] is True
+    assert enqueued["payload"]["config"]["require_scene_headers"] is True
+

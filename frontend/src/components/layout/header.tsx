@@ -15,6 +15,7 @@ import {
   Languages,
   LogOut,
   KeyRound,
+  Receipt,
   ShieldCheck,
   X,
 } from "lucide-react";
@@ -52,7 +53,7 @@ import {
   markUpgradeSeen,
   shouldShowUpgradeNudge,
 } from "@/lib/release-notification-state";
-import { notificationCenterHidden } from "@/lib/ui-hide-flags";
+import { headerSettingsHidden, notificationCenterHidden } from "@/lib/ui-hide-flags";
 import { FREEZONE_DOCK_OFFSET_ANIMATED_STYLE } from "@/features/freezone/dockOffset";
 import {
   ProjectHeaderNavigation,
@@ -128,8 +129,10 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
     !notificationCenterHidden() &&
     (shouldShowUpgradeNudge(releaseFeed) || announcementUnreadCount(announcementIds) > 0);
   const gatewayConfig = modelGatewayConfig.data?.data;
+  const settingsHidden = headerSettingsHidden();
   const hasSettingsWarning = Boolean(
-    ceRuntime &&
+    !settingsHidden &&
+      ceRuntime &&
       gatewayConfig &&
       (gatewayConfig.effective.configured === false ||
         gatewayConfig.mediaRelay?.configured === false),
@@ -374,29 +377,56 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
               </Tooltip>
             </TooltipProvider>
           ) : null}
-          <div ref={settingsAnchorRef} className="relative">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className="relative size-[32px] text-sidebar-foreground/82 transition-colors duration-150 ease-[var(--ease-out-quint)] hover:bg-black/[0.05] hover:text-foreground aria-expanded:bg-black/[0.05] aria-expanded:text-foreground"
-              aria-label={
-                hasSettingsWarning ? t("header.settingsWithWarning") : t("header.settings")
-              }
-              aria-expanded={settingsOpen}
-              onClick={() => setSettingsOpen(true)}
-            >
-              <Bolt className="size-[17px]" />
-              {hasSettingsWarning ? (
-                <span
-                  className="absolute right-[5px] top-[5px] flex size-[11px] items-center justify-center rounded-full bg-amber-400 text-black shadow-[0_0_7px_rgba(251,191,36,0.68)]"
-                  aria-hidden="true"
+          {access?.enabled && access.kind === "internal" ? (
+            <TooltipProvider delay={80}>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Link
+                      to="/production-prices"
+                      aria-label={t("header.productionPrices")}
+                      className="relative flex size-[32px] items-center justify-center rounded-[6px] text-sidebar-foreground/82 transition-colors duration-150 ease-[var(--ease-out-quint)] hover:bg-black/[0.05] hover:text-foreground"
+                    />
+                  }
                 >
-                  <AlertTriangle className="size-[8px]" strokeWidth={3} />
-                </span>
-              ) : null}
-            </Button>
-          </div>
+                  <Receipt className="size-[17px]" />
+                </TooltipTrigger>
+                <TooltipContent
+                  side="bottom"
+                  sideOffset={10}
+                  showArrow={false}
+                  className="border border-black/10 bg-background/95 text-foreground shadow-none"
+                >
+                  {t("header.productionPrices")}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : null}
+          {settingsHidden ? null : (
+            <div ref={settingsAnchorRef} className="relative">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="relative size-[32px] text-sidebar-foreground/82 transition-colors duration-150 ease-[var(--ease-out-quint)] hover:bg-black/[0.05] hover:text-foreground aria-expanded:bg-black/[0.05] aria-expanded:text-foreground"
+                aria-label={
+                  hasSettingsWarning ? t("header.settingsWithWarning") : t("header.settings")
+                }
+                aria-expanded={settingsOpen}
+                onClick={() => setSettingsOpen(true)}
+              >
+                <Bolt className="size-[17px]" />
+                {hasSettingsWarning ? (
+                  <span
+                    className="absolute right-[5px] top-[5px] flex size-[11px] items-center justify-center rounded-full bg-amber-400 text-black shadow-[0_0_7px_rgba(251,191,36,0.68)]"
+                    aria-hidden="true"
+                  >
+                    <AlertTriangle className="size-[8px]" strokeWidth={3} />
+                  </span>
+                ) : null}
+              </Button>
+            </div>
+          )}
           <CreditBalanceBadge />
           <div
             id="superchat-header-controls"

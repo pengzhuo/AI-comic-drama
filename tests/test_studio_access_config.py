@@ -20,6 +20,7 @@ from starlette.requests import Request
 
 from novelvideo import studio_access
 from novelvideo.api.routes import access as access_routes
+from novelvideo.api.routes import auth as auth_routes
 
 PHONE = "13800000000"
 SECRET = "test-client-secret"
@@ -481,6 +482,7 @@ async def test_link_endpoint_builds_absolute_link(gate_env):
     assert data["phone"] == PHONE
     assert data["code"] == _code()
     assert data["link"] == f"https://aistory.nanie168.com/studio?phone={PHONE}&code={data['code']}"
+    assert data["canvas_link"] == f"https://aistory.nanie168.com/canvas?phone={PHONE}&code={data['code']}"
 
     bad_phone = await access_routes.create_access_link(
         access_routes.AccessLinkBody(phone="123"), _request(_internal_cookies())
@@ -491,6 +493,28 @@ async def test_link_endpoint_builds_absolute_link(gate_env):
         access_routes.AccessLinkBody(phone=PHONE), _request()
     )
     assert anonymous.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_link_endpoint_canvas_link_targets_project(gate_env):
+    _write_secret(_secret_path(gate_env))
+
+    response = await access_routes.create_access_link(
+        access_routes.AccessLinkBody(phone=PHONE, project="01M6GSBBZJ0ZTQ3XNFYSFNCE05"),
+        _request(_internal_cookies()),
+    )
+
+    data = response["data"]
+    assert data["canvas_link"] == (
+        f"https://localhost/canvas/01M6GSBBZJ0ZTQ3XNFYSFNCE05"
+        f"?phone={PHONE}&code={data['code']}"
+    )
+
+    bad_project = await access_routes.create_access_link(
+        access_routes.AccessLinkBody(phone=PHONE, project="../etc/passwd"),
+        _request(_internal_cookies()),
+    )
+    assert bad_project.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -564,3 +588,76 @@ async def test_settings_endpoints_rate_limit_strangers(gate_env):
         _request(_internal_cookies(), extra_headers={"x-forwarded-for": "203.0.113.5, 172.18.0.1"}),
         access_routes._RATE_SCOPE_SETTINGS,
     )
+
+
+# --------------------------------------------------------------------------- #
+# session cookies + logout
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_access_cookies_are_session_scoped(gate_env):
+    """关掉浏览器就该失效：访问 cookie 不带 Max-Age/Expires。"""
+    _write_secret(_secret_path(gate_env))
+
+    client = await access_routes.create_client_session(
+        access_routes.ClientSessionBody(phone=PHONE, code=_code()), _request()
+    )
+    assert _status(client) == 200
+    client_header = client.headers["set-cookie"].lower()
+    assert client_header.startswith(f"{studio_access.CLIENT_COOKIE_NAME}=")
+    assert "max-age" not in client_header
+    assert "expires" not in client_header
+
+    internal = await access_routes.create_internal_session(
+        access_routes.InternalSessionBody(key=INTERNAL_KEY),
+        _request(client=("203.0.113.6", 4321)),
+    )
+    assert _status(internal) == 200
+    internal_header = internal.headers["set-cookie"].lower()
+    assert internal_header.startswith(f"{studio_access.INTERNAL_COOKIE_NAME}=")
+    assert "max-age" not in internal_header
+    assert "expires" not in internal_header
+
+
+@pytest.mark.asyncio
+async def test_client_session_clears_internal_identity(gate_env):
+    """兑换客户链接必须当场清掉内部身份：internal 优先于 client，留着它就等于
+    客户链接被忽略（页头回落到用户名 local）。"""
+    _write_secret(_secret_path(gate_env))
+
+    response = await access_routes.create_client_session(
+        access_routes.ClientSessionBody(phone=PHONE, code=_code()),
+        _request(_internal_cookies()),
+    )
+    assert _status(response) == 200
+    headers = response.headers.getlist("set-cookie")
+    joined = " ".join(headers).lower()
+    assert f"{studio_access.CLIENT_COOKIE_NAME}=" in joined
+
+    cleared = [
+        header
+        for header in headers
+        if header.split("=")[0].strip() == studio_access.INTERNAL_COOKIE_NAME
+    ]
+    assert len(cleared) == 1, headers
+    assert "max-age=0" in cleared[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_logout_clears_studio_access_cookies(gate_env):
+    """退出（/auth/logout）必须连访问身份一起清，否则 30 天 cookie 还在。"""
+    _write_secret(_secret_path(gate_env))
+
+    response = await auth_routes.logout(_request())
+    assert _status(response) == 200
+    headers = response.headers.getlist("set-cookie")
+    joined = " ".join(headers).lower()
+    assert f"{studio_access.CLIENT_COOKIE_NAME}=" in joined
+    assert f"{studio_access.INTERNAL_COOKIE_NAME}=" in joined
+    # 下发的每个访问 cookie 都是「立即过期」形态。
+    wanted = {studio_access.CLIENT_COOKIE_NAME, studio_access.INTERNAL_COOKIE_NAME}
+    cleared = [h for h in headers if h.split("=")[0].strip() in wanted]
+    assert len(cleared) == 2
+    for header in cleared:
+        assert "max-age=0" in header.lower()

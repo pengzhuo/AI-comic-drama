@@ -4,8 +4,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   appMode,
+  hasInternalRoutes,
   internalEntryPath,
   internalHomePath,
+  isCanvasMode,
   isClientMode,
 } from "@/lib/app-mode";
 
@@ -19,16 +21,31 @@ describe("app mode", () => {
   it("defaults to the internal app", () => {
     expect(appMode()).toBe("internal");
     expect(isClientMode()).toBe(false);
+    expect(isCanvasMode()).toBe(false);
+    expect(hasInternalRoutes()).toBe(true);
   });
 
   it("reads the client build flag", () => {
     vi.stubEnv("VITE_APP_MODE", "client");
     expect(isClientMode()).toBe(true);
+    expect(isCanvasMode()).toBe(false);
+    expect(hasInternalRoutes()).toBe(false);
+  });
+
+  it("reads the canvas build flag", () => {
+    vi.stubEnv("VITE_APP_MODE", "canvas");
+    expect(appMode()).toBe("canvas");
+    expect(isCanvasMode()).toBe(true);
+    // canvas 不是 client：它有自己的入口 `/canvas`，别被当成工作室。
+    expect(isClientMode()).toBe(false);
+    expect(hasInternalRoutes()).toBe(false);
   });
 
   it("treats unknown flags as the internal app", () => {
     vi.stubEnv("VITE_APP_MODE", "something-else");
     expect(isClientMode()).toBe(false);
+    expect(isCanvasMode()).toBe(false);
+    expect(hasInternalRoutes()).toBe(true);
   });
 });
 

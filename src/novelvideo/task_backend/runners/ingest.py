@@ -50,6 +50,9 @@ async def _run_ingest_fast(
     payload = envelope.get("payload") or {}
     novel_path = str(payload["novel_path"])
     config = dict(payload.get("config") or {})
+    # ``warn`` 的导入（工作室一键成片）只提示不拦：缺场景头时任务级门禁也要放行，
+    # 否则刚建好的项目会被 ingest 任务本身跑失败。默认严格，内部捏料页行为不变。
+    require_scene_headers = bool(config.get("require_scene_headers", True))
     manager = get_task_manager()
 
     # structured_v1 imports never build a graph, so they open the project with
@@ -98,6 +101,7 @@ async def _run_ingest_fast(
                 novel_path,
                 spine_template=str(config.get("spine_template") or "").strip()
                 or None,
+                require_scene_headers=require_scene_headers,
                 on_progress=update,
                 on_log=lambda message: update(None, message),
             )
@@ -106,6 +110,7 @@ async def _run_ingest_fast(
                 novel_path,
                 rebuild=bool(config.get("rebuild", False)),
                 spine_template=str(config.get("spine_template") or "").strip() or None,
+                require_scene_headers=require_scene_headers,
                 on_progress=update,
                 on_log=lambda message: update(None, message),
             )

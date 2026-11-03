@@ -6,6 +6,11 @@ import {
 } from "@/api/canvas";
 import { useAuthStore } from "@/stores/auth-store";
 import { getAppRouter } from "@/lib/app-router";
+import {
+  freezoneEntryFromPath,
+  freezoneNavTarget,
+  freezonePathFor,
+} from "@/lib/freezone-entry";
 import { writeUrl } from "@/lib/url-params";
 import {
   consumeQueuedLocalFreezoneProjections,
@@ -58,7 +63,10 @@ export async function openPresetProjectionInMyCanvas(
   });
   consumeQueuedLocalFreezoneProjections(projectId, canvasId);
 
-  const freezonePath = `/projects/${encodeURIComponent(projectId)}/freezone`;
+  // Same address shape the user is already on (internal `/projects/<id>/freezone`
+  // or canvas `/canvas/<id>`) — do not bounce between the two entries.
+  const scheme = freezoneEntryFromPath(startPathname ?? "")?.scheme ?? "internal";
+  const freezonePath = freezonePathFor(scheme, projectId);
   // Same source as startPathname: use the router's location so an in-flight
   // navigation (queued but not yet flushed to window.location) is respected.
   const currentPathname =
@@ -72,8 +80,7 @@ export async function openPresetProjectionInMyCanvas(
   if (currentPathname !== freezonePath) {
     if (router) {
       router.navigate({
-        to: "/projects/$project/freezone",
-        params: { project: projectId },
+        ...freezoneNavTarget(scheme, projectId),
         search: { canvas: canvasId },
         resetScroll: false,
       });

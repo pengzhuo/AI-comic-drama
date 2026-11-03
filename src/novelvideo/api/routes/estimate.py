@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
+from novelvideo import points_client
 from novelvideo import production_estimate as estimate
 from novelvideo import production_prices as prices
 from novelvideo import studio_access
@@ -59,16 +60,23 @@ def _resolve_view(user: dict, as_client: str) -> tuple[str, str]:
     return view, phone
 
 
-def _settings_denied(request: Request) -> JSONResponse | None:
-    """单价表只有内部端能读写。"""
+def _settings_denied(request: Request, user: dict) -> JSONResponse | None:
+    """单价表只有内部端能读写。
+
+    访问验证开启时认 ``st_console`` 会话；未开启的部署（上游 CE 等）没有内部会话
+    可言，此时只拒绝明确以客户身份进来的请求。
+    """
     if studio_access.verify_internal_cookie(
         request.cookies.get(studio_access.INTERNAL_COOKIE_NAME)
     ):
         return None
     if not studio_access.enabled():
-        return JSONResponse(
-            {"ok": False, "error": "studio access is not enabled"}, status_code=404
-        )
+        kind = str(user.get("credential_kind") or "")
+        if kind == studio_access.CREDENTIAL_KIND_CLIENT:
+            return JSONResponse(
+                {"ok": False, "error": "仅内部端可操作单价表"}, status_code=403
+            )
+        return None
     return JSONResponse({"ok": False, "error": "仅内部端可操作单价表"}, status_code=403)
 
 
@@ -216,7 +224,56 @@ async def _build_estimate(
     if not estimate.display_safety_check(payload):  # pragma: no cover - 防线
         logger.error("客户视角载荷出现金额，已强制脱敏 project=%s", project)
         payload = estimate._mask_for_client(payload)  # noqa: SLF001
+    return _with_points(payload)
+
+
+def _with_points(payload: dict[str, Any]) -> dict[str, Any]:
+    """给 ``price`` 补上伴点数（100 伴点 = ¥1）。
+
+    ``points`` 是客户**自己售价**的换算，不是成本，脱敏安全
+    （``display_safety_check`` 只看 cost / 单价 / markup）；算不出售价时为 ``None``。
+    """
+
+    price = dict(payload.get("price") or {})
+    value = price.get("cny")
+    price["points"] = (
+        points_client.points_for_cny(float(value))
+        if isinstance(value, (int, float))
+        else None
+    )
+    payload["price"] = price
     return payload
+
+
+async def client_price_cny(
+    *,
+    project: str,
+    request: Request,
+    user: dict,
+    episode: int,
+    phone: str,
+) -> float | None:
+    """按客户身份算某一集的精估**售价**（¥）；算不出时返回 ``None``。
+
+    伴点预扣复用这个口径——扣的就是客户在报价卡上看到的那个数。缺省倍率恒为
+    1 倍，所以正常都能算出售价；``None`` 只是防御分支。
+    """
+
+    payload = await _build_estimate(
+        project=project,
+        request=request,
+        user=user,
+        episode=int(episode),
+        stage="refined",
+        chars=None,
+        episodes=None,
+        chapters=None,
+        as_client=phone,
+        include_actual=False,
+    )
+    price = payload.get("price") or {}
+    value = price.get("cny")
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 @router.get("/projects/{project}/production-estimate")
@@ -330,9 +387,11 @@ def _price_book_payload(book: prices.PriceBook) -> dict[str, Any]:
 
 
 @router.get("/settings/production-prices")
-async def read_production_prices(request: Request):
+async def read_production_prices(
+    request: Request, user: dict = Depends(get_api_user)
+):
     """当前单价表（内部端）。"""
-    denied = _settings_denied(request)
+    denied = _settings_denied(request, user)
     if denied is not None:
         return denied
     return {"ok": True, "data": _price_book_payload(prices.load(force=True))}
@@ -340,10 +399,12 @@ async def read_production_prices(request: Request):
 
 @router.put("/settings/production-prices")
 async def update_production_prices(
-    request: Request, body: dict[str, Any] = Body(default_factory=dict)
+    request: Request,
+    body: dict[str, Any] = Body(default_factory=dict),
+    user: dict = Depends(get_api_user),
 ):
     """局部更新单价表（只覆盖给定字段，热生效）。"""
-    denied = _settings_denied(request)
+    denied = _settings_denied(request, user)
     if denied is not None:
         return denied
     if not isinstance(body, dict):
@@ -401,9 +462,11 @@ def _validate_price_updates(body: dict[str, Any]) -> str:
 
 
 @router.post("/settings/production-prices/sync")
-async def sync_production_prices(request: Request):
+async def sync_production_prices(
+    request: Request, user: dict = Depends(get_api_user)
+):
     """从上游中转站拉公开价目，快照进单价表（不覆盖手工规则）。"""
-    denied = _settings_denied(request)
+    denied = _settings_denied(request, user)
     if denied is not None:
         return denied
     _book, result = prices.sync_prices()
@@ -418,7 +481,7 @@ async def calibrate_production_prices(
     user: dict = Depends(get_api_user),
 ):
     """用项目已对账的真实账单反推 ``¥/单位``（默认只预览）。"""
-    denied = _settings_denied(request)
+    denied = _settings_denied(request, user)
     if denied is not None:
         return denied
     resolution = await resolve_project_scope(project, user, required_role="owner")

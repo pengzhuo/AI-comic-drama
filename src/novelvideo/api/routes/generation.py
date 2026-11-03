@@ -716,19 +716,51 @@ async def compose_video(
     return {"ok": False, "error": "成片合成需要 project context"}
 
 
+def _project_id_of(resolved: Any, project: str) -> str:
+    """结算用的 ``projectsuuid``：优先 ProjectContext 的稳定项目 id。"""
+
+    ctx = getattr(resolved, "ctx", None)
+    return str(getattr(ctx, "project_id", "") or project or "")
+
+
 @router.get("/projects/{project}/episodes/{episode_num}/final")
 async def get_final_video(
     project: str,
     episode_num: int,
+    as_client: str = Query("", description="内部端预览客户视角：手机号或 1"),
     user: dict = Depends(get_api_user),
 ):
-    """读取 episode 成片状态，供 supertale-fe compose 页刷新 hydration。"""
+    """读取 episode 成片状态，供 supertale-fe compose 页刷新 hydration。
+
+    成片欠费（补缴未结清）时返回 ``blocked``，**不给** ``video_url``——预览与
+    下载一起挡，客户补缴后自动解锁。
+    """
     resolved = await _resolve_generation_project(project, user, required_role="viewer")
     project_dir = resolved.project_dir
     filename = f"ep{episode_num:03d}_final.mp4"
     final_path = project_dir / "videos" / "episodes" / filename
     data = {"exists": final_path.exists(), "filename": filename}
     if final_path.exists():
+        from novelvideo import points_settlement
+
+        block = points_settlement.gate_delivery(
+            user=user,
+            state_dir=resolved.state_dir,
+            episode=episode_num,
+            projects_uuid=_project_id_of(resolved, project),
+            as_client=as_client,
+        )
+        if block is not None:
+            data.update(
+                {
+                    "blocked": True,
+                    "settle_status": block.status,
+                    "owed_points": block.owed_points,
+                    "message": block.message,
+                }
+            )
+            return {"ok": True, "data": data}
+        data["blocked"] = False
         data["video_url"] = make_static_url_for_context(
             resolved.ctx,
             f"videos/episodes/{filename}",
@@ -4057,6 +4089,16 @@ async def export_final_video(
     final_path = project_dir / "videos" / "episodes" / filename
     if not final_path.exists():
         raise HTTPException(status_code=404, detail="Final video not found")
+    from novelvideo import points_settlement
+
+    block = points_settlement.gate_delivery(
+        user=user,
+        state_dir=resolved.state_dir,
+        episode=episode_num,
+        projects_uuid=_project_id_of(resolved, project),
+    )
+    if block is not None:
+        raise HTTPException(status_code=402, detail=block.message)
     return FileResponse(
         path=str(final_path),
         filename=filename,
@@ -4395,6 +4437,16 @@ async def export_zip(project: str, episode_num: int, user: dict = Depends(get_ap
     resolved = await _resolve_generation_project(project, user, required_role="viewer")
     project_name = resolved.project_name
     project_dir = resolved.project_dir
+    from novelvideo import points_settlement
+
+    block = points_settlement.gate_delivery(
+        user=user,
+        state_dir=resolved.state_dir,
+        episode=episode_num,
+        projects_uuid=_project_id_of(resolved, project),
+    )
+    if block is not None:
+        raise HTTPException(status_code=402, detail=block.message)
     store = (
         await make_sqlite_store_for_context(resolved.ctx)
         if resolved.ctx

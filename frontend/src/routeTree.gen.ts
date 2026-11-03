@@ -15,16 +15,21 @@ import { Route as StudioRouteImport } from './routes/studio'
 import { Route as RechargeRouteImport } from './routes/recharge'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as CheckoutRouteImport } from './routes/checkout'
+import { Route as CanvasRouteImport } from './routes/canvas'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as StudioIndexRouteImport } from './routes/studio/index'
+import { Route as CanvasIndexRouteImport } from './routes/canvas/index'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as WatchWorkRouteImport } from './routes/watch.$work'
 import { Route as StudioProjectRouteImport } from './routes/studio/$project'
+import { Route as CanvasProjectRouteImport } from './routes/canvas/$project'
+import { Route as AppProductionPricesRouteImport } from './routes/_app/production-prices'
 import { Route as AppPaymentReturnRouteImport } from './routes/_app/payment-return'
 import { Route as AppCreditsRouteImport } from './routes/_app/credits'
 import { Route as AppConsoleRouteImport } from './routes/_app/console'
 import { Route as AppAccessUnavailableRouteImport } from './routes/_app/access-unavailable'
 import { Route as AppAccessSettingsRouteImport } from './routes/_app/access-settings'
+import { Route as StudioQuoteProjectRouteImport } from './routes/studio/quote.$project'
 import { Route as AppProjectsProjectTasksRouteImport } from './routes/_app/projects.$project/tasks'
 import { Route as AppProjectsProjectStylesRouteImport } from './routes/_app/projects.$project/styles'
 import { Route as AppProjectsProjectReportsRouteImport } from './routes/_app/projects.$project/reports'
@@ -87,6 +92,11 @@ const CheckoutRoute = CheckoutRouteImport.update({
   path: '/checkout',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CanvasRoute = CanvasRouteImport.update({
+  id: '/canvas',
+  path: '/canvas',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AppRoute = AppRouteImport.update({
   id: '/_app',
   getParentRoute: () => rootRouteImport,
@@ -95,6 +105,11 @@ const StudioIndexRoute = StudioIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => StudioRoute,
+} as any)
+const CanvasIndexRoute = CanvasIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => CanvasRoute,
 } as any)
 const AppIndexRoute = AppIndexRouteImport.update({
   id: '/',
@@ -110,6 +125,16 @@ const StudioProjectRoute = StudioProjectRouteImport.update({
   id: '/$project',
   path: '/$project',
   getParentRoute: () => StudioRoute,
+} as any)
+const CanvasProjectRoute = CanvasProjectRouteImport.update({
+  id: '/$project',
+  path: '/$project',
+  getParentRoute: () => CanvasRoute,
+} as any)
+const AppProductionPricesRoute = AppProductionPricesRouteImport.update({
+  id: '/production-prices',
+  path: '/production-prices',
+  getParentRoute: () => AppRoute,
 } as any)
 const AppPaymentReturnRoute = AppPaymentReturnRouteImport.update({
   id: '/payment-return',
@@ -135,6 +160,11 @@ const AppAccessSettingsRoute = AppAccessSettingsRouteImport.update({
   id: '/access-settings',
   path: '/access-settings',
   getParentRoute: () => AppRoute,
+} as any)
+const StudioQuoteProjectRoute = StudioQuoteProjectRouteImport.update({
+  id: '/quote/$project',
+  path: '/quote/$project',
+  getParentRoute: () => StudioRoute,
 } as any)
 const AppProjectsProjectFreezoneLazyRoute =
   AppProjectsProjectFreezoneLazyRouteImport.update({
@@ -274,6 +304,7 @@ const AppProjectsProjectEpisodesEpisodeAudioLazyRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
+  '/canvas': typeof CanvasRouteWithChildren
   '/checkout': typeof CheckoutRoute
   '/login': typeof LoginRoute
   '/recharge': typeof RechargeRoute
@@ -284,9 +315,13 @@ export interface FileRoutesByFullPath {
   '/console': typeof AppConsoleRoute
   '/credits': typeof AppCreditsRoute
   '/payment-return': typeof AppPaymentReturnRoute
+  '/production-prices': typeof AppProductionPricesRoute
+  '/canvas/$project': typeof CanvasProjectRoute
   '/studio/$project': typeof StudioProjectRoute
   '/watch/$work': typeof WatchWorkRoute
+  '/canvas/': typeof CanvasIndexRoute
   '/studio/': typeof StudioIndexRoute
+  '/studio/quote/$project': typeof StudioQuoteProjectRoute
   '/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
@@ -314,10 +349,14 @@ export interface FileRoutesByTo {
   '/console': typeof AppConsoleRoute
   '/credits': typeof AppCreditsRoute
   '/payment-return': typeof AppPaymentReturnRoute
+  '/production-prices': typeof AppProductionPricesRoute
+  '/canvas/$project': typeof CanvasProjectRoute
   '/studio/$project': typeof StudioProjectRoute
   '/watch/$work': typeof WatchWorkRoute
   '/': typeof AppIndexRoute
+  '/canvas': typeof CanvasIndexRoute
   '/studio': typeof StudioIndexRoute
+  '/studio/quote/$project': typeof StudioQuoteProjectRoute
   '/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
@@ -338,6 +377,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
+  '/canvas': typeof CanvasRouteWithChildren
   '/checkout': typeof CheckoutRoute
   '/login': typeof LoginRoute
   '/recharge': typeof RechargeRoute
@@ -348,10 +388,14 @@ export interface FileRoutesById {
   '/_app/console': typeof AppConsoleRoute
   '/_app/credits': typeof AppCreditsRoute
   '/_app/payment-return': typeof AppPaymentReturnRoute
+  '/_app/production-prices': typeof AppProductionPricesRoute
+  '/canvas/$project': typeof CanvasProjectRoute
   '/studio/$project': typeof StudioProjectRoute
   '/watch/$work': typeof WatchWorkRoute
   '/_app/': typeof AppIndexRoute
+  '/canvas/': typeof CanvasIndexRoute
   '/studio/': typeof StudioIndexRoute
+  '/studio/quote/$project': typeof StudioQuoteProjectRoute
   '/_app/projects/$project/assistant': typeof AppProjectsProjectAssistantRoute
   '/_app/projects/$project/episodes': typeof AppProjectsProjectEpisodesRouteWithChildren
   '/_app/projects/$project/ingest': typeof AppProjectsProjectIngestRoute
@@ -373,6 +417,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/canvas'
     | '/checkout'
     | '/login'
     | '/recharge'
@@ -383,9 +428,13 @@ export interface FileRouteTypes {
     | '/console'
     | '/credits'
     | '/payment-return'
+    | '/production-prices'
+    | '/canvas/$project'
     | '/studio/$project'
     | '/watch/$work'
+    | '/canvas/'
     | '/studio/'
+    | '/studio/quote/$project'
     | '/projects/$project/assistant'
     | '/projects/$project/episodes'
     | '/projects/$project/ingest'
@@ -413,10 +462,14 @@ export interface FileRouteTypes {
     | '/console'
     | '/credits'
     | '/payment-return'
+    | '/production-prices'
+    | '/canvas/$project'
     | '/studio/$project'
     | '/watch/$work'
     | '/'
+    | '/canvas'
     | '/studio'
+    | '/studio/quote/$project'
     | '/projects/$project/assistant'
     | '/projects/$project/episodes'
     | '/projects/$project/ingest'
@@ -436,6 +489,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/_app'
+    | '/canvas'
     | '/checkout'
     | '/login'
     | '/recharge'
@@ -446,10 +500,14 @@ export interface FileRouteTypes {
     | '/_app/console'
     | '/_app/credits'
     | '/_app/payment-return'
+    | '/_app/production-prices'
+    | '/canvas/$project'
     | '/studio/$project'
     | '/watch/$work'
     | '/_app/'
+    | '/canvas/'
     | '/studio/'
+    | '/studio/quote/$project'
     | '/_app/projects/$project/assistant'
     | '/_app/projects/$project/episodes'
     | '/_app/projects/$project/ingest'
@@ -470,6 +528,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   AppRoute: typeof AppRouteWithChildren
+  CanvasRoute: typeof CanvasRouteWithChildren
   CheckoutRoute: typeof CheckoutRoute
   LoginRoute: typeof LoginRoute
   RechargeRoute: typeof RechargeRoute
@@ -515,6 +574,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CheckoutRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/canvas': {
+      id: '/canvas'
+      path: '/canvas'
+      fullPath: '/canvas'
+      preLoaderRoute: typeof CanvasRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/_app': {
       id: '/_app'
       path: ''
@@ -528,6 +594,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/studio/'
       preLoaderRoute: typeof StudioIndexRouteImport
       parentRoute: typeof StudioRoute
+    }
+    '/canvas/': {
+      id: '/canvas/'
+      path: '/'
+      fullPath: '/canvas/'
+      preLoaderRoute: typeof CanvasIndexRouteImport
+      parentRoute: typeof CanvasRoute
     }
     '/_app/': {
       id: '/_app/'
@@ -549,6 +622,20 @@ declare module '@tanstack/react-router' {
       fullPath: '/studio/$project'
       preLoaderRoute: typeof StudioProjectRouteImport
       parentRoute: typeof StudioRoute
+    }
+    '/canvas/$project': {
+      id: '/canvas/$project'
+      path: '/$project'
+      fullPath: '/canvas/$project'
+      preLoaderRoute: typeof CanvasProjectRouteImport
+      parentRoute: typeof CanvasRoute
+    }
+    '/_app/production-prices': {
+      id: '/_app/production-prices'
+      path: '/production-prices'
+      fullPath: '/production-prices'
+      preLoaderRoute: typeof AppProductionPricesRouteImport
+      parentRoute: typeof AppRoute
     }
     '/_app/payment-return': {
       id: '/_app/payment-return'
@@ -584,6 +671,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/access-settings'
       preLoaderRoute: typeof AppAccessSettingsRouteImport
       parentRoute: typeof AppRoute
+    }
+    '/studio/quote/$project': {
+      id: '/studio/quote/$project'
+      path: '/quote/$project'
+      fullPath: '/studio/quote/$project'
+      preLoaderRoute: typeof StudioQuoteProjectRouteImport
+      parentRoute: typeof StudioRoute
     }
     '/_app/projects/$project/freezone': {
       id: '/_app/projects/$project/freezone'
@@ -742,6 +836,7 @@ interface AppRouteChildren {
   AppConsoleRoute: typeof AppConsoleRoute
   AppCreditsRoute: typeof AppCreditsRoute
   AppPaymentReturnRoute: typeof AppPaymentReturnRoute
+  AppProductionPricesRoute: typeof AppProductionPricesRoute
   AppIndexRoute: typeof AppIndexRoute
   AppProjectsProjectAssistantRoute: typeof AppProjectsProjectAssistantRoute
   AppProjectsProjectEpisodesRoute: typeof AppProjectsProjectEpisodesRouteWithChildren
@@ -759,6 +854,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppConsoleRoute: AppConsoleRoute,
   AppCreditsRoute: AppCreditsRoute,
   AppPaymentReturnRoute: AppPaymentReturnRoute,
+  AppProductionPricesRoute: AppProductionPricesRoute,
   AppIndexRoute: AppIndexRoute,
   AppProjectsProjectAssistantRoute: AppProjectsProjectAssistantRoute,
   AppProjectsProjectEpisodesRoute: AppProjectsProjectEpisodesRouteWithChildren,
@@ -772,14 +868,29 @@ const AppRouteChildren: AppRouteChildren = {
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
 
+interface CanvasRouteChildren {
+  CanvasProjectRoute: typeof CanvasProjectRoute
+  CanvasIndexRoute: typeof CanvasIndexRoute
+}
+
+const CanvasRouteChildren: CanvasRouteChildren = {
+  CanvasProjectRoute: CanvasProjectRoute,
+  CanvasIndexRoute: CanvasIndexRoute,
+}
+
+const CanvasRouteWithChildren =
+  CanvasRoute._addFileChildren(CanvasRouteChildren)
+
 interface StudioRouteChildren {
   StudioProjectRoute: typeof StudioProjectRoute
   StudioIndexRoute: typeof StudioIndexRoute
+  StudioQuoteProjectRoute: typeof StudioQuoteProjectRoute
 }
 
 const StudioRouteChildren: StudioRouteChildren = {
   StudioProjectRoute: StudioProjectRoute,
   StudioIndexRoute: StudioIndexRoute,
+  StudioQuoteProjectRoute: StudioQuoteProjectRoute,
 }
 
 const StudioRouteWithChildren =
@@ -787,6 +898,7 @@ const StudioRouteWithChildren =
 
 const rootRouteChildren: RootRouteChildren = {
   AppRoute: AppRouteWithChildren,
+  CanvasRoute: CanvasRouteWithChildren,
   CheckoutRoute: CheckoutRoute,
   LoginRoute: LoginRoute,
   RechargeRoute: RechargeRoute,

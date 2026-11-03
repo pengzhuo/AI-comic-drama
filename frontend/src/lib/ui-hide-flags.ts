@@ -61,3 +61,13 @@ export function modelGuideHidden(): boolean {
 export function githubStarsHidden(): boolean {
   return envFlag(import.meta.env.VITE_HIDE_GITHUB_STARS);
 }
+
+/**
+ * Hide the top-right 「设置」 button in the internal app header, along with the
+ * "missing setup" bubble anchored to it. The settings dialog becomes
+ * unreachable afterwards; instances that configure their gateway elsewhere can
+ * drop the entry. The client `/studio` shell never had this button.
+ */
+export function headerSettingsHidden(): boolean {
+  return envFlag(import.meta.env.VITE_HIDE_HEADER_SETTINGS);
+}

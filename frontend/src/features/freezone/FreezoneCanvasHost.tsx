@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { useRouterState } from "@tanstack/react-router";
 import { Suspense, lazy, useEffect, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
 
 const FreezoneCanvasRoot = lazy(() => import("./FreezoneCanvasRoot"));
 
-/** `/projects/<project>/<section>` —— section 可能不存在（项目根路径）。 */
-function parseProjectLocation(pathname: string): {
+export interface FreezoneCanvasHostProps {
+  /** 要保活的项目 id；null 表示当前不在任何项目里。 */
   project: string | null;
-  section: string | null;
-} {
-  const match = pathname.match(/^\/projects\/([^/]+)(?:\/([^/]+))?/);
-  if (!match) return { project: null, section: null };
-  return { project: decodeURIComponent(match[1]), section: match[2] ?? null };
+  /** 画布是不是当前页面；false 表示被保活在后台。 */
+  active: boolean;
 }
 
 /**
@@ -33,21 +29,21 @@ function parseProjectLocation(pathname: string): {
  *
  * 保活的代价是画布在后台仍然活着，所以要显式交出「只有前台该做的事」——这些由
  * FreezoneShell 的 active 开关负责（全局快捷键、两条轮询）。
+ *
+ * `project` / `active` 由调用方喂进来（内部壳用 `useFreezoneCanvasRoute()` 从
+ * `/projects/<id>/freezone` 算，将来的 `/canvas/<id>` 入口自己算），宿主本身不认
+ * URL —— 换一套地址形状不用动这里。
  */
-export function FreezoneCanvasHost() {
-  const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const { project, section } = parseProjectLocation(pathname);
-  const isFreezone = section === "freezone";
-
+export function FreezoneCanvasHost({ project, active }: FreezoneCanvasHostProps) {
   // 只有真的进过捏画才挂载：在捏集里从头到尾没开过画布的用户，不该为它付出
   // 挂载成本，也不该多打那些 canvas 请求。
   // 惰性初值而不是先 null 再由 effect 补：直接把地址栏敲成 /freezone 进来时，
   // 前者首帧就能挂上画布，后者要白等一帧。
   const [mountedProject, setMountedProject] = useState<string | null>(() =>
-    isFreezone && project ? project : null,
+    active && project ? project : null,
   );
   useEffect(() => {
-    if (isFreezone && project) {
+    if (active && project) {
       setMountedProject(project);
       return;
     }
@@ -56,14 +52,14 @@ export function FreezoneCanvasHost() {
     if (!project || project !== mountedProject) {
       setMountedProject(null);
     }
-  }, [isFreezone, project, mountedProject]);
+  }, [active, project, mountedProject]);
 
   // 画布不再被卸载，正在播的视频/音频就不会跟着停 —— 切到捏集后会变成看不见的
   // 后台声音。隐藏时统一暂停一次（只暂停、不恢复：切回来是否继续播由用户决定，
   // 自动续播比静音更让人意外）。
   const containerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (isFreezone) return;
+    if (active) return;
     const container = containerRef.current;
     if (!container) return;
     container
@@ -71,7 +67,7 @@ export function FreezoneCanvasHost() {
       .forEach((media) => {
         if (!media.paused) media.pause();
       });
-  }, [isFreezone]);
+  }, [active]);
 
   if (!mountedProject) return null;
 
@@ -85,10 +81,10 @@ export function FreezoneCanvasHost() {
         // 开关、SplitText 动画结束时的 el.style.visibility = "visible"），opacity
         // 顶不掉。两个都不用 display:none，是要保住容器尺寸，否则 ReactFlow 的
         // ResizeObserver 会重置视口，切回来缩放和位置就没了。
-        !isFreezone && "invisible opacity-0 pointer-events-none",
+        !active && "invisible opacity-0 pointer-events-none",
       )}
-      aria-hidden={!isFreezone}
-      inert={!isFreezone}
+      aria-hidden={!active}
+      inert={!active}
     >
       <Suspense fallback={<FreezoneChunkLoading />}>
         {/* key 必须带项目：在捏画里直接换项目（ProjectSwitcher 会保持在捏画）
@@ -99,7 +95,7 @@ export function FreezoneCanvasHost() {
         <FreezoneCanvasRoot
           key={mountedProject}
           project={mountedProject}
-          active={isFreezone}
+          active={active}
         />
       </Suspense>
     </div>

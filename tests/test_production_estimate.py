@@ -64,7 +64,10 @@ def test_plan_refined_counts(beats):
 
     images = [a for a in actions if a.kind == "image"]
     assert {a.feature_key for a in images} == {"mainline.sketch_grid", "mainline.render_grid"}
-    assert all(a.quantity == expected_grids for a in images)
+    by_feature = {a.feature_key: a.quantity for a in images}
+    assert by_feature["mainline.sketch_grid"] == expected_grids
+    # 上色是每镜头一张，不是每格一张。
+    assert by_feature["mainline.render_grid"] == len(pe._shot_beats(beats))
 
     video = next(a for a in actions if a.kind == "video")
     assert video.quantity == 6
@@ -151,9 +154,9 @@ def test_build_estimate_lists_unpriced():
 
 
 def test_build_estimate_applies_client_markup():
-    book = _book(client_markups={"19174820303": {"markup": 3.0}}, contingency_pct=0.0)
+    book = _book(client_markups={"13800138000": {"markup": 3.0}}, contingency_pct=0.0)
     actions = [ActionRequest(kind="image", model="m", quantity=2, metrics={"call_count": 2})]
-    result = pe.build_estimate(actions=actions, book=book, phone="19174820303")
+    result = pe.build_estimate(actions=actions, book=book, phone="13800138000")
     assert result["cost"]["total_cny"] == pytest.approx(1.0)
     assert result["price"]["cny"] == pytest.approx(3.0)
     assert result["price"]["markup_source"] == "client"
@@ -165,9 +168,9 @@ def test_build_estimate_applies_client_markup():
 
 
 def test_client_view_never_leaks_cost(beats):
-    book = _book(client_markups={"19174820303": {"markup": 2.0}})
+    book = _book(client_markups={"13800138000": {"markup": 2.0}})
     actions = pe.plan_refined(beats=beats, book=book)
-    client = pe.build_estimate(actions=actions, book=book, view="client", phone="19174820303")
+    client = pe.build_estimate(actions=actions, book=book, view="client", phone="13800138000")
 
     assert pe.display_safety_check(client)
     assert client["cost"] is None
@@ -175,19 +178,29 @@ def test_client_view_never_leaks_cost(beats):
     assert all(item["unit_price"] is None for item in client["items"])
     assert all(row["cny"] is None for row in client["by_kind"])
     assert client["price"]["cny"] is not None
+    # 倍率不能给客户：售价 ÷ 倍率 = 成本。
+    assert client["price"]["markup"] is None
+    assert client["price"]["markup_source"] == ""
 
-    internal = pe.build_estimate(actions=actions, book=book, view="internal", phone="19174820303")
+    internal = pe.build_estimate(actions=actions, book=book, view="internal", phone="13800138000")
     assert internal["cost"]["cny"] > 0
     assert not pe.display_safety_check(
         {**client, "cost": {"total_cny": 1.0}}
     )  # 自检确实会抓到泄漏
+    assert not pe.display_safety_check(
+        {**client, "price": {"cny": 1.0, "markup": 2.0, "markup_source": "client"}}
+    )  # 倍率泄漏也要抓到
 
 
-def test_client_without_markup_shows_no_amount(beats):
+def test_client_without_markup_defaults_to_one_x(beats):
     book = _book()
     actions = pe.plan_refined(beats=beats, book=book)
     client = pe.build_estimate(actions=actions, book=book, view="client", phone="13800000000")
-    assert client["price"]["cny"] is None
+    # 缺省 1 倍：售价 = 成本 + 应急，且客户载荷只露售价、不露成本/倍率。
+    assert client["price"]["cny"] is not None
+    assert client["price"]["markup"] is None
+    assert client["price"]["markup_source"] == ""
+    assert client["cost"] is None
     assert pe.display_safety_check(client)
 
 
@@ -198,10 +211,10 @@ def test_client_without_markup_shows_no_amount(beats):
 
 @pytest.fixture()
 def internal_payload(beats):
-    book = _book(client_markups={"19174820303": {"markup": 2.0}})
+    book = _book(client_markups={"13800138000": {"markup": 2.0}})
     actions = pe.plan_refined(beats=beats, book=book)
     return pe.build_estimate(
-        actions=actions, book=book, view="internal", phone="19174820303", stage="refined"
+        actions=actions, book=book, view="internal", phone="13800138000", stage="refined"
     )
 
 
@@ -227,11 +240,19 @@ def test_render_quote_txt_no_none_crash(internal_payload):
 
 
 def test_render_quote_client_hides_cost(beats):
-    book = _book(client_markups={"19174820303": {"markup": 2.0}})
+    book = _book(client_markups={"13800138000": {"markup": 2.0}})
     actions = pe.plan_refined(beats=beats, book=book)
-    client = pe.build_estimate(actions=actions, book=book, view="client", phone="19174820303")
+    client = pe.build_estimate(actions=actions, book=book, view="client", phone="13800138000")
     for fmt in ("md", "csv", "txt"):
         _, content = pe.render_quote(client, fmt)
         assert "成本小计" not in content
         assert "成本合计" not in content
-        assert "售价" in content
+        # 不暴露倍率，也不留「单价/金额」空列。
+        assert "成本" not in content
+        assert "单价" not in content
+        assert "报价合计" in content
+        if fmt != "csv":
+            assert "制作报价单" in content
+    # 客户版 CSV 不出现「单价/金额」列。
+    _, csv_content = pe.render_quote(client, "csv")
+    assert csv_content.splitlines()[0] == "种类,项目,数量,单位"

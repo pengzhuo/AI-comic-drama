@@ -583,6 +583,7 @@ class CogneeStore:
         novel_path: str,
         rebuild: bool = False,
         spine_template: str | None = None,
+        require_scene_headers: bool = True,
         on_progress: Optional[Callable[[float, str], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
     ) -> dict:
@@ -593,6 +594,7 @@ class CogneeStore:
                 novel_path,
                 rebuild=rebuild,
                 spine_template=spine_template,
+                require_scene_headers=require_scene_headers,
                 on_progress=on_progress,
                 on_log=on_log,
             )
@@ -602,6 +604,7 @@ class CogneeStore:
         novel_path: str,
         rebuild: bool = False,
         spine_template: str | None = None,
+        require_scene_headers: bool = True,
         on_progress: Optional[Callable[[float, str], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
     ) -> dict:
@@ -650,7 +653,11 @@ class CogneeStore:
             )
 
             if assess_screenplay_scene_headers(content).status == "missing":
-                raise ValueError("精品剧必须包含场景头，请补充后重新导入")
+                if require_scene_headers:
+                    raise ValueError("精品剧必须包含场景头，请补充后重新导入")
+                # ``warn``(工作室一键成片)放行：场景头缺失只提示，交由剧本
+                # 处理阶段规范化分场，而不是把用户挡在导入之外。
+                log("未检测到场景头，放行导入并交由剧本处理阶段规范化")
 
         os.environ["COGNEE_TELEMETRY_ENABLED"] = "false"
 

@@ -37,7 +37,7 @@ with iterative `tsc -b` rather than a blind cut.
 | `cli.py` | CLI entry: `novelvideo api --port 8780` |
 | `api/app.py` | FastAPI app construction, startup hooks |
 | `api/__init__.py` | Router registration (`api_router`, `/api/v1`) |
-| `api/routes/*.py` | REST routes: `ingest`, `projects`, `characters`, `episodes`, `scripts`, `content`, `generation`, `tasks`, `pipeline`, `screenplay`, `freezone`, `chat`, `styles`, `assets`, `scenes`, `props` |
+| `api/routes/*.py` | REST routes: `ingest`, `projects`, `characters`, `episodes`, `scripts`, `content`, `generation`, `tasks`, `pipeline`, `screenplay`, `freezone`, `chat`, `styles`, `assets`, `scenes`, `props`, `points` |
 | `api/deps.py` | Project scope/store factories (`resolve_project_scope`, `make_sqlite_store_for_context`) |
 | `api/schemas.py` | Pydantic request/response models |
 | `task_backend/registry.py` | Task runner registry |
@@ -58,6 +58,8 @@ with iterative `tsc -b` rather than a blind cut.
 | `generators/anchor_moderation.py` | 首帧真人隐私审核的降质阶梯（`plan_anchor_variants`）——素材库不可用时的兜底 |
 | `storage/asset_library.py` | AICF 素材库：真人首帧登记成 `asset://` 引用（免输入档隐私拒绝）+ 台账 — 见 [`asset-library.md`](asset-library.md) |
 | `storage/media_relay.py` | 本地媒体 → 公网 URL（`upload_image_file` / `upload_media_bytes`） |
+| `points_client.py` | 漫剧伴点预扣（`dopoints.php`）+ `/data/dopoints.json` 配置 — 见 [`points-prepay.md`](points-prepay.md) |
+| `points_settlement.py` | 成片后按实际用量多退少补（状态机/relay 核算/交付闸门/后台调度）+ `api/routes/points.py` — 见 [`points-prepay.md`](points-prepay.md) |
 | `seedance2_i2v/` | Seedance image-to-video pipeline |
 | `freezone/` | XiaHua canvas: `workflow_runs`, `agent_workflows/`, `agent_catalog/`, `text_node`/`image_node`/`video_node`, `recipe_runtime` |
 | `director_world/` | 3D previz/staging/voxel + spatial contracts |

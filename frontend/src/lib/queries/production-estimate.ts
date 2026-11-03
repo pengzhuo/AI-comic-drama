@@ -62,7 +62,8 @@ export interface ProductionEstimate {
   assumptions: Record<string, number>;
   /** 客户视角为 null（防泄利润）。 */
   cost: { cny: number; contingency_cny: number; total_cny: number } | null;
-  price: { cny: number | null; markup: number | null; markup_source: string };
+  /** `points` 是售价换算出的伴点（100 伴点 = ¥1）；算不出售价时为 null。 */
+  price: { cny: number | null; markup: number | null; markup_source: string; points?: number | null };
   by_kind: ProductionEstimateByKind[];
   items: ProductionEstimateItem[];
   unpriced: ProductionEstimateItem[];

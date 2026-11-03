@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -42,6 +43,15 @@ DEFAULT_RELAY_BASE_URLS = (
     "https://aicf.nanie168.com",
     "https://aigc.nanie168.com",
 )
+
+#: 账单账号热更文件（``/data/relay-billing.json``）：容器里没有环境变量时，
+#: 把账号写进这个文件即可让「结算前 relay 对账」生效，改文件即时生效、无需重启。
+#: 形如 ``{"base_urls": [...], "username": "...", "password": "...",
+#: "cache_path": "/data/runtime/relay_billing_cache.json"}``。**不进 git**。
+ENV_BILLING_CONFIG_PATH = "NOVELVIDEO_RELAY_BILLING_CONFIG"
+DEFAULT_BILLING_CONFIG_PATH = "/data/relay-billing.json"
+#: 缓存文件兜底（与 ``config.RELAY_BILLING_CACHE_PATH`` 一致）。
+DEFAULT_BILLING_CACHE_PATH = "/data/runtime/relay_billing_cache.json"
 
 
 class RelayBillingError(RuntimeError):
@@ -388,6 +398,138 @@ def build_endpoints(
         RelayEndpoint(base_url=url, username=username, password=password)
         for url in dict.fromkeys(urls)
     ]
+
+
+@dataclass
+class RelayBillingSettings:
+    """中转站账单账号：环境变量优先，其次热更文件。"""
+
+    base_urls: tuple[str, ...] = DEFAULT_RELAY_BASE_URLS
+    username: str = ""
+    password: str = ""
+    cache_path: str = ""
+    source: str = ""
+    path: Path | None = None
+    mtime: float = 0.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.username and self.password)
+
+
+def billing_config_path() -> Path:
+    """账号文件路径：``NOVELVIDEO_RELAY_BILLING_CONFIG`` > ``<DATA_ROOT>/relay-billing.json``。"""
+
+    override = str(os.environ.get(ENV_BILLING_CONFIG_PATH, "") or "").strip()
+    if override:
+        return Path(override)
+    try:
+        from novelvideo.config import DATA_ROOT
+
+        return Path(DATA_ROOT) / "relay-billing.json"
+    except Exception:  # noqa: BLE001 - 配置模块异常也别把结算整个挂掉
+        return Path(DEFAULT_BILLING_CONFIG_PATH)
+
+
+def _env_settings() -> RelayBillingSettings:
+    """环境变量口径（``config`` 在导入期就读取，这里再读一次保持一致）。"""
+
+    from novelvideo import config
+
+    base_urls = tuple(
+        url.strip()
+        for url in str(getattr(config, "RELAY_BILLING_BASE_URLS", "") or "").split(",")
+        if url.strip()
+    )
+    return RelayBillingSettings(
+        base_urls=base_urls or DEFAULT_RELAY_BASE_URLS,
+        username=str(getattr(config, "RELAY_BILLING_USERNAME", "") or "").strip(),
+        password=str(getattr(config, "RELAY_BILLING_PASSWORD", "") or ""),
+        cache_path=str(getattr(config, "RELAY_BILLING_CACHE_PATH", "") or "").strip(),
+        source="env",
+    )
+
+
+_SETTINGS_LOCK = threading.RLock()
+_SETTINGS_CACHE: dict[str, tuple[float, RelayBillingSettings]] = {}
+
+
+def load_settings(*, force: bool = False) -> RelayBillingSettings:
+    """读取账单账号设置（按 mtime 缓存）；环境变量有账号时直接用它。
+
+    环境变量没有账号时再读文件——文件不存在就返回未配置（调用方按
+    「relay 不可用」处理，绝不因此锁死客户）。
+    """
+
+    settings = _env_settings()
+    if settings.configured:
+        return settings
+
+    path = billing_config_path()
+    key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    with _SETTINGS_LOCK:
+        cached = _SETTINGS_CACHE.get(key)
+        if cached is not None and not force and cached[0] == mtime:
+            return cached[1]
+    file_settings = _read_settings_file(path)
+    with _SETTINGS_LOCK:
+        _SETTINGS_CACHE[key] = (mtime, file_settings)
+    return file_settings
+
+
+def _read_settings_file(path: Path) -> RelayBillingSettings:
+    if not path.is_file():
+        return _env_settings()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - 坏文件不能让结算挂掉
+        logger.warning("中转站账号文件不可读，忽略: %s (%s)", path, exc)
+        return _env_settings()
+    if not isinstance(payload, dict):
+        return _env_settings()
+
+    env = _env_settings()
+    urls = payload.get("base_urls")
+    if isinstance(urls, (list, tuple)):
+        base_urls = tuple(str(url).strip() for url in urls if str(url).strip())
+    elif isinstance(urls, str) and urls.strip():
+        base_urls = tuple(url.strip() for url in urls.split(",") if url.strip())
+    else:
+        base_urls = env.base_urls
+    return RelayBillingSettings(
+        base_urls=base_urls or DEFAULT_RELAY_BASE_URLS,
+        username=str(payload.get("username") or env.username or "").strip(),
+        password=str(payload.get("password") or env.password or ""),
+        cache_path=str(payload.get("cache_path") or env.cache_path or "").strip(),
+        source="file",
+        path=path,
+    )
+
+
+def billing_cache_path(settings: RelayBillingSettings | None = None) -> str:
+    """账单缓存文件路径：设置 > 默认。"""
+
+    resolved = settings or load_settings()
+    return resolved.cache_path or DEFAULT_BILLING_CACHE_PATH
+
+
+def configured_endpoints(
+    *, settings: RelayBillingSettings | None = None
+) -> list[RelayEndpoint]:
+    """已配置账号的端点；账号缺失时返回空列表（调用方自行决定降级）。"""
+
+    resolved = settings or load_settings()
+    if not resolved.configured:
+        return []
+    return build_endpoints(
+        list(resolved.base_urls),
+        username=resolved.username,
+        password=resolved.password,
+    )
 
 
 def collect_quotas(

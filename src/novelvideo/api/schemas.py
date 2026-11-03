@@ -140,6 +140,10 @@ class IngestStart(BaseModel):
     filename: str
     rebuild: bool = False
     spine_template: Optional[Literal["drama", "narrated"]] = None
+    #: 「精品剧」的场景头门禁策略。``block``（默认）保留内部捏料页的阻断行为；
+    #: ``warn`` 放行导入、把格式体检结果放进成功响应交给调用方提示（工作室一键成片
+    #: 用它：用户不该为格式细节卡在门口，后续剧本处理阶段会把剧本整理成标准分场）。
+    format_policy: Literal["block", "warn"] = "block"
 
 
 class ScriptProcessStart(BaseModel):
