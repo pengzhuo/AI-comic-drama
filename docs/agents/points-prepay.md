@@ -103,9 +103,10 @@
 | `settled` | 已结清（含退款成功、差额在容差内） | 放行 |
 | `settled_manual` | 运营手动核销/放行 | 放行 |
 | `refund_pending` | 退款失败（**不自动重退**） | 放行（不锁客户） |
-| `pending` | 算不出实际用量（relay 账号缺失 / 超时 / 对不上 / 没客户倍率） | 放行 |
+| `pending` | 已预扣，但算不出实际用量（relay 账号缺失 / 超时 / 对不上 / 没客户倍率） | 放行 |
 | `owed` | 待补缴（`reason=insufficient` 用接口原文；`unavailable` 用固定文案） | **拦** |
-| （无台账但已有预扣） | 正在核算 | **短暂拦**，首次访问触发一次后台结算 |
+| `unpriced` | **从未预扣**，又算不出实际用量 → fail-closed | **拦** |
+| （无台账但应收费） | 正在核算（有预扣 **或** 客户项目 + gate 开） | **短暂拦**，首次访问触发一次后台结算 |
 
 - **补扣失败也拦**（fail-closed）：`code != 0` 与超时/5xx 都记 `owed`。
 - **交付后成本再涨不再追扣**：终态（`settled` / `refund_pending` /
@@ -118,7 +119,17 @@
 
 `points_settlement.gate_delivery(user=…, state_dir=…, episode=…)` 按**身份 + 状态**
 拦：客户身份（`credential_kind=studio_client`，或 `as_client=<手机号>` 预览）被拦，
-内部端放行。落点：
+内部端放行。判据是「这一集**该不该收费**」，不是「有没有预扣台账」：
+
+- 有预扣 → 按台账状态拦（`owed` 拦、`inflight` 短拦并触发一次核算）。
+- **无预扣但应收费**（客户项目 + `production_estimate_gate` 启用）→ 同样拦下，并触发
+  一次以 `prepaid=0` 计的全额补收。客户项目 = `state_dir` 父目录名是手机号
+  （`owner_username` 契约，内部项目是 `local`）。
+- 内部项目 / 闸门关 → 与收费无关，放行。
+- 算不出实际用量（relay 超时/对不上）：无预扣集记 `unpriced` **拦**（fail-closed），
+  有预扣集仍记 `pending` 放行。
+
+落点：
 
 - `/projects/{p}/episodes/{n}/final` → 200 但 `blocked/settle_status/owed_points/message`，
   **不给 `video_url`**；
@@ -174,6 +185,51 @@
 
 - `tests/test_points_client.py` — 签名黄金向量、表单字段、成功/`code=1`/5xx/超时/坏 JSON/未配置、注入 transport。
 - `tests/test_points_gate.py` — 闸门扣费各分支 + 端点接线（402 时闸门不答、重复确认不重复扣）。
-- `tests/test_points_settlement.py` — 结算状态机（补扣/不足/传输失败/退款/退款失败/幂等/容差）、`episode_quota` 只认命中行、交付闸门（只拦客户、`inflight` 触发调度、无预扣放行、手动放行解锁）、结算/放行端点。
+- `tests/test_points_settlement.py` — 结算状态机（补扣/不足/传输失败/退款/退款失败/幂等/容差）、`episode_quota` 只认命中行、交付闸门（只拦客户、`inflight` 触发调度、**无预扣的客户集拦下并全额补收 / 内部项目或闸门关放行 / 算不出记 `unpriced` 拦**、手动放行解锁）、结算/放行端点。
 - `tests/test_project_config_image_gates.py` — `points_charges` round-trip。
 - `frontend/.../director-cost-estimate-card.test.tsx` — 伴点提示 + 402 弹消息。
+
+## 已知问题（待修）
+
+### 重启会把「被绕过收费闸门」的 running run 重新驱动
+
+`DirectorAutoCoordinator.resume()`（进程启动时调用）会对 `store.active`（`status='running'`）
+的每条 run 都 `_ensure_worker`。而收费闸门的拦截只加在 `resume_paused`（`paused` → 恢复）
+这一条路径上，所以一条**当前仍停在 `running`、但当初是靠 `/director-auto/continue`
+绕过闸门**的历史 run，会在**任何一次 API 重启后**被重新 arm，继续派发花钱的阶段——不经过预扣。
+
+- 线上实例 2026-11-03 复现过一次：一条 `running` run 在 `docker restart` 后重新开始
+  生成分镜视频，靠人工把该 run 暂停成 `[cost_estimate]` 态才止住。
+- 待修方向：`resume()` 只 arm「持有有效租约」或「尚未越过收费阶段」的 run；对已经走过
+  「分镜完成、但该集 `cost_estimate_confirmed` 仍为空」的 run，一律回落到闸门态
+  （与 `_pause_gate` 同口径），不要直接续跑。
+- 相关：`chat/director_auto.py` 的 `resume` / `_ensure_worker` / `_cost_gate_blocks_resume`
+  与 `DirectorAutoStore.active`（只取 `status='running'`）。
+
+## 修复记录
+
+### 交付闸门对「无预扣记录」的集直接放行（已修 2026-11-04）
+
+`delivery_block()` 原先第一条判断是 `if not points_charge_in_state_dir(...): return None`，
+导致「收费闸门被绕过、从未预扣」的集成片后可免费交付。现按「这一集**该不该收费**」判断：
+
+- 无预扣但属于客户项目（`state_dir` 父目录是手机号）+ `production_estimate_gate` 启用
+  → 交付闸门拦下，并触发一次以 `prepaid=0` 计的全额补收；算不出实际用量时记 `unpriced`
+  fail-closed（`pending` 只对「已预扣」的集放行）。
+- 内部项目 / 闸门关 → 与收费无关，放行。
+- 实现：`points_settlement._unprepaid_client_phone` / `delivery_block` /
+  `_settle_episode_locked` / `_compute_and_settle`，
+  `project_config.cost_estimate_gate_enabled_in_state_dir`。
+- 回归：`tests/test_points_settlement.py` 的
+  `test_gate_delivery_unprepaid_client_blocks_and_schedules` /
+  `test_unprepaid_client_episode_charges_full_and_settles` /
+  `test_unprepaid_client_insufficient_blocks_as_owed` /
+  `test_unprepaid_client_relay_unknown_blocks_as_unpriced` /
+  `test_unprepaid_gate_disabled_passes` / `test_unprepaid_non_client_dir_passes`。
+- 存量影响：换新判据后，所有「客户项目 + 闸门开 + 无预扣」的已交付集会在**下次
+  访问**时被拦并触发全额补收（实际用量口径）；不想补收的存量项目把
+  `production_estimate_gate` 关掉，或运营手动放行。
+- **与手工补记脚本互斥**：`.deploy/backcharge_episode.py` 按报价口径手工扣一次，
+  与新闸门按实际用量的自动补收会**重复收费**——同一集二选一。2026-11-04 已把该
+  脚本在服务器上停用为 `backcharge_episode.py.disabled`（运行需显式
+  `ALLOW_BACKCHARGE=1`），`nn_1104_1` 的补收交给交付闸门。

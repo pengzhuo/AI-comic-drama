@@ -17,16 +17,19 @@
     settled          已结清（含退款成功、差额在容差内）→ 放行
     settled_manual   运营手动核销/放行 → 放行
     refund_pending   退款失败 → 放行（不重复退，等人核销）
-    pending          实际用量算不出来（relay 账号缺失/超时/对不上）→ 放行
+    pending          已预扣、但实际用量算不出来（relay 缺失/超时/对不上）→ 放行
     owed             待补缴（余额不足 / 渠道不可用）→ **拦成片**
-    （无台账但已有预扣 = 正在核算）→ **短暂拦**，并触发一次后台结算
+    unpriced         从未预扣、实际用量又算不出来 → **拦成片**（fail-closed）
+    （无台账但应收费 = 正在核算）→ **短暂拦**，并触发一次后台结算
 
 设计约定
 --------
 - **成片完成后后台触发**（``director_auto`` fire-and-forget），不拖慢成片、不挂
   客户请求；带预算超时，超时按「算不出来」记 ``pending`` 放行。
-- **前置条件**：只有走过预扣（``points_charges`` 有这一集）的项目才结算，
-  否则与这个功能无关。
+- **适用范围**：走过预扣（``points_charges`` 有这一集）的项目照常结算；**没预扣
+  但应收费**（客户项目 + ``production_estimate_gate`` 启用）的集也会拦交付并触发
+  一次补收（``prepaid=0`` ⇒ 差额即全额），不再放行。内部项目、闸门关闭的项目
+  与这个功能无关。
 - **交付后成本再涨不再追扣**：终态一次写死，重复触发直接返回台账。
 - 凭据走 :mod:`novelvideo.relay_billing`（环境变量优先，其次
   ``/data/relay-billing.json``）；取不到账号照样可以命中账单缓存。
@@ -49,13 +52,16 @@ STATUS_SETTLED_MANUAL = "settled_manual"
 STATUS_OWED = "owed"
 STATUS_INFLIGHT = "inflight"
 STATUS_PENDING = "pending"
+STATUS_UNPRICED = "unpriced"
 STATUS_REFUND_PENDING = "refund_pending"
 
 REASON_INSUFFICIENT = "insufficient"
 REASON_UNAVAILABLE = "unavailable"
+REASON_UNPRICED = "unpriced"
 
 INFLIGHT_MESSAGE = "正在核算本集实际用量，请稍候"
 PENDING_MESSAGE = "本集实际用量暂不可用，已按预扣放行"
+UNPRICED_MESSAGE = "本集费用尚未结算完成，请稍后重试或联系客服解锁"
 UNAVAILABLE_MESSAGE = "结算服务暂时不可用，请稍后重试补缴"
 
 #: 成片的规范相对路径：``videos/episodes/epNNN_final.mp4``。
@@ -64,10 +70,16 @@ _FINAL_VIDEO_RE = re.compile(
 )
 
 
-def owed_message(points: int) -> str:
-    """``owed`` 给客户看的一句话（前端也会渲染自己的卡片）。"""
+def owed_message(points: int, *, prepaid: int | None = None) -> str:
+    """``owed`` 给客户看的一句话（前端也会渲染自己的卡片）。
 
-    return f"本集实际用量超过预扣，需补缴 {int(points)} 伴点后解锁成片"
+    从未预扣（``prepaid`` 为 0）时不能说「超过预扣」——这一集压根没付过钱。
+    """
+
+    amount = int(points)
+    if prepaid is not None and int(prepaid) <= 0:
+        return f"本集尚未支付制作伴点，需补缴 {amount} 伴点后解锁成片"
+    return f"本集实际用量超过预扣，需补缴 {amount} 伴点后解锁成片"
 
 
 def final_video_episode(file_path: str | Path | None) -> int | None:
@@ -128,6 +140,38 @@ def is_operator(user: dict[str, Any] | None) -> bool:
         return str(data.get("user_id") or "") == studio_access.INTERNAL_USER_ID
     except Exception:  # noqa: BLE001
         return False
+
+
+# ---------------------------------------------------------------------------
+# 「应不应该收费」（无预扣时的判据）
+# ---------------------------------------------------------------------------
+
+#: ``normalize_phone`` 只去非数字，裸数字串（如内部 owner ``user123`` 的 ``123``）
+#: 会被误当手机号。要求长度像手机号，避免据此向错误号码补扣。
+_MIN_PHONE_DIGITS = 7
+_MAX_PHONE_DIGITS = 15
+
+
+def _unprepaid_client_phone(state_dir: str | Path) -> str:
+    """从未预扣时判断这一集**该不该收费**；该收费则返回客户手机号。
+
+    客户项目的 ``state_dir`` 形如 ``<root>/<手机号>/<项目名>/``——父目录名就是归属
+    者 ``owner_username``（契约见 :mod:`novelvideo.ports.local.project`：客户 =
+    ``phone_from_client_user_id`` 即手机号，内部 = ``local``）。再叠加
+    ``production_estimate_gate``（缺省启用）：运维把这个项目闸门关掉即明确不收费。
+
+    返回空串 = 与伴点收费无关（内部项目 / 闸门关 / 认不出手机号），调用方放行。
+    """
+
+    from novelvideo import production_prices as prices
+    from novelvideo.project_config import cost_estimate_gate_enabled_in_state_dir
+
+    if not cost_estimate_gate_enabled_in_state_dir(state_dir):
+        return ""
+    phone = prices.normalize_phone(Path(state_dir).parent.name)
+    if _MIN_PHONE_DIGITS <= len(phone) <= _MAX_PHONE_DIGITS:
+        return phone
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +358,7 @@ async def _apply_delta(
         "refunded": int(refunded),
         "trigger": str(trigger),
         "projects_uuid": str(projects_uuid or ""),
+        "phone": str(phone or ""),
     }
     if actual is not None:
         base.update(
@@ -351,7 +396,7 @@ async def _apply_delta(
         message = outcome[1] or (
             UNAVAILABLE_MESSAGE
             if reason == REASON_UNAVAILABLE
-            else owed_message(remaining)
+            else owed_message(remaining, prepaid=prepaid)
         )
         return _record(
             state_dir, episode, STATUS_OWED, reason=reason, message=message, **base
@@ -397,31 +442,39 @@ async def _compute_and_settle(
         state_dir, episode, budget_seconds=float(config.settle_budget_seconds)
     )
     if actual is None:
+        # 已预扣 → pending 放行（预扣已在手，不卡客户）；从未预扣 → 算不出也必须
+        # 拦（unpriced），否则等于免费交付。
+        priced_out = int(prepaid) > 0
         return _record(
             state_dir,
             episode,
-            STATUS_PENDING,
+            STATUS_PENDING if priced_out else STATUS_UNPRICED,
+            reason=None if priced_out else REASON_UNPRICED,
             prepaid=int(prepaid),
-            message=PENDING_MESSAGE,
+            message=PENDING_MESSAGE if priced_out else UNPRICED_MESSAGE,
             trigger=str(trigger),
             projects_uuid=str(projects_uuid or ""),
+            phone=str(phone or ""),
         )
     price = _sale_cny(float(actual["cny"]), phone)
     if price is None:
         # 防御分支：``resolve_markup`` 现在恒返回 1 倍起，正常不会再走到这里。
         logger.info("结算缺少客户倍率 phone=%s episode=%s", phone, episode)
+        priced_out = int(prepaid) > 0
         return _record(
             state_dir,
             episode,
-            STATUS_PENDING,
+            STATUS_PENDING if priced_out else STATUS_UNPRICED,
+            reason=None if priced_out else REASON_UNPRICED,
             prepaid=int(prepaid),
             actual_cny=round(float(actual["cny"]), 4),
             quota=actual.get("quota"),
             matched=actual.get("matched"),
             rows=actual.get("rows"),
-            message=PENDING_MESSAGE,
+            message=PENDING_MESSAGE if priced_out else UNPRICED_MESSAGE,
             trigger=str(trigger),
             projects_uuid=str(projects_uuid or ""),
+            phone=str(phone or ""),
         )
     settlement = int(points_client.points_for_cny(price, config))
     tolerance = max(0.0, float(config.settle_tolerance_pct))
@@ -444,6 +497,7 @@ async def _compute_and_settle(
             refunded=0,
             trigger=str(trigger),
             projects_uuid=str(projects_uuid or ""),
+            phone=str(phone or ""),
         )
     return await _apply_delta(
         state_dir=state_dir,
@@ -485,10 +539,11 @@ async def settle_episode(
 ) -> dict | None:
     """结算一集；返回台账（``None`` = 这一集与伴点结算无关，未做任何事）。
 
-    - 开关关 / 没预扣过 → ``None``
+    - 开关关、或「没预扣且不属于应收费项目」→ ``None``
     - 已是终态 → 直接返回台账（幂等，不重复扣/退）
-    - ``owed`` / ``pending`` / ``inflight`` → 只有 ``force=True``（客户点补缴、
-      运营重试）才重算
+    - ``owed`` / ``pending`` / ``unpriced`` / ``inflight`` → 只有 ``force=True``
+      （客户点补缴、运营重试）才重算
+    - 没预扣但应收费（客户项目 + 闸门开）→ 以 ``prepaid=0`` 按实际用量全额补收
 
     同一 (事件循环, 项目, 集) 用锁串行化：客户双击「补缴」不会并列扣两次。
     """
@@ -524,10 +579,15 @@ async def _settle_episode_locked(
     if not config.settle_enabled:
         return None
     charge = points_charge_in_state_dir(state_dir, episode)
-    if not charge or int(charge.get("amount") or 0) <= 0:
-        return None
-    client_phone = str(charge.get("phone") or phone or "").strip()
-    prepaid = int(charge.get("amount") or 0)
+    if charge and int(charge.get("amount") or 0) > 0:
+        client_phone = str(charge.get("phone") or phone or "").strip()
+        prepaid = int(charge.get("amount") or 0)
+    else:
+        # 从未预扣但应收费（客户项目 + 闸门开）：prepaid=0，按实际用量全额补收。
+        client_phone = str(phone or "").strip() or _unprepaid_client_phone(state_dir)
+        prepaid = 0
+        if not client_phone:
+            return None
 
     existing = points_settlement_in_state_dir(state_dir, episode)
     if existing:
@@ -542,7 +602,7 @@ async def _settle_episode_locked(
                 state_dir=state_dir,
                 episode=episode,
                 config=config,
-                phone=client_phone,
+                phone=str(existing.get("phone") or client_phone),
                 projects_uuid=str(existing.get("projects_uuid") or projects_uuid or ""),
                 prepaid=int(existing.get("prepaid") or prepaid),
                 settlement=int(existing.get("settlement") or prepaid),
@@ -584,7 +644,12 @@ def delivery_block(
     state_dir: str | Path,
     episode: int,
 ) -> DeliveryBlock | None:
-    """``None`` = 放行；否则拦（调用方决定的 HTTP 形态）。"""
+    """``None`` = 放行；否则拦（调用方决定的 HTTP 形态）。
+
+    判据不是「有没有预扣台账」，而是「这一集**应不应该收费**」：有预扣照常按台账
+    状态拦；没预扣但属于应收费的客户项目（``_unprepaid_client_phone`` 非空）同样
+    拦下（``inflight`` 让调用方触发一次补收），不再因为「没预扣」就整条跳过。
+    """
 
     from novelvideo import points_client
     from novelvideo.project_config import (
@@ -595,22 +660,30 @@ def delivery_block(
     config = points_client.load()
     if not config.settle_enabled:
         return None
-    if not points_charge_in_state_dir(state_dir, episode):
-        return None
+    charge = points_charge_in_state_dir(state_dir, episode)
+    if not charge or int(charge.get("amount") or 0) <= 0:
+        # 没有预扣：只有「应收费」的客户项目才拦；内部项目 / 闸门关 → 无关。
+        if not _unprepaid_client_phone(state_dir):
+            return None
     entry = points_settlement_in_state_dir(state_dir, episode)
     if not entry:
-        # 有预扣但还没结算（核算中 / 还没触发）→ 短暂拦，由调用方触发结算。
+        # 应收费但还没结算（核算中 / 还没触发）→ 短暂拦，由调用方触发结算。
         return DeliveryBlock(STATUS_INFLIGHT, 0, INFLIGHT_MESSAGE)
     status = str(entry.get("status") or "")
-    if status != STATUS_OWED:
+    if status not in (STATUS_OWED, STATUS_UNPRICED):
         return None
-    owed = entry.get("delta")
     try:
-        points = int(owed) - int(entry.get("charged") or 0)
+        points = int(entry.get("delta") or 0) - int(entry.get("charged") or 0)
     except (TypeError, ValueError):
         points = 0
     points = max(0, points)
-    message = str(entry.get("message") or "").strip() or owed_message(points)
+    message = str(entry.get("message") or "").strip()
+    if not message:
+        message = (
+            UNPRICED_MESSAGE
+            if status == STATUS_UNPRICED
+            else owed_message(points, prepaid=entry.get("prepaid"))
+        )
     return DeliveryBlock(status, points, message)
 
 
@@ -671,7 +744,8 @@ def gate_delivery(
 ) -> DeliveryBlock | None:
     """成片交付（预览 + 下载）统一闸门；内部视角直接放行。
 
-    有预扣但还没结算时顺手触发一次后台核算——客户第一次打开成片页面就把账算完。
+    应收费但还没结算时顺手触发一次后台核算——客户第一次打开成片页面就把账算完
+    （没预扣的集也一样：这里触发的那次结算会以 ``prepaid=0`` 全额补收）。
     """
 
     phone = viewer_client_phone(user, as_client)
@@ -694,12 +768,15 @@ __all__ = [
     "PENDING_MESSAGE",
     "REASON_INSUFFICIENT",
     "REASON_UNAVAILABLE",
+    "REASON_UNPRICED",
     "STATUS_INFLIGHT",
     "STATUS_OWED",
     "STATUS_PENDING",
     "STATUS_REFUND_PENDING",
     "STATUS_SETTLED",
     "STATUS_SETTLED_MANUAL",
+    "STATUS_UNPRICED",
+    "UNPRICED_MESSAGE",
     "UNAVAILABLE_MESSAGE",
     "DeliveryBlock",
     "delivery_block",

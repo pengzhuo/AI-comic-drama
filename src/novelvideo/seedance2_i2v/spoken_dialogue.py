@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,16 +33,35 @@ def _spoken_source(beat: dict[str, Any]) -> str:
     )
 
 
+#: 句末标点后紧跟空白 = 脚本把下一句（多半是动作旁白）并进同一行的分隔。
+_LAST_LINE_PROSE_SPLIT_RE = re.compile(r"[。！？!?]\s+")
+
+
+def _drop_trailing_prose(text: str) -> str:
+    """Keep only the first spoken sentence of the last line's captured text.
+
+    台词行之间由说话人前缀分隔；句末标点后**紧跟空白**再接一段没有说话人前缀的
+    文字，是脚本把动作描述并进同一行的写法（``…。 苏念愣住，睁圆眼睛。``）。校验
+    只要求「至少包含台词」，所以这里只保留第一句——少 require 不会误伤，多
+    require 却会把整条 beat 拦死。
+    """
+
+    match = _LAST_LINE_PROSE_SPLIT_RE.search(text)
+    if match is None:
+        return text
+    return text[: match.start() + 1].strip(" \t\r\n，,。；;")
+
+
 def parse_seedance2_spoken_lines(beat: dict[str, Any]) -> list[Seedance2SpokenLine]:
     """Parse dialogue text into speaker/action/text lines.
 
     Only parses explicit literal-script lines such as ``角色（动作）：台词``.
     Ambiguous beat-level prose is left intact for the AI prompt composer.
 
-    ``名前：`` 的前缀同样要过 ``looks_like_speaker_label``：散文里的冒号
-    （``认定书上写着：违规操作…``）不是说话人，误判的代价是给一个不存在的角色
-    去要参考声线，整条 beat 直接卡在发请求之前。字幕剥离走的就是这条规则，
-    两处口径必须一致。
+    ``角色（动作）：`` 带括注的就是脚本台词形态，直接认；裸 ``名前：`` 才过
+    ``looks_like_speaker_label``：散文里的冒号（``认定书上写着：违规操作…``）不是
+    说话人，误判的代价是给一个不存在的角色去要参考声线，整条 beat 直接卡在发请求
+    之前。字幕剥离走的就是这条规则，两处口径必须一致。
     """
 
     if normalize_seedance2_audio_type(beat) != "dialogue":
@@ -54,13 +74,21 @@ def parse_seedance2_spoken_lines(beat: dict[str, Any]) -> list[Seedance2SpokenLi
     matches = [
         match
         for match in _SPEAKER_PREFIX_RE.finditer(raw)
-        if looks_like_speaker_label(match.group("speaker"))
+        if match.group("action")
+        or match.group("action_ascii")
+        or looks_like_speaker_label(match.group("speaker"))
     ]
     lines: list[Seedance2SpokenLine] = []
+    last_index = len(matches) - 1
     for index, match in enumerate(matches):
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
         text = raw[start:end].strip(" \t\r\n，,。；;")
+        if index == last_index:
+            # 最后一行台词后面若还缀着没有说话人前缀的旁白（``…。 苏念愣住…``），
+            # 只保留第一句：校验只要求「至少包含台词」，宁可少 require，也不能把
+            # 动作描述当成必录台词，把整条 beat 拦在发请求之前。
+            text = _drop_trailing_prose(text)
         if not text:
             continue
         lines.append(

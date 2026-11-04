@@ -697,6 +697,20 @@ def set_cost_estimate_gate(username: str, project: str, enabled: bool) -> None:
     update_project_config_file(username, project, _apply)
 
 
+def cost_estimate_gate_enabled_in_state_dir(state_dir: str | Path) -> bool:
+    """预估闸门是否启用（缺省启用）；调用方只有 ``state_dir``，没有 username/project。
+
+    交付闸门用它判断「没预扣的集该不该收费」——与 :func:`cost_estimate_gate_enabled`
+    同口径，只是从项目目录读配置。
+    """
+
+    config = load_project_config_file_from_state_dir(state_dir)
+    value = config.get(COST_ESTIMATE_GATE_KEY)
+    if value is None:
+        return True
+    return bool(value)
+
+
 def cost_estimate_confirmed(username: str, project: str, episode: int) -> bool:
     """第 ``episode`` 集的「制作成本预估」闸门是否已经答过。"""
 

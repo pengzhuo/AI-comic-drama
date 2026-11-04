@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render } from "@testing-library/react";
-import { createElement, type ComponentType } from "react";
+import { cleanup, render, screen } from "@testing-library/react";
+import { createElement, type ComponentType, type ReactNode } from "react";
 
 const accessMocks = vi.hoisted(() => ({
   fetchAccessSession: vi.fn(),
@@ -18,6 +18,7 @@ vi.mock("@/lib/access-session", () => accessMocks);
 
 const appModeMocks = vi.hoisted(() => ({
   hasInternalRoutes: vi.fn(() => false),
+  isCanvasMode: vi.fn(() => false),
   internalEntryPath: vi.fn(() => ""),
   clientEntryPath: vi.fn(() => "/canvas"),
 }));
@@ -37,11 +38,33 @@ vi.mock("@/stores/auth-store", () => ({
     selector({ username: null }),
 }));
 
+const routerMocks = vi.hoisted(() => ({ pathname: "/canvas" }));
+
 vi.mock("@tanstack/react-router", () => ({
   createFileRoute: () => (options: unknown) => ({ options }),
-  Link: () => null,
+  // 降级成普通 <a>，方便断言 href（真实 <Link> 需要路由上下文）。
+  Link: ({
+    to,
+    params,
+    children,
+    ...rest
+  }: {
+    to: string;
+    params?: { project?: string };
+    children?: ReactNode;
+  }) =>
+    createElement(
+      "a",
+      { href: to.replace("$project", params?.project ?? ""), ...rest },
+      children,
+    ),
   Outlet: () => null,
   redirect: (options: unknown) => ({ options }),
+  useRouterState: ({
+    select,
+  }: {
+    select: (state: { location: { pathname: string } }) => unknown;
+  }) => select({ location: { pathname: routerMocks.pathname } }),
 }));
 
 import { Route } from "@/routes/canvas";
@@ -151,20 +174,57 @@ describe("/canvas 客户链接兑换", () => {
 });
 
 describe("/canvas 客户外壳", () => {
-  it("主区用 fill 布局：不滚动，画布宿主拿它当定位上下文", () => {
+  function renderLayout(): HTMLElement | null {
+    cleanup();
+    const Layout = Route.options.component as ComponentType;
+    render(createElement(Layout));
+    return document.getElementById("main-content");
+  }
+
+  beforeEach(() => {
     accessMocks.useAccessSession.mockReturnValue({
       enabled: true,
       kind: "client",
       phone: "13000000000",
     });
+  });
 
-    const Layout = Route.options.component as ComponentType;
-    render(createElement(Layout));
+  it("首页（/canvas）用 scroll 布局：内容一超一屏能上下滚", () => {
+    routerMocks.pathname = "/canvas";
 
-    const main = document.getElementById("main-content");
+    const main = renderLayout();
+
+    expect(main).not.toBeNull();
+    expect(main?.className).toContain("overflow-y-auto");
+    expect(main?.className).not.toContain("overflow-hidden");
+  });
+
+  it("项目画布（/canvas/<项目>）用 fill 布局：不滚动，画布宿主拿它当定位上下文", () => {
+    routerMocks.pathname = "/canvas/01M6GSBBZJ0ZTQ3XNFYSFNCE05";
+
+    const main = renderLayout();
+
     expect(main).not.toBeNull();
     expect(main?.className).toContain("overflow-hidden");
     expect(main?.className).toContain("relative");
     expect(main?.className).not.toContain("overflow-y-auto");
+  });
+
+  it("项目画布顶栏给出「返回工作台」，指向 /studio/<项目>", () => {
+    routerMocks.pathname = "/canvas/01ABC";
+
+    renderLayout();
+
+    const link = screen.getByRole("link", { name: "返回工作台" });
+    expect(link.getAttribute("href")).toBe("/studio/01ABC");
+  });
+
+  it("首页（/canvas，无项目）不显示互跳按钮", () => {
+    routerMocks.pathname = "/canvas";
+
+    renderLayout();
+
+    expect(screen.queryByRole("link", { name: "返回工作台" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "进入捏画" })).toBeNull();
   });
 });

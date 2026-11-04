@@ -141,6 +141,12 @@ IDENTITY_IMAGES_REQUIRED_ERROR = (
 COST_ESTIMATE_REQUIRED_ERROR = (
     f"{COST_ESTIMATE_GATE_TAG} 分镜已完成，请先确认本集制作成本预估，再开始生成画面与视频"
 )
+#: 闸门没答就有人从「继续」恢复：拒绝，并把原因直接交给客户。
+#: 收费闸门的恢复只有一条合法路径——在报价卡上确认（那里会先预扣伴点）。见
+#: :meth:`DirectorAutoCoordinator._cost_gate_blocks_resume`。
+COST_ESTIMATE_RESUME_BLOCKED_ERROR = (
+    "本集制作成本尚未确认：请先在客户工作台点「确认报价，继续制作」（会预扣伴点）后再继续"
+)
 #: Meta/bridge tools the agent uses to inspect its tool surface instead of
 #: operating on the project. Introspection must never count as a write: the
 #: bridge echoes the *described* tool name, so a turn that only described a
@@ -316,6 +322,22 @@ def _stage_key_for(task: TaskState | None, run: DirectorAutoRun) -> str:
     if task_type:
         return task_type
     return run.stage_key or "unknown"
+
+
+def _fallback_kind(stage_key: str) -> str:
+    """该 stage 失败时的本地降级方式。
+
+    ``video``：单镜视频 → 用首帧合成静帧/缓推短片；
+    ``frame``：首帧渲染 → 用已有草图顶替首帧；
+    ``none``：没有可靠的本地兜底（如草图本身），只能登记后跳过。
+    """
+
+    key = (stage_key or "").lower()
+    if "video" in key:
+        return "video"
+    if key in {"selected_regen", "render", "first_frame"} or "regen" in key:
+        return "frame"
+    return "none"
 
 
 def _film_pack_delivery_block() -> str:
@@ -541,6 +563,12 @@ class DirectorAutoRun:
     stage_key: str = ""
     stage_attempts: int = 0
     next_attempt_at: float = 0.0
+    #: Shots the coordinator gave up on for this run (upstream moderation, or
+    #: retries exhausted). Each entry is ``{episode, beat, stage, code, reason,
+    #: degraded, at}``. The coordinator skips them so the episode can still
+    #: finish instead of stalling on one shot; the client surfaces them as a
+    #: loud, per-shot error the user can act on (fix the prompt and redo).
+    blocked_shots: tuple[dict[str, Any], ...] = ()
 
     @property
     def context(self) -> ProjectContext:
@@ -587,6 +615,7 @@ class DirectorAutoStore:
               stage_key TEXT NOT NULL DEFAULT '',
               stage_attempts INTEGER NOT NULL DEFAULT 0,
               next_attempt_at REAL NOT NULL DEFAULT 0,
+              blocked_shots_json TEXT NOT NULL DEFAULT '[]',
               owner_token TEXT NOT NULL DEFAULT '',
               lease_expires_at REAL NOT NULL DEFAULT 0,
               UNIQUE(username, project_id)
@@ -652,6 +681,11 @@ class DirectorAutoStore:
                 "ALTER TABLE director_auto_runs "
                 "ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
             )
+        if "blocked_shots_json" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN blocked_shots_json TEXT NOT NULL DEFAULT '[]'"
+            )
         conn.commit()
         return conn
 
@@ -680,6 +714,7 @@ class DirectorAutoStore:
             stage_key=str(row["stage_key"] or ""),
             stage_attempts=int(row["stage_attempts"] or 0),
             next_attempt_at=float(row["next_attempt_at"] or 0.0),
+            blocked_shots=tuple(json.loads(row["blocked_shots_json"] or "[]")),
         )
 
     def upsert(self, run: DirectorAutoRun) -> None:
@@ -691,8 +726,8 @@ class DirectorAutoStore:
                   updated_at, context_json, baseline_task_ids_json,
                   handled_task_ids_json, recovery_keys_json, voice_policy, last_error,
                   scope, target_episodes, config_json, driver,
-                  stage_key, stage_attempts, next_attempt_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  stage_key, stage_attempts, next_attempt_at, blocked_shots_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username, project_id) DO UPDATE SET
                   run_id=excluded.run_id,
                   episode=excluded.episode,
@@ -712,6 +747,7 @@ class DirectorAutoStore:
                   stage_key=excluded.stage_key,
                   stage_attempts=excluded.stage_attempts,
                   next_attempt_at=excluded.next_attempt_at,
+                  blocked_shots_json=excluded.blocked_shots_json,
                   owner_token=CASE
                     WHEN director_auto_runs.run_id != excluded.run_id THEN ''
                     ELSE director_auto_runs.owner_token
@@ -742,6 +778,7 @@ class DirectorAutoStore:
                     run.stage_key,
                     int(run.stage_attempts or 0),
                     float(run.next_attempt_at or 0.0),
+                    json.dumps(list(run.blocked_shots)),
                 ),
             )
 
@@ -874,7 +911,8 @@ class DirectorAutoStore:
                     baseline_task_ids_json=?, handled_task_ids_json=?,
                     recovery_keys_json=?, voice_policy=?, last_error=?,
                     scope=?, target_episodes=?, config_json=?, driver=?,
-                    stage_key=?, stage_attempts=?, next_attempt_at=?
+                    stage_key=?, stage_attempts=?, next_attempt_at=?,
+                    blocked_shots_json=?
                 WHERE run_id=? AND status='running' AND owner_token=?
                   AND lease_expires_at>?
                 """,
@@ -896,6 +934,7 @@ class DirectorAutoStore:
                     run.stage_key,
                     int(run.stage_attempts or 0),
                     float(run.next_attempt_at or 0.0),
+                    json.dumps(list(run.blocked_shots)),
                     run.run_id,
                     owner_token,
                     current,
@@ -1196,6 +1235,30 @@ class DirectorAutoCoordinator:
         await self._broadcast_status(updated)
         return updated
 
+    @staticmethod
+    def _cost_gate_blocks_resume(run: DirectorAutoRun) -> bool:
+        """停在收费闸门、且这一集还没确认时，任何「继续」都要被拦下。
+
+        只读项目配置（不跑预估），所以不会因为预估失败而卡住恢复路径。运维把
+        ``production_estimate_gate`` 关掉即放行——与 :meth:`_pause_gate` 同一口径。
+        """
+
+        if COST_ESTIMATE_GATE_TAG not in str(run.last_error or ""):
+            return False
+        from novelvideo.project_config import (
+            cost_estimate_confirmed,
+            cost_estimate_gate_enabled,
+        )
+
+        project_name = run.context.project_name
+        if not cost_estimate_gate_enabled(run.username, project_name):
+            return False
+        episode = int(run.episode or 0)
+        if episode <= 0:
+            # 认不出集号就 fail-closed：这条 run 本来就停在闸门上，放行只会白花钱。
+            return True
+        return not cost_estimate_confirmed(run.username, project_name, episode)
+
     async def resume_paused(
         self,
         *,
@@ -1211,6 +1274,10 @@ class DirectorAutoCoordinator:
         gate being the common case.  Terminal statuses stay terminal; the user
         restarts those with a fresh auto run so a finished/failed run is never
         silently replayed.
+
+        唯一的例外是**收费**的 ``cost_estimate`` 闸门：它只能由客户在报价卡上确认
+        （确认端点先预扣伴点、再写答案、最后才调到这里），所以未确认时这里一律拒绝，
+        否则「继续」会绕过预扣直接开跑花钱的阶段。
         """
 
         run = await asyncio.to_thread(self.store.get, username, project_id)
@@ -1221,6 +1288,8 @@ class DirectorAutoCoordinator:
             return run
         if run.status != "paused":
             raise ValueError("只有已暂停的本集自动任务可以继续")
+        if self._cost_gate_blocks_resume(run):
+            raise ValueError(COST_ESTIMATE_RESUME_BLOCKED_ERROR)
         normalized_policy = (
             voice_policy if voice_policy in {"system", "custom"} else run.voice_policy
         )
@@ -1616,6 +1685,141 @@ class DirectorAutoCoordinator:
         worker = self._workers.pop(run.run_id, None)
         if worker is not None and worker is not asyncio.current_task():
             worker.cancel()
+        return updated
+
+    async def _block_shot_and_continue(
+        self,
+        *,
+        run: DirectorAutoRun,
+        episode: int,
+        beat_num: int,
+        stage: str,
+        code: str,
+        reason: str,
+        kind: str = "video",
+    ) -> DirectorAutoRun | None:
+        """Give up on one shot **without stalling the whole run**.
+
+        工作台不允许假死：单个镜头过不了上游审核（或重试耗尽）时，不再把整条 run
+        停成 ``paused`` 等人工介入，而是：
+
+        * 先做一次**本地降级**，让该镜仍有可用产物、下游不受影响：
+          - ``kind="video"``：用该镜已生成的首帧合成一支同规格短片
+            （``render_still_clip``，不触网、不占额度）；
+          - ``kind="frame"``：把该镜已有的草图当作首帧落盘（首帧审核过不了时的兜底）。
+        * 把该镜写进 ``blocked_shots``，客户端据此醒目报错、逐镜标记；
+        * 把该镜的 dispatch 签名标记为「已尝试」，确定性派发会跳过它去下一镜。
+
+        返回值是更新后的 run（仍为 ``running``），调用方只需继续循环即可；返回
+        ``None`` 表示租约已不属于本 worker，调用方应直接退出。
+        """
+
+        ctx = run.context
+        ep_str = f"ep{episode:03d}"
+        frame = ctx.output_dir / "frames" / ep_str / f"beat_{beat_num:02d}.png"
+        video = ctx.output_dir / "videos" / "beats" / ep_str / f"beat_{beat_num:02d}.mp4"
+        sketch = ctx.output_dir / "sketches" / ep_str / f"beat_{beat_num:02d}.png"
+
+        degraded = False
+        if kind == "video":
+            from novelvideo.generators.fallback_clip import render_still_clip
+
+            degraded = await asyncio.to_thread(render_still_clip, frame, video)
+        elif kind == "frame":
+            degraded = await asyncio.to_thread(self._degrade_first_frame, frame, sketch)
+
+        entry = {
+            "episode": int(episode),
+            "beat": int(beat_num),
+            "stage": str(stage or "single_video"),
+            "code": str(code or "unrenderable"),
+            "reason": reason,
+            "degraded": bool(degraded),
+            "at": _utc_now(),
+        }
+        # 同一镜重复阻塞时只保留最新一条，避免刷屏。
+        kept = [
+            item
+            for item in run.blocked_shots
+            if (
+                int(item.get("episode", 0) or 0),
+                int(item.get("beat", 0) or 0),
+            )
+            != (int(episode), int(beat_num))
+        ]
+        blocked = tuple([*kept, entry])
+
+        stage_key = str(entry["stage"])
+        # 让确定性派发跳过这一镜（签名与 ``_dispatch_single_videos`` 一致）。
+        skip_signature = f"dispatch:{stage_key}:{episode}:{beat_num}"
+        updated = DirectorAutoRun(
+            **{
+                **asdict(run),
+                "updated_at": _utc_now(),
+                "status": "running",
+                "blocked_shots": blocked,
+                "recovery_keys": tuple(
+                    sorted({*run.recovery_keys, skip_signature})
+                ),
+                "stage_key": stage_key,
+                "stage_attempts": 0,
+                "next_attempt_at": datetime.now(timezone.utc).timestamp(),
+                "last_error": reason,
+            }
+        )
+        if not await self._update_owned(updated):
+            return None
+        return updated
+
+    @staticmethod
+    def _degrade_first_frame(frame: Path, sketch: Path) -> bool:
+        """首帧生成不过审时的本地兜底：用已有草图顶替首帧落盘。"""
+
+        if frame.is_file():
+            return False
+        if not sketch.is_file():
+            return False
+        try:
+            frame.parent.mkdir(parents=True, exist_ok=True)
+            frame.write_bytes(sketch.read_bytes())
+        except OSError:
+            return False
+        return True
+
+    async def clear_blocked_shot(
+        self,
+        *,
+        username: str,
+        project_id: str,
+        episode: int,
+        beat_num: int,
+    ) -> DirectorAutoRun | None:
+        """用户重做某个被降级/跳过的镜头后，清掉它在 run 上的阻塞标记。
+
+        只清标记，不删产物、不重新派发：重做本身由调用方（工作台的「重做该镜」）
+        显式入队单镜生成，这里只是让错误条不再继续挂着一面已重做的红牌。
+        """
+
+        run = await asyncio.to_thread(self.store.get, username, project_id)
+        if run is None:
+            return None
+        remaining = tuple(
+            item
+            for item in run.blocked_shots
+            if (int(item.get("episode", 0) or 0), int(item.get("beat", 0) or 0))
+            != (int(episode), int(beat_num))
+        )
+        if len(remaining) == len(run.blocked_shots):
+            return run
+        updated = DirectorAutoRun(
+            **{
+                **asdict(run),
+                "updated_at": _utc_now(),
+                "blocked_shots": remaining,
+            }
+        )
+        await asyncio.to_thread(self.store.upsert, updated)
+        await self._broadcast_status(updated)
         return updated
 
     def _clear_stage_signatures(self, run: DirectorAutoRun) -> tuple[str, ...]:
@@ -2347,25 +2551,48 @@ class DirectorAutoCoordinator:
                         repair_key = (
                             moderation_repair_recovery_key(*target) if target else ""
                         )
-                        if not target or repair_key in set(updated.recovery_keys):
-                            blocked = (
-                                "本集的镜头已经自动改写过一次提示词仍未通过"
-                                if target
-                                else "无法定位到具体镜头"
-                            )
-                            await self._pause_owned(
+                        if not target:
+                            # 连「是哪一镜」都定位不到（批量 stage 的失败报文没有镜号）：
+                            # 无法本地降级，只能把决定权交回用户。用 awaiting_confirmation
+                            # 而不是 paused，避免客户端把这类暂停当硬暂停无限续跑。
+                            await self._suspend_owned(
                                 run_id=run_id,
                                 username=username,
                                 project_id=project_id,
-                                reason=f"内容审核未通过，{blocked}，需要人工处理",
+                                reason="内容审核未通过，无法定位到具体镜头，需要人工处理",
                                 terminal_task_id=failed.task_id,
                             )
                             await self._notify(
                                 updated,
                                 f"本集自动已暂停：{_task_instruction(failed)} "
-                                f"未通过内容审核，{blocked}，请检查提示词或参考素材后重试。",
+                                "未通过内容审核，且无法定位到具体镜头，"
+                                "请检查提示词或参考素材后重试。",
                             )
                             return
+                        if repair_key in set(updated.recovery_keys):
+                            # 已自动改写过一次仍被拒：改用本地降级、跳过该镜继续，
+                            # 不再把整条 run 停死（否则用户只会看到「一直在制作中」）。
+                            stage_key = _stage_key_for(failed, updated)
+                            blocked_run = await self._block_shot_and_continue(
+                                run=updated,
+                                episode=target[0],
+                                beat_num=target[1],
+                                stage=stage_key,
+                                code=CONTENT_MODERATION_FAILED_CODE,
+                                reason="内容审核未通过，已自动改写过一次提示词仍未通过",
+                                kind=_fallback_kind(stage_key),
+                            )
+                            if blocked_run is None:
+                                return
+                            await self._notify(
+                                blocked_run,
+                                f"{_task_instruction(failed)} 已自动改写过一次提示词，"
+                                "仍未通过内容审核；已用本地素材降级该镜，先保证本集完整，"
+                                "稍后可在工作台修改提示词重做该镜。",
+                            )
+                            taskless_continuations = 0
+                            await asyncio.sleep(POLL_SECONDS)
+                            continue
                         outcome = await self._repair_moderation_prompt(
                             run=updated,
                             episode=target[0],
@@ -2374,22 +2601,30 @@ class DirectorAutoCoordinator:
                             raw_error=_task_moderation_text(failed),
                         )
                         if not outcome.repaired:
-                            await self._pause_owned(
-                                run_id=run_id,
-                                username=username,
-                                project_id=project_id,
+                            stage_key = _stage_key_for(failed, updated)
+                            blocked_run = await self._block_shot_and_continue(
+                                run=updated,
+                                episode=target[0],
+                                beat_num=target[1],
+                                stage=stage_key,
+                                code=CONTENT_MODERATION_FAILED_CODE,
                                 reason=(
                                     f"内容审核未通过且无法改写提示词（{outcome.detail}）"
                                 ),
-                                terminal_task_id=failed.task_id,
+                                kind=_fallback_kind(stage_key),
                             )
+                            if blocked_run is None:
+                                return
                             await self._notify(
-                                updated,
-                                f"本集自动已暂停：{_task_instruction(failed)} "
-                                f"未通过内容审核，且无法自动改写提示词（{outcome.detail}）。"
-                                "请手工调整该镜提示词或参考素材后重试。",
+                                blocked_run,
+                                f"{_task_instruction(failed)} 未通过内容审核，"
+                                f"且无法自动改写提示词（{outcome.detail}）；"
+                                "已用本地素材降级该镜，先保证本集完整，"
+                                "稍后可在工作台修改提示词重做该镜。",
                             )
-                            return
+                            taskless_continuations = 0
+                            await asyncio.sleep(POLL_SECONDS)
+                            continue
                         repaired_run = DirectorAutoRun(
                             **{
                                 **asdict(updated),
@@ -2450,6 +2685,35 @@ class DirectorAutoCoordinator:
                             updated,
                             f"{_task_instruction(failed)} 执行失败，正在自动重试"
                             f"（第 {attempt}/{MAX_STAGE_ATTEMPTS} 次）。",
+                        )
+                        taskless_continuations = 0
+                        await asyncio.sleep(POLL_SECONDS)
+                        continue
+                    # 重试预算用尽：若这一失败能定位到具体镜头、且该 stage 有可靠的
+                    # 本地兜底，就降级该镜并继续推进（工作台不允许因一镜停死）。
+                    shot = _moderation_repair_target(failed, updated)
+                    fallback_kind = _fallback_kind(_stage_key_for(failed, updated))
+                    if shot is not None and fallback_kind != "none":
+                        blocked_run = await self._block_shot_and_continue(
+                            run=updated,
+                            episode=shot[0],
+                            beat_num=shot[1],
+                            stage=_stage_key_for(failed, updated),
+                            code="retries_exhausted",
+                            reason=(
+                                f"自动重试 "
+                                f"{max(0, min(attempt - 1, MAX_STAGE_ATTEMPTS))} 次仍未成功："
+                                f"{reason}"
+                            ),
+                            kind=fallback_kind,
+                        )
+                        if blocked_run is None:
+                            return
+                        await self._notify(
+                            blocked_run,
+                            f"{_task_instruction(failed)} 自动重试仍未成功；"
+                            "已用本地素材降级该镜，先保证本集完整，"
+                            "稍后可在工作台重做该镜。",
                         )
                         taskless_continuations = 0
                         await asyncio.sleep(POLL_SECONDS)

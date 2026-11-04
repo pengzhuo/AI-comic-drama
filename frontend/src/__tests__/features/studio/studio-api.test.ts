@@ -10,7 +10,11 @@ vi.mock("@/lib/api", () => ({
   uploadApi: ky.create({ baseUrl: "http://localhost:3000/" }),
 }));
 
-import { startStudioIngest } from "@/features/studio/studio-api";
+import {
+  regenerateStudioBeatVideo,
+  startStudioIngest,
+  waitForStudioBeatVideo,
+} from "@/features/studio/studio-api";
 
 const server = setupServer();
 
@@ -80,5 +84,108 @@ describe("studio import start payload", () => {
     await expect(startStudioIngest("demo", "剧本.txt", "drama")).rejects.toThrow(
       "项目类型只能在重新导入时修改",
     );
+  });
+});
+
+const TASK_GET = "http://localhost:3000/api/v1/projects/demo/tasks/single_video/1";
+const REDO_POST = "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/39/video";
+
+function makeTask(taskId: string, status: string, error?: string) {
+  return {
+    task_id: taskId,
+    task_type: "single_video",
+    username: "demo",
+    project: "demo",
+    episode: 1,
+    beat_num: 39,
+    status,
+    progress: 0,
+    error,
+  };
+}
+
+/**
+ * 「重做该镜」必须**成功才清标记**。
+ *
+ * 服务端一镜过不了时会本地降级并登记 `blocked_shots`。客户点重做后若又失败，
+ * 标记绝不能提前消失——否则前端会假装那镜好了。这组测试把该契约钉住。
+ */
+describe("重做该镜：成功才清标记", () => {
+  it("记下重做前那次失败的任务，并带回本次 task_id", async () => {
+    let getCalls = 0;
+    server.use(
+      http.get(TASK_GET, () => {
+        getCalls += 1;
+        return HttpResponse.json({
+          ok: true,
+          data:
+            getCalls === 1
+              ? makeTask("old-task", "failed", "旧的那次失败")
+              : makeTask("new-task", "completed"),
+        });
+      }),
+      http.post(REDO_POST, () =>
+        HttpResponse.json({
+          ok: true,
+          task_type: "single_video",
+          task_id: "new-task",
+          message: "queued",
+        }),
+      ),
+    );
+
+    await expect(regenerateStudioBeatVideo("demo", 1, 39)).resolves.toEqual({
+      taskId: "new-task",
+      previousTaskId: "old-task",
+    });
+  });
+
+  it("等到该镜 completed 才算成功", async () => {
+    server.use(
+      http.get(TASK_GET, () =>
+        HttpResponse.json({ ok: true, data: makeTask("new-task", "completed") }),
+      ),
+    );
+
+    await expect(
+      waitForStudioBeatVideo("demo", 1, 39, { taskId: "new-task", intervalMs: 5 }),
+    ).resolves.toEqual({ ok: true });
+  });
+
+  it("新任务 failed 时不算成功，并带回原因", async () => {
+    server.use(
+      http.get(TASK_GET, () =>
+        HttpResponse.json({
+          ok: true,
+          data: makeTask("new-task", "failed", "内容审核未通过"),
+        }),
+      ),
+    );
+
+    const result = await waitForStudioBeatVideo("demo", 1, 39, {
+      taskId: "new-task",
+      intervalMs: 5,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("内容审核未通过");
+  });
+
+  it("轮询到旧任务时不误判成功（超时后保留标记）", async () => {
+    server.use(
+      http.get(TASK_GET, () =>
+        HttpResponse.json({
+          ok: true,
+          data: makeTask("old-task", "failed", "旧的那次失败"),
+        }),
+      ),
+    );
+
+    const result = await waitForStudioBeatVideo("demo", 1, 39, {
+      taskId: "new-task",
+      previousTaskId: "old-task",
+      intervalMs: 5,
+      timeoutMs: 40,
+    });
+    expect(result.ok).toBe(false);
   });
 });

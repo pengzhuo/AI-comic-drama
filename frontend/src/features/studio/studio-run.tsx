@@ -4,7 +4,10 @@ import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, Play } from "lucide
 
 import { Button } from "@/components/ui/button";
 import { isImportSettled } from "@/features/studio/studio-api";
-import type { DirectorAutoRunPayload } from "@/lib/queries/director-auto";
+import type {
+  DirectorAutoRunPayload,
+  DirectorBlockedShot,
+} from "@/lib/queries/director-auto";
 import type { PipelineStatus, PipelineStepStatus } from "@/types/episode";
 import { cn } from "@/lib/utils";
 
@@ -108,12 +111,20 @@ export function StudioRunBanner({
   recoveries,
   onResume,
   resumePending,
+  resumeBlocked = false,
 }: {
   run: DirectorAutoRunPayload | undefined;
   needsHuman: string | null;
   recoveries: number;
   onResume: () => void;
   resumePending: boolean;
+  /**
+   * 停在**收费**闸门（本集制作报价）时为真：横幅不再给「继续制作」。
+   *
+   * 这条 run 只能从报价卡确认后继续（后端也会拒绝未确认的 ``/director-auto/continue``），
+   * 否则客户点一下就绕过伴点预扣直接开跑花钱的阶段。
+   */
+  resumeBlocked?: boolean;
 }) {
   const status = run?.status ?? "manual";
   const tone =
@@ -132,7 +143,7 @@ export function StudioRunBanner({
           <CheckCircle2 className="size-4 text-emerald-500" />
         ) : null}
         <span className={cn("text-sm font-semibold", tone)}>
-          {needsHuman ? "需要人工介入" : RUN_LABEL[status]}
+          {needsHuman && !resumeBlocked ? "需要人工介入" : RUN_LABEL[status]}
         </span>
         {run?.episode ? (
           <span className="text-xs text-muted-foreground">第 {run.episode} 集</span>
@@ -141,7 +152,7 @@ export function StudioRunBanner({
           <span className="text-xs text-muted-foreground">（已自动恢复 {recoveries} 次）</span>
         ) : null}
       </div>
-      {needsHuman ? (
+      {needsHuman && !resumeBlocked ? (
         <Button type="button" size="sm" onClick={onResume} disabled={resumePending}>
           <Play className="size-3.5" />
           继续制作
@@ -156,6 +167,79 @@ export function StudioHumanNotice({ message }: { message: string }) {
     <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
       <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
       <span className="text-amber-700 dark:text-amber-300">{message}</span>
+    </div>
+  );
+}
+
+/**
+ * 做不出来、已被服务端**本地降级并跳过**的镜头。
+ *
+ * 服务端不再为一镜停死整条自动成片（见 `director_auto._block_shot_and_continue`），
+ * 所以这些镜头不会再让工作台「假死」；但它们确实没按预期生成，必须**醒目**地摆给
+ * 客户看：顶部一条汇总 + 逐镜一行，带原因与「重做该镜」入口。
+ */
+export function StudioBlockedShots({
+  shots,
+  onRedo,
+  pendingBeat = null,
+}: {
+  shots: DirectorBlockedShot[];
+  onRedo?: (shot: DirectorBlockedShot) => void;
+  /** 正在重做的那一镜（重做期间该行按钮禁用并显示「重做中…」）。 */
+  pendingBeat?: number | null;
+}) {
+  if (shots.length === 0) return null;
+  const degraded = shots.filter((shot) => shot.degraded).length;
+  return (
+    <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-3 py-3 text-sm">
+      <div className="flex items-start gap-2">
+        <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+        <div className="min-w-0 flex-1 space-y-2">
+          <div className="font-medium text-destructive">
+            有 {shots.length} 个镜头没能正常生成
+            {degraded > 0 ? "（已用本地素材降级，成片仍完整）" : ""}
+          </div>
+          <ul className="space-y-1.5">
+            {shots.map((shot) => (
+              <li
+                key={`${shot.episode}-${shot.beat}`}
+                className="flex flex-wrap items-center gap-x-2 gap-y-1"
+              >
+                <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-xs font-medium text-destructive">
+                  第 {shot.episode} 集 · 第 {shot.beat} 镜
+                </span>
+                <span
+                  className={cn(
+                    "text-xs",
+                    shot.degraded
+                      ? "text-warning"
+                      : "text-destructive",
+                  )}
+                >
+                  {shot.degraded ? "已降级 · 待重做" : "未生成"}
+                </span>
+                <span
+                  className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
+                  title={shot.reason}
+                >
+                  {shot.reason}
+                </span>
+                {onRedo ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={pendingBeat === shot.beat}
+                    onClick={() => onRedo(shot)}
+                  >
+                    {pendingBeat === shot.beat ? "重做中…" : "重做该镜"}
+                  </Button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
     </div>
   );
 }

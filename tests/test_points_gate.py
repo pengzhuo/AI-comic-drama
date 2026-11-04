@@ -228,6 +228,9 @@ def _gate_app(
         async def resume_paused(self, **kwargs):
             # 恢复必须落在 run 归属者身上，而不是请求者身份。
             assert kwargs.get("username") == run.username
+            # 真协调器的收费闸门拦截：未确认时任何「继续」都必须被拒（见 director_auto）。
+            if director_auto_module.DirectorAutoCoordinator._cost_gate_blocks_resume(run):
+                raise ValueError(director_auto_module.COST_ESTIMATE_RESUME_BLOCKED_ERROR)
             return SimpleNamespace(**{**vars(run), "status": "running"})
 
     monkeypatch.setattr(chat_route, "resolve_project_context", fake_resolve)
@@ -323,6 +326,49 @@ def test_confirm_endpoint_unknown_gate_still_400(gate_http, gate_env):
     )
     assert response.status_code == 400
     assert gate_env.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 旁路：run 停在收费闸门时，「继续」不能绕过预扣
+# ---------------------------------------------------------------------------
+
+
+def _cost_gate_run(*, username: str = "13800138000") -> SimpleNamespace:
+    return SimpleNamespace(
+        **{
+            **vars(_gate_run(username=username)),
+            "last_error": director_auto_module.COST_ESTIMATE_REQUIRED_ERROR,
+        }
+    )
+
+
+def test_continue_is_refused_while_the_client_has_not_confirmed(
+    monkeypatch, gate_env
+) -> None:
+    """线上事故的回归：报价卡没点，直接打 /continue 必须 409，不能白跑一集。"""
+
+    monkeypatch.setattr(project_config, "cost_estimate_gate_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr(project_config, "cost_estimate_confirmed", lambda *_a, **_k: False)
+    client = _gate_app(monkeypatch, user=_client_user(), run=_cost_gate_run())
+
+    response = client.post("/api/v1/projects/demo/chat/director-auto/continue", json={})
+
+    assert response.status_code == 409
+    assert "确认报价" in response.json()["detail"]
+    assert gate_env.calls == []
+    assert gate_env.ledger == []
+    assert gate_env.confirmed == []
+
+
+def test_continue_is_allowed_once_the_client_has_confirmed(monkeypatch, gate_env) -> None:
+    monkeypatch.setattr(project_config, "cost_estimate_gate_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr(project_config, "cost_estimate_confirmed", lambda *_a, **_k: True)
+    client = _gate_app(monkeypatch, user=_client_user(), run=_cost_gate_run())
+
+    response = client.post("/api/v1/projects/demo/chat/director-auto/continue", json={})
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
 
 
 def test_director_auto_gate_map_has_cost_estimate():

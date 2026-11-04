@@ -148,7 +148,7 @@ import {
 } from "@/features/superchat/director-run-mode";
 import { ComposerWaitingStatus } from "@/features/superchat/composer-waiting-status";
 import { ChatTaskStatusBar } from "@/features/superchat/chat-task-status-bar";
-import { DirectorCharacterImagesCard } from "@/features/superchat/director-character-images-card";
+import { DirectorCharacterImagesCard } from "@/components/director/director-character-images-card";
 import { DirectorCostEstimateCard } from "@/features/superchat/director-cost-estimate-card";
 import { calculateTimelineContextDelta } from "@/features/superchat/timeline-scroll";
 import { useEventBus } from "@/task-center/event-bus-context";

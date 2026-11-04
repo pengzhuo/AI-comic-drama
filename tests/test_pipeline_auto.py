@@ -282,15 +282,18 @@ async def test_dispatch_single_videos_only_sends_ready_beats(
     )
 
     assert task_type == "single_video"
-    assert signature == "dispatch:single_video:1:1-3"
-    assert [call["beat_num"] for call in calls] == [1, 3]
+    # 一次一条：beat 1 就绪先发出；beat 2 有视频、beat 4 没首帧都被跳过。
+    assert signature == "dispatch:single_video:1:1"
+    assert [call["beat_num"] for call in calls] == [1]
     assert {call["episode_num"] for call in calls} == {1}
 
 
 @pytest.mark.asyncio
-async def test_dispatch_single_videos_caps_the_chunk_at_the_runtime_limit(
+async def test_dispatch_single_videos_is_paced_one_beat_per_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """每轮发一条：某条 beat 被卡住时，同批其它 beat 下一轮还能继续发出。"""
+
     patch_status(monkeypatch, "single_video", episode=1)
     calls = _capture_single_video_enqueues(monkeypatch)
     beat_numbers = tuple(range(1, 13))
@@ -304,8 +307,8 @@ async def test_dispatch_single_videos_caps_the_chunk_at_the_runtime_limit(
     )
 
     assert task_type == "single_video"
-    assert signature == "dispatch:single_video:1:1-9"
-    assert [call["beat_num"] for call in calls] == list(range(1, 10))
+    assert signature == "dispatch:single_video:1:1"
+    assert [call["beat_num"] for call in calls] == [1]
 
 
 @pytest.mark.asyncio
@@ -344,14 +347,17 @@ async def test_dispatch_single_videos_skips_beats_already_generating(
     )
 
     assert task_type == "single_video"
-    assert [call["beat_num"] for call in calls] == [3, 4]
-    assert signature == "dispatch:single_video:1:3-4"
+    # 在飞的 1/2 被剔掉，就绪集合是 {3, 4}，这一轮发头一条。
+    assert [call["beat_num"] for call in calls] == [3]
+    assert signature == "dispatch:single_video:1:3"
 
 
 @pytest.mark.asyncio
-async def test_dispatch_single_videos_does_not_repeat_a_chunk(
+async def test_dispatch_single_videos_skips_an_attempted_beat(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """已 attempted 的 beat 不能拦住同批其它 beat。"""
+
     patch_status(monkeypatch, "single_video", episode=1)
     calls = _capture_single_video_enqueues(monkeypatch)
     _write_video_inputs(tmp_path, (1, 2))
@@ -361,12 +367,46 @@ async def test_dispatch_single_videos_does_not_repeat_a_chunk(
         username="alice",
         store=_video_store((1, 2)),
         episode=1,
-        attempted={"dispatch:single_video:1:1-2"},
+        attempted={"dispatch:single_video:1:1"},
     )
 
-    assert task_type is None
-    assert signature == "dispatch:single_video:1:1-2"
-    assert calls == []
+    assert task_type == "single_video"
+    assert signature == "dispatch:single_video:1:2"
+    assert [call["beat_num"] for call in calls] == [2]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_single_videos_does_not_record_a_rejected_beat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """准备阶段被挡下的 beat（``ok: False``）不能记成已派发，也不能连坐同批。"""
+
+    from novelvideo.api.routes import generation
+
+    patch_status(monkeypatch, "single_video", episode=1)
+    _write_video_inputs(tmp_path, (1, 2))
+
+    calls: list[dict] = []
+
+    async def fake_enqueue_single_video_task(**kwargs):
+        calls.append(kwargs)
+        if kwargs["beat_num"] == 1:
+            return {"ok": False, "error": "Seedance2 最终提示词缺少台词内容"}
+        return {"ok": True, "task_type": "single_video"}
+
+    monkeypatch.setattr(generation, "enqueue_single_video_task", fake_enqueue_single_video_task)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+    )
+
+    # beat 1 被拒 → 不记它的签名；继续把 beat 2 发出去。
+    assert task_type == "single_video"
+    assert signature == "dispatch:single_video:1:2"
+    assert [call["beat_num"] for call in calls] == [1, 2]
 
 
 @pytest.mark.asyncio

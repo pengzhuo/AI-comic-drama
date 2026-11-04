@@ -2,7 +2,7 @@
 // Copyright (c) 2026 ClaymoreLab
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { createElement, type ComponentType } from "react";
+import { createElement, type ComponentType, type ReactNode } from "react";
 
 const accessMocks = vi.hoisted(() => ({
   fetchAccessSession: vi.fn(),
@@ -14,10 +14,14 @@ const accessMocks = vi.hoisted(() => ({
   useAccessSession: vi.fn(() => ({ enabled: true, kind: "none", phone: "" })),
 }));
 
+// 顶栏互跳按钮读 pathname；每个用例自己设。
+const routerMocks = vi.hoisted(() => ({ pathname: "/studio" }));
+
 vi.mock("@/lib/access-session", () => accessMocks);
 
 vi.mock("@/lib/app-mode", () => ({
   isClientMode: () => false,
+  isCanvasMode: () => false,
   internalEntryPath: () => "/console",
   // ClientAccessShell 的品牌链接用 clientEntryPath()；缺了它渲染外壳会抛错。
   clientEntryPath: () => "/studio",
@@ -38,9 +42,29 @@ vi.mock("@/stores/auth-store", () => ({
 
 vi.mock("@tanstack/react-router", () => ({
   createFileRoute: () => (options: unknown) => ({ options }),
-  Link: () => null,
+  // 降级成普通 <a>，方便断言 href（真实 <Link> 需要路由上下文）。
+  Link: ({
+    to,
+    params,
+    children,
+    ...rest
+  }: {
+    to: string;
+    params?: { project?: string };
+    children?: ReactNode;
+  }) =>
+    createElement(
+      "a",
+      { href: to.replace("$project", params?.project ?? ""), ...rest },
+      children,
+    ),
   Outlet: () => null,
   redirect: (options: unknown) => ({ options }),
+  useRouterState: ({
+    select,
+  }: {
+    select: (state: { location: { pathname: string } }) => unknown;
+  }) => select({ location: { pathname: routerMocks.pathname } }),
 }));
 
 import { Route } from "@/routes/studio";
@@ -163,6 +187,10 @@ describe("/studio 客户链接兑换", () => {
 });
 
 describe("/studio 客户外壳", () => {
+  beforeEach(() => {
+    routerMocks.pathname = "/studio";
+  });
+
   it("主内容区可被 RouteFocusManager 聚焦（id + tabIndex=-1）", () => {
     accessMocks.useAccessSession.mockReturnValue({
       enabled: true,
@@ -188,5 +216,35 @@ describe("/studio 客户外壳", () => {
 
     // 以前按钮只在 identity 非空时渲染，纯内部身份（username 为空）会连退出都没有。
     expect(screen.getByRole("button", { name: "退出" })).toBeTruthy();
+  });
+
+  it("项目页顶栏给出「进入捏画」，指向 /canvas/<项目>", () => {
+    accessMocks.useAccessSession.mockReturnValue({
+      enabled: true,
+      kind: "client",
+      phone: "13000000000",
+    });
+    routerMocks.pathname = "/studio/01ABC";
+
+    const Layout = Route.options.component as ComponentType;
+    render(createElement(Layout));
+
+    const link = screen.getByRole("link", { name: "进入捏画" });
+    expect(link.getAttribute("href")).toBe("/canvas/01ABC");
+  });
+
+  it("首页（无项目）不显示互跳按钮", () => {
+    accessMocks.useAccessSession.mockReturnValue({
+      enabled: true,
+      kind: "client",
+      phone: "13000000000",
+    });
+    routerMocks.pathname = "/studio";
+
+    const Layout = Route.options.component as ComponentType;
+    render(createElement(Layout));
+
+    expect(screen.queryByRole("link", { name: "进入捏画" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "返回工作台" })).toBeNull();
   });
 });

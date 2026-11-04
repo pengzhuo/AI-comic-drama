@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { Link } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import { useState, type ReactNode } from "react";
 
+import { buttonVariants } from "@/components/ui/button";
 import { StudioLinkGate } from "@/features/access/studio-link-gate";
-import { clientEntryPath } from "@/lib/app-mode";
+import { clientEntryPath, isCanvasMode } from "@/lib/app-mode";
 import { brandAttribution } from "@/lib/brand-attribution";
+import { clientEntryFromPath, crossEntryFor } from "@/lib/client-entry-links";
 import {
   logoutAccessSession,
   maskPhone,
@@ -45,6 +47,8 @@ export function ClientAccessShell({ children, content = "scroll" }: ClientAccess
   const access = useAccessSession() ?? { enabled: false, kind: "open" as const, phone: "" };
   const username = useAuthStore((state) => state.username);
   const [notice] = useState(() => takeAccessNotice());
+  // 顶栏「工作室 ↔ 捏画」互跳按钮要看当前在哪个入口/哪个项目，所以读一次 pathname。
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
   // 实例级署名。内部端挂在底部状态栏上，但状态栏属于 `_app`（客户产物里整棵被
   // 排除），所以客户外壳自己渲染一次；未设置（上游构建）时不渲染。
   const attribution = brandAttribution();
@@ -68,6 +72,12 @@ export function ClientAccessShell({ children, content = "scroll" }: ClientAccess
   // 登录用户名（identity 为空），以前会连按钮都不渲染，导致无法从 /studio 登出。
   const canLogout = access.enabled && (access.kind === "client" || access.kind === "internal");
 
+  // 项目页才有的「进入捏画 / 返回工作台」互跳；首页（无项目）不显示。
+  // `canvas` 产物里没有 `/studio`，所以那边不渲染「返回工作台」，免得跳到 404。
+  const entry = clientEntryFromPath(pathname);
+  const crossEntry =
+    entry && !(entry.kind === "canvas" && isCanvasMode()) ? crossEntryFor(entry) : null;
+
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
       <header className="shrink-0 border-b border-border/60 bg-card/60 backdrop-blur">
@@ -77,6 +87,15 @@ export function ClientAccessShell({ children, content = "scroll" }: ClientAccess
           </Link>
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
             {identity ? <span className="truncate">{identity}</span> : null}
+            {crossEntry ? (
+              <Link
+                to={crossEntry.to}
+                params={crossEntry.params}
+                className={cn(buttonVariants({ variant: "outline", size: "sm" }))}
+              >
+                {crossEntry.label}
+              </Link>
+            ) : null}
             {canLogout ? (
               <button
                 type="button"

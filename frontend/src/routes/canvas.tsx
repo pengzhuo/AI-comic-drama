@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { Outlet, createFileRoute, redirect } from "@tanstack/react-router";
+import { Outlet, createFileRoute, redirect, useRouterState } from "@tanstack/react-router";
 
 import { ClientAccessShell } from "@/features/access/client-access-shell";
 import { exchangeClientLinkFromLocation } from "@/features/access/studio-link-entry";
@@ -19,6 +19,12 @@ import { ensureAuthenticatedForAppRoute } from "@/lib/auth-mode";
  * `_app` 整棵树排除掉了，所以内部页不在产物里。守卫与 `__root.tsx` 一致：纯内部端
  * （有内部树且内部入口就是 `/`）没有客户入口，回内部首页；双入口实例与两种客户
  * 产物都放行。
+ *
+ * 两个子路由要的外壳内容模式不同，由这里按路径分派（全站 `html/body/#root` 锁了
+ * `overflow: hidden`，模式给错内容一超一屏就被裁掉、滚不动）：
+ *
+ * - `/canvas`（首页：上传卡 + 「我的剧」列表）是普通文档流 → `scroll`；
+ * - `/canvas/<项目>` 是整屏画布（宿主 `absolute inset-0`，滚动交给画布内部）→ `fill`。
  */
 export const Route = createFileRoute("/canvas")({
   beforeLoad: async ({ location }) => {
@@ -52,8 +58,12 @@ export const Route = createFileRoute("/canvas")({
 });
 
 function CanvasLayout() {
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  // `/canvas/` 与 `/canvas` 都算首页；`/canvas/<项目>` 走整屏画布。
+  const isHome = pathname.replace(/\/+$/, "") === "/canvas";
+
   return (
-    <ClientAccessShell content="fill">
+    <ClientAccessShell content={isHome ? "scroll" : "fill"}>
       <Outlet />
     </ClientAccessShell>
   );

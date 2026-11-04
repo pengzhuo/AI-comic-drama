@@ -466,6 +466,12 @@ class DirectorAutoContinueIn(BaseModel):
     voice_policy: str | None = Field(default=None, pattern="^(system|custom)$")
 
 
+class DirectorAutoBlockedClearIn(BaseModel):
+    """用户重做某个被降级/跳过的镜头后，清掉它的阻塞标记。"""
+
+    episode: int = Field(default=1, ge=1)
+
+
 class DirectorAutoGateConfirmIn(BaseModel):
     """Answer to one inline 「角色图片指定」card: 上传后继续, or an explicit skip.
 
@@ -556,6 +562,7 @@ def _director_auto_payload(run: Any | None) -> dict[str, Any]:
         "target_episodes": getattr(run, "target_episodes", 0),
         "driver": getattr(run, "driver", "agent"),
         "gate": _director_auto_gate(run.last_error or "") if run.status == "paused" else None,
+        "blocked_shots": list(getattr(run, "blocked_shots", ()) or ()),
     }
 
 
@@ -713,6 +720,30 @@ async def continue_director_auto_run(
     if run is None:
         raise HTTPException(status_code=404, detail="该项目没有一键成片任务")
     return {"ok": True, "data": _director_auto_payload(run)}
+
+
+@router.post("/projects/{project}/chat/director-auto/blocked/{beat}/clear")
+async def clear_blocked_shot(
+    project: str,
+    beat: int,
+    payload: DirectorAutoBlockedClearIn,
+    user: dict = Depends(get_api_user),
+) -> dict[str, Any]:
+    """用户重做某个被降级/跳过的镜头后，清掉工作台上的那面红牌。"""
+
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="editor"
+    )
+    run, owner, _name = await _director_auto_target(ctx)
+    if run is None:
+        raise HTTPException(status_code=404, detail="该项目没有一键成片任务")
+    updated = await director_auto_coordinator.clear_blocked_shot(
+        username=owner,
+        project_id=ctx.project_id,
+        episode=payload.episode,
+        beat_num=beat,
+    )
+    return {"ok": True, "data": _director_auto_payload(updated)}
 
 
 async def _charge_points_for_episode(

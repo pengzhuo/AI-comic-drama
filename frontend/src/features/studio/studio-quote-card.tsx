@@ -82,7 +82,7 @@ export function StudioQuoteCard({
             onClick={confirmAndResume}
           >
             {confirmGate.isPending ? <Loader2 className="size-3.5 animate-spin" /> : null}
-            继续制作
+            确认报价，继续制作
           </Button>
         </div>
       </div>

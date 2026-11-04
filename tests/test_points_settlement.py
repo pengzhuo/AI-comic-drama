@@ -130,6 +130,12 @@ def _make_usage_db(state_dir: Path, rows: list[tuple[str, int | None, int | None
     return db
 
 
+def _client_state_dir(tmp_path: Path, name: str = "proj") -> Path:
+    """客户项目形态的状态目录：父目录名是手机号（``owner_username`` 契约）。"""
+
+    return tmp_path / CLIENT_PHONE / name
+
+
 @pytest.fixture()
 def env(monkeypatch, tmp_path):
     """settle=compose + 假 PointsClient + 假价格表；返回状态容器。"""
@@ -188,6 +194,15 @@ def test_final_video_episode_matches_canonical_path():
     assert points_settlement.final_video_episode("frames/ep003/1.png") is None
 
 
+def test_owed_message_wording_depends_on_prepaid():
+    assert points_settlement.owed_message(900) == (
+        "本集实际用量超过预扣，需补缴 900 伴点后解锁成片"
+    )
+    assert points_settlement.owed_message(900, prepaid=0) == (
+        "本集尚未支付制作伴点，需补缴 900 伴点后解锁成片"
+    )
+
+
 # ---------------------------------------------------------------------------
 # episode_quota（按集汇总，relay 只认对上的行）
 # ---------------------------------------------------------------------------
@@ -230,6 +245,78 @@ async def test_episode_without_prepay_is_not_ours(env):
     _make_usage_db(env.state_dir, [("t1", 1, 1000)])
     _seed_prepay(env.state_dir, 1, amount=0)
     assert await _settle(env) is None
+
+
+async def test_unprepaid_client_episode_charges_full_and_settles(env, tmp_path):
+    """客户项目 + gate 开 + 从未预扣：按实际用量**全额**补收，不再放行。"""
+
+    client_dir = _client_state_dir(tmp_path)
+    _make_usage_db(client_dir, [("t1", 1, 0)])
+    env.maps["t1"] = QUOTA
+    entry = await points_settlement.settle_episode(
+        state_dir=client_dir,
+        episode=1,
+        projects_uuid="01M5TESTPROJECT0000000000",
+    )
+    assert entry["status"] == points_settlement.STATUS_SETTLED
+    assert entry["prepaid"] == 0
+    assert entry["settlement"] == SETTLEMENT_POINTS
+    assert entry["charged"] == SETTLEMENT_POINTS
+    assert FakePointsClient.calls == [
+        {
+            "optype": 1,
+            "phone": CLIENT_PHONE,
+            "amount": SETTLEMENT_POINTS,
+            "projectsuuid": "01M5TESTPROJECT0000000000",
+        }
+    ]
+    assert points_settlement.delivery_block(state_dir=client_dir, episode=1) is None
+
+
+async def test_unprepaid_client_insufficient_blocks_as_owed(env, tmp_path):
+    client_dir = _client_state_dir(tmp_path)
+    _make_usage_db(client_dir, [("t1", 1, 0)])
+    env.maps["t1"] = QUOTA
+    FakePointsClient.errors.append(points_client.PointsNotEnough("伴点不足，请先充值"))
+    entry = await points_settlement.settle_episode(state_dir=client_dir, episode=1)
+    assert entry["status"] == points_settlement.STATUS_OWED
+    assert entry["prepaid"] == 0
+    assert entry["phone"] == CLIENT_PHONE
+    block = points_settlement.delivery_block(state_dir=client_dir, episode=1)
+    assert block is not None
+    assert block.status == points_settlement.STATUS_OWED
+    assert block.owed_points == SETTLEMENT_POINTS
+    assert block.message == "伴点不足，请先充值"
+
+
+async def test_unprepaid_client_relay_unknown_blocks_as_unpriced(env, tmp_path):
+    """算不出实际用量时，无预扣集 fail-closed（unpriced），不放行。"""
+
+    client_dir = _client_state_dir(tmp_path)
+    _make_usage_db(client_dir, [("t1", 1, 0)])
+    env.maps.clear()  # 对不上 → 算不出实际用量
+    entry = await points_settlement.settle_episode(state_dir=client_dir, episode=1)
+    assert entry["status"] == points_settlement.STATUS_UNPRICED
+    assert FakePointsClient.calls == []
+    block = points_settlement.delivery_block(state_dir=client_dir, episode=1)
+    assert block is not None
+    assert block.status == points_settlement.STATUS_UNPRICED
+
+
+async def test_unprepaid_client_retry_after_topup_charges(env, tmp_path):
+    client_dir = _client_state_dir(tmp_path)
+    _make_usage_db(client_dir, [("t1", 1, 0)])
+    env.maps["t1"] = QUOTA
+    FakePointsClient.errors.append(points_client.PointsNotEnough("伴点不足，请先充值"))
+    first = await points_settlement.settle_episode(state_dir=client_dir, episode=1)
+    assert first["status"] == points_settlement.STATUS_OWED
+
+    retried = await points_settlement.settle_episode(
+        state_dir=client_dir, episode=1, force=True
+    )
+    assert retried["status"] == points_settlement.STATUS_SETTLED
+    assert retried["charged"] == SETTLEMENT_POINTS
+    assert points_settlement.delivery_block(state_dir=client_dir, episode=1) is None
 
 
 async def test_no_relay_match_is_pending_and_allows(env):
@@ -463,13 +550,57 @@ def test_gate_delivery_without_settlement_entry_is_inflight(env, monkeypatch):
     assert scheduled and scheduled[0]["episode"] == 1
 
 
-def test_gate_delivery_passes_without_prepay(env):
+def test_gate_delivery_passes_without_prepay_for_non_client_dir(env):
+    """``env.state_dir`` 的父目录不是手机号（非客户项目）→ 无预扣仍放行。"""
+
     assert (
         points_settlement.gate_delivery(
             user=_client_user(), state_dir=env.state_dir, episode=1
         )
         is None
     )
+
+
+def test_gate_delivery_unprepaid_client_blocks_and_schedules(env, tmp_path, monkeypatch):
+    """客户项目 + gate 开 + 无预扣：交付闸门拦下并触发一次补收。"""
+
+    client_dir = _client_state_dir(tmp_path)
+    scheduled: list[dict] = []
+    monkeypatch.setattr(
+        points_settlement,
+        "schedule_settle",
+        lambda **kwargs: scheduled.append(kwargs) or True,
+    )
+    block = points_settlement.gate_delivery(
+        user=_client_user(), state_dir=client_dir, episode=1
+    )
+    assert block is not None
+    assert block.status == points_settlement.STATUS_INFLIGHT
+    assert scheduled and scheduled[0]["episode"] == 1
+
+
+def test_unprepaid_gate_disabled_passes(env, tmp_path):
+    """运维把 ``production_estimate_gate`` 关掉 → 明确不收费，无预扣也放行。"""
+
+    client_dir = _client_state_dir(tmp_path)
+    client_dir.mkdir(parents=True, exist_ok=True)
+    (client_dir / "project_config.json").write_text(
+        json.dumps({"production_estimate_gate": False}), encoding="utf-8"
+    )
+    assert points_settlement.delivery_block(state_dir=client_dir, episode=1) is None
+    assert (
+        points_settlement.gate_delivery(
+            user=_client_user(), state_dir=client_dir, episode=1
+        )
+        is None
+    )
+
+
+def test_unprepaid_non_client_dir_passes(env, tmp_path):
+    """内部项目（owner 目录 ``local``）无预扣 → 与收费无关。"""
+
+    internal_dir = tmp_path / "local" / "01M5TESTPROJECT0000000000"
+    assert points_settlement.delivery_block(state_dir=internal_dir, episode=1) is None
 
 
 def test_manual_release_unlocks_delivery(env):
@@ -504,6 +635,15 @@ def test_manual_release_unlocks_delivery(env):
 # ---------------------------------------------------------------------------
 # 端点
 # ---------------------------------------------------------------------------
+
+
+def test_population_blocks_unpriced():
+    data = points_route._population(
+        {"status": points_settlement.STATUS_UNPRICED, "message": "稍后重试"}
+    )
+    assert data["blocked"] is True
+    assert data["owed_points"] == 0
+    assert data["message"] == "稍后重试"
 
 
 @pytest.fixture()

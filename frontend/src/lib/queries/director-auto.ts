@@ -25,6 +25,23 @@ export type DirectorAutoStatus =
 export type DirectorAutoGate = "character_images" | "identity_images" | "cost_estimate";
 export type DirectorVoicePolicy = "system" | "custom";
 
+/**
+ * 一个「做不出来、已本地降级跳过」的镜头。
+ *
+ * 审核反复不过 / 重试耗尽时，服务端不再停整条 run，而是用本地素材降级该镜并继续
+ * （见 `director_auto._block_shot_and_continue`），同时把它登记在这里，让工作台
+ * 顶部醒目报错、逐镜标记，用户可以改完提示词后重做。
+ */
+export interface DirectorBlockedShot {
+  episode: number;
+  beat: number;
+  stage: string;
+  code: string;
+  reason: string;
+  degraded: boolean;
+  at: string;
+}
+
 export interface DirectorAutoRunPayload {
   status: DirectorAutoStatus;
   episode: number | null;
@@ -37,6 +54,8 @@ export interface DirectorAutoRunPayload {
   last_error?: string | null;
   /** 暂停在一个内联图片闸门上时的闸门名。 */
   gate?: DirectorAutoGate | null;
+  /** 做不出来、已本地降级跳过的镜头（工作台据此报错与逐镜标记）。 */
+  blocked_shots?: DirectorBlockedShot[] | null;
 }
 
 /** 一键成片要预置的项目配置：用户在工作室里不需要回答这些问题。 */
@@ -155,6 +174,33 @@ export function usePauseDirectorAutoRun(project: string) {
   return useMutation({
     mutationFn: async () => {
       await api.post(p`api/v1/projects/${project}/chat/director-auto/pause`).json<unknown>();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.directorAutoRun(project) });
+    },
+  });
+}
+
+/**
+ * 重做某个被降级/跳过的镜头后，清掉它在 run 上的阻塞标记。
+ *
+ * 「重做」本身的入队由调用方显式发起（单镜视频生成）；这个 hook 只负责让工作台的
+ * 错误条不再挂着那面已经重做的红牌。
+ */
+export function useClearBlockedShot(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: { episode: number; beat: number }) => {
+      const response = await jsonWithBackendError<
+        OkResponse<DirectorAutoRunPayload> | ErrorResponse
+      >(
+        api.post(
+          p`api/v1/projects/${project}/chat/director-auto/blocked/${params.beat}/clear`,
+          { json: { episode: params.episode }, throwHttpErrors: false },
+        ),
+      );
+      if (!response.ok) throw new Error(response.error);
+      return response;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.directorAutoRun(project) });

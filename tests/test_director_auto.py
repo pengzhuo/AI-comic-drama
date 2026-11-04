@@ -77,6 +77,17 @@ def run_record(tmp_path: Path, **overrides) -> DirectorAutoRun:
 
 def test_store_round_trips_durable_run(tmp_path: Path) -> None:
     store = DirectorAutoStore(tmp_path / "director-auto.db")
+    blocked = (
+        {
+            "episode": 1,
+            "beat": 12,
+            "stage": "single_video",
+            "code": "CONTENT_MODERATION_FAILED",
+            "reason": "内容审核未通过",
+            "degraded": True,
+            "at": "2026-08-14T00:00:00+00:00",
+        },
+    )
     run = run_record(
         tmp_path,
         baseline_task_ids=("old",),
@@ -85,6 +96,7 @@ def test_store_round_trips_durable_run(tmp_path: Path) -> None:
         stage_key="single_video",
         stage_attempts=2,
         next_attempt_at=1755000000.5,
+        blocked_shots=blocked,
     )
     store.upsert(run)
 
@@ -95,6 +107,7 @@ def test_store_round_trips_durable_run(tmp_path: Path) -> None:
     assert loaded.stage_key == "single_video"
     assert loaded.stage_attempts == 2
     assert loaded.next_attempt_at == 1755000000.5
+    assert loaded.blocked_shots == blocked
     assert loaded.context.output_dir == context(tmp_path).output_dir
     assert store.active() == [run]
 
@@ -919,6 +932,150 @@ async def test_continue_keeps_the_existing_policy_and_rejects_terminal_runs(
 
 
 @pytest.mark.asyncio
+async def test_continue_is_refused_while_the_cost_gate_is_unanswered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """收费闸门只能从报价卡确认：未确认时任何「继续」都要被拦下。
+
+    线上事故：客户在工作室点横幅上的「继续制作」→ ``/director-auto/continue`` →
+    ``resume_paused`` 把状态改回 ``running``，协调器下一轮直接派发 ``asset_references``
+    / ``sketch_generation``——预扣伴点那一步（``_charge_points_for_episode``）只在报价卡
+    的确认端点里，于是一整集白生成。
+    """
+
+    from novelvideo import project_config
+
+    class QuietCoordinator(DirectorAutoCoordinator):
+        def _ensure_worker(self, run):
+            raise AssertionError("未确认的收费闸门不该唤醒 worker")
+
+        async def _broadcast_status(self, run, **_kwargs):
+            raise AssertionError("未确认的收费闸门不该广播状态")
+
+    monkeypatch.setattr(project_config, "cost_estimate_gate_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr(project_config, "cost_estimate_confirmed", lambda *_a, **_k: False)
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="paused",
+            last_error=director_auto.COST_ESTIMATE_REQUIRED_ERROR,
+        )
+    )
+    coordinator = QuietCoordinator(store)
+
+    with pytest.raises(ValueError, match="尚未确认"):
+        await coordinator.resume_paused(username="alice", project_id="project-1")
+
+    # 闸门没答：run 必须留在 paused，不能被改成 running。
+    still = store.get("alice", "project-1")
+    assert still is not None and still.status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_continue_after_the_cost_gate_is_answered_goes_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """客户点过报价卡（答案已写）后，``resume_paused`` 照常放行。"""
+
+    from novelvideo import project_config
+
+    class QuietCoordinator(DirectorAutoCoordinator):
+        def _ensure_worker(self, run):
+            return None
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+    monkeypatch.setattr(project_config, "cost_estimate_gate_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr(project_config, "cost_estimate_confirmed", lambda *_a, **_k: True)
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="paused",
+            last_error=director_auto.COST_ESTIMATE_REQUIRED_ERROR,
+        )
+    )
+    coordinator = QuietCoordinator(store)
+
+    continued = await coordinator.resume_paused(username="alice", project_id="project-1")
+    assert continued is not None
+    assert continued.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_switching_the_cost_gate_off_unblocks_continue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """运维把 ``production_estimate_gate`` 关掉就是放行（与 ``_pause_gate`` 同口径）。"""
+
+    from novelvideo import project_config
+
+    class QuietCoordinator(DirectorAutoCoordinator):
+        def _ensure_worker(self, run):
+            return None
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+    monkeypatch.setattr(project_config, "cost_estimate_gate_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr(project_config, "cost_estimate_confirmed", lambda *_a, **_k: False)
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="paused",
+            last_error=director_auto.COST_ESTIMATE_REQUIRED_ERROR,
+        )
+    )
+    coordinator = QuietCoordinator(store)
+
+    continued = await coordinator.resume_paused(username="alice", project_id="project-1")
+    assert continued is not None
+    assert continued.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_other_pauses_still_continue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """回归：非收费闸门的暂停不受这道拦截影响，也不该去读成本闸门配置。"""
+
+    from novelvideo import project_config
+
+    class QuietCoordinator(DirectorAutoCoordinator):
+        def _ensure_worker(self, run):
+            return None
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+    def _boom(*_a, **_k):
+        raise AssertionError("非收费闸门不该读成本闸门配置")
+
+    monkeypatch.setattr(project_config, "cost_estimate_gate_enabled", _boom)
+    monkeypatch.setattr(project_config, "cost_estimate_confirmed", _boom)
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="paused",
+            last_error=director_auto.VOICE_POLICY_REQUIRED_ERROR,
+        )
+    )
+    coordinator = QuietCoordinator(store)
+
+    continued = await coordinator.resume_paused(
+        username="alice", project_id="project-1", voice_policy="system"
+    )
+    assert continued is not None
+    assert continued.status == "running"
+
+
+@pytest.mark.asyncio
 async def test_continue_after_voice_setup_only_revives_the_voice_gate(tmp_path: Path) -> None:
     class QuietCoordinator(DirectorAutoCoordinator):
         def _ensure_worker(self, run):
@@ -1359,11 +1516,15 @@ async def test_moderation_failure_rewrites_prompt_before_retrying(
 
 
 @pytest.mark.asyncio
-async def test_moderation_failure_pauses_when_prompt_was_already_rewritten(
+async def test_moderation_failure_degrades_and_continues_when_prompt_was_already_rewritten(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """同一个 beat 只改一次词：第二次审核失败就停下，不再消耗预算。"""
+    """同一个 beat 只改一次词：第二次审核失败**不再停死整条 run**。
+
+    工作台不允许假死：服务端登记该镜为 blocked、本地降级（这里没有首帧，降级落空
+    但流程照走）、标记该镜的派发签名并继续推进。
+    """
 
     failed = _moderation_task()
     notified = asyncio.Event()
@@ -1377,9 +1538,12 @@ async def test_moderation_failure_pauses_when_prompt_was_already_rewritten(
             super().__init__(store)
             self.notifications: list[str] = []
             self.repairs = 0
+            self.first_snapshot: DirectorAutoRun | None = None
 
         async def _notify(self, run, text):
             self.notifications.append(text)
+            if self.first_snapshot is None:
+                self.first_snapshot = self.store.get("alice", "project-1")
             notified.set()
             return {"content": text}
 
@@ -1407,20 +1571,31 @@ async def test_moderation_failure_pauses_when_prompt_was_already_rewritten(
         coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
         await asyncio.wait_for(notified.wait(), timeout=5)
 
-        saved = store.get("alice", "project-1")
-        assert saved is not None and saved.status == "paused"
+        saved = coordinator.first_snapshot
+        assert saved is not None
+        # 关键：不再停成 paused，run 继续往前走。
+        assert saved.status == "running"
         assert coordinator.repairs == 0
-        assert "已经自动改写过一次" in coordinator.notifications[0]
+        assert [shot["beat"] for shot in saved.blocked_shots] == [12]
+        assert saved.blocked_shots[0]["code"] == "CONTENT_MODERATION_FAILED"
+        # 测试环境没有首帧可降级，degraded 落空，但 blocked 仍登记、流程照走。
+        assert saved.blocked_shots[0]["degraded"] is False
+        assert "dispatch:single_video:1:12" in saved.recovery_keys
+        assert "降级该镜" in coordinator.notifications[0]
     finally:
         await coordinator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_moderation_failure_on_batch_stage_pauses_without_guessing(
+async def test_moderation_failure_on_batch_stage_suspends_without_guessing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """定位不到具体镜头时不猜：直接停下，而不是拿原样参数重投。"""
+    """定位不到具体镜头时不猜：不本地降级，但也不留一个会自动续跑的死循环。
+
+    用 ``awaiting_confirmation``（需要用户决定）而不是 ``paused``——客户端不会把前者
+    当硬暂停无限 ``/continue``。
+    """
 
     failed = _moderation_task(task_type="sketch_grid_generation", beat_num=None)
     notified = asyncio.Event()
@@ -1463,7 +1638,7 @@ async def test_moderation_failure_on_batch_stage_pauses_without_guessing(
         await asyncio.wait_for(notified.wait(), timeout=5)
 
         saved = store.get("alice", "project-1")
-        assert saved is not None and saved.status == "paused"
+        assert saved is not None and saved.status == "awaiting_confirmation"
         assert coordinator.repairs == 0
         assert "无法定位到具体镜头" in coordinator.notifications[0]
         # 也没有偷偷走通用重试。
@@ -1473,11 +1648,11 @@ async def test_moderation_failure_on_batch_stage_pauses_without_guessing(
 
 
 @pytest.mark.asyncio
-async def test_moderation_failure_pauses_when_prompt_cannot_be_rewritten(
+async def test_moderation_failure_degrades_when_prompt_cannot_be_rewritten(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """改写不出不同参数时必须暂停，绝不允许原样重投。"""
+    """改写不出不同参数时也降级继续，绝不允许原样重投、也不停死。"""
 
     failed = _moderation_task(provider_error="Output video may contain sensitive content")
     notified = asyncio.Event()
@@ -1490,9 +1665,12 @@ async def test_moderation_failure_pauses_when_prompt_cannot_be_rewritten(
         def __init__(self, store):
             super().__init__(store)
             self.notifications: list[str] = []
+            self.first_snapshot: DirectorAutoRun | None = None
 
         async def _notify(self, run, text):
             self.notifications.append(text)
+            if self.first_snapshot is None:
+                self.first_snapshot = self.store.get("alice", "project-1")
             notified.set()
             return {"content": text}
 
@@ -1517,11 +1695,137 @@ async def test_moderation_failure_pauses_when_prompt_cannot_be_rewritten(
         coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
         await asyncio.wait_for(notified.wait(), timeout=5)
 
-        saved = store.get("alice", "project-1")
-        assert saved is not None and saved.status == "paused"
+        saved = coordinator.first_snapshot
+        assert saved is not None and saved.status == "running"
+        assert [shot["beat"] for shot in saved.blocked_shots] == [12]
         assert "无法自动改写提示词" in coordinator.notifications[0]
         assert "重新生成提示词失败" in coordinator.notifications[0]
-        assert saved.stage_attempts == 0
     finally:
         await coordinator.shutdown()
+
+
+def test_fallback_kind_picks_the_local_degrade_ladder() -> None:
+    assert director_auto._fallback_kind("single_video") == "video"
+    assert director_auto._fallback_kind("selected_regen") == "frame"
+    assert director_auto._fallback_kind("identity_image") == "none"
+    assert director_auto._fallback_kind("sketch_grid_generation") == "none"
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausted_video_shot_degrades_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """重试预算用尽时，可降级的单镜**不再停死整条 run**，而是降级该镜并继续。"""
+
+    failed = task("new-failed", "failed", task_type="single_video")
+    failed.beat_num = 12
+    failed.error = "upstream rejected"
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [failed]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+            self.blocked_snapshot: DirectorAutoRun | None = None
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            saved = self.store.get("alice", "project-1")
+            if saved is not None and saved.blocked_shots and self.blocked_snapshot is None:
+                self.blocked_snapshot = saved
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            return True
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    # 该 stage 的重试预算已用尽：这次失败直接进入「降级 or 停」分支。
+    store.upsert(
+        run_record(
+            tmp_path,
+            stage_key="single_video",
+            stage_attempts=director_auto.MAX_STAGE_ATTEMPTS,
+        )
+    )
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        for _ in range(600):
+            if coordinator.blocked_snapshot is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        saved = coordinator.blocked_snapshot
+        assert saved is not None, coordinator.notifications
+        assert saved.status == "running"
+        assert [shot["beat"] for shot in saved.blocked_shots] == [12]
+        assert saved.blocked_shots[0]["code"] == "retries_exhausted"
+        assert "dispatch:single_video:1:12" in saved.recovery_keys
+    finally:
+        await coordinator.shutdown()
+
+
+def test_degrade_first_frame_copies_the_sketch_when_available(tmp_path: Path) -> None:
+    frame = tmp_path / "frames" / "ep001" / "beat_12.png"
+    sketch = tmp_path / "sketches" / "ep001" / "beat_12.png"
+    sketch.parent.mkdir(parents=True, exist_ok=True)
+    sketch.write_bytes(b"sketch-bytes")
+
+    assert DirectorAutoCoordinator._degrade_first_frame(frame, sketch) is True
+    assert frame.read_bytes() == b"sketch-bytes"
+    # 已有首帧就不覆盖（降级只兜底缺失）。
+    frame.write_bytes(b"real-frame")
+    assert DirectorAutoCoordinator._degrade_first_frame(frame, sketch) is False
+    assert frame.read_bytes() == b"real-frame"
+    # 连草图都没有就没得降级。
+    assert (
+        DirectorAutoCoordinator._degrade_first_frame(
+            tmp_path / "frames" / "ep001" / "beat_99.png",
+            tmp_path / "sketches" / "ep001" / "beat_99.png",
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_clear_blocked_shot_drops_only_the_named_entry(tmp_path: Path) -> None:
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            blocked_shots=(
+                {"episode": 1, "beat": 12, "stage": "single_video", "degraded": True},
+                {"episode": 1, "beat": 13, "stage": "single_video", "degraded": True},
+            ),
+        )
+    )
+    coordinator = DirectorAutoCoordinator(store)
+    try:
+        updated = await coordinator.clear_blocked_shot(
+            username="alice", project_id="project-1", episode=1, beat_num=12
+        )
+        assert updated is not None
+        assert [shot["beat"] for shot in updated.blocked_shots] == [13]
+        persisted = store.get("alice", "project-1")
+        assert persisted is not None
+        assert [shot["beat"] for shot in persisted.blocked_shots] == [13]
+        # 不存在的镜号原样返回，不报错。
+        same = await coordinator.clear_blocked_shot(
+            username="alice", project_id="project-1", episode=1, beat_num=99
+        )
+        assert same is not None and len(same.blocked_shots) == 1
+    finally:
+        await coordinator.shutdown()
+
+
 

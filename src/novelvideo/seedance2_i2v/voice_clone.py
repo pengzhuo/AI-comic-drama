@@ -78,6 +78,10 @@ SCRIPT_LEADING_NOTE_RE = re.compile(
 )
 SCRIPT_LABEL_MAX_CHARS = 12
 SCRIPT_LABEL_VERBS = ("说", "道", "问", "答", "喊", "叫", "念", "读", "写")
+#: 单字动词在名字里很常见（``苏念`` 含 ``念``）。只有达到这个长度的前缀才用动词
+#: 字符判定为散文；更短的前缀一律当名字，否则短名会被误杀——被误杀的代价是整条
+#: beat 卡在发请求之前、上游连请求都收不到。
+SCRIPT_LABEL_VERB_MIN_CHARS = 3
 # ``（os）``/``（旁白）`` mark *who* is talking, not how; they are not acting cues.
 NON_PERFORMANCE_NOTE_MARKERS = frozenset(
     {"os", "旁白", "画外", "内心独白", "独白", "心声", "内心"}
@@ -89,11 +93,17 @@ def looks_like_speaker_label(label: str) -> bool:
 
     ``角色（动作）：台词`` is the scripted shape, so a short name-like prefix is a
     label; a clause such as ``我说的是：`` is prose and must survive untouched.
+
+    单/双字前缀不再用动词字符否决：``苏念`` 里的 ``念`` 是名字，不是「念道」的
+    动作词。只有达到 :data:`SCRIPT_LABEL_VERB_MIN_CHARS` 的前缀（如
+    ``认定书上写着``）才按散文处理。
     """
 
     text = str(label or "").strip()
     if not text or len(text) > SCRIPT_LABEL_MAX_CHARS:
         return False
+    if len(text) < SCRIPT_LABEL_VERB_MIN_CHARS:
+        return True
     return not any(verb in text for verb in SCRIPT_LABEL_VERBS)
 
 

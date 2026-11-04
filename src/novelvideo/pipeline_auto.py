@@ -29,6 +29,7 @@ fit the coordinator's task bookkeeping and is still driven by the agent.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -759,15 +760,20 @@ async def _dispatch_single_videos(
     project_dir: Path,
     attempted: set[str],
 ) -> tuple[str | None, str | None]:
-    """Enqueue the ready beats' videos in the same payload the REST route uses.
+    """Enqueue one ready beat's video in the same payload the REST route uses.
 
     "Ready" means the promoted first frame exists and the beat still has no
     video, **and no video task for it is already in flight** — otherwise the
     beats being generated keep occupying the head of the list and newly finished
-    frames never get dispatched. The chunk is capped at the runtime's own
-    ``batch_size <= 9`` limit, and the signature carries the chunk so the next
-    call (after this chunk completes) is recognised as progress rather than a
-    retry.
+    frames never get dispatched.
+
+    Each call ships exactly one beat and returns that beat's own signature
+    (``dispatch:single_video:{episode}:{beat}``). A per-beat signature keeps one
+    rejected beat from marking its whole batch "attempted" and starving the
+    others; beats already in ``attempted`` are skipped so the loop walks on to
+    the next one. A beat whose enqueue comes back ``ok: False`` (prompt/voice
+    validation) is *not* treated as dispatched, so it is retried instead of
+    silently vanishing.
     """
 
     from novelvideo.api.schemas import SingleVideoRequest
@@ -789,12 +795,15 @@ async def _dispatch_single_videos(
     )
     if not ready:
         return None, None
-    batch = ready[:MAX_SINGLE_VIDEO_BATCH]
-    signature = f"dispatch:single_video:{episode}:{batch[0]}-{batch[-1]}"
-    if signature in attempted:
-        return None, signature
-    for beat_num in batch:
-        await enqueue_single_video_task(
+    for beat_num in ready:
+        # 签名按 beat 记：一批里某条 beat 被上游拒绝/校验挡下时，不能让同批其它
+        # beat 跟着一起卡死（旧版用 ``{first}-{last}`` 整批签名，一条坏 beat 就把
+        # 整批标成「已派发」而永不重试，别的 beat 明明能出片也发不出去）。每轮
+        # 只发一条，已 attempted 的跳过；协调器 1.5s 一轮，一个 episode 也就十几秒。
+        signature = f"dispatch:single_video:{episode}:{beat_num}"
+        if signature in attempted:
+            continue
+        result = await enqueue_single_video_task(
             ctx=ctx,
             store=store,
             username=ctx.requester_username,
@@ -804,7 +813,40 @@ async def _dispatch_single_videos(
             beat_num=beat_num,
             body=SingleVideoRequest(),
         )
-    return "single_video", signature
+        if not _single_video_enqueued(result):
+            # 准备阶段就被挡下（提示词/声线校验等）：路由以 HTTP 200 +
+            # ``{"ok": False}`` 返回，绝不能记成「已派发」，否则这条 beat 永不重试、
+            # 还会连坐同批。留日志，交给协调器的重试预算处理。
+            logging.getLogger(__name__).warning(
+                "single_video dispatch rejected user=%s project=%s episode=%s beat=%s error=%s",
+                ctx.requester_username,
+                ctx.project_name,
+                episode,
+                beat_num,
+                _single_video_dispatch_error(result),
+            )
+            continue
+        return "single_video", signature
+    return None, None
+
+
+def _single_video_enqueued(result: Any) -> bool:
+    """Whether ``enqueue_single_video_task`` actually queued the render.
+
+    The route reports preparation failures (prompt/voice validation, moderation…)
+    as ``{"ok": False, "error": ...}`` with HTTP 200, so the payload — not the
+    absence of an exception — decides whether the beat may be marked dispatched.
+    """
+
+    if isinstance(result, dict):
+        return bool(result.get("ok", True))
+    return True
+
+
+def _single_video_dispatch_error(result: Any) -> str:
+    if isinstance(result, dict):
+        return str(result.get("error") or result.get("detail") or "")
+    return ""
 
 
 async def _dispatch_compose(

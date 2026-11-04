@@ -32,8 +32,12 @@ def _population(entry: dict[str, Any] | None) -> dict[str, Any]:
     from novelvideo import points_settlement
 
     status = str(entry.get("status") or "")
+    blocked = status in (
+        points_settlement.STATUS_OWED,
+        points_settlement.STATUS_UNPRICED,
+    )
     owed = 0
-    if status == points_settlement.STATUS_OWED:
+    if blocked:
         try:
             owed = max(
                 0, int(entry.get("delta") or 0) - int(entry.get("charged") or 0)
@@ -42,7 +46,7 @@ def _population(entry: dict[str, Any] | None) -> dict[str, Any]:
             owed = 0
     return {
         "status": status,
-        "blocked": status == points_settlement.STATUS_OWED,
+        "blocked": blocked,
         "owed_points": owed,
         "prepaid": entry.get("prepaid"),
         "settlement": entry.get("settlement"),

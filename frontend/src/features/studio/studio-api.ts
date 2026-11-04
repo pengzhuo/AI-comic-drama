@@ -10,6 +10,7 @@ import {
 } from "@/lib/queries/ingest";
 import type { ErrorResponse, OkResponse, TaskResponse } from "@/types/api";
 import type { StudioRunConfig } from "@/lib/queries/director-auto";
+import type { Task } from "@/types/task";
 import type { SpineTemplate } from "@/types/project";
 
 /**
@@ -232,4 +233,92 @@ export function isImportSettled(
 ): boolean {
   if (!global?.ingested) return false;
   return !global.screenplay_preprocess_pending && !global.script_process_pending;
+}
+
+/**
+ * 重做单个镜头：入队单镜视频生成。
+ *
+ * 服务端在一镜反复审核不过 / 重试耗尽时会**本地降级**该镜并继续（工作台顶部报错、
+ * 逐镜标记）。客户改完提示词后点「重做该镜」，就用这个显式重跑那一镜。
+ */
+export async function regenerateStudioBeatVideo(
+  project: string,
+  episode: number,
+  beat: number,
+): Promise<{ taskId?: string; previousTaskId?: string }> {
+  // 记下重做前该镜的任务 id，用来把「旧的那次失败」和「这次重做」区分开。
+  const previousTaskId = (await fetchStudioBeatTask(project, episode, beat))?.task_id;
+  const response = await jsonWithBackendError<OkResponse<unknown> | ErrorResponse>(
+    api.post(
+      p`api/v1/projects/${project}/episodes/${episode}/beats/${beat}/video`,
+      { json: {}, throwHttpErrors: false },
+    ),
+  );
+  if (!response.ok) throw new Error(response.error);
+  const taskId = (response as { task_id?: string }).task_id;
+  return { taskId, previousTaskId };
+}
+
+/** 查该镜当前的 `single_video` 任务（没有则返回 null）。 */
+export async function fetchStudioBeatTask(
+  project: string,
+  episode: number,
+  beat: number,
+): Promise<Task | null> {
+  const response = await api
+    .get(p`api/v1/projects/${project}/tasks/single_video/${episode}`, {
+      searchParams: { beat_num: String(beat) },
+    })
+    .json<OkResponse<Task | null>>();
+  return response.data ?? null;
+}
+
+/**
+ * 等这次重做的单镜任务跑到终态。
+ *
+ * 前置背景：`director-auto` 在一镜过不了时会把该镜**本地降级**并跳过、登记进
+ * `blocked_shots`。客户点「重做该镜」后，我们**只在这镜确实生成成功时才清掉
+ * 标记**——否则（又失败 / 超时）标记保留，避免「标记先清了、结果还是坏镜头」。
+ *
+ * - 只认 `single_video` 且（若有）任务 id 不等于重做前那个的任务，避开旧的那次失败。
+ * - `completed` → 成功；`failed`/`cancelled` → 失败并带回错误原因。
+ */
+export async function waitForStudioBeatVideo(
+  project: string,
+  episode: number,
+  beat: number,
+  {
+    taskId,
+    previousTaskId,
+    timeoutMs = 20 * 60 * 1000,
+    intervalMs = 4000,
+  }: {
+    taskId?: string;
+    previousTaskId?: string;
+    timeoutMs?: number;
+    intervalMs?: number;
+  } = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    let task: Task | null = null;
+    try {
+      task = await fetchStudioBeatTask(project, episode, beat);
+    } catch {
+      continue; // 网络抖动：继续轮询
+    }
+    if (!task) continue;
+    // 只看这次重做对应的任务：优先按 task_id 精确匹配，退而求其次要求「不是旧任务」。
+    if (taskId) {
+      if (task.task_id !== taskId) continue;
+    } else if (previousTaskId && task.task_id === previousTaskId) {
+      continue;
+    }
+    if (task.status === "completed") return { ok: true };
+    if (task.status === "failed" || task.status === "cancelled") {
+      return { ok: false, error: task.error || `该镜任务已${task.status}` };
+    }
+  }
+  return { ok: false, error: "等待该镜生成超时，标记保留，请稍后刷新查看" };
 }

@@ -4,18 +4,30 @@ import { useEffect, useRef, useState } from "react";
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
 import { ArrowLeft, Loader2 } from "lucide-react";
 
+import { DirectorCharacterImagesCard } from "@/components/director/director-character-images-card";
 import { StudioCostOverview } from "@/features/studio/studio-cost";
 import { StudioEpisodeList } from "@/features/studio/studio-episode-list";
 import { StudioQuoteCard } from "@/features/studio/studio-quote-card";
 import {
+  StudioBlockedShots,
   StudioHumanNotice,
   StudioRunBanner,
   StudioStageChecklist,
 } from "@/features/studio/studio-run";
-import { isImportSettled, studioRunConfig } from "@/features/studio/studio-api";
+import { StudioVoiceGateCard } from "@/features/studio/studio-voice-gate-card";
+import {
+  isImportSettled,
+  regenerateStudioBeatVideo,
+  studioRunConfig,
+  waitForStudioBeatVideo,
+} from "@/features/studio/studio-api";
 import { useStudioPolling } from "@/features/studio/use-studio-polling";
 import { useStudioRun } from "@/features/studio/use-studio-run";
-import { useStartProjectAutoRun } from "@/lib/queries/director-auto";
+import {
+  useClearBlockedShot,
+  useStartProjectAutoRun,
+  type DirectorBlockedShot,
+} from "@/lib/queries/director-auto";
 import { useEpisodes, usePipelineStatus } from "@/lib/queries/episodes";
 import { useAllProjectSummaries, useProject } from "@/lib/queries/projects";
 import { useTasks } from "@/lib/queries/tasks";
@@ -47,8 +59,11 @@ function StudioProjectPage() {
   const summaries = summariesQuery.data;
   const startRun = useStartProjectAutoRun(project);
   const run = useStudioRun(project, { auto: true });
+  const clearBlockedShot = useClearBlockedShot(project);
 
   const [startError, setStartError] = useState<string | null>(null);
+  const [redoError, setRedoError] = useState<string | null>(null);
+  const [redoPendingBeat, setRedoPendingBeat] = useState<number | null>(null);
   const [quoteDismissed, setQuoteDismissed] = useState(false);
   // 换集或过闸门后重新给一次机会：上次「先不生成」只针对那一集的报价。
   const gateEpisode =
@@ -97,7 +112,6 @@ function StudioProjectPage() {
     clearParam();
     startRunMutation(
       {
-        voicePolicy: "system",
         // 一键成片读项目配置：用户在上传页选的风格/人群/项目类型在这里生效，而不是
         // 覆盖成写死的默认值。
         config: studioRunConfig(projectQuery.data?.data),
@@ -139,7 +153,7 @@ function StudioProjectPage() {
   }
 
   const projectName =
-    summaries?.find((item) => item.id === project)?.name ?? "制作中";
+    summaries?.find((item) => item.id === project)?.name ?? "制作台";
   const currentEpisode = pipeline?.current_episode ?? null;
   const episodes = (episodesQuery.data?.data ?? []).map((episode) => ({
     number: episode.number,
@@ -153,6 +167,43 @@ function StudioProjectPage() {
     run.run?.status === "paused" && run.run?.gate === "cost_estimate"
       ? (run.run.episode ?? currentEpisode ?? 1)
       : null;
+  // 客户工作台停在的闸门（含没有 tag 的声线策略）：都要客户自己点，见 use-studio-run。
+  const gateKind = run.gateKind;
+  const activeGateEpisode = run.run?.episode ?? currentEpisode ?? 1;
+  // 服务端因审核/重试耗尽而本地降级、跳过的镜头：顶部错误条 + 逐镜标记（不假死）。
+  const blockedShots = run.run?.blocked_shots ?? [];
+
+  /**
+   * 「重做该镜」：先重跑这一镜，**等它真的成功**再清掉降级标记。
+   *
+   * 以前是「触发后就立刻清标记」的乐观清理——重做再次失败时标记已经没了，客户会
+   * 以为那镜好了。现在只在该镜任务 `completed` 后清；失败 / 超时都保留标记并把
+   * 原因摆给客户看。
+   */
+  const handleRedoBlockedShot = async (shot: DirectorBlockedShot) => {
+    setRedoError(null);
+    setRedoPendingBeat(shot.beat);
+    try {
+      const { taskId, previousTaskId } = await regenerateStudioBeatVideo(
+        project,
+        shot.episode,
+        shot.beat,
+      );
+      const result = await waitForStudioBeatVideo(project, shot.episode, shot.beat, {
+        taskId,
+        previousTaskId,
+      });
+      if (!result.ok) {
+        setRedoError(result.error);
+        return;
+      }
+      await clearBlockedShot.mutateAsync({ episode: shot.episode, beat: shot.beat });
+    } catch (error) {
+      setRedoError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRedoPendingBeat(null);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -182,18 +233,34 @@ function StudioProjectPage() {
       {startError ? (
         <StudioHumanNotice message={`启动制作失败：${startError}`} />
       ) : null}
-      {costGateEpisode && !quoteDismissed ? (
+      {gateKind === "cost_estimate" && !quoteDismissed ? (
         <StudioQuoteCard
           project={project}
-          episode={costGateEpisode}
+          episode={costGateEpisode ?? activeGateEpisode}
           onDismiss={() => setQuoteDismissed(true)}
         />
+      ) : gateKind === "character_images" || gateKind === "identity_images" ? (
+        <DirectorCharacterImagesCard
+          project={project}
+          gate={gateKind}
+          episode={activeGateEpisode}
+          variant="card"
+          onResolved={() => undefined}
+        />
+      ) : gateKind === "voice_setup" ? (
+        <StudioVoiceGateCard project={project} episode={activeGateEpisode} />
       ) : run.needsHuman ? (
         <StudioHumanNotice message={run.needsHuman} />
       ) : null}
       {!run.needsHuman && failedTask?.error ? (
         <StudioHumanNotice message={`有任务失败：${failedTask.error}`} />
       ) : null}
+      <StudioBlockedShots
+        shots={blockedShots}
+        onRedo={handleRedoBlockedShot}
+        pendingBeat={redoPendingBeat}
+      />
+      {redoError ? <StudioHumanNotice message={`重做该镜未成功：${redoError}`} /> : null}
 
       <section className="space-y-3 rounded-2xl border border-border/60 bg-card p-4">
         <StudioRunBanner
@@ -202,6 +269,7 @@ function StudioProjectPage() {
           recoveries={run.recoveries}
           onResume={run.resumeManually}
           resumePending={run.resumePending}
+          resumeBlocked={gateKind !== null}
         />
         <StudioStageChecklist pipeline={pipeline} />
       </section>

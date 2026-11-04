@@ -16,7 +16,7 @@ vi.mock("@/lib/api", () => ({
 import {
   characterNeedsPortrait,
   DirectorCharacterImagesCard,
-} from "@/features/superchat/director-character-images-card";
+} from "@/components/director/director-character-images-card";
 import type { Character } from "@/types/character";
 
 const server = setupServer();
