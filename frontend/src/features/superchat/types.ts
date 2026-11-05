@@ -343,6 +343,10 @@ export type ServerFrame =
       stall_scope?: string | null;
       /** Operation / model-call diagnostics for a stalled task. */
       diagnostics?: unknown;
+      /** Structured pause class from the backend (`DirectorAutoRun.pause_kind`). */
+      pause_kind?: string | null;
+      /** Server-side auto interventions (fallback continue / stall re-arm) spent. */
+      recovery_attempts?: number | null;
     }
   | { type: "project.created"; project: string }
   | { type: "error"; message: string; turn_id?: string }

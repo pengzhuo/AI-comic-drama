@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -891,7 +892,12 @@ async def test_paused_auto_run_can_be_continued_with_a_voice_policy(tmp_path: Pa
     assert continued.run_id == original.run_id
     assert continued.voice_policy == "system"
     assert continued.last_error == ""
-    assert continued.stage_key == ""
+    # ``stage_key`` is deliberately preserved: it lets the loop tell "advanced to
+    # another stage" (progress → reset the recovery budget) from "the same stage
+    # failed again" (no progress). Clearing it would make every resume look like
+    # progress and defeat the bounded auto-recovery. Re-dispatch is unblocked by
+    # clearing ``recovery_keys`` below, which is what the dispatcher dedupes on.
+    assert continued.stage_key == "selected_regen"
     assert continued.stage_attempts == 0
     assert continued.next_attempt_at == 0.0
     # The dispatcher dedupe keys must go too, or the deterministic fast path
@@ -1382,6 +1388,129 @@ async def test_reaper_rearms_stalled_run_and_leaves_a_driven_run_alone(
     assert coordinator.armed == ["stalled"]
 
 
+def test_store_paused_identity_gate_before_only_matches_stale_identity_pauses(
+    tmp_path: Path,
+) -> None:
+    """巡检的查询面：只认「停在身份图闸门且已等超时」的 paused。
+
+    角色肖像闸门（要不要交自己的图）、正在运行的 run、以及还没到宽限期的身份图
+    暂停都不能被这条查询捞走——捞走就等于替客户做了本该他做的决定。
+    """
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="stale",
+            status="paused",
+            updated_at="2026-08-14T00:00:00+00:00",
+            last_error=director_auto.IDENTITY_IMAGES_REQUIRED_ERROR,
+        )
+    )
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="fresh",
+            project_id="project-2",
+            status="paused",
+            updated_at="2026-08-14T05:00:00+00:00",
+            last_error=director_auto.IDENTITY_IMAGES_REQUIRED_ERROR,
+        )
+    )
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="portraits",
+            project_id="project-3",
+            status="paused",
+            updated_at="2026-08-14T00:00:00+00:00",
+            last_error=director_auto.CHARACTER_IMAGES_REQUIRED_ERROR,
+        )
+    )
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="running",
+            project_id="project-4",
+            last_error=director_auto.IDENTITY_IMAGES_REQUIRED_ERROR,
+        )
+    )
+
+    stale = store.paused_identity_gate_before("2026-08-14T01:00:00+00:00")
+
+    assert {run.run_id for run in stale} == {"stale"}
+
+
+@pytest.mark.asyncio
+async def test_stale_identity_gate_is_auto_answered_and_other_gates_stay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """身份图闸门是「不传就由 AI 生成」的一档：到点由服务端替客户答，绝不永久挂着。
+
+    工作台开着时前端会先自动确认；这里覆盖「浏览器不在」的情况。角色肖像与报价
+    闸门必须原样停着——那才是真需要客户点头的决定。
+    """
+
+    from novelvideo import project_config
+
+    answered: list[tuple[str, str, int]] = []
+    monkeypatch.setattr(
+        project_config,
+        "confirm_identity_images",
+        lambda username, project, episode: answered.append(
+            (username, project, episode)
+        ),
+    )
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store: DirectorAutoStore) -> None:
+            super().__init__(store)
+            self.resumed: list[tuple[str, str]] = []
+
+        async def resume_paused(self, *, username, project_id, voice_policy=None):
+            self.resumed.append((username, project_id))
+            return None
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="stale",
+            status="paused",
+            updated_at="2026-08-14T00:00:00+00:00",
+            last_error=director_auto.IDENTITY_IMAGES_REQUIRED_ERROR,
+        )
+    )
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="fresh",
+            project_id="project-2",
+            status="paused",
+            updated_at=director_auto.datetime.now(
+                director_auto.timezone.utc
+            ).isoformat(),
+            last_error=director_auto.IDENTITY_IMAGES_REQUIRED_ERROR,
+        )
+    )
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="portraits",
+            project_id="project-3",
+            status="paused",
+            updated_at="2026-08-14T00:00:00+00:00",
+            last_error=director_auto.CHARACTER_IMAGES_REQUIRED_ERROR,
+        )
+    )
+
+    coordinator = RecordingCoordinator(store)
+    await coordinator._auto_answer_stale_identity_gates()
+
+    assert answered == [("alice", "demo", 1)]
+    assert coordinator.resumed == [("alice", "project-1")]
+
+
 @pytest.mark.asyncio
 async def test_resume_starts_one_supervisor_and_shutdown_stops_it(
     monkeypatch: pytest.MonkeyPatch,
@@ -1826,6 +1955,279 @@ async def test_clear_blocked_shot_drops_only_the_named_entry(tmp_path: Path) -> 
         assert same is not None and len(same.blocked_shots) == 1
     finally:
         await coordinator.shutdown()
+
+
+def test_pause_kind_for_reason_maps_each_family() -> None:
+    classify = director_auto._pause_kind_for_reason
+
+    assert classify(director_auto.CHARACTER_IMAGES_REQUIRED_ERROR) == director_auto.PAUSE_KIND_GATE
+    assert classify(director_auto.IDENTITY_IMAGES_REQUIRED_ERROR) == director_auto.PAUSE_KIND_GATE
+    assert classify(director_auto.COST_ESTIMATE_REQUIRED_ERROR) == director_auto.PAUSE_KIND_GATE
+    assert classify(director_auto.VOICE_POLICY_REQUIRED_ERROR) == director_auto.PAUSE_KIND_VOICE
+    assert (
+        classify("项目配置缺失（如视觉风格、叙事方式等），请先完成配置")
+        == director_auto.PAUSE_KIND_NEEDS_CONFIG
+    )
+    assert classify("自动续跑未产生写任务") == director_auto.PAUSE_KIND_BLOCKED
+    assert (
+        classify("自动续跑未产生新的任务（最后一次工具调用：x）")
+        == director_auto.PAUSE_KIND_BLOCKED
+    )
+    assert classify("项目权限校验失败：boom") == director_auto.PAUSE_KIND_FATAL
+    assert classify("用户切换为手动模式") == director_auto.PAUSE_KIND_STOPPED
+    assert classify("生成失败") == director_auto.PAUSE_KIND_RETRYABLE
+
+
+def test_store_round_trips_pause_kind_and_recovery_attempts(tmp_path: Path) -> None:
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    run = run_record(
+        tmp_path,
+        status="paused",
+        last_error="生成失败",
+        pause_kind=director_auto.PAUSE_KIND_RETRYABLE,
+        recovery_attempts=3,
+    )
+    store.upsert(run)
+
+    loaded = store.get("alice", "project-1")
+    assert loaded == run
+    assert loaded is not None
+    assert loaded.pause_kind == director_auto.PAUSE_KIND_RETRYABLE
+    assert loaded.recovery_attempts == 3
+
+
+def test_store_paused_kind_before_matches_kind_and_grace(tmp_path: Path) -> None:
+    """兜底续跑的查询面：只认「停在该 kind 且已等超时」的 paused。"""
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    old = "2026-08-14T00:00:00+00:00"
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="retry",
+            status="paused",
+            pause_kind=director_auto.PAUSE_KIND_RETRYABLE,
+            updated_at=old,
+        )
+    )
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="gate",
+            project_id="project-2",
+            status="paused",
+            pause_kind=director_auto.PAUSE_KIND_GATE,
+            updated_at=old,
+        )
+    )
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="running",
+            project_id="project-3",
+            pause_kind=director_auto.PAUSE_KIND_RETRYABLE,
+            updated_at=old,
+        )
+    )
+
+    found = store.paused_kind_before(
+        director_auto.PAUSE_KIND_RETRYABLE, "2026-08-14T01:00:00+00:00"
+    )
+    assert {run.run_id for run in found} == {"retry"}
+
+
+class _StubCoordinator(DirectorAutoCoordinator):
+    """记录 ``_ensure_worker`` / ``_broadcast_status``，避免真的起 worker。"""
+
+    def __init__(self, store: DirectorAutoStore) -> None:
+        super().__init__(store)
+        self.started: list[str] = []
+        self.resumed: list[tuple[str, bool]] = []
+
+    def _ensure_worker(self, run: DirectorAutoRun) -> None:
+        self.started.append(run.run_id)
+
+    async def _broadcast_status(self, run: DirectorAutoRun, **_kwargs) -> None:
+        return None
+
+
+class _AutoResumeRecorder(_StubCoordinator):
+    """把兜底续跑记录下来（不真的唤醒 worker）。"""
+
+    async def resume_paused(
+        self,
+        *,
+        username: str,
+        project_id: str,
+        voice_policy: str | None = None,
+        auto: bool = False,
+    ) -> DirectorAutoRun | None:
+        self.resumed.append((project_id, auto))
+        return None
+
+
+
+@pytest.mark.asyncio
+async def test_resume_paused_auto_keeps_budget_manual_resets(tmp_path: Path) -> None:
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="paused",
+            last_error="生成失败",
+            pause_kind=director_auto.PAUSE_KIND_RETRYABLE,
+            recovery_attempts=2,
+        )
+    )
+    coordinator = _StubCoordinator(store)
+
+    resumed = await coordinator.resume_paused(
+        username="alice", project_id="project-1", auto=True
+    )
+    assert resumed is not None
+    assert resumed.recovery_attempts == 3
+    assert resumed.pause_kind == ""
+
+    # 人工点击清零预算（人已介入）。
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="paused",
+            last_error="生成失败",
+            pause_kind=director_auto.PAUSE_KIND_RETRYABLE,
+            recovery_attempts=4,
+        )
+    )
+    manual = await coordinator.resume_paused(
+        username="alice", project_id="project-1", auto=False
+    )
+    assert manual is not None
+    assert manual.recovery_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_paused_auto_refuses_when_budget_exhausted(tmp_path: Path) -> None:
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="paused",
+            last_error="生成失败",
+            pause_kind=director_auto.PAUSE_KIND_RETRYABLE,
+            recovery_attempts=director_auto.MAX_RECOVERY_ATTEMPTS,
+        )
+    )
+    coordinator = _StubCoordinator(store)
+
+    with pytest.raises(ValueError, match="自动恢复次数已用尽"):
+        await coordinator.resume_paused(
+            username="alice", project_id="project-1", auto=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_auto_resume_stale_hard_pauses_resumes_only_retryable(
+    tmp_path: Path,
+) -> None:
+    """浏览器不在时，可重试的硬暂停由服务端兜底续跑；闸门/阻塞/配置/致命不碰。"""
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    old = "2026-08-14T00:00:00+00:00"
+    cases = [
+        ("retry", "project-1", director_auto.PAUSE_KIND_RETRYABLE),
+        ("gate", "project-2", director_auto.PAUSE_KIND_GATE),
+        ("blocked", "project-3", director_auto.PAUSE_KIND_BLOCKED),
+        ("config", "project-4", director_auto.PAUSE_KIND_NEEDS_CONFIG),
+        ("fatal", "project-5", director_auto.PAUSE_KIND_FATAL),
+        ("stopped", "project-6", director_auto.PAUSE_KIND_STOPPED),
+    ]
+    for run_id, project_id, kind in cases:
+        store.upsert(
+            run_record(
+                tmp_path,
+                run_id=run_id,
+                project_id=project_id,
+                status="paused",
+                pause_kind=kind,
+                updated_at=old,
+            )
+        )
+    # 还没到宽限期的 retryable 不动。
+    store.upsert(
+        run_record(
+            tmp_path,
+            run_id="fresh",
+            project_id="project-7",
+            status="paused",
+            pause_kind=director_auto.PAUSE_KIND_RETRYABLE,
+            updated_at=director_auto.datetime.now(
+                director_auto.timezone.utc
+            ).isoformat(),
+        )
+    )
+
+    coordinator = _AutoResumeRecorder(store)
+    await coordinator._auto_resume_stale_hard_pauses()
+
+    assert coordinator.resumed == [("project-1", True)]
+
+@pytest.mark.asyncio
+async def test_auto_resume_marks_needs_human_when_budget_spent(tmp_path: Path) -> None:
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="paused",
+            pause_kind=director_auto.PAUSE_KIND_RETRYABLE,
+            recovery_attempts=director_auto.MAX_RECOVERY_ATTEMPTS,
+            updated_at="2026-08-14T00:00:00+00:00",
+        )
+    )
+    coordinator = _StubCoordinator(store)
+
+    await coordinator._auto_resume_stale_hard_pauses()
+
+    assert coordinator.resumed == []
+    loaded = store.get("alice", "project-1")
+    assert loaded is not None
+    assert loaded.pause_kind == director_auto.PAUSE_KIND_NEEDS_HUMAN
+
+
+@pytest.mark.asyncio
+async def test_reap_unprogressing_run_rearms_live_worker(tmp_path: Path) -> None:
+    """租约还在、心跳还在续，但没有任何进展且无任务在飞 → 重拉一次（有界）。"""
+
+    class C(_StubCoordinator):
+        async def _has_active_task(self, run: DirectorAutoRun) -> bool:
+            return False
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            status="running",
+            updated_at="2026-08-14T00:00:00+00:00",
+        )
+    )
+    coordinator = C(store)
+
+    async def _never() -> None:
+        await asyncio.sleep(3600)
+
+    worker = asyncio.create_task(_never())
+    coordinator._workers["run-1"] = worker
+    try:
+        await coordinator._reap_unprogressing_runs()
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+
+    loaded = store.get("alice", "project-1")
+    assert loaded is not None
+    assert loaded.recovery_attempts == 1
+    assert coordinator.started == ["run-1"]
+
 
 
 

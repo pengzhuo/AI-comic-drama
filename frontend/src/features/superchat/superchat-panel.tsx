@@ -11191,6 +11191,7 @@ type DirectorAutoServerResponse = {
     episode: number | null;
     run_id: string | null;
     activated_at?: string | null;
+    updated_at?: string | null;
     voice_policy?: DirectorVoicePolicy | null;
     scope?: "episode" | "project";
     driver?: "agent" | "deterministic" | null;
@@ -11198,7 +11199,38 @@ type DirectorAutoServerResponse = {
     last_error?: string | null;
     /** Inline gate a paused run is waiting on, when the pause is one. */
     gate?: "character_images" | "identity_images" | "cost_estimate" | null;
+    /** Structured pause class (mirrors `DirectorAutoRun.pause_kind`). */
+    pause_kind?: DirectorPauseKind | null;
+    /** Server-side auto interventions spent without real progress. */
+    recovery_attempts?: number | null;
+    /** Shots the coordinator gave up on (upstream moderation / retries spent). */
+    blocked_shots?: DirectorBlockedShot[] | null;
   };
+};
+
+/**
+ * Structural pause classification mirrored from the backend
+ * (`DirectorAutoRun.pause_kind`). The console keys its copy and actions on this
+ * instead of substring-matching `last_error`.
+ */
+type DirectorPauseKind =
+  | "gate"
+  | "voice_setup"
+  | "blocked"
+  | "needs_config"
+  | "fatal"
+  | "retryable"
+  | "needs_human"
+  | "confirm"
+  | "stopped";
+
+type DirectorBlockedShot = {
+  episode?: number | null;
+  beat?: number | null;
+  stage?: string | null;
+  code?: string | null;
+  reason?: string | null;
+  degraded?: boolean | null;
 };
 
 /** Marks a durable auto run that paused because a task stopped reporting progress. */
@@ -11223,6 +11255,140 @@ function directorGateFromReason(reason?: string | null): DirectorGate | null {
   if (reason.includes(DIRECTOR_IDENTITY_IMAGES_TAG)) return "identity_images";
   if (reason.includes(DIRECTOR_COST_ESTIMATE_TAG)) return "cost_estimate";
   return null;
+}
+
+/** Marks the 「缺少配音声线」 pause (mirrors the backend `VOICE_POLICY_REQUIRED_ERROR`). */
+const DIRECTOR_VOICE_POLICY_MARKER = "缺少配音声线";
+/** Marks the dispatch-idle pause (mirrors the backend `BLOCKED_PAUSE_MARKER`). */
+const DIRECTOR_BLOCKED_MARKER = "自动续跑未产生";
+/** Marks the project-config-missing pause (mirrors the backend prefix). */
+const DIRECTOR_NEEDS_CONFIG_MARKER = "项目配置缺失";
+/** Marks a permission/upstream failure the user must fix (no retry helps). */
+const DIRECTOR_FATAL_MARKER = "项目权限校验失败";
+
+/**
+ * Resolve the structured pause class for a server/SSE payload.
+ *
+ * Prefers the backend's `pause_kind`; falls back to the stable `last_error`
+ * markers so a rolling upgrade (server not yet emitting the field) still
+ * classifies instead of silently doing nothing.
+ */
+function directorPauseKindFrom(input: {
+  pauseKind?: string | null;
+  gate?: DirectorGate | null;
+  lastError?: string | null;
+}): DirectorPauseKind | null {
+  const known: DirectorPauseKind[] = [
+    "gate",
+    "voice_setup",
+    "blocked",
+    "needs_config",
+    "fatal",
+    "retryable",
+    "needs_human",
+    "confirm",
+    "stopped",
+  ];
+  const kind = input.pauseKind;
+  if (kind && (known as string[]).includes(kind)) return kind as DirectorPauseKind;
+  if (input.gate) return "gate";
+  const reason = input.lastError ?? "";
+  if (!reason) return null;
+  if (
+    reason.includes(DIRECTOR_CHARACTER_IMAGES_TAG) ||
+    reason.includes(DIRECTOR_IDENTITY_IMAGES_TAG) ||
+    reason.includes(DIRECTOR_COST_ESTIMATE_TAG)
+  ) {
+    return "gate";
+  }
+  if (reason.includes(DIRECTOR_VOICE_POLICY_MARKER)) return "voice_setup";
+  if (reason.includes(DIRECTOR_BLOCKED_MARKER)) return "blocked";
+  if (reason.trimStart().startsWith(DIRECTOR_NEEDS_CONFIG_MARKER)) return "needs_config";
+  if (reason.startsWith(DIRECTOR_FATAL_MARKER)) return "fatal";
+  if (reason.includes("手动模式") || reason.includes("终止")) return "stopped";
+  return "retryable";
+}
+
+/** A pause the console keeps on screen with a way out (never a dead end). */
+type DirectorPauseNotice = {
+  kind: DirectorPauseKind;
+  status: "paused" | "awaiting_confirmation";
+  message: string;
+  episode: number | null;
+  recoveryAttempts: number;
+};
+
+/** Human copy + the primary action the console offers for each pause class. */
+function directorPauseCopy(notice: DirectorPauseNotice): {
+  title: string;
+  body: string;
+  /** Button label; `null` = no auto/continue action to offer (manual only). */
+  action: string | null;
+} {
+  const detail = notice.message.trim();
+  switch (notice.kind) {
+    case "voice_setup":
+      return {
+        title: "需要选择配音声线",
+        body:
+          "本集自动停在配音环节：请先在“一键成片”里选好系统声线或自定义声线，再点继续。",
+        action: "选好声线后继续",
+      };
+    case "needs_config":
+      return {
+        title: "项目配置还没补全",
+        body:
+          `${detail || "缺少视觉风格 / 叙事方式等配置"}。请先到项目设置里补全配置，再点继续。`,
+        action: "我已补好配置，继续",
+      };
+    case "fatal":
+      return {
+        title: "遇到无法自动重试的问题",
+        body: `${detail || "上游拒绝或权限不足"}。请检查账号额度 / 权限后再点继续。`,
+        action: "我已处理，继续",
+      };
+    case "blocked":
+      return {
+        title: "自动推进已停下（没有可执行的新任务）",
+        body:
+          `${detail || "连续几轮没有产生新的制作任务"}。可以点继续重试，或转手动处理当前步骤。`,
+        action: "继续制作",
+      };
+    case "needs_human":
+      return {
+        title: "自动恢复次数已用尽",
+        body:
+          `${detail || "服务端多次自动续跑仍没有进展"}。请检查后手动继续，或转手动处理。`,
+        action: "继续制作",
+      };
+    case "stopped":
+      return { title: "已切换为手动模式", body: "本集自动已停止，可在下方手动推进。", action: null };
+    case "gate":
+      return { title: "等待你确认", body: detail || "请完成上方卡片里的确认后继续。", action: "继续制作" };
+    case "confirm":
+    default:
+      return {
+        title: "制作流程需要确认",
+        body: detail || "捏导建议了一处修改，确认后即可继续自动推进。",
+        action: "同意并继续",
+      };
+  }
+}
+
+function directorPauseNoticeFrom(input: {
+  kind: DirectorPauseKind;
+  status: "paused" | "awaiting_confirmation";
+  message?: string | null;
+  episode?: number | null;
+  recoveryAttempts?: number | null;
+}): DirectorPauseNotice {
+  return {
+    kind: input.kind,
+    status: input.status,
+    message: input.message ?? "",
+    episode: input.episode ?? null,
+    recoveryAttempts: input.recoveryAttempts ?? 0,
+  };
 }
 
 type DirectorStallNotice = {
@@ -11333,6 +11499,39 @@ async function pauseDirectorAutoServer(project: string): Promise<void> {
 async function resumeDirectorAutoServer(project: string): Promise<void> {
   await api.post(p`api/v1/projects/${project}/chat/director-auto/resume`)
     .json<DirectorAutoServerResponse>();
+}
+
+/**
+ * Continue a hard-paused run. A manual click always sends `auto:false`, which the
+ * server treats as a human decision and resets the automatic-recovery budget.
+ */
+async function continueDirectorAutoServer(
+  project: string,
+  options: { voicePolicy?: DirectorVoicePolicy | null } = {},
+): Promise<void> {
+  await api.post(p`api/v1/projects/${project}/chat/director-auto/continue`, {
+    json: {
+      ...(options.voicePolicy ? { voice_policy: options.voicePolicy } : {}),
+      auto: false,
+    },
+  }).json<DirectorAutoServerResponse>();
+}
+
+/**
+ * Continue by the run's current status. The two endpoints only accept their own
+ * status (`/continue` rejects `awaiting_confirmation`, `/resume` rejects
+ * `paused`), so picking by status is what keeps the console button from 409-ing.
+ */
+async function resumeDirectorAutoForStatus(
+  project: string,
+  status: "paused" | "awaiting_confirmation",
+  options: { voicePolicy?: DirectorVoicePolicy | null } = {},
+): Promise<void> {
+  if (status === "awaiting_confirmation") {
+    await resumeDirectorAutoServer(project);
+    return;
+  }
+  await continueDirectorAutoServer(project, options);
 }
 
 /** Terminate one stalled project task (running task needs explicit confirmation). */
@@ -12792,6 +12991,12 @@ export function SuperChatPanel({
   const [directorStallBusy, setDirectorStallBusy] = useState(false);
   // Set while 一键成片 waits for the user to hand over 角色肖像 / 身份图 (or skip).
   const [directorGate, setDirectorGate] = useState<DirectorGateNotice | null>(null);
+  // Persistent pause strip: any non-gate stop keeps a way out on screen instead
+  // of a toast that scrolls away (the console must never look dead).
+  const [directorPauseNotice, setDirectorPauseNotice] = useState<DirectorPauseNotice | null>(null);
+  const [directorPauseBusy, setDirectorPauseBusy] = useState(false);
+  // Shots the coordinator gave up on; shown so the user can redo them by hand.
+  const [directorBlockedShots, setDirectorBlockedShots] = useState<DirectorBlockedShot[]>([]);
   const isChatInitializing = !chat.historyReady && chat.messages.length === 0 && (chat.connecting || chat.connected);
 
   useEffect(() => {
@@ -13168,6 +13373,8 @@ export function SuperChatPanel({
     let cancelled = false;
     void getDirectorAutoServer(project).then((server) => {
       if (cancelled) return;
+      setDirectorBlockedShots(server.blocked_shots ?? []);
+      setDirectorPauseNotice(null);
       if (server.status === "running") {
         const confirmed = {
           ...confirmDirectorEpisodeAuto(loaded),
@@ -13194,6 +13401,18 @@ export function SuperChatPanel({
             mode: "hard",
             episode: server.episode ?? suspended.episode ?? null,
           });
+        } else {
+          // No stall: keep a persistent 「同意并继续」 affordance so the panel
+          // doesn't look dead if the toast is missed.
+          setDirectorPauseNotice(
+            directorPauseNoticeFrom({
+              kind: "confirm",
+              status: "awaiting_confirmation",
+              message: server.last_error,
+              episode: server.episode ?? suspended.episode ?? null,
+              recoveryAttempts: server.recovery_attempts,
+            }),
+          );
         }
       } else if (server.status === "paused" || server.status === "completed") {
         // A persisted terminal server run is authoritative. In particular,
@@ -13212,6 +13431,25 @@ export function SuperChatPanel({
         setDirectorGate(
           gate ? { gate, episode: server.episode ?? settled.episode ?? 1 } : null,
         );
+        if (server.status === "paused" && !gate) {
+          // A hard pause that is not an inline gate (voice / config / fatal /
+          // retry / needs-human). Keep the actionable strip on screen.
+          const kind = directorPauseKindFrom({
+            pauseKind: server.pause_kind,
+            lastError: server.last_error,
+          });
+          if (kind) {
+            setDirectorPauseNotice(
+              directorPauseNoticeFrom({
+                kind,
+                status: "paused",
+                message: server.last_error,
+                episode: server.episode ?? settled.episode ?? null,
+                recoveryAttempts: server.recovery_attempts,
+              }),
+            );
+          }
+        }
       } else if (isDirectorEpisodeAutoSession(loaded)) {
         const settled = settledDirectorRunState(loaded.mode);
         directorRunStateRef.current = settled;
@@ -13232,6 +13470,16 @@ export function SuperChatPanel({
     saveDirectorRunState(directorRunProject, next);
   }, [directorRunProject]);
 
+  // `blocked_shots` is not carried on the SSE frame; refresh it from the server
+  // whenever the run pauses/needs confirmation so the console can list them.
+  const refreshDirectorBlockedShots = useCallback(() => {
+    const project = params.project?.trim();
+    if (variant === "freezone" || !project) return;
+    void getDirectorAutoServer(project)
+      .then((server) => setDirectorBlockedShots(server.blocked_shots ?? []))
+      .catch(() => undefined);
+  }, [params.project, variant]);
+
   useEffect(() => {
     if (variant === "freezone") return;
     const onStatus = (event: Event) => {
@@ -13246,6 +13494,8 @@ export function SuperChatPanel({
         stallBeatNum?: number | null;
         stallScope?: string | null;
         diagnostics?: unknown;
+        pauseKind?: string | null;
+        recoveryAttempts?: number | null;
       }>).detail;
       if (detail?.terminalTaskId) {
         directorAutoTerminalTaskIdsRef.current.add(detail.terminalTaskId);
@@ -13265,6 +13515,8 @@ export function SuperChatPanel({
       }
       if (detail?.status === "running") {
         const current = directorRunStateRef.current;
+        setDirectorPauseNotice(null);
+        setDirectorGate(null);
         updateDirectorRunState({
           ...confirmDirectorEpisodeAuto(current),
           episode: detail.episode ?? current.episode ?? 1,
@@ -13287,7 +13539,16 @@ export function SuperChatPanel({
           });
           return;
         }
-        toast.info("本集自动已暂停后续推进，等待你确认是否修改", { duration: 10000 });
+        setDirectorPauseNotice(
+          directorPauseNoticeFrom({
+            kind: "confirm",
+            status: "awaiting_confirmation",
+            message: detail.message,
+            episode: detail.episode ?? current.episode ?? null,
+            recoveryAttempts: detail.recoveryAttempts,
+          }),
+        );
+        refreshDirectorBlockedShots();
         return;
       }
       if (detail?.status === "paused" || detail?.status === "completed") {
@@ -13298,21 +13559,43 @@ export function SuperChatPanel({
         );
         if (detail.status === "completed") {
           setDirectorGate(null);
+          setDirectorPauseNotice(null);
           toast.success(`第 ${detail.episode ?? "当前"} 集自动制作已完成`);
         } else if (detail.message && detail.message !== "用户切换为手动模式") {
           const gate = directorGateFromReason(detail.message);
           setDirectorGate(
             gate ? { gate, episode: detail.episode ?? 1 } : null,
           );
+          if (gate) {
+            setDirectorPauseNotice(null);
+          } else {
+            const kind = directorPauseKindFrom({
+              pauseKind: detail.pauseKind,
+              lastError: detail.message,
+            });
+            setDirectorPauseNotice(
+              kind
+                ? directorPauseNoticeFrom({
+                    kind,
+                    status: "paused",
+                    message: detail.message,
+                    episode: detail.episode ?? null,
+                    recoveryAttempts: detail.recoveryAttempts,
+                  })
+                : null,
+            );
+          }
+          refreshDirectorBlockedShots();
           toast.error("本集自动已暂停");
         } else {
           setDirectorGate(null);
+          setDirectorPauseNotice(null);
         }
       }
     };
     window.addEventListener("director-auto-status", onStatus);
     return () => window.removeEventListener("director-auto-status", onStatus);
-  }, [updateDirectorRunState, variant]);
+  }, [updateDirectorRunState, refreshDirectorBlockedShots, variant]);
 
   const resolveDirectorStall = useCallback(
     async (action: "resume" | "pause" | "dismiss") => {
@@ -13359,6 +13642,52 @@ export function SuperChatPanel({
     },
     [directorStallNotice, params.project, updateDirectorRunState],
   );
+
+  /**
+   * Continue / terminate from the persistent pause strip. Human clicks always
+   * pick the endpoint by the run's status and send `auto:false`, so a stuck
+   * automatic run gets one more honest attempt (and the server resets its
+   * auto-recovery budget) instead of looping forever.
+   */
+  const resolveDirectorPause = useCallback(
+    async (action: "continue" | "terminate") => {
+      const project = params.project?.trim();
+      const notice = directorPauseNotice;
+      if (!project || !notice) return;
+      setDirectorPauseBusy(true);
+      try {
+        if (action === "terminate") {
+          await pauseDirectorAutoServer(project).catch(() => undefined);
+          setDirectorPauseNotice(null);
+          updateDirectorRunState(defaultDirectorRunState());
+          toast.info(<DirectorKeywordText text="已终止本次自动制作，可手动处理当前步骤" bare />);
+          return;
+        }
+        await resumeDirectorAutoForStatus(project, notice.status, {
+          voicePolicy: directorRunStateRef.current.voicePolicy,
+        });
+        const current = directorRunStateRef.current;
+        updateDirectorRunState({
+          ...confirmDirectorEpisodeAuto(current),
+          episode: notice.episode ?? current.episode ?? 1,
+        });
+        setDirectorPauseNotice(null);
+        setDirectorGate(null);
+        toast.info(<DirectorKeywordText text="已继续本集自动制作" bare />);
+      } catch (error) {
+        toast.error(
+          `继续失败：${error instanceof Error ? error.message : "请稍后重试"}`,
+        );
+      } finally {
+        setDirectorPauseBusy(false);
+      }
+    },
+    [directorPauseNotice, params.project, updateDirectorRunState],
+  );
+
+  const directorPauseView = directorPauseNotice
+    ? { notice: directorPauseNotice, copy: directorPauseCopy(directorPauseNotice) }
+    : null;
 
   const setDirectorExecutionMode = useCallback((mode: DirectorRunMode) => {
     if (mode === "episode_auto") {
@@ -16519,6 +16848,63 @@ export function SuperChatPanel({
                   onResolved={() => setDirectorGate(null)}
                 />
               )
+            )}
+            {!isFreezoneLayout && !directorGate && directorPauseView && params.project?.trim() && (
+              <div className="border-b border-warning/30 bg-warning/10 px-4 py-3 text-warning">
+                <div className="flex items-start gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium">
+                      {directorPauseView.copy.title}
+                      {directorPauseView.notice.recoveryAttempts > 0 && (
+                        <span className="ml-2 text-xs font-normal opacity-80">
+                          已自动重试 {directorPauseView.notice.recoveryAttempts} 次
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-1 whitespace-pre-wrap text-xs opacity-90">
+                      {directorPauseView.copy.body}
+                    </div>
+                    {directorBlockedShots.length > 0 && (
+                      <ul className="mt-2 space-y-1">
+                        {directorBlockedShots.slice(0, 6).map((shot, index) => (
+                          <li
+                            key={`${shot.episode ?? "?"}-${shot.beat ?? "?"}-${shot.stage ?? index}`}
+                            className="text-xs text-destructive"
+                          >
+                            第 {shot.episode ?? "?"} 集 · 镜头 {shot.beat ?? "?"}
+                            {shot.reason ? `：${shot.reason}` : ""}
+                          </li>
+                        ))}
+                        {directorBlockedShots.length > 6 && (
+                          <li className="text-xs opacity-70">
+                            另有 {directorBlockedShots.length - 6} 个镜头未成功…
+                          </li>
+                        )}
+                      </ul>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 flex-col items-end gap-2">
+                    {directorPauseView.copy.action && (
+                      <button
+                        type="button"
+                        disabled={directorPauseBusy}
+                        onClick={() => void resolveDirectorPause("continue")}
+                        className="rounded-md bg-warning px-3 py-1.5 text-xs font-medium text-warning-foreground transition hover:bg-warning/90 disabled:opacity-50"
+                      >
+                        {directorPauseBusy ? "处理中…" : directorPauseView.copy.action}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={directorPauseBusy}
+                      onClick={() => void resolveDirectorPause("terminate")}
+                      className="rounded-md border border-warning/40 px-3 py-1.5 text-xs font-medium text-warning transition hover:bg-warning/10 disabled:opacity-50"
+                    >
+                      终止自动
+                    </button>
+                  </div>
+                </div>
+              </div>
             )}
             {!hasActiveComposerPrompt && showClearCommandSuggestion && (
               <button

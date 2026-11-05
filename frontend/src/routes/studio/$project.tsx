@@ -22,7 +22,10 @@ import {
   waitForStudioBeatVideo,
 } from "@/features/studio/studio-api";
 import { useStudioPolling } from "@/features/studio/use-studio-polling";
-import { useStudioRun } from "@/features/studio/use-studio-run";
+import {
+  IDENTITY_GATE_GRACE_SECONDS,
+  useStudioRun,
+} from "@/features/studio/use-studio-run";
 import {
   useClearBlockedShot,
   useStartProjectAutoRun,
@@ -233,6 +236,10 @@ function StudioProjectPage() {
       {startError ? (
         <StudioHumanNotice message={`启动制作失败：${startError}`} />
       ) : null}
+      {run.needsHuman && gateKind !== "cost_estimate" && gateKind !== "voice_setup" ? (
+        // 闸门暂停也要有横幅：只有一张卡片时，客户很容易以为工作台没反应。
+        <StudioHumanNotice message={run.needsHuman} />
+      ) : null}
       {gateKind === "cost_estimate" && !quoteDismissed ? (
         <StudioQuoteCard
           project={project}
@@ -245,15 +252,20 @@ function StudioProjectPage() {
           gate={gateKind}
           episode={activeGateEpisode}
           variant="card"
+          autoSkipSeconds={
+            gateKind === "identity_images" ? IDENTITY_GATE_GRACE_SECONDS : undefined
+          }
           onResolved={() => undefined}
         />
       ) : gateKind === "voice_setup" ? (
         <StudioVoiceGateCard project={project} episode={activeGateEpisode} />
-      ) : run.needsHuman ? (
-        <StudioHumanNotice message={run.needsHuman} />
       ) : null}
-      {!run.needsHuman && failedTask?.error ? (
+      {failedTask?.error ? (
+        // 与闸门横幅并列，不互相顶掉：一边是「在等你决定」，一边是「有任务真失败了」。
         <StudioHumanNotice message={`有任务失败：${failedTask.error}`} />
+      ) : null}
+      {run.stuckLikely ? (
+        <StudioHumanNotice message="制作已经有一段时间没有进展，可能在跑一个很长的步骤；如果一直不动，可以点「继续制作」重试当前步骤，或「终止自动」。" />
       ) : null}
       <StudioBlockedShots
         shots={blockedShots}
@@ -270,6 +282,9 @@ function StudioProjectPage() {
           onResume={run.resumeManually}
           resumePending={run.resumePending}
           resumeBlocked={gateKind !== null}
+          onStop={run.stopManually}
+          stopPending={run.stopPending}
+          stuckLikely={run.stuckLikely}
         />
         <StudioStageChecklist pipeline={pipeline} />
       </section>

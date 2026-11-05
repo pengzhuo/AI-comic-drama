@@ -130,4 +130,56 @@ describe("DirectorCharacterImagesCard", () => {
     await waitFor(() => expect(confirmed).toHaveLength(1));
     expect(confirmed[0]).toEqual({ episode: 3 });
   });
+
+  it("身份图卡片把「N 秒后自动跳过」摆出来（工作台不再像假死）", async () => {
+    server.use(
+      http.get("http://localhost:3000/api/v1/projects/demo/pipeline/status", () =>
+        HttpResponse.json({
+          ok: true,
+          data: {
+            project: "demo",
+            global: { ingested: true, configured: true, characters: 1, episodes: 1, portraits_done: true },
+            current_episode: 1,
+            episode_status: { identity_plan: true, identities_missing: [] },
+            next_step: "identity_images",
+            next_step_name: "身份图生成",
+          },
+        }),
+      ),
+    );
+
+    render(
+      <DirectorCharacterImagesCard
+        project="demo"
+        gate="identity_images"
+        episode={1}
+        autoSkipSeconds={90}
+        onResolved={() => undefined}
+      />,
+      { wrapper },
+    );
+
+    expect(await screen.findByText(/90 秒后未指定会自动跳过，由 AI 生成/)).toBeTruthy();
+  });
+
+  it("角色肖像卡片不提自动跳过（那一档必须客户点头）", async () => {
+    server.use(
+      http.get("http://localhost:3000/api/v1/projects/demo/characters", () =>
+        HttpResponse.json({ ok: true, data: [character({ name: "秦" })] }),
+      ),
+    );
+
+    render(
+      <DirectorCharacterImagesCard
+        project="demo"
+        gate="character_images"
+        episode={1}
+        onResolved={() => undefined}
+      />,
+      { wrapper },
+    );
+
+    expect(await screen.findByText("秦")).toBeTruthy();
+    expect(screen.queryByText(/自动跳过/)).toBeNull();
+  });
 });

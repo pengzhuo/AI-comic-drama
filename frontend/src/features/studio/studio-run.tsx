@@ -112,6 +112,9 @@ export function StudioRunBanner({
   onResume,
   resumePending,
   resumeBlocked = false,
+  onStop,
+  stopPending = false,
+  stuckLikely = false,
 }: {
   run: DirectorAutoRunPayload | undefined;
   needsHuman: string | null;
@@ -125,14 +128,26 @@ export function StudioRunBanner({
    * 否则客户点一下就绕过伴点预扣直接开跑花钱的阶段。
    */
   resumeBlocked?: boolean;
+  /** 「终止自动」：把工作台从任何循环里救出来（切手动）。 */
+  onStop?: () => void;
+  stopPending?: boolean;
+  /** `status=running` 但很久没有进展：疑似卡死，给醒目提示与出口。 */
+  stuckLikely?: boolean;
 }) {
   const status = run?.status ?? "manual";
   const tone =
     status === "completed"
       ? "text-emerald-600 dark:text-emerald-400"
-      : status === "paused" || needsHuman
+      : status === "paused" || needsHuman || stuckLikely
         ? "text-amber-600 dark:text-amber-500"
         : "text-foreground";
+  const effectiveNeedsHuman = Boolean(needsHuman) && !resumeBlocked;
+  const label = stuckLikely
+    ? "疑似卡住"
+    : effectiveNeedsHuman
+      ? "需要人工介入"
+      : RUN_LABEL[status];
+  const resumeLabel = status === "awaiting_confirmation" ? "同意并继续" : "继续制作";
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -142,9 +157,7 @@ export function StudioRunBanner({
         ) : status === "completed" ? (
           <CheckCircle2 className="size-4 text-emerald-500" />
         ) : null}
-        <span className={cn("text-sm font-semibold", tone)}>
-          {needsHuman && !resumeBlocked ? "需要人工介入" : RUN_LABEL[status]}
-        </span>
+        <span className={cn("text-sm font-semibold", tone)}>{label}</span>
         {run?.episode ? (
           <span className="text-xs text-muted-foreground">第 {run.episode} 集</span>
         ) : null}
@@ -152,12 +165,25 @@ export function StudioRunBanner({
           <span className="text-xs text-muted-foreground">（已自动恢复 {recoveries} 次）</span>
         ) : null}
       </div>
-      {needsHuman && !resumeBlocked ? (
-        <Button type="button" size="sm" onClick={onResume} disabled={resumePending}>
-          <Play className="size-3.5" />
-          继续制作
-        </Button>
-      ) : null}
+      <div className="flex items-center gap-2">
+        {(effectiveNeedsHuman || stuckLikely) && onStop ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={onStop}
+            disabled={stopPending}
+          >
+            终止自动
+          </Button>
+        ) : null}
+        {effectiveNeedsHuman ? (
+          <Button type="button" size="sm" onClick={onResume} disabled={resumePending}>
+            <Play className="size-3.5" />
+            {resumeLabel}
+          </Button>
+        ) : null}
+      </div>
     </div>
   );
 }

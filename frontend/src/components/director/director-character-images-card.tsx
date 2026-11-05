@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ImagePlus, Loader2, SkipForward } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -184,12 +184,35 @@ function IdentityRow({
   );
 }
 
+/**
+ * 宽限期倒计时：身份图闸门到点会自动放行，把「还有多久」摆出来，客户才不会以为
+ * 工作台卡死。``autoSkipSeconds`` 不传（助手面板里的条带形态）就不显示倒计时。
+ */
+function useCountdown(seconds: number | undefined): number | null {
+  const [left, setLeft] = useState<number | null>(seconds ?? null);
+
+  useEffect(() => {
+    if (seconds === undefined) {
+      setLeft(null);
+      return;
+    }
+    setLeft(seconds);
+    const id = window.setInterval(() => {
+      setLeft((current) => (current === null ? null : Math.max(0, current - 1)));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [seconds]);
+
+  return left;
+}
+
 export function DirectorCharacterImagesCard({
   project,
   gate,
   episode,
   busy = false,
   variant = "strip",
+  autoSkipSeconds,
   onResolved,
 }: {
   project: string;
@@ -201,6 +224,11 @@ export function DirectorCharacterImagesCard({
    * 两种形态共用同一套判定与上传逻辑，只是外框不同。
    */
   variant?: "strip" | "card";
+  /**
+   * 身份图闸门的自动放行宽限（秒）：工作台会在倒计时结束后替客户点「跳过，由 AI
+   * 生成」。不传则不显示倒计时（助手面板里的条带形态不需要）。
+   */
+  autoSkipSeconds?: number;
   onResolved: () => void;
 }) {
   const wantsPortraits = gate === "character_images";
@@ -208,6 +236,7 @@ export function DirectorCharacterImagesCard({
   const pipelineQuery = usePipelineStatus(wantsPortraits ? "" : project);
   const [answered, setAnswered] = useState<string[]>([]);
   const [confirming, setConfirming] = useState(false);
+  const countdown = useCountdown(autoSkipSeconds);
 
   const portraitRows = useMemo(
     () => (charactersQuery.data?.data ?? []).filter(characterNeedsPortrait),
@@ -266,6 +295,14 @@ export function DirectorCharacterImagesCard({
           </span>
         )}
       </div>
+
+      {!wantsPortraits && autoSkipSeconds !== undefined ? (
+        <div className="mb-2 text-xs leading-5 text-muted-foreground">
+          {countdown === null || countdown > 0
+            ? `${countdown ?? autoSkipSeconds} 秒后未指定会自动跳过，由 AI 生成。`
+            : "正在自动跳过，由 AI 生成…"}
+        </div>
+      ) : null}
 
       <div className="mb-2 overflow-hidden rounded-2xl bg-black/[0.035] ring-1 ring-black/[0.07]">
         {loading ? (

@@ -464,6 +464,9 @@ class DirectorAutoContinueIn(BaseModel):
     """Optional voice-policy override when continuing a hard-paused run."""
 
     voice_policy: str | None = Field(default=None, pattern="^(system|custom)$")
+    #: 前端自动派续跑（无人值守）带 ``True``：不清零服务端的自动恢复预算，
+    #: 撞满上限就交给 ``needs_human``；人工点击走 ``False``（默认），预算清零。
+    auto: bool = False
 
 
 class DirectorAutoBlockedClearIn(BaseModel):
@@ -563,6 +566,8 @@ def _director_auto_payload(run: Any | None) -> dict[str, Any]:
         "driver": getattr(run, "driver", "agent"),
         "gate": _director_auto_gate(run.last_error or "") if run.status == "paused" else None,
         "blocked_shots": list(getattr(run, "blocked_shots", ()) or ()),
+        "pause_kind": getattr(run, "pause_kind", "") or None,
+        "recovery_attempts": int(getattr(run, "recovery_attempts", 0) or 0),
     }
 
 
@@ -642,6 +647,7 @@ async def pause_director_auto_run(
         username=owner,
         project_id=ctx.project_id,
         reason="用户切换为手动模式",
+        kind="stopped",
     )
     return {"ok": True, "data": _director_auto_payload(run)}
 
@@ -714,6 +720,7 @@ async def continue_director_auto_run(
             username=owner,
             project_id=ctx.project_id,
             voice_policy=(payload.voice_policy if payload is not None else None),
+            auto=(payload.auto if payload is not None else False),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -895,6 +902,18 @@ async def confirm_director_auto_gate(
             confirm_cost_estimate(owner_username, project_name, episode)
         else:
             confirm_identity_images(owner_username, project_name, episode)
+    # 幂等守卫：这个闸门可能已经被别处答过（前端宽限期自动确认、服务端巡检兜底、
+    # 或另开了一个标签页）。只有 run 此刻**确实停在本闸门上**才值得唤醒它；若它
+    # 已经不在暂停态、或停的是另一个闸门，陈旧卡片重复提交就不该再 ``resume_paused``
+    # 把 run 在 paused↔running 之间抖来抖去（现场一次「角色图片指定」被这样点了
+    # 11 次）。答案照写，唤醒按需。
+    current_gate = (
+        _director_auto_gate(run.last_error or "") if run.status == "paused" else None
+    )
+    if run.status != "paused" or (
+        current_gate is not None and current_gate != normalized
+    ):
+        return {"ok": True, "data": _director_auto_payload(run)}
     try:
         resumed = await director_auto_coordinator.resume_paused(
             username=owner_username, project_id=ctx.project_id

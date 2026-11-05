@@ -153,7 +153,7 @@
 
 ```json
 {
-  "base_urls": ["https://aicf.nanie168.com", "https://aigc.nanie168.com"],
+  "base_urls": ["https://aicf.nanie168.com", "https://aigc.nanie168.com", "https://aiqy.nanie168.com"],
   "username": "<中转站账号>",
   "password": "<口令>",
   "cache_path": "/data/runtime/relay_billing_cache.json"

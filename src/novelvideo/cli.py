@@ -603,7 +603,7 @@ def cost_reconcile_cmd(
         help="quota 来源：gateway=本地捏驿账单库；relay=上游中转站真实账单",
     ),
     relay_base_url: list[str] = typer.Option(
-        [], "--relay-base-url", help="中转站地址，可重复；默认 aicf + aigc"
+        [], "--relay-base-url", help="中转站地址，可重复；默认 aicf + aigc + aiqy"
     ),
     relay_username: str = typer.Option(
         "", "--relay-username", help="中转站账号（--source relay 必填）"

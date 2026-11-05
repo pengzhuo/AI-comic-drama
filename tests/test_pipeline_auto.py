@@ -410,6 +410,61 @@ async def test_dispatch_single_videos_does_not_record_a_rejected_beat(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_single_videos_backs_off_after_repeated_prep_rejections(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """准备阶段被反复拒绝的 beat 不能无限空转：到上限后进入冷却，内容改写即恢复。
+
+    现场问题：``t1`` ep1 的 beat 49/51/57 因提示词缺字 / 幽灵说话人每 ~1.5s 被拒一次，
+    8 小时累计 ~2900 次拒绝 + 4350 次重开 SQLite，整集看起来永远「正在生成」。
+    """
+
+    from novelvideo.api.routes import generation
+
+    patch_status(monkeypatch, "single_video", episode=1)
+    _write_video_inputs(tmp_path, (1,))
+    pipeline_auto._PREP_REJECTION_STATE.clear()
+
+    calls: list[dict] = []
+
+    async def reject_enqueue(**kwargs):
+        calls.append(kwargs)
+        return {"ok": False, "error": "Seedance2 最终提示词缺少台词内容"}
+
+    monkeypatch.setattr(generation, "enqueue_single_video_task", reject_enqueue)
+
+    for _ in range(pipeline_auto.PREP_REJECTION_RETRY_LIMIT):
+        assert await pipeline_auto.dispatch_next_stage(
+            ctx=ctx(tmp_path), username="alice", store=_video_store((1,)), episode=1
+        ) == (None, None)
+
+    attempts_before = len(calls)
+    assert attempts_before == pipeline_auto.PREP_REJECTION_RETRY_LIMIT
+
+    # 进入冷却：同一轮不再重试这条 beat（不再刷库、刷日志）。
+    assert await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=_video_store((1,)), episode=1
+    ) == (None, None)
+    assert len(calls) == attempts_before
+
+    # 提示词/台词被改写（指纹变化）后立即恢复重试。
+    class ChangedStore:
+        async def get_beats_as_dicts(self, _episode: int):
+            return [{"beat_number": 1, "narration": "改好的台词。"}]
+
+    async def ok_enqueue(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "task_type": "single_video"}
+
+    monkeypatch.setattr(generation, "enqueue_single_video_task", ok_enqueue)
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=ChangedStore(), episode=1
+    )
+    assert task_type == "single_video"
+    assert signature == "dispatch:single_video:1:1"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_single_videos_without_ready_beats_falls_back(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

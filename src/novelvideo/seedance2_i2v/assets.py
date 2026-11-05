@@ -781,11 +781,29 @@ def _dialogue_voice_assets(
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for speaker in unique_seedance2_dialogue_speakers(beat):
+    speakers = unique_seedance2_dialogue_speakers(beat)
+    # 单说话人 beat 的兜底信号：解析出的 speaker 匹配不到任何角色、整条 beat 又只有
+    # 一个「说话人」时，几乎可以断定是散文冒号被 ``looks_like_speaker_label`` 误判
+    # （``…你只回他一句：星辰的实控人没变``），而不是真有第二个角色。
+    single_parsed_speaker = len(speakers) == 1
+    for speaker in speakers:
         character = next(
             (item for item in characters if _speaker_matches_character(speaker, item)),
             None,
         )
+        if character is None and single_parsed_speaker:
+            # 回落到 beat 自身声明的 speaker：否则会给一个不存在的角色索要声线
+            # （``assets/characters/你只回他一句/voices/...``），构建期报「缺少参考
+            # 声线」，整条 beat 卡在发请求之前。真正的多说话人 beat 不走这条路。
+            fallback = _text(beat.get("speaker"))
+            if fallback and fallback != _text(speaker):
+                fallback_character = next(
+                    (item for item in characters if _speaker_matches_character(fallback, item)),
+                    None,
+                )
+                if fallback_character is not None:
+                    character = fallback_character
+                    speaker = fallback
         if character is None:
             display_name = speaker_display_name(speaker)
             missing_path = (

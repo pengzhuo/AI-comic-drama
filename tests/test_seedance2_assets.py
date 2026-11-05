@@ -370,6 +370,64 @@ def test_dialogue_line_with_prose_colon_resolves_the_character_voice(tmp_path):
     assert selected_reference_paths(assets, "reference_audios") == [str(voice)]
 
 
+def test_dialogue_inline_colon_clause_resolves_the_beat_speaker_voice(tmp_path):
+    """句内冒号从句（不含动作括注）不能造出幽灵说话人。
+
+    现场问题：``t1`` ep1 beat 51 的台词是
+    「…你只回他一句：星辰的实控人没变。…」——裸 ``你只回他一句：`` 不含
+    「说/道/问…」动词，通过了 ``looks_like_speaker_label``，声线于是指向
+    ``assets/characters/你只回他一句/...``，构建期报「缺少参考声线」，整条 beat
+    卡在发请求之前。单说话人 beat 必须回落到 ``speaker`` 声明的角色。
+    """
+
+    from novelvideo.seedance2_i2v.assets import (
+        build_seedance2_project_assets,
+        selected_reference_paths,
+    )
+
+    project_dir = tmp_path / "project"
+    frame = project_dir / "frames" / "ep001" / "beat_51.png"
+    voice = project_dir / "assets" / "characters" / "顾清商" / "voices" / "voice_default.mp3"
+    _write_png(frame)
+    voice.parent.mkdir(parents=True)
+    voice.write_bytes(b"voice")
+    character = NovelCharacter(
+        name="顾清商",
+        reference_audio_path="assets/characters/顾清商/voices/voice_default.mp3",
+    )
+    character.identities = [
+        CharacterIdentity(
+            identity_id="顾清商_青年时期",
+            character_name="顾清商",
+            identity_name="青年时期",
+        )
+    ]
+
+    assets = build_seedance2_project_assets(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=1,
+        beat={
+            "beat_number": 51,
+            "audio_type": "dialogue",
+            "speaker": "顾清商_青年时期",
+            "detected_identities": ["顾清商_青年时期"],
+            "narration": (
+                "张诚那点股份，连话语权都够不上，他打听就让他打听。"
+                "你只回他一句：星辰的实控人没变。让他自己决定。"
+            ),
+        },
+        mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+        characters=[character],
+    )
+
+    audio_assets = [asset for asset in assets if asset.media_type == "audio"]
+    assert [asset.key for asset in audio_assets] == ["voice:顾清商_青年时期"]
+    assert audio_assets[0].exists is True
+    assert audio_assets[0].label == "顾清商 · 青年时期声线"
+    assert selected_reference_paths(assets, "reference_audios") == [str(voice)]
+
+
 async def test_prepare_dialogue_beat_with_prose_colon_keeps_the_voice_reference(tmp_path):
     """端到端回归：冒号误判 + 提示词漏写编号，两处叠加会卡在发请求之前。
 
@@ -437,6 +495,73 @@ async def test_prepare_dialogue_beat_with_prose_colon_keeps_the_voice_reference(
     assert "@音频1" in prepared.prompt
     assert "【声音参考】" in prepared.prompt
     assert "班长 · 中年时期声线" in prepared.prompt
+
+
+async def test_prepare_dialogue_beat_with_inline_colon_keeps_the_speaker_voice(tmp_path):
+    """端到端回归：句内冒号从句 + 提示词漏写编号，两处叠加会卡在发请求之前。
+
+    现场问题：``t1`` ep1 beat 51 —— 幽灵说话人把声线换成不存在的文件、漏写编号
+    又把声线丢掉，``prepare`` 直接抛「缺少参考声线」，上游一个请求都没收到。
+    """
+
+    import json
+
+    from novelvideo.seedance2_i2v.pipeline import prepare_seedance2_generation_inputs
+
+    project_dir = tmp_path / "project"
+    _write_png(project_dir / "frames" / "ep001" / "beat_51.png")
+    voice = project_dir / "assets" / "characters" / "顾清商" / "voices" / "voice_default.mp3"
+    voice.parent.mkdir(parents=True)
+    voice.write_bytes(b"voice")
+    character = NovelCharacter(
+        name="顾清商",
+        reference_audio_path="assets/characters/顾清商/voices/voice_default.mp3",
+    )
+    character.identities = [
+        CharacterIdentity(
+            identity_id="顾清商_青年时期",
+            character_name="顾清商",
+            identity_name="青年时期",
+        )
+    ]
+    narration = (
+        "张诚那点股份，连话语权都够不上，他打听就让他打听。"
+        "你只回他一句：星辰的实控人没变。让他自己决定。"
+    )
+
+    prepared = await prepare_seedance2_generation_inputs(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=1,
+        beat={
+            "beat_number": 51,
+            "audio_type": "dialogue",
+            "speaker": "顾清商_青年时期",
+            "detected_identities": ["顾清商_青年时期"],
+            "narration": narration,
+            # 提示词故意不写「音频1」：这就是线上那条提示词。
+            "seedance2_config_json": json.dumps(
+                {
+                    "mode": "multimodal_reference",
+                    "final_prompt": f"严格首帧生成，人物以图片1为准。原文全文，逐字念出：{narration}",
+                    "generate_audio": True,
+                },
+                ensure_ascii=False,
+            ),
+        },
+        video_mode="first_frame",
+        prompt="",
+        duration=5.0,
+        resolution="720p",
+        ratio="9:16",
+        characters=[character],
+    )
+
+    config = json.loads(prepared.seedance2_config_json)
+    assert config["reference_audio_paths"] == [str(voice)]
+    assert [ref.role for ref in prepared.references if ref.type == "audio"] == ["音频1"]
+    assert "@音频1" in prepared.prompt
+    assert "顾清商 · 青年时期声线" in prepared.prompt
 
 
 def test_multimodal_dialogue_assets_follow_multi_speaker_text_order(tmp_path):

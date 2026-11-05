@@ -26,6 +26,30 @@ export type DirectorAutoGate = "character_images" | "identity_images" | "cost_es
 export type DirectorVoicePolicy = "system" | "custom";
 
 /**
+ * 结构化的暂停分类（后端 ``DirectorAutoRun.pause_kind``）。客户端据此决定展示与
+ * 动作，不再靠 ``last_error`` 子串匹配猜。
+ *
+ * - ``gate`` / ``voice_setup``：等客户在闸门卡片上做决定；
+ * - ``blocked``：派发空转，进展缓慢，交给客户判断；
+ * - ``needs_config``：项目配置缺失，应引导去补配置；
+ * - ``fatal``：计费/权限/取消这类重试也没用的失败；
+ * - ``retryable``：可重试的硬暂停，服务端会兜底续跑；
+ * - ``needs_human``：自动恢复已用尽，停下等人工；
+ * - ``confirm``：``awaiting_confirmation``（Agent 提议改动 / 卡住等用户点头）；
+ * - ``stopped``：用户主动切到手动。
+ */
+export type DirectorPauseKind =
+  | "gate"
+  | "voice_setup"
+  | "blocked"
+  | "needs_config"
+  | "fatal"
+  | "retryable"
+  | "needs_human"
+  | "confirm"
+  | "stopped";
+
+/**
  * 一个「做不出来、已本地降级跳过」的镜头。
  *
  * 审核反复不过 / 重试耗尽时，服务端不再停整条 run，而是用本地素材降级该镜并继续
@@ -47,6 +71,7 @@ export interface DirectorAutoRunPayload {
   episode: number | null;
   run_id: string | null;
   activated_at?: string | null;
+  updated_at?: string | null;
   voice_policy?: DirectorVoicePolicy | null;
   scope?: "episode" | "project";
   driver?: "agent" | "deterministic" | null;
@@ -56,6 +81,10 @@ export interface DirectorAutoRunPayload {
   gate?: DirectorAutoGate | null;
   /** 做不出来、已本地降级跳过的镜头（工作台据此报错与逐镜标记）。 */
   blocked_shots?: DirectorBlockedShot[] | null;
+  /** 结构化暂停分类（见 {@link DirectorPauseKind}）。 */
+  pause_kind?: DirectorPauseKind | null;
+  /** 服务端自动干预（兜底续跑 + 卡死重拉）尚未换来真正进展的次数。 */
+  recovery_attempts?: number | null;
 }
 
 /** 一键成片要预置的项目配置：用户在工作室里不需要回答这些问题。 */
@@ -71,7 +100,11 @@ export interface StudioRunConfig {
 
 export function useDirectorAutoRun(
   project: string,
-  options: { enabled?: boolean; refetchIntervalMs?: number } = {},
+  options: {
+    enabled?: boolean;
+    refetchIntervalMs?: number;
+    pausedRefetchIntervalMs?: number;
+  } = {},
 ) {
   return useQuery({
     queryKey: queryKeys.directorAutoRun(project),
@@ -80,11 +113,16 @@ export function useDirectorAutoRun(
         .get(p`api/v1/projects/${project}/chat/director-auto`, { signal })
         .json<OkResponse<DirectorAutoRunPayload>>(),
     enabled: !!project && (options.enabled ?? true),
-    // 运行中的 run 需要跟着它走；停下来的 run 不该继续打接口。
+    // 运行中 / 等确认的 run 要跟着它走；暂停的 run 用更慢的节奏轮询——别的设备
+    // 或服务端的兜底（身份图 600s、硬暂停 120s）改了状态，这个标签页也得能跟上，
+    // 否则它会一直停在旧卡片上，看起来像「假死」。
     refetchInterval: (query) => {
       const status = query.state.data?.data?.status;
       if (status === "running" || status === "awaiting_confirmation") {
         return options.refetchIntervalMs ?? 3000;
+      }
+      if (status === "paused") {
+        return options.pausedRefetchIntervalMs ?? 10000;
       }
       return false;
     },
@@ -146,16 +184,67 @@ export function useConfirmDirectorGate(project: string) {
   });
 }
 
-/** 硬暂停（非闸门）后继续：带上声线策略，避免再次卡在同一步。 */
+/** 硬暂停（非闸门）后继续：可带声线策略，避免再次卡在同一步。
+ *
+ * ``auto=true`` 供工作台的无人值守控制器使用：服务端据此**不**清零自动恢复预算
+ * （撞满上限转 ``needs_human``）；人工点击走默认 ``false``，预算清零。
+ */
 export function useContinueDirectorAutoRun(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (params: { voicePolicy?: DirectorVoicePolicy } = {}) => {
+    mutationFn: async (
+      params: { voicePolicy?: DirectorVoicePolicy; auto?: boolean } = {},
+    ) => {
+      const body: Record<string, unknown> = {};
+      if (params.voicePolicy) body.voice_policy = params.voicePolicy;
+      if (params.auto) body.auto = true;
       const response = await jsonWithBackendError<
         OkResponse<DirectorAutoRunPayload> | ErrorResponse
       >(
         api.post(p`api/v1/projects/${project}/chat/director-auto/continue`, {
-          json: params.voicePolicy ? { voice_policy: params.voicePolicy } : {},
+          json: body,
+          throwHttpErrors: false,
+        }),
+      );
+      if (!response.ok) throw new Error(response.error);
+      return response;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.directorAutoRun(project) });
+    },
+  });
+}
+
+/**
+ * 一键成片的「继续」：按 run 当前状态自动选对端点。
+ *
+ * - ``paused`` → ``/continue``（后端 ``resume_paused``）；
+ * - ``awaiting_confirmation`` → ``/resume``（后端 ``resume_suspended``）。
+ *
+ * 以前工作台横幅的「继续制作」只打 ``/continue``，停在 ``awaiting_confirmation`` 时
+ * 必然 409，客户点一次报一次错——这才是真正的「卡住」。工作台与内部端共用这一个
+ * hook，避免两端再分叉。
+ */
+export function useResumeDirectorAutoRun(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: {
+      status: DirectorAutoStatus;
+      voicePolicy?: DirectorVoicePolicy;
+      auto?: boolean;
+    }) => {
+      const awaiting = params.status === "awaiting_confirmation";
+      const endpoint = awaiting ? "resume" : "continue";
+      const body: Record<string, unknown> = {};
+      if (!awaiting) {
+        if (params.voicePolicy) body.voice_policy = params.voicePolicy;
+        if (params.auto) body.auto = true;
+      }
+      const response = await jsonWithBackendError<
+        OkResponse<DirectorAutoRunPayload> | ErrorResponse
+      >(
+        api.post(p`api/v1/projects/${project}/chat/director-auto/${endpoint}`, {
+          json: body,
           throwHttpErrors: false,
         }),
       );

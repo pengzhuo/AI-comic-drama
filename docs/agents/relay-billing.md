@@ -9,8 +9,9 @@
 `dramaclaw-newapi-1` 是我们自己的 NewAPI 中继，它的 `options.ModelRatio` 里没有
 `DC-*-LLM` / `seedance-2.0-fast` / `LingShan-G2` 这些别名，于是落到默认倍率
 （`37.5`）计费，算出来的 `quota` 比上游实收高 **35～212 倍**。真实收费方是
-`aicf.nanie168.com`（LLM/图像/视频，channel 1）与 `aigc.nanie168.com`（音频，
-channel 7），同一账号可登录两站，账单要两边合并。
+`aicf.nanie168.com`（LLM/图像，channel 1）、`aigc.nanie168.com`（音频，channel 7）
+与 `aiqy.nanie168.com`（视频，channel 8 `DC-doubao_video`）。三站共用同一账号
+（`hiaihub`）与令牌池，账单要三边合并。
 
 ## 单号桥接（本地单号 → 上游单号）
 

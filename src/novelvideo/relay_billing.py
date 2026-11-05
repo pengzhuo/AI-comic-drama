@@ -42,6 +42,7 @@ MAX_PAGES = 5000
 DEFAULT_RELAY_BASE_URLS = (
     "https://aicf.nanie168.com",
     "https://aigc.nanie168.com",
+    "https://aiqy.nanie168.com",
 )
 
 #: 账单账号热更文件（``/data/relay-billing.json``）：容器里没有环境变量时，

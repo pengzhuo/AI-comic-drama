@@ -2485,6 +2485,8 @@ export function useSuperChat({
             stallBeatNum: frame.stall_beat_num,
             stallScope: frame.stall_scope,
             diagnostics: frame.diagnostics,
+            pauseKind: frame.pause_kind,
+            recoveryAttempts: frame.recovery_attempts,
           },
         }));
         break;

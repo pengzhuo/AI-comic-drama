@@ -660,7 +660,7 @@ QUOTA_PER_USD = _env_float("NOVELVIDEO_QUOTA_PER_USD", 500000.0)
 # 因此费用以真正收钱的上游账单为准。凭据只用于 CLI 运行，不落库、不进 git。
 RELAY_BILLING_BASE_URLS = os.environ.get(
     "NOVELVIDEO_RELAY_BILLING_BASE_URLS",
-    "https://aicf.nanie168.com,https://aigc.nanie168.com",
+    "https://aicf.nanie168.com,https://aigc.nanie168.com,https://aiqy.nanie168.com",
 )
 RELAY_BILLING_USERNAME = os.environ.get("NOVELVIDEO_RELAY_BILLING_USERNAME", "")
 RELAY_BILLING_PASSWORD = os.environ.get("NOVELVIDEO_RELAY_BILLING_PASSWORD", "")

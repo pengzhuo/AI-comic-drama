@@ -11,7 +11,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -101,8 +101,73 @@ LEASE_SECONDS = 120.0
 HEARTBEAT_SECONDS = 10.0
 #: 连续多少次续租失败才判定租约真丢了（每次间隔 ``HEARTBEAT_SECONDS``）。
 LEASE_RENEW_ATTEMPTS = 4
+#: 认领租约的自旋上限（每次间隔 ``HEARTBEAT_SECONDS``，默认约 10 分钟）。只有在
+#: 「另一个 owner 还握着有效租约」时才会一直转；设上限免得一个卡住的 owner 把
+#: worker 永久挂在自旋里。
+MAX_LEASE_CLAIM_ATTEMPTS = 60
 #: 巡检间隔：发现「``status=running`` 但没有 worker 持有租约」就重新拉起。
 REAPER_SECONDS = 30.0
+#: 「身份图指定」闸门的服务端兜底宽限：这一档的语义是「不指定就由 AI 生成」，
+#: 本来就没有必须人做主的决定。工作台开着时前端到点自己确认；浏览器不在时由
+#: 巡检兜底，暂停超过这个时长就替客户把答案写下并继续，绝不把项目永久挂在
+#: 「等一次人工点击」上（现场 ``系统标准格式版`` 就这么挂了 24 小时）。
+IDENTITY_GATE_GRACE_SECONDS = 600.0
+#: 硬暂停（非闸门）的服务端兜底宽限：工作台是「自动驾驶但方向盘在浏览器里」，
+#: 浏览器一关，任何 ``paused`` 就永久停。巡检在这个宽限后替它续跑一次；只碰
+#: :data:`PAUSE_KIND_RETRYABLE` 的暂停（闸门/阻塞/配置缺失/致命一律不碰）。
+HARD_PAUSE_GRACE_SECONDS = 120.0
+#: 服务端自动干预（兜底续跑 + 卡死重拉）的次数上限。只有 run **真正往前**
+#: （换了一个 stage）或人工点击才清零，避免「暂停↔续跑」空转。
+MAX_RECOVERY_ATTEMPTS = 5
+#: ``status=running`` 但「真的没有进展」多久就判定卡死并重拉 worker（秒）。
+#: 有相关任务在飞不算卡死（长渲染可以几十分钟没有 stage 变化）。
+STALL_PROGRESS_SECONDS = 900.0
+
+#: 暂停分类（``DirectorAutoRun.pause_kind``）。前端 / 内部端据此决定展示与动作，
+#: 不再靠 ``last_error`` 子串匹配猜。
+PAUSE_KIND_GATE = "gate"
+PAUSE_KIND_VOICE = "voice_setup"
+PAUSE_KIND_BLOCKED = "blocked"
+PAUSE_KIND_NEEDS_CONFIG = "needs_config"
+PAUSE_KIND_FATAL = "fatal"
+PAUSE_KIND_RETRYABLE = "retryable"
+PAUSE_KIND_NEEDS_HUMAN = "needs_human"
+PAUSE_KIND_CONFIRM = "confirm"
+#: 用户主动切换为手动 / 终止自动。绝不能被服务端兜底续跑唤醒。
+PAUSE_KIND_STOPPED = "stopped"
+#: 配置缺失暂停的稳定前缀（``_pause_gate`` 里那条）。
+NEEDS_CONFIG_PREFIX = "项目配置缺失"
+#: 阻塞型暂停的稳定标记：两种 reason 都含这个子串。
+BLOCKED_PAUSE_MARKER = "自动续跑未产生"
+
+
+def _pause_kind_for_reason(reason: str) -> str:
+    """把人类可读的暂停原因归类成稳定的 ``pause_kind``。
+
+    闸门/视图靠 ``last_error`` 的稳定标记（gate tag、配置缺失前缀、阻塞标记）
+    识别，致命失败由调用方显式传 ``kind``（它的文字没有稳定前缀）。
+    """
+
+    text = str(reason or "")
+    if (
+        CHARACTER_IMAGES_GATE_TAG in text
+        or IDENTITY_IMAGES_GATE_TAG in text
+        or COST_ESTIMATE_GATE_TAG in text
+    ):
+        return PAUSE_KIND_GATE
+    if text.strip() == VOICE_POLICY_REQUIRED_ERROR:
+        return PAUSE_KIND_VOICE
+    if text.startswith(NEEDS_CONFIG_PREFIX):
+        return PAUSE_KIND_NEEDS_CONFIG
+    if BLOCKED_PAUSE_MARKER in text:
+        return PAUSE_KIND_BLOCKED
+    if text.startswith("项目权限校验失败"):
+        return PAUSE_KIND_FATAL
+    if "手动模式" in text or "终止" in text:
+        return PAUSE_KIND_STOPPED
+    return PAUSE_KIND_RETRYABLE
+
+
 _MISSING_CHARACTER_PORTRAIT_RE = re.compile(
     r"请先为角色[「“\"](?P<character>.+?)[」”\"]生成\s*Portrait（面部特写）"
 )
@@ -147,6 +212,8 @@ COST_ESTIMATE_REQUIRED_ERROR = (
 COST_ESTIMATE_RESUME_BLOCKED_ERROR = (
     "本集制作成本尚未确认：请先在客户工作台点「确认报价，继续制作」（会预扣伴点）后再继续"
 )
+#: 自动兜底续跑撞到上限：run 已被设为 ``needs_human``，等人工判断（别再自动重试）。
+AUTO_RECOVERY_EXHAUSTED_ERROR = "自动恢复次数已用尽，请人工检查后继续"
 #: Meta/bridge tools the agent uses to inspect its tool surface instead of
 #: operating on the project. Introspection must never count as a write: the
 #: bridge echoes the *described* tool name, so a turn that only described a
@@ -258,6 +325,10 @@ def _is_fatal_failure(task: TaskState) -> str | None:
 
 #: 审核补救允许 composer 花多久（秒）。composer 自带重试，这里只兜住「卡死不返回」。
 MODERATION_REPAIR_TIMEOUT_SECONDS = 300.0
+#: 一次 agent 续跑最多允许多久（秒）。后端自带 300s idle / 1800s total，这里再兜一层
+#: 显式总超时：一旦超时就当「可重试失败」暂停，交给服务端兜底续跑/人工，绝不让一次
+#: 挂死的 turn 把 run 永久留在 ``running``（心跳还在续租，reaper 看不出来）。
+AGENT_CONTINUE_TIMEOUT_SECONDS = 1800.0
 
 
 def _task_moderation_text(task: TaskState) -> str:
@@ -569,6 +640,12 @@ class DirectorAutoRun:
     #: finish instead of stalling on one shot; the client surfaces them as a
     #: loud, per-shot error the user can act on (fix the prompt and redo).
     blocked_shots: tuple[dict[str, Any], ...] = ()
+    #: 结构化暂停分类（见 :data:`PAUSE_KIND_GATE` 等）。客户端据此决定展示与动作，
+    #: 不再靠 ``last_error`` 子串匹配；``""`` 表示当前没有暂停。
+    pause_kind: str = ""
+    #: 服务端自动干预（兜底续跑 + 卡死重拉）尚未换来真正进展的次数。只有换了一个
+    #: stage（真正往前）或人工点击才清零，见 :data:`MAX_RECOVERY_ATTEMPTS`。
+    recovery_attempts: int = 0
 
     @property
     def context(self) -> ProjectContext:
@@ -616,6 +693,8 @@ class DirectorAutoStore:
               stage_attempts INTEGER NOT NULL DEFAULT 0,
               next_attempt_at REAL NOT NULL DEFAULT 0,
               blocked_shots_json TEXT NOT NULL DEFAULT '[]',
+              pause_kind TEXT NOT NULL DEFAULT '',
+              recovery_attempts INTEGER NOT NULL DEFAULT 0,
               owner_token TEXT NOT NULL DEFAULT '',
               lease_expires_at REAL NOT NULL DEFAULT 0,
               UNIQUE(username, project_id)
@@ -686,6 +765,16 @@ class DirectorAutoStore:
                 "ALTER TABLE director_auto_runs "
                 "ADD COLUMN blocked_shots_json TEXT NOT NULL DEFAULT '[]'"
             )
+        if "pause_kind" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN pause_kind TEXT NOT NULL DEFAULT ''"
+            )
+        if "recovery_attempts" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0"
+            )
         conn.commit()
         return conn
 
@@ -715,6 +804,8 @@ class DirectorAutoStore:
             stage_attempts=int(row["stage_attempts"] or 0),
             next_attempt_at=float(row["next_attempt_at"] or 0.0),
             blocked_shots=tuple(json.loads(row["blocked_shots_json"] or "[]")),
+            pause_kind=str(row["pause_kind"] or ""),
+            recovery_attempts=int(row["recovery_attempts"] or 0),
         )
 
     def upsert(self, run: DirectorAutoRun) -> None:
@@ -726,8 +817,9 @@ class DirectorAutoStore:
                   updated_at, context_json, baseline_task_ids_json,
                   handled_task_ids_json, recovery_keys_json, voice_policy, last_error,
                   scope, target_episodes, config_json, driver,
-                  stage_key, stage_attempts, next_attempt_at, blocked_shots_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  stage_key, stage_attempts, next_attempt_at, blocked_shots_json,
+                  pause_kind, recovery_attempts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username, project_id) DO UPDATE SET
                   run_id=excluded.run_id,
                   episode=excluded.episode,
@@ -748,6 +840,8 @@ class DirectorAutoStore:
                   stage_attempts=excluded.stage_attempts,
                   next_attempt_at=excluded.next_attempt_at,
                   blocked_shots_json=excluded.blocked_shots_json,
+                  pause_kind=excluded.pause_kind,
+                  recovery_attempts=excluded.recovery_attempts,
                   owner_token=CASE
                     WHEN director_auto_runs.run_id != excluded.run_id THEN ''
                     ELSE director_auto_runs.owner_token
@@ -779,6 +873,8 @@ class DirectorAutoStore:
                     int(run.stage_attempts or 0),
                     float(run.next_attempt_at or 0.0),
                     json.dumps(list(run.blocked_shots)),
+                    run.pause_kind or "",
+                    int(run.recovery_attempts or 0),
                 ),
             )
 
@@ -827,6 +923,51 @@ class DirectorAutoStore:
                 (float(now),),
             ).fetchall()
         return [run for row in rows if (run := self._row(row)) is not None]
+
+    def paused_identity_gate_before(self, cutoff: str) -> list[DirectorAutoRun]:
+        """暂停在「身份图指定」闸门、且已经等超过 ``cutoff`` 的 run。
+
+        停下来的 run 不再被 worker 推进，所以 ``updated_at`` 就是它写进暂停原因
+        的那一刻；此后没人碰过就一直是它，正好当「停在这个闸门上多久了」的计时钟。
+        ``last_error`` 里带 ``[identity_images]`` 是闸门的稳定标记（见
+        :data:`IDENTITY_IMAGES_GATE_TAG`），与前端识别闸门用的是同一份约定。
+        """
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM director_auto_runs "
+                "WHERE status='paused' AND last_error LIKE ? AND updated_at<=?",
+                (f"{IDENTITY_IMAGES_GATE_TAG}%", str(cutoff)),
+            ).fetchall()
+        return [run for row in rows if (run := self._row(row)) is not None]
+
+    def paused_kind_before(self, kind: str, cutoff: str) -> list[DirectorAutoRun]:
+        """暂停在指定 ``pause_kind``、且已超过 ``cutoff`` 的 run。
+
+        用于服务端兜底续跑：只选 ``retryable``（闸门 / 阻塞 / 配置缺失 / 致命由
+        各自的人工入口处理）。``updated_at`` 就是它写进暂停原因的那一刻，正好当
+        「停在这里多久了」的计时钟。
+        """
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM director_auto_runs "
+                "WHERE status='paused' AND pause_kind=? AND updated_at<=?",
+                (str(kind), str(cutoff)),
+            ).fetchall()
+        return [run for row in rows if (run := self._row(row)) is not None]
+
+    def running_all(self, before: str) -> list[DirectorAutoRun]:
+        """``status=running`` 且 ``updated_at`` 早于 ``before`` 的 run（卡死检测）。"""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM director_auto_runs "
+                "WHERE status='running' AND updated_at<=?",
+                (str(before),),
+            ).fetchall()
+        return [run for row in rows if (run := self._row(row)) is not None]
+
 
     def claim_lease(
         self,
@@ -912,7 +1053,7 @@ class DirectorAutoStore:
                     recovery_keys_json=?, voice_policy=?, last_error=?,
                     scope=?, target_episodes=?, config_json=?, driver=?,
                     stage_key=?, stage_attempts=?, next_attempt_at=?,
-                    blocked_shots_json=?
+                    blocked_shots_json=?, pause_kind=?, recovery_attempts=?
                 WHERE run_id=? AND status='running' AND owner_token=?
                   AND lease_expires_at>?
                 """,
@@ -935,6 +1076,8 @@ class DirectorAutoStore:
                     int(run.stage_attempts or 0),
                     float(run.next_attempt_at or 0.0),
                     json.dumps(list(run.blocked_shots)),
+                    run.pause_kind or "",
+                    int(run.recovery_attempts or 0),
                     run.run_id,
                     owner_token,
                     current,
@@ -1138,6 +1281,9 @@ class DirectorAutoCoordinator:
             driver="deterministic" if driver == "deterministic" else "agent",
         )
         await asyncio.to_thread(self.store.upsert, run)
+        # 巡检（reaper + 崩溃兜底）必须跟 run 一起起来。以前只有 ``resume`` 会拉起它，
+        # 一旦启动路径失败，整条 run 再没人为它兜底。
+        self._ensure_supervisor()
         self._ensure_worker(run)
         await self._broadcast_status(run)
         return run
@@ -1149,6 +1295,7 @@ class DirectorAutoCoordinator:
         project_id: str,
         reason: str = "",
         terminal_task_id: str | None = None,
+        kind: str = "",
     ) -> DirectorAutoRun | None:
         run = await asyncio.to_thread(self.store.get, username, project_id)
         if run is None:
@@ -1159,6 +1306,7 @@ class DirectorAutoCoordinator:
                 "status": "paused",
                 "updated_at": _utc_now(),
                 "last_error": reason,
+                "pause_kind": kind or _pause_kind_for_reason(reason),
             }
         )
         await asyncio.to_thread(self.store.upsert, updated)
@@ -1191,6 +1339,7 @@ class DirectorAutoCoordinator:
                 "status": "awaiting_confirmation",
                 "updated_at": _utc_now(),
                 "last_error": reason,
+                "pause_kind": PAUSE_KIND_CONFIRM,
             }
         )
         await asyncio.to_thread(self.store.upsert, updated)
@@ -1223,6 +1372,8 @@ class DirectorAutoCoordinator:
                 "status": "running",
                 "updated_at": _utc_now(),
                 "last_error": "",
+                "pause_kind": "",
+                "recovery_attempts": 0,
                 # A user decision is a fresh start: do not hold the attempts
                 # spent before the pause against the next failure.
                 "stage_key": "",
@@ -1265,6 +1416,7 @@ class DirectorAutoCoordinator:
         username: str,
         project_id: str,
         voice_policy: str | None = None,
+        auto: bool = False,
     ) -> DirectorAutoRun | None:
         """Continue a hard-paused run (unmet prerequisite or retryable failure).
 
@@ -1290,6 +1442,11 @@ class DirectorAutoCoordinator:
             raise ValueError("只有已暂停的本集自动任务可以继续")
         if self._cost_gate_blocks_resume(run):
             raise ValueError(COST_ESTIMATE_RESUME_BLOCKED_ERROR)
+        # 自动兜底续跑自带预算：撞满上限就让巡检把它标成 needs_human，人工来定。
+        # 人工点击（auto=False）永远放行，并把预算清零（人已经介入）。
+        recovery_attempts = int(run.recovery_attempts or 0)
+        if auto and recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
+            raise ValueError(AUTO_RECOVERY_EXHAUSTED_ERROR)
         normalized_policy = (
             voice_policy if voice_policy in {"system", "custom"} else run.voice_policy
         )
@@ -1299,6 +1456,8 @@ class DirectorAutoCoordinator:
                 "status": "running",
                 "updated_at": _utc_now(),
                 "last_error": "",
+                "pause_kind": "",
+                "recovery_attempts": recovery_attempts + 1 if auto else 0,
                 "voice_policy": normalized_policy,
                 # A user decision is a fresh start: do not hold the attempts
                 # spent before the pause against the next failure. The
@@ -1306,8 +1465,13 @@ class DirectorAutoCoordinator:
                 # deterministic fast path still sees the paused stage as already
                 # attempted and refuses to re-enqueue it, silently degrading
                 # every "继续" into the slow agent fallback.
+                #
+                # ``stage_key`` is deliberately kept: it is the marker the loop
+                # uses to tell "advanced to another stage" (progress, so the
+                # recovery budget resets) from "the same stage failed again"
+                # (no progress). Clearing it here would make every resume look
+                # like progress and defeat MAX_RECOVERY_ATTEMPTS.
                 "recovery_keys": self._clear_stage_signatures(run),
-                "stage_key": "",
                 "stage_attempts": 0,
                 "next_attempt_at": 0.0,
             }
@@ -1490,7 +1654,184 @@ class DirectorAutoCoordinator:
                 await self._reap_stalled_runs()
             except Exception:  # noqa: BLE001 - 巡检自己绝不能死
                 logger.exception("director auto supervision pass failed")
+            try:
+                await self._reap_unprogressing_runs()
+            except Exception:  # noqa: BLE001 - 巡检自己绝不能死
+                logger.exception("director auto progress pass failed")
+            try:
+                await self._auto_answer_stale_identity_gates()
+            except Exception:  # noqa: BLE001 - 巡检自己绝不能死
+                logger.exception("director auto identity gate pass failed")
+            try:
+                await self._auto_resume_stale_hard_pauses()
+            except Exception:  # noqa: BLE001 - 巡检自己绝不能死
+                logger.exception("director auto recovery pass failed")
             await asyncio.sleep(REAPER_SECONDS)
+
+    async def _auto_resume_stale_hard_pauses(self) -> None:
+        """服务端兜底续跑：浏览器关掉后，可重试的硬暂停也不能永久停。
+
+        工作台的自动续跑活在浏览器里；客户一关标签页，任何 ``paused`` 就再没人
+        唤醒。这里只挑 :data:`PAUSE_KIND_RETRYABLE`（``stage`` 级重试已用尽的
+        失败），在宽限期后替它续跑一次，并且**带持久化预算**：只有 run 真正换到
+        下一个 stage（``recovery_attempts`` 在那边清零）或人工介入，预算才回满。
+        闸门 / 阻塞型 / 配置缺失 / 致命失败各有自己的入口，绝不在这里放行。
+        """
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=HARD_PAUSE_GRACE_SECONDS)
+        ).isoformat()
+        stale = await asyncio.to_thread(
+            self.store.paused_kind_before, PAUSE_KIND_RETRYABLE, cutoff
+        )
+        for run in stale:
+            if int(run.recovery_attempts or 0) >= MAX_RECOVERY_ATTEMPTS:
+                await self._mark_needs_human(run)
+                continue
+            try:
+                await self.resume_paused(
+                    username=run.username,
+                    project_id=run.project_id,
+                    auto=True,
+                )
+            except ValueError:
+                # 预算刚好用尽 / 已被别的路径处理：交给 needs_human 兜底。
+                await self._mark_needs_human(run)
+                continue
+            except Exception:  # noqa: BLE001 - 兜底失败不能拖垮巡检
+                logger.exception(
+                    "director auto hard-pause auto-resume failed: project_id=%s",
+                    run.project_id,
+                )
+                continue
+            logger.info(
+                "director auto auto-resumed stale hard pause project_id=%s run_id=%s",
+                run.project_id,
+                run.run_id,
+            )
+
+    async def _mark_needs_human(self, run: DirectorAutoRun) -> None:
+        """自动恢复已用尽：把 run 标成 ``needs_human``，停下等人工判断。"""
+
+        if str(run.pause_kind or "") == PAUSE_KIND_NEEDS_HUMAN:
+            return
+        updated = DirectorAutoRun(
+            **{
+                **asdict(run),
+                "updated_at": _utc_now(),
+                "pause_kind": PAUSE_KIND_NEEDS_HUMAN,
+            }
+        )
+        await asyncio.to_thread(self.store.upsert, updated)
+        await self._broadcast_status(updated)
+
+    async def _reap_unprogressing_runs(self) -> None:
+        """``status=running`` 但「真的没有进展」太久 → 重拉 worker（有界）。
+
+        与 :meth:`_reap_stalled_runs` 的差别：后者只管「租约掉了」（worker 死了），
+        这里管「租约还在、心跳还在续，但事件循环/agent turn 卡住，没有任何 stage
+        推进」。判据是 ``updated_at`` 太久没动 **且** 项目当前没有相关任务在飞
+        （长渲染可以几十分钟没有 stage 变化，那不算卡死）。
+        """
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=STALL_PROGRESS_SECONDS)
+        ).isoformat()
+        stale = await asyncio.to_thread(self.store.running_all, cutoff)
+        for run in stale:
+            worker = self._workers.get(run.run_id)
+            if worker is None or worker.done():
+                # 没有本地活着的 worker：要么 run 归别的进程（绝不能抢它的租约），
+                # 要么根本没有 worker —— 后者交给 _reap_stalled_runs 处理。
+                continue
+            if await self._has_active_task(run):
+                continue
+            if int(run.recovery_attempts or 0) >= MAX_RECOVERY_ATTEMPTS:
+                await self.pause(
+                    username=run.username,
+                    project_id=run.project_id,
+                    reason="制作长时间没有进展，自动重拉已用尽，请人工检查后继续",
+                    kind=PAUSE_KIND_NEEDS_HUMAN,
+                )
+                continue
+            logger.warning(
+                "director auto re-arming unprogressing run project_id=%s run_id=%s stage=%s",
+                run.project_id,
+                run.run_id,
+                run.stage_key,
+            )
+            bumped = DirectorAutoRun(
+                **{
+                    **asdict(run),
+                    "updated_at": _utc_now(),
+                    "recovery_attempts": int(run.recovery_attempts or 0) + 1,
+                }
+            )
+            await asyncio.to_thread(self.store.upsert, bumped)
+            worker.cancel()
+            await asyncio.to_thread(self.store.force_release_lease, run.run_id)
+            self._workers.pop(run.run_id, None)
+            self._ensure_worker(bumped)
+
+    async def _has_active_task(self, run: DirectorAutoRun) -> bool:
+        """项目当前是否有相关任务在跑（有就不算卡死：那是正常的在飞工作）。"""
+
+        try:
+            tasks = await asyncio.to_thread(
+                get_task_manager().list_tasks_for_project, run.context
+            )
+        except Exception:  # noqa: BLE001 - 读不到就当没有，交由 reaper 兜底
+            return False
+        return any(
+            task.status in ACTIVE_STATUSES for task in _relevant_tasks(run, tasks)
+        )
+
+    async def _auto_answer_stale_identity_gates(self) -> None:
+        """身份图闸门的服务端兜底：没人看着的时候也不会永久卡住。
+
+        这一档的语义就是「不指定就由 AI 生成」，没有必须人做主的决定；工作台开着
+        时前端会给一段宽限期再自动确认，这里负责「浏览器不在」的情况。真正需要
+        客户点头的 ``character_images``（首次角色肖像）与 ``cost_estimate``（付费
+        报价）不在这里放行。
+        """
+
+        from novelvideo.project_config import confirm_identity_images
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=IDENTITY_GATE_GRACE_SECONDS)
+        ).isoformat()
+        stale = await asyncio.to_thread(self.store.paused_identity_gate_before, cutoff)
+        for run in stale:
+            episode = int(run.episode or 0)
+            if episode <= 0:
+                # 认不出集号就 fail-closed：闸门本来就没有可写的答案。
+                continue
+            try:
+                await asyncio.to_thread(
+                    confirm_identity_images,
+                    run.username,
+                    run.context.project_name,
+                    episode,
+                )
+                await self.resume_paused(
+                    username=run.username, project_id=run.project_id
+                )
+            except ValueError:
+                # 已被前端或别的路径确认并恢复：好事，不该记成错误。
+                continue
+            except Exception:  # noqa: BLE001 - 兜底失败不能拖垮巡检
+                logger.exception(
+                    "director auto identity gate auto-confirm failed: project_id=%s",
+                    run.project_id,
+                )
+                continue
+            logger.info(
+                "director auto auto-confirmed stale identity gate "
+                "project_id=%s run_id=%s episode=%s",
+                run.project_id,
+                run.run_id,
+                episode,
+            )
 
     async def _reap_stalled_runs(self) -> None:
         """把「worker 悄悄没了」的 run 重新拉起来。
@@ -1515,7 +1856,9 @@ class DirectorAutoCoordinator:
             self._ensure_worker(run)
 
     async def _run_with_lease(self, run_id: str, username: str, project_id: str) -> None:
-        while not self._stopping:
+        for _ in range(MAX_LEASE_CLAIM_ATTEMPTS):
+            if self._stopping:
+                return
             claimed = await asyncio.to_thread(
                 self.store.claim_lease,
                 run_id,
@@ -1528,6 +1871,11 @@ class DirectorAutoCoordinator:
                 return
             await asyncio.sleep(HEARTBEAT_SECONDS)
         else:
+            logger.warning(
+                "director auto gave up claiming lease run_id=%s after %s attempts",
+                run_id,
+                MAX_LEASE_CLAIM_ATTEMPTS,
+            )
             return
         parent = asyncio.current_task()
         heartbeat = asyncio.create_task(
@@ -1620,6 +1968,7 @@ class DirectorAutoCoordinator:
         project_id: str,
         reason: str = "",
         terminal_task_id: str | None = None,
+        kind: str = "",
     ) -> DirectorAutoRun | None:
         """Pause from a worker only if this coordinator still owns the run."""
 
@@ -1632,6 +1981,7 @@ class DirectorAutoCoordinator:
                 "status": "paused",
                 "updated_at": _utc_now(),
                 "last_error": reason,
+                "pause_kind": kind or _pause_kind_for_reason(reason),
             }
         )
         if not await self._update_owned(updated):
@@ -1655,6 +2005,7 @@ class DirectorAutoCoordinator:
         project_id: str,
         reason: str = "",
         terminal_task_id: str | None = None,
+        kind: str = "",
     ) -> DirectorAutoRun | None:
         """Pause a stalled run for a user decision, keeping it resumable.
 
@@ -1672,6 +2023,7 @@ class DirectorAutoCoordinator:
                 "status": "awaiting_confirmation",
                 "updated_at": _utc_now(),
                 "last_error": reason,
+                "pause_kind": kind or PAUSE_KIND_CONFIRM,
             }
         )
         if not await self._update_owned(updated):
@@ -1890,6 +2242,8 @@ class DirectorAutoCoordinator:
                 "message": run.last_error or None,
                 "terminal_task_id": terminal_task_id,
                 "voice_policy": run.voice_policy or None,
+                "pause_kind": run.pause_kind or None,
+                "recovery_attempts": int(run.recovery_attempts or 0),
             },
         )
 
@@ -2057,21 +2411,38 @@ class DirectorAutoCoordinator:
                 )
 
         try:
-            await chat_service.stream_assistant_reply(
-                run.username,
-                run.project_id,
-                prompt,
-                on_event,
-                project_dir=ctx.output_dir,
-                project_state_dir=ctx.state_dir,
-                surface="director",
-                turn_id=turn_id,
-                route_prompt="自动继续下一步",
+            await asyncio.wait_for(
+                chat_service.stream_assistant_reply(
+                    run.username,
+                    run.project_id,
+                    prompt,
+                    on_event,
+                    project_dir=ctx.output_dir,
+                    project_state_dir=ctx.state_dir,
+                    surface="director",
+                    turn_id=turn_id,
+                    route_prompt="自动继续下一步",
+                ),
+                timeout=AGENT_CONTINUE_TIMEOUT_SECONDS,
             )
             self._remember_continuation(
                 run.run_id, wrote=saw_write, note=last_tool_note
             )
             return saw_write
+        except TimeoutError:
+            logger.warning(
+                "director auto continuation timed out project=%s", run.project_id
+            )
+            await self._pause_owned(
+                run_id=run.run_id,
+                username=run.username,
+                project_id=run.project_id,
+                reason="捏导续跑超时，未在限定时间内返回",
+            )
+            await self._notify(
+                run, "本集自动已暂停：捏导续跑超时，稍后会自动重试或需要人工检查。"
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
             logger.exception("director auto continuation failed project=%s", run.project_id)
             await self._pause_owned(
@@ -2437,6 +2808,9 @@ class DirectorAutoCoordinator:
                         "stage_attempts": 0,
                         "next_attempt_at": 0.0,
                         "last_error": "",
+                        # 真的换到下一个 stage = 真正往前，服务端自动干预的预算回满，
+                        # 这样长片里偶发的多次瞬时失败不会被误判成空转。
+                        "recovery_attempts": 0,
                     }
                 updated = DirectorAutoRun(
                     **{
@@ -2669,6 +3043,7 @@ class DirectorAutoCoordinator:
                             project_id=project_id,
                             reason=_failure_reason_with_detail(failed, fatal),
                             terminal_task_id=failed.task_id,
+                            kind=PAUSE_KIND_FATAL,
                         )
                         await self._notify(
                             updated,

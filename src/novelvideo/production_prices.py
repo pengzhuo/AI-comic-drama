@@ -161,7 +161,7 @@ def _default_config() -> dict[str, Any]:
             "image_calls_per_beat": 1.0,
         },
         "aliases": {
-            "seedance-2.0-fast": "aicf:doubao-seedance-2.0-fast",
+            "seedance-2.0-fast": "aiqy:doubao-seedance-2.0-fast",
         },
         "rules": [],
         "actual_rules": [],

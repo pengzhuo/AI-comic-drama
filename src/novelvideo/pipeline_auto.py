@@ -29,7 +29,9 @@ fit the coordinator's task bookkeeping and is still driven by the agent.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,8 @@ from novelvideo.pipeline_status import (
 from novelvideo.task_backend.client import enqueue_project_task
 from novelvideo.task_state import get_task_manager
 from novelvideo.utils.path_resolver import compute_identity_path, compute_portrait_path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_EPISODE_TARGET = 10
 DEFAULT_COMPOSE_RESOLUTION = "720x1280"
@@ -753,6 +757,81 @@ async def _has_in_flight_task(ctx: Any, task_type: str) -> bool:
     return await asyncio.to_thread(_collect)
 
 
+#: 同一条 beat 在准备阶段（提示词/声线校验）被挡下多少次后暂时停止重试。
+#: 协调器约 1.5s 一轮，无上限重试会让一条坏 beat 把整集卡成「一直在制作中」——
+#: 线上实测 8 小时累计 ~2900 次拒绝、815 个 lane-full 失败任务、4350 次重开 SQLite，
+#: 用户端只看到「一直在生成」却永远不出片。给一个有限预算 + 冷却；提示词/台词被
+#: 改写（指纹变化）时立即重置，声线补传也最多等一个冷却周期就会自动恢复。
+PREP_REJECTION_RETRY_LIMIT = 5
+PREP_REJECTION_COOLDOWN_SECONDS = 1800.0
+
+#: ``(project_dir, episode, beat_num)`` ->
+#: ``(fingerprint, rejection_count, blocked_until_monotonic)``
+_PREP_REJECTION_STATE: dict[tuple[str, int, int], tuple[str, int, float]] = {}
+
+
+def _prep_rejection_fingerprint(beat: dict[str, Any]) -> str:
+    """改动提示词/台词后指纹变化 → 立刻重新尝试这条 beat。"""
+
+    parts = [
+        str(beat.get("audio_type") or ""),
+        str(beat.get("speaker") or ""),
+        str(beat.get("narration") or ""),
+        str(beat.get("narration_segment") or ""),
+        str(beat.get("dialogue") or ""),
+        str(beat.get("seedance2_config_json") or ""),
+    ]
+    return hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def _prep_rejection_in_cooldown(
+    key: tuple[str, int, int],
+    fingerprint: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """这条 beat 是否正处于「被拒冷却」中，应当跳过。"""
+
+    entry = _PREP_REJECTION_STATE.get(key)
+    if entry is None:
+        return False
+    recorded, _count, blocked_until = entry
+    if recorded != fingerprint:
+        # 提示词/台词已改写：视为新内容，立刻允许重试。
+        _PREP_REJECTION_STATE.pop(key, None)
+        return False
+    clock = time.monotonic() if now is None else now
+    return blocked_until > clock
+
+
+def _note_prep_rejection(
+    key: tuple[str, int, int],
+    fingerprint: str,
+    *,
+    now: float | None = None,
+) -> int:
+    """记一次准备阶段拒绝，返回该 beat 的连续拒绝次数。"""
+
+    clock = time.monotonic() if now is None else now
+    entry = _PREP_REJECTION_STATE.get(key)
+    if entry is None or entry[0] != fingerprint:
+        _PREP_REJECTION_STATE[key] = (fingerprint, 1, 0.0)
+        return 1
+    _recorded, count, _blocked_until = entry
+    count += 1
+    blocked_until = (
+        clock + PREP_REJECTION_COOLDOWN_SECONDS
+        if count >= PREP_REJECTION_RETRY_LIMIT
+        else 0.0
+    )
+    _PREP_REJECTION_STATE[key] = (entry[0], count, blocked_until)
+    return count
+
+
+def _clear_prep_rejection(key: tuple[str, int, int]) -> None:
+    _PREP_REJECTION_STATE.pop(key, None)
+
+
 async def _dispatch_single_videos(
     ctx: Any,
     store: Any,
@@ -783,6 +862,7 @@ async def _dispatch_single_videos(
     beats = await store.get_beats_as_dicts(episode)
     if not beats:
         return None, None
+    beats_by_number = {int(beat.get("beat_number") or 0): beat for beat in beats}
     paths = PathResolver(str(project_dir), episode)
     in_flight = await _in_flight_beat_numbers(ctx, "single_video")
     ready = sorted(
@@ -803,6 +883,11 @@ async def _dispatch_single_videos(
         signature = f"dispatch:single_video:{episode}:{beat_num}"
         if signature in attempted:
             continue
+        rejection_key = (str(project_dir), int(episode), int(beat_num))
+        fingerprint = _prep_rejection_fingerprint(beats_by_number.get(beat_num) or {})
+        if _prep_rejection_in_cooldown(rejection_key, fingerprint):
+            # 已连续多次准备阶段拒绝：进入冷却，不再每轮空转重试（静默跳过）。
+            continue
         result = await enqueue_single_video_task(
             ctx=ctx,
             store=store,
@@ -816,16 +901,34 @@ async def _dispatch_single_videos(
         if not _single_video_enqueued(result):
             # 准备阶段就被挡下（提示词/声线校验等）：路由以 HTTP 200 +
             # ``{"ok": False}`` 返回，绝不能记成「已派发」，否则这条 beat 永不重试、
-            # 还会连坐同批。留日志，交给协调器的重试预算处理。
-            logging.getLogger(__name__).warning(
-                "single_video dispatch rejected user=%s project=%s episode=%s beat=%s error=%s",
-                ctx.requester_username,
-                ctx.project_name,
-                episode,
-                beat_num,
-                _single_video_dispatch_error(result),
-            )
+            # 还会连坐同批。留日志；连续被拒到上限后进入冷却，避免整集空转。
+            count = _note_prep_rejection(rejection_key, fingerprint)
+            detail = _single_video_dispatch_error(result)
+            if count >= PREP_REJECTION_RETRY_LIMIT:
+                logger.error(
+                    "single_video dispatch rejected user=%s project=%s episode=%s "
+                    "beat=%s error=%s（已连续 %d 次，暂停重试 %d 分钟；"
+                    "改写提示词/台词或补传声线后自动恢复）",
+                    ctx.requester_username,
+                    ctx.project_name,
+                    episode,
+                    beat_num,
+                    detail,
+                    count,
+                    int(PREP_REJECTION_COOLDOWN_SECONDS // 60),
+                )
+            else:
+                logger.warning(
+                    "single_video dispatch rejected user=%s project=%s episode=%s "
+                    "beat=%s error=%s",
+                    ctx.requester_username,
+                    ctx.project_name,
+                    episode,
+                    beat_num,
+                    detail,
+                )
             continue
+        _clear_prep_rejection(rejection_key)
         return "single_video", signature
     return None, None
 

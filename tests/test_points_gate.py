@@ -329,6 +329,68 @@ def test_confirm_endpoint_unknown_gate_still_400(gate_http, gate_env):
 
 
 # ---------------------------------------------------------------------------
+# 幂等守卫：陈旧卡片答错闸门时只写答案，不唤醒 run
+# ---------------------------------------------------------------------------
+
+
+def _identity_gate_run() -> SimpleNamespace:
+    return SimpleNamespace(
+        **{
+            **vars(_gate_run()),
+            "last_error": director_auto_module.IDENTITY_IMAGES_REQUIRED_ERROR,
+        }
+    )
+
+
+def test_confirm_of_a_different_gate_answers_without_waking_the_run(
+    monkeypatch, gate_env
+):
+    """页面过期的「角色图片指定」卡片答在「身份图指定」暂停上：答案照写，但不唤醒。
+
+    现场事故：run 停在身份图闸门，陈旧卡片被连点 11 次，每次都 ``resume_paused``，
+    run 在 paused↔running 之间空抖，客户只看到进度不动。
+    """
+
+    answered: list[tuple] = []
+    monkeypatch.setattr(
+        project_config,
+        "confirm_character_images",
+        lambda *args: answered.append(args),
+    )
+    client = _gate_app(monkeypatch, user=_client_user(), run=_identity_gate_run())
+
+    response = client.post(
+        "/api/v1/projects/demo/chat/director-auto/gates/character_images/confirm",
+        json={"episode": 1},
+    )
+
+    assert response.status_code == 200
+    assert answered == [("13800138000", "novel-x")]
+    # run 仍然停在它真正在等的那个闸门上，没有被这次点击唤醒。
+    assert response.json()["data"]["status"] == "paused"
+    assert response.json()["data"]["gate"] == "identity_images"
+
+
+def test_confirm_of_the_gate_the_run_waits_on_does_wake_it(monkeypatch, gate_env):
+    answered: list[tuple] = []
+    monkeypatch.setattr(
+        project_config,
+        "confirm_identity_images",
+        lambda *args: answered.append(args),
+    )
+    client = _gate_app(monkeypatch, user=_client_user(), run=_identity_gate_run())
+
+    response = client.post(
+        "/api/v1/projects/demo/chat/director-auto/gates/identity_images/confirm",
+        json={"episode": 1},
+    )
+
+    assert response.status_code == 200
+    assert answered == [("13800138000", "novel-x", 1)]
+    assert response.json()["data"]["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
 # 旁路：run 停在收费闸门时，「继续」不能绕过预扣
 # ---------------------------------------------------------------------------
 
