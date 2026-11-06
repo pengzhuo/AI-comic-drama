@@ -82,7 +82,7 @@ async def test_dispatch_build_episodes_uses_target(
 
     assert task_type == "build_episodes"
     assert calls[0]["payload"]["config"]["target_episodes"] == 7
-    assert calls[0]["payload"]["config"]["planning_mode"] == "chapters"
+    assert calls[0]["payload"]["config"]["planning_mode"] == "duration"
 
 
 @pytest.mark.asyncio

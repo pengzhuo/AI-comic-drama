@@ -115,6 +115,8 @@ export function StudioRunBanner({
   onStop,
   stopPending = false,
   stuckLikely = false,
+  onStart,
+  startPending = false,
 }: {
   run: DirectorAutoRunPayload | undefined;
   needsHuman: string | null;
@@ -133,6 +135,14 @@ export function StudioRunBanner({
   stopPending?: boolean;
   /** `status=running` 但很久没有进展：疑似卡死，给醒目提示与出口。 */
   stuckLikely?: boolean;
+  /**
+   * 「开始制作」：还没有 run（`manual`）时的唯一入口。
+   *
+   * 以前这条路径只由上传页的 `?autostart=1` 触发——从「我的剧」进项目不带该参数，
+   * 页面就永远只剩一句「待开始」，客户没有任何可点的东西。传了才渲染按钮。
+   */
+  onStart?: () => void;
+  startPending?: boolean;
 }) {
   const status = run?.status ?? "manual";
   const tone =
@@ -166,6 +176,16 @@ export function StudioRunBanner({
         ) : null}
       </div>
       <div className="flex items-center gap-2">
+        {onStart ? (
+          <Button type="button" size="sm" onClick={onStart} disabled={startPending}>
+            {startPending ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Play className="size-3.5" />
+            )}
+            开始制作
+          </Button>
+        ) : null}
         {(effectiveNeedsHuman || stuckLikely) && onStop ? (
           <Button
             type="button"

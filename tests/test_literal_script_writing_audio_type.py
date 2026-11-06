@@ -607,6 +607,38 @@ async def test_literal_workflow_does_not_send_unprocessed_next_line(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_literal_workflow_compacts_beats_when_pacing_settings_given(monkeypatch):
+    from novelvideo.pacing import PacingSettings
+
+    store = _LiteralRunStore()
+    agent = _SequencedLiteralAgent(
+        [
+            _valid_literal_output("屋内烛火轻轻摇晃。"),
+            _valid_literal_output("窗外风声渐起。"),
+        ]
+    )
+    monkeypatch.setattr(
+        LiteralScriptWritingWorkflow,
+        "agent",
+        property(lambda _workflow: agent),
+    )
+    workflow = LiteralScriptWritingWorkflow(
+        cognee_store=store,
+        sqlite_store=store,
+        pacing_settings=PacingSettings(),
+    )
+
+    script = await workflow.run(
+        episode_num=1,
+        source_text="第1场 苏鸾寝殿 夜 内\n△烛火摇晃。\n△风声渐起。",
+    )
+
+    # 两行同音色相邻镜头合并为一镜（默认单镜上限 15s）。
+    assert len(script.beats) == 1
+    assert script.beats[0].visual_description == "屋内烛火轻轻摇晃。"
+
+
+@pytest.mark.asyncio
 async def test_literal_workflow_does_not_degrade_gateway_403(monkeypatch):
     store = _LiteralRunStore()
     agent = _SequencedLiteralAgent(

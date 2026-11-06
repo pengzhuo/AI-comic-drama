@@ -240,11 +240,15 @@ async def _run_script_writer_scoped(
             project=ctx.project_name,
         )
         merged_config = {**project_config, **config}
+        from novelvideo.pacing import resolve_pacing_settings
+
+        pacing_settings = resolve_pacing_settings(merged_config)
         workflow = create_script_writing_workflow(
             store,
             genre=merged_config.get("genre", ""),
             story_setting=merged_config.get("story_setting", ""),
             spine_template=merged_config.get("spine_template", "drama"),
+            pacing_settings=pacing_settings,
         )
 
         script = await workflow.run(

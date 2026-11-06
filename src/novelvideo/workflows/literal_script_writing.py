@@ -391,6 +391,7 @@ class LiteralScriptWritingWorkflow:
         sqlite_store: Any | None = None,
         output_dir: str = "",
         audio_type_mode: str = "literal",
+        pacing_settings: Any | None = None,
     ) -> None:
         self.cognee_store = cognee_store
         self.sqlite_store = sqlite_store or cognee_store
@@ -398,6 +399,8 @@ class LiteralScriptWritingWorkflow:
         self.audio_type_mode = (
             "narrated" if audio_type_mode == "narrated" else "literal"
         )
+        # 节奏参数（每集目标时长 / 单镜上限）。None 时在 run() 里按环境/默认解析。
+        self.pacing_settings = pacing_settings
         self._current_episode = 1
         self._agent: Agent | None = None
         self._valid_identity_ids: set[str] = set()
@@ -839,6 +842,25 @@ class LiteralScriptWritingWorkflow:
         self._valid_identity_ids.update(episode_identity_ids)
         self._valid_prop_ids.clear()
         self._valid_prop_ids.update(episode_prop_ids)
+
+        # 镜头越少越好：把“一行一镜”合并成更少、更长的镜头（同音色才合并）。
+        # 仅在显式传入节奏参数时启用——生产 runner 总会传（默认全局 60s/单镜 15s），
+        # 这样直接构造 workflow 的库调用/单测维持旧的“一行一镜”行为。
+        if self.pacing_settings is not None:
+            from novelvideo.pacing import compact_beats_for_shots
+
+            pacing = self.pacing_settings
+            compacted = compact_beats_for_shots(
+                beats,
+                shot_target_seconds=pacing.shot_target_seconds,
+                max_shots=pacing.max_shots,
+            )
+            if len(compacted) != len(beats):
+                log(
+                    f"[Literal] 镜头合并: {len(beats)} -> {len(compacted)} 镜 "
+                    f"(单镜上限 {pacing.shot_target_seconds:.0f}s)"
+                )
+            beats = compacted
 
         script = NarrationScript(
             episode_number=episode_num,
@@ -1537,6 +1559,7 @@ def create_literal_script_writing_workflow(
     genre: str = "",
     story_setting: str = "",
     audio_type_mode: str = "literal",
+    pacing_settings: Any | None = None,
 ) -> LiteralScriptWritingWorkflow:
     del genre, story_setting
     return LiteralScriptWritingWorkflow(
@@ -1544,4 +1567,5 @@ def create_literal_script_writing_workflow(
         sqlite_store=sqlite_store or cognee_store,
         output_dir=output_dir,
         audio_type_mode=audio_type_mode,
+        pacing_settings=pacing_settings,
     )

@@ -367,6 +367,12 @@ _NEWAPI_IMAGE_CONTENT_POLICY_MARKERS = (
     "content policy",
     "内容政策",
     "content_policy",
+    # 2026-11-06：图像上游（aiqy ``doubao-seedream-5.0-flash`` / Ark）判敏感时回的是
+    # 光杆 ``InputTextSensitiveContentDetected`` / ``InputImageSensitiveContentDetected``
+    # / ``OutputImageSensitiveContentDetected``，既没有 OpenAI 的
+    # ``content_policy_violation``，也没有「内容政策」字样。缺这条时连这一次「同参重投」
+    # 都不会发生——而**输出画面**被拒是随机结果，重投确实有机会过审。
+    "sensitivecontentdetected",
 )
 
 

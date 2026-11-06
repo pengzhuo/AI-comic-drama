@@ -2,8 +2,9 @@
 // Copyright (c) 2026 ClaymoreLab
 import { useEffect, useRef, useState } from "react";
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Loader2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Loader2, Play } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { DirectorCharacterImagesCard } from "@/components/director/director-character-images-card";
 import { StudioCostOverview } from "@/features/studio/studio-cost";
 import { StudioEpisodeList } from "@/features/studio/studio-episode-list";
@@ -16,8 +17,10 @@ import {
 } from "@/features/studio/studio-run";
 import { StudioVoiceGateCard } from "@/features/studio/studio-voice-gate-card";
 import {
+  isImportRunning,
   isImportSettled,
   regenerateStudioBeatVideo,
+  startStudioIngest,
   studioRunConfig,
   waitForStudioBeatVideo,
 } from "@/features/studio/studio-api";
@@ -65,6 +68,7 @@ function StudioProjectPage() {
   const clearBlockedShot = useClearBlockedShot(project);
 
   const [startError, setStartError] = useState<string | null>(null);
+  const [startPending, setStartPending] = useState(false);
   const [redoError, setRedoError] = useState<string | null>(null);
   const [redoPendingBeat, setRedoPendingBeat] = useState<number | null>(null);
   const [quoteDismissed, setQuoteDismissed] = useState(false);
@@ -77,9 +81,12 @@ function StudioProjectPage() {
 
   const pipeline = pipelineQuery.data?.data;
   const importSettled = isImportSettled(pipeline?.global);
+  const importRunning = isImportRunning(pipeline?.global, tasksQuery.data?.data);
   const status = run.run?.status ?? "manual";
   const runActive =
     status === "running" || status === "awaiting_confirmation" || status === "paused";
+  // 能不能「开始制作」：还没有 run，且没有导入任务在飞（在飞时不给按钮，避免打断）。
+  const canStartProduction = status === "manual" && !importRunning;
 
   // 真隔离：别人的项目在这里既不在自己的项目列表里，单项目接口也是 404。
   // 两个信号同时成立才判定「不存在或不属于你」，避免把刚创建、列表还没刷新的
@@ -90,7 +97,9 @@ function StudioProjectPage() {
     !summaries.some((item) => item.id === project) &&
     (pipelineQuery.isError || episodesQuery.isError);
 
-  useStudioPolling(project, { enabled: !importSettled || runActive });
+  // 还没启动的 `manual` 项目也要跟着轮询：别的设备点了「开始制作」，这边不能一直停在
+  // 「待开始」上。
+  useStudioPolling(project, { enabled: !importSettled || runActive || status === "manual" });
 
   // 导入完成后自动开跑；跑起来就把 URL 参数清掉，刷新不会重复启动。
   const autostartFired = useRef(false);
@@ -177,6 +186,37 @@ function StudioProjectPage() {
   const blockedShots = run.run?.blocked_shots ?? [];
 
   /**
+   * 「开始制作」——项目还没启动时的手动出口。
+   *
+   * 从「我的剧」进项目不带上传页的 `?autostart=1`，所以这条路径必须自带完整动作：
+   * ① 导入产物还没落盘（`ingested` 不为真）时先补一次导入（文件名取项目配置里记的
+   * 上传源文件）；② 再启动项目级「一键成片」。缺文件名（目录里没有上传记录）时直接
+   * 报错、不静默跳过——否则 run 会起来却在「小说摄入」上空转。
+   */
+  const handleStartProduction = async () => {
+    if (startPending) return;
+    setStartError(null);
+    setStartPending(true);
+    try {
+      const config = projectQuery.data?.data;
+      if (!pipeline?.global.ingested) {
+        const filename = String(config?.ingest_source_filename ?? "").trim();
+        if (!filename) {
+          throw new Error("找不到已上传的剧本文件，请回到「我的剧」重新上传剧本后再开始。");
+        }
+        await startStudioIngest(project, filename, config?.spine_template ?? "drama", {
+          formatPolicy: "warn",
+        });
+      }
+      await startRun.mutateAsync({ config: studioRunConfig(config) });
+    } catch (error) {
+      setStartError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setStartPending(false);
+    }
+  };
+
+  /**
    * 「重做该镜」：先重跑这一镜，**等它真的成功**再清掉降级标记。
    *
    * 以前是「触发后就立刻清标记」的乐观清理——重做再次失败时标记已经没了，客户会
@@ -223,7 +263,33 @@ function StudioProjectPage() {
         </h1>
       </div>
 
-      {!importSettled ? (
+      {!importSettled && status === "manual" && !importRunning ? (
+        // 没导入完、也没有任何导入任务在跑：必须给出口，否则就是永久假死。
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
+            <span className="text-amber-700 dark:text-amber-300">
+              这个项目还没有开始制作
+              {pipeline?.next_step_name ? `（待完成：${pipeline.next_step_name}）` : ""}
+              。点「开始制作」从剧本导入开始，之后会自动往下推进。
+            </span>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            onClick={handleStartProduction}
+            disabled={startPending}
+          >
+            {startPending ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Play className="size-3.5" />
+            )}
+            开始制作
+          </Button>
+        </div>
+      ) : !importSettled ? (
+        // 真的在导入（或有 run 在驱动）：转圈只表示进度，不再假装「马上就好」。
         <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-card px-4 py-3 text-sm">
           <Loader2 className="size-4 animate-spin text-primary" />
           <span>
@@ -285,6 +351,12 @@ function StudioProjectPage() {
           onStop={run.stopManually}
           stopPending={run.stopPending}
           stuckLikely={run.stuckLikely}
+          onStart={
+            // 「待开始」+ 导入已完成：横幅是这一页唯一的启动入口（上面的导入卡在这
+            // 种情况下不渲染）。
+            canStartProduction && importSettled ? handleStartProduction : undefined
+          }
+          startPending={startPending}
         />
         <StudioStageChecklist pipeline={pipeline} />
       </section>

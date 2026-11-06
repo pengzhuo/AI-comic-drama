@@ -41,9 +41,11 @@ $env:VITE_APP_VERSION="dev"    # 与现网 version.json 的 version 保持一致
 npm run build:ce               # tsc -b && vite build --mode ce（自动加载 .env.ce.local）
 ```
 
-构建后先离线自检：
+构建后先离线自检（`verify:ce` 就是镜像构建末尾那一支脚本；下面三条是最常看的人眼判据）：
 
 ```powershell
+npm run verify:ce               # 断言产物确实带上了实例配置（脚本版，全绿才继续）
+
 # 1) 星标请求必须 0 命中（漏载 .env.ce.local 时会出现）
 Select-String -Path dist\assets\*.js -Pattern "api\.github\.com" -List
 
@@ -58,6 +60,43 @@ Test-Path dist\announcements.empty.json        # 应为 True（26 B）
 > `nfg-web-assets.cdnfg.com`（社区/更新素材）、`relayclaw.cdnfg.com`（设置里的外链）
 > 等官方静态链接常量会一直留在产物中，与本实例的隐藏开关无关 —— 所以**不能**再用
 > 「`cdnfg.com` 0 命中」做判据。
+
+### 2.1 镜像构建（`docker compose build web`）也必须走 CE 形态
+
+除了 `.env.ce.local` + 本机构建，**重建 web 镜像**这条路也常走。两种方式必须产出同一个形态，
+否则又会踩同一个坑。2026-11-06 出过一次线上事故：用官方镜像里那条 `RUN pnpm build`
+（production 模式）重建，`.env.ce.local` 不但没被加载，`.dockerignore` 里的 `.env.*` 还把它
+挡在构建上下文之外 —— 产物丢掉全部实例配置（7 个隐藏开关、公告源、署名），并且
+`VITE_INTERNAL_ENTRY_PATH` 变空 → `src/routes/studio.tsx` 的守卫把客户链接
+`/studio?phone=&code=` 弹回内部首页 → 客户被要求输入**内部访问口令**。
+
+现在这条链已经焊死，改任何一环都要同步：
+
+- `frontend/Dockerfile` 用 `RUN pnpm build:ce`（不是 `build`），并为每个实例开关声明
+  `ARG`/`ENV` —— `.dockerignore` 排除 `.env`/`.env.*`，镜像里读不到 `.env.ce.local`，
+  只能靠 build args 传；每个 `ARG` 都写了注释说明为什么必须有。
+- `docker-compose.yml` 的 `web.build.args` 从宿主 `.env` 转发同一组值（默认空 = 官方原样）。
+- 构建末尾 `RUN pnpm verify:ce`（= `frontend/scripts/verify-ce-bundle.mjs`）断言产物确实带上
+  了这些值：`api.github.com` 必须 0 命中、公告源与署名必须命中、
+  `VITE_INTERNAL_ENTRY_PATH` 必须进了内联的 `import.meta.env` 对象。不符直接
+  `process.exit(1)` 让构建失败。注意 `VITE_HIDE_*` 是直接 `import.meta.env.X` 读的，
+  压缩后产物里**看不到变量名**，所以脚本只对这 4 类「可观察后果」下断言、其余只打日志记录。
+- `frontend/src/__tests__/dockerfile-build-args.test.ts` 守住三方一致：
+  `verify-ce-bundle.mjs` 的 `INSTANCE_VARS` ⊆ `docker-compose.yml` 的 args ⊆ Dockerfile 的 `ARG`。
+
+所以源码构建就是：
+
+```bash
+# 宿主 .env 里要带上 §1 那组值（服务器 /root/dramaclaw/.env 已有）
+docker compose build web
+```
+
+如果只想拿「本机 `npm run build:ce` 的 dist」打一个持久镜像（不跑 vite、不装依赖），用最小的
+两阶段 Dockerfile：`FROM nginx:... AS nginx-config-test` 自检 `docker/19-payment-form-csp.envsh`
++ `nginx.conf.template`，再 `COPY dist /usr/share/nginx/html`。**务必构建到
+`--target nginx-config-test` 先过自检**（普通 `docker build` 只建最后阶段，会跳过 CSP 检查），
+再用 `docker compose -f docker-compose.release.yml up -d --no-deps web` 换容器（`--no-deps`
+保证不碰 api）。线上 `2.0.15-nn27` 就是这么打的。
 
 ## 3. 部署（热补丁，绝不 `docker compose up -d`）
 

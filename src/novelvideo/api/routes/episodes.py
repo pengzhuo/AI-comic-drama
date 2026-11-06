@@ -306,23 +306,40 @@ async def plan_episodes(project: str, body: EpisodePlanRequest, user: dict = Dep
     output_dir = resolved.output_dir
     state_dir = resolved.state_dir
 
+    # 默认分集模式来自项目配置（默认 duration：每集≈目标时长）。
+    mode = body.planning_mode
+    if not mode:
+        try:
+            from novelvideo.project_config import load_project_config_from_state_dir
+
+            pcfg = load_project_config_from_state_dir(
+                state_dir,
+                username=getattr(ctx, "owner_username", None) if ctx else None,
+                project=getattr(ctx, "project_name", None) if ctx else None,
+            )
+            mode = str(pcfg.get("episode_planning_mode") or "duration")
+        except Exception:
+            mode = "duration"
+
     config = {
         "target_episodes": body.target_episodes,
-        "planning_mode": body.planning_mode,
+        "planning_mode": mode,
     }
+    if body.target_seconds is not None:
+        config["target_seconds"] = body.target_seconds
 
     if ctx is not None:
         if not has_imported_novel(resolved.project_dir):
             return novel_import_required_response()
-        # The AI planners read the Cognee graph, which structured_v1 projects do
-        # not have. Reject before enqueue so the user gets an answer instead of
-        # a task that is guaranteed to fail after reserving credit.
-        if is_structured_pipeline(state_dir) and body.planning_mode != "chapters":
-            return {
-                "ok": False,
-                "code": KnowledgePipelineUnsupported.error_code,
-                "error": "该项目只支持按章节/集号的确定性分集",
-            }
+        # AI/时长规划器依赖图谱或章节正文；结构化项目只支持确定性章节映射。
+        if is_structured_pipeline(state_dir):
+            if body.planning_mode and body.planning_mode != "chapters":
+                return {
+                    "ok": False,
+                    "code": KnowledgePipelineUnsupported.error_code,
+                    "error": "该项目只支持按章节/集号的确定性分集",
+                }
+            config["planning_mode"] = "chapters"
         queued = await get_task_backend().enqueue_project_task(
             ctx,
             product_surface="mainline",

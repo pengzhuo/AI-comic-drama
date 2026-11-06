@@ -7,9 +7,12 @@ coverage
 *.log
 .vscode
 .idea
+# Env files stay out of the image. Consequence: `vite build --mode ce` inside the
+# image cannot read `.env.ce.local`, so instance config must arrive as build args
+# — see the ARG block in Dockerfile plus docs/agents/web-hotpatch-deploy.md.
 .env
 .env.*
-# Keep worker/ in the build context: tsc -b (via `pnpm build`) compiles the
+# Keep worker/ in the build context: tsc -b (via `pnpm build:ce`) compiles the
 # test suite under src/, and src/__tests__/worker/cache-headers.test.ts imports
 # worker/index. Excluding worker/ breaks the Docker build with TS2307 even
 # though the nginx runtime image never ships it.

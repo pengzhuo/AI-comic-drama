@@ -32,6 +32,7 @@ def create_script_writing_workflow(
     genre: str = "",
     story_setting: str = "",
     spine_template: str = "drama",
+    pacing_settings: object | None = None,
 ) -> ScriptWritingWorkflow:
     """创建脚本生成 workflow。
 
@@ -45,6 +46,7 @@ def create_script_writing_workflow(
         sqlite_store=cognee_store,
         output_dir=getattr(cognee_store, "output_dir", ""),
         audio_type_mode=audio_type_mode,
+        pacing_settings=pacing_settings,
     )
 
 

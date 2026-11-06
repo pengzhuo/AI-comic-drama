@@ -626,12 +626,18 @@ def _install_pydantic_ai_openai_trace_patch() -> None:
     def _patched_process_response(self, response):
         request_id = ""
         try:
+            # Prefer the gateway id carried in the response headers
+            # (``x-newapi-request-id`` / ``x-oneapi-request-id``). The OpenAI SDK
+            # pre-populates ``_request_id`` from the generic ``x-request-id``
+            # header, which is the *upstream* id and matches neither the gateway
+            # billing log nor the relay bill; the header lookup therefore has to
+            # win so cost reconciliation can join the call to its quota.
             request_id = (
-                str(getattr(response, "_request_id", "") or "").strip()
-                or str(getattr(response, "request_id", "") or "").strip()
-                or _header_value(
+                _header_value(
                     getattr(response, "_response_headers", None), *_PROVIDER_REQUEST_ID_HEADER_NAMES
                 )
+                or str(getattr(response, "_request_id", "") or "").strip()
+                or str(getattr(response, "request_id", "") or "").strip()
             )
         except Exception:
             request_id = ""

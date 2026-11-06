@@ -131,6 +131,27 @@ async def dispatch_next_stage(
         )
     if next_step == "build_episodes":
         target = int(target_episodes or 0) or DEFAULT_EPISODE_TARGET
+        # 默认按“每集≈目标时长”分集；结构化项目仍走确定性的章节映射。
+        state_dir = getattr(ctx, "state_dir", ctx.output_dir)
+        from novelvideo.knowledge_pipeline import is_structured_pipeline
+
+        mode = "chapters"
+        if not is_structured_pipeline(state_dir):
+            mode = "duration"
+            try:
+                from novelvideo.project_config import (
+                    load_project_config_from_state_dir,
+                )
+
+                pcfg = load_project_config_from_state_dir(
+                    state_dir,
+                    username=getattr(ctx, "owner_username", None)
+                    or getattr(ctx, "requester_username", None),
+                    project=getattr(ctx, "project_name", None),
+                )
+                mode = str(pcfg.get("episode_planning_mode") or "duration")
+            except Exception:
+                mode = "duration"
         return await _enqueue_once(
             ctx,
             attempted,
@@ -139,7 +160,7 @@ async def dispatch_next_stage(
             episode=0,
             signature="dispatch:build_episodes",
             payload={
-                "config": {"target_episodes": target, "planning_mode": "chapters"},
+                "config": {"target_episodes": target, "planning_mode": mode},
                 "output_dir": str(project_dir),
                 "state_dir": str(ctx.state_dir),
             },

@@ -53,6 +53,8 @@ with iterative `tsc -b` rather than a blind cut.
 | `screenplay_preprocess.py` | 剧本预处理 artifacts (`screenplay/preprocess.json`, `novel.normalized.txt`, `novel.original.txt`) |
 | `workflows/*.py` | Script-writing workflows (`script_writing`, `literal_script_writing`, `script_processing`) |
 | `structured_ingest.py`, `structured_extraction.py`, `structured_builders.py` | Structured (`structured_v1`) ingest + extraction |
+| `pacing.py` | 剧集节奏：每集≈60s + 镜头最少（分集规则、镜头合并、`resolve_pacing_settings`）——见 [`episode-pacing.md`](episode-pacing.md) |
+| `sqlite_store.py` | `build_episodes_from_chapters`（一章一集）/ `build_episodes_by_duration`（按目标时长分集，默认模式） |
 | `cognee/` | Legacy knowledge-graph pipeline (`store`, `pipeline`, `event_extractor`, `screenplay_normalizer`) |
 | `generators/` | Media generation (`video_composer`, `prompt_builder`, `nanobanana_grid`, image/video generators) |
 | `generators/anchor_moderation.py` | 首帧真人隐私审核的降质阶梯（`plan_anchor_variants`）——素材库不可用时的兜底 |

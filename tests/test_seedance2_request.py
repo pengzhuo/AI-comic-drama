@@ -1662,10 +1662,15 @@ async def test_newapi_video_seedance2_references_normalize_only_image_refs(
 @pytest.mark.parametrize(
     ("model", "mode", "ratio", "expected_ratio", "expected_duration"),
     [
-        ("seedance-2.5", "video_edit", "16:9", "auto", "auto"),
-        ("seedance-2.5", "videoEdit", "auto", "auto", "auto"),
-        ("seedance-2.5", "video_extend", "16:9", "auto", 6),
-        ("seedance-2.5", "all_reference", "auto", "auto", 6),
+        # Seedance 带输入视频时，厂商对「比例/时长跟随输入」有硬校验，且它的比例枚举里
+        # 没有规范契约的 `auto`——只有 `adaptive`（时长同理是 -1）。所以只在
+        # 「Seedance + 比例已是 auto + 带参考视频」时改写，见
+        # ``video_generator._apply_seedance_source_video_ratio``；用户明确选了比例
+        # （16:9）或非 Seedance 系（happyhorse）一律不动。
+        ("seedance-2.5", "video_edit", "16:9", "adaptive", "auto"),
+        ("seedance-2.5", "videoEdit", "auto", "adaptive", "auto"),
+        ("seedance-2.5", "video_extend", "16:9", "adaptive", 6),
+        ("seedance-2.5", "all_reference", "auto", "adaptive", 6),
         ("seedance-2.5", "all_reference", "16:9", "16:9", 6),
         ("happyhorse-1.0", "video_edit", "16:9", "auto", "auto"),
     ],
@@ -1716,7 +1721,7 @@ async def test_newapi_source_video_request_preserves_dc_media_contract(
     assert payload["metadata"]["reference_videos"] == ["https://example.com/source.mp4"]
     assert "reference_file" not in payload["metadata"]
     assert "reference_link" not in payload["metadata"]
-    if expected_ratio == "auto":
+    if expected_ratio in {"auto", "adaptive"}:
         assert not {"width", "height", "size"}.intersection(payload)
 
 

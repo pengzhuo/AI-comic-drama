@@ -14,6 +14,13 @@ export interface ProjectConfig {
   tts_voice?: string;
   grid_mode?: string;
   grid_model?: string;
+  /**
+   * 已导入剧本的源文件名（上传 / 首次导入时落在项目配置里）。
+   *
+   * 工作台「开始制作」在导入被中断、需要重跑时用它调 `ingest/start`；后端
+   * `GET /projects/{id}` 会把项目配置整体带出来，所以这里是可读的。
+   */
+  ingest_source_filename?: string;
   video_backend?: string;
   use_director_render?: boolean;
   video_resolution?: string;
@@ -21,6 +28,12 @@ export interface ProjectConfig {
   sketch_image_selection?: string;
   render_image_selection?: string;
   sketch_aspect_padding?: boolean;
+  // 节奏：每集≈目标时长、镜头尽量少（默认 60s / 单镜 15s）。见 novelvideo/pacing.py。
+  episode_planning_mode?: "chapters" | "duration" | "ai" | "ai_events";
+  episode_target_seconds?: number;
+  episode_merge_floor_seconds?: number;
+  episode_split_threshold_seconds?: number;
+  shot_target_seconds?: number;
   // Server-computed: whether a project-level scene build can produce anything.
   // Narrated structured projects have no scene headings to build a catalogue
   // from, so their scenes are created per episode during planning instead.

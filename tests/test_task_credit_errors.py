@@ -207,6 +207,68 @@ def test_celery_task_failure_maps_input_image_policy_violation(monkeypatch) -> N
     assert "dynamic-request-id" in metadata["provider_error"]
 
 
+def test_celery_task_failure_maps_bare_ark_sensitive_codes(monkeypatch) -> None:
+    """2026-11-06 线上实例：图像上游只回光杆 ``*SensitiveContentDetected``。
+
+    换到 aiqy ``doubao-seedream-5.0-flash`` 后，Ark 的拒绝不再带
+    ``.PolicyViolation`` 子类（``InputText`` / ``InputImage`` / ``OutputImage`` 三态都是
+    光杆码）。缺这条归类时 ``chat/director_auto.py`` 认不出是审核类，只能拿同一套参数
+    （同一张参考图 + 同一段提示词）盲重试到预算耗尽。
+    """
+
+    celery_tasks = _import_celery_tasks(monkeypatch)
+
+    cases = (
+        (
+            "InputTextSensitiveContentDetected",
+            "the input text may contain sensitive information",
+            CONTENT_MODERATION_FAILED_MESSAGE,
+        ),
+        (
+            "InputImageSensitiveContentDetected",
+            "the input image may contain sensitive information",
+            INPUT_IMAGE_POLICY_FAILED_MESSAGE,
+        ),
+        (
+            "OutputImageSensitiveContentDetected",
+            "the output image may contain sensitive information",
+            CONTENT_MODERATION_FAILED_MESSAGE,
+        ),
+    )
+    for code, message_fragment, expected_message in cases:
+        exc = RuntimeError(
+            "DramaClawAPI Images 未返回图像数据: HTTP 400: body={"
+            f'"error":{{"message":"The request failed because {message_fragment}. '
+            'Request id: 021793970277069d2ec6088cd57f16be69183642d63bc7748cbb0",'
+            f'"type":"BadRequest","param":"","code":"{code}"}}}}'
+        )
+
+        error, metadata, handled = celery_tasks._project_task_failure_for_exception(exc)
+
+        assert handled is True, code
+        assert error == expected_message, code
+        assert metadata["message"] == expected_message, code
+        assert metadata["error_code"] == CONTENT_MODERATION_FAILED_CODE, code
+        assert code in metadata["provider_error"], code
+
+
+def test_celery_task_failure_maps_privacy_information_rejection(monkeypatch) -> None:
+    """``.PrivacyInformation`` 也是「输入参考图被拒」，文案同为「换参考图」。"""
+
+    celery_tasks = _import_celery_tasks(monkeypatch)
+
+    exc = RuntimeError(
+        "HTTP 400: body={\"error\":{\"message\":\"input image may contain real person\","
+        "\"code\":\"InputImageSensitiveContentDetected.PrivacyInformation\"}}"
+    )
+
+    error, metadata, handled = celery_tasks._project_task_failure_for_exception(exc)
+
+    assert handled is True
+    assert error == INPUT_IMAGE_POLICY_FAILED_MESSAGE
+    assert metadata["error_code"] == CONTENT_MODERATION_FAILED_CODE
+
+
 def test_celery_task_failure_maps_soft_time_limit(monkeypatch) -> None:
     celery_tasks = _import_celery_tasks(monkeypatch)
     from celery.exceptions import SoftTimeLimitExceeded

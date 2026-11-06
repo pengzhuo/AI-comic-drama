@@ -11,6 +11,7 @@
     "build:ce": "tsc -b && vite build --mode ce",
     "build:client": "vite build --mode client",
     "build:canvas": "vite build --mode canvas",
+    "verify:ce": "node scripts/verify-ce-bundle.mjs dist",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"

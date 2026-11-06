@@ -101,12 +101,21 @@ const SORT_OPTIONS: { value: SortKey; labelKey: string }[] = [
   { value: "name-desc", labelKey: "project.sort.nameDesc" },
 ];
 
-const PROJECT_NAME_PATTERN = /^[a-zA-Z0-9_]+$/;
 export const PROJECT_NAME_MAX_LENGTH = 64;
+// 与后端 api/deps.py 的 validate_project_name 对齐：允许 Unicode 字母/数字/下划线
+// （含中文），再显式挡掉路径分隔符、通配符、控制字符、空格与 "."，避免路径歧义。
+const PROJECT_NAME_ALLOWED_PATTERN = /^[\p{L}\p{N}_]+$/u;
+const PROJECT_NAME_FORBIDDEN_CHARS = '/\\:*?"<>|. \t\n\r\u0000\u007f';
 
 export function getProjectNameValidationKey(name: string): string | null {
   if (name.length > PROJECT_NAME_MAX_LENGTH) return "project.nameTooLong";
-  return !PROJECT_NAME_PATTERN.test(name) ? "project.nameInvalid" : null;
+  const hasForbidden = [...name].some((ch) => PROJECT_NAME_FORBIDDEN_CHARS.includes(ch));
+  if (!PROJECT_NAME_ALLOWED_PATTERN.test(name) || hasForbidden || name.includes("..")) {
+    return "project.nameInvalid";
+  }
+  // 后端 RESERVED_PROJECT_PREFIX 为 "_"：下划线开头视为保留前缀。
+  if (name.startsWith("_")) return "project.nameReservedPrefix";
+  return null;
 }
 
 const PROJECT_CARD_MIN_HEIGHT_CLASS = "min-h-[12.75rem]";

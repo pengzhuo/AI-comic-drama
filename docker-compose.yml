@@ -52,14 +52,23 @@ services:
         # 可选：构建期 npm 镜像（默认官方 registry）。国内构建建议设
         # NPM_REGISTRY=https://registry.npmmirror.com。
         NPM_REGISTRY: "${NPM_REGISTRY:-}"
-        # 实例级 UI 隐藏开关（构建期写入前端产物，默认空 = 官方原样）。
-        # 自建实例设成 1 可去掉首次进入的更新弹窗、状态栏 Piko 入口、
-        # 通知中心、官方渠道页与模型引导页。见 frontend/src/lib/ui-hide-flags.ts。
+        # CE 回退版本；未设时保持 Dockerfile 的默认（ce）。
+        VITE_EDITION: "${VITE_EDITION-ce}"
+        # 实例级构建期配置（默认空 = 官方原样）。这些值会被写进产物，所以必须经
+        # build args 传进来：`.dockerignore` 排除了 `.env.*`，镜像里读不到
+        # `.env.ce.local`。见 frontend/Dockerfile 的 ARG 段与
+        # docs/agents/web-hotpatch-deploy.md §1/§6；`pnpm verify:ce` 会在构建末尾
+        # 断言产物确实带上了这些值。
         VITE_HIDE_RELEASE_POPUP: "${VITE_HIDE_RELEASE_POPUP:-}"
         VITE_HIDE_PIKO_ENTRY: "${VITE_HIDE_PIKO_ENTRY:-}"
-        VITE_HIDE_NOTIFICATION_CENTER: "${VITE_HIDE_NOTIFICATION_CENTER:-}"
         VITE_HIDE_OFFICIAL_CHANNELS: "${VITE_HIDE_OFFICIAL_CHANNELS:-}"
+        VITE_HIDE_NOTIFICATION_CENTER: "${VITE_HIDE_NOTIFICATION_CENTER:-}"
         VITE_HIDE_MODEL_GUIDE: "${VITE_HIDE_MODEL_GUIDE:-}"
+        VITE_HIDE_GITHUB_STARS: "${VITE_HIDE_GITHUB_STARS:-}"
+        VITE_HIDE_HEADER_SETTINGS: "${VITE_HIDE_HEADER_SETTINGS:-}"
+        VITE_LOGIN_ANNOUNCEMENTS_URL: "${VITE_LOGIN_ANNOUNCEMENTS_URL:-}"
+        VITE_INTERNAL_ENTRY_PATH: "${VITE_INTERNAL_ENTRY_PATH:-}"
+        VITE_BRAND_ATTRIBUTION: "${VITE_BRAND_ATTRIBUTION:-}"
 
 # extends 不带顶层 volumes，需在此重申（名字与 release 文件一致，数据卷共用）。
 volumes:

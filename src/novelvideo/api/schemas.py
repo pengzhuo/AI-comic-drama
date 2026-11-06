@@ -118,6 +118,12 @@ class ProjectUpdate(BaseModel):
     sketch_image_selection: Optional[str] = None
     render_image_selection: Optional[str] = None
     sketch_aspect_padding: Optional[bool] = None
+    # 节奏：每集≈目标时长、镜头尽量少。
+    episode_planning_mode: Optional[Literal["chapters", "duration", "ai", "ai_events"]] = None
+    episode_target_seconds: Optional[float] = None
+    episode_merge_floor_seconds: Optional[float] = None
+    episode_split_threshold_seconds: Optional[float] = None
+    shot_target_seconds: Optional[float] = None
 
 
 class RenderSettingsUpdate(BaseModel):
@@ -175,7 +181,10 @@ class PortraitGenRequest(BaseModel):
 
 class EpisodePlanRequest(BaseModel):
     target_episodes: int = 10
-    planning_mode: str = "chapters"
+    #: 分集模式。None 表示用项目配置（默认 duration：每集≈目标时长）。
+    planning_mode: Optional[str] = None
+    #: 每集目标时长（秒）。None 表示用项目配置/全局默认（60s）。
+    target_seconds: Optional[float] = None
 
 
 # ── 剧本 ──────────────────────────────────────────────────────────────────────

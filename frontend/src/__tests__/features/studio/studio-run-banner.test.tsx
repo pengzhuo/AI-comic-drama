@@ -63,3 +63,55 @@ describe("StudioRunBanner", () => {
     expect(screen.queryByRole("button", { name: /继续制作/ })).toBeNull();
   });
 });
+
+const MANUAL_RUN: DirectorAutoRunPayload = {
+  status: "manual",
+  episode: null,
+  run_id: null,
+};
+
+/**
+ * 「开始制作」是 `manual` 项目唯一的入口。
+ *
+ * 从「我的剧」进项目不带上传页的 `?autostart=1`，以前页面就只剩一句「待开始」、
+ * 没有任何可点的东西——客户只能干等。这个按钮把出口补上：`manual` 且父级认为可以
+ * 启动时渲染，点击回调。
+ */
+describe("StudioRunBanner 的「开始制作」", () => {
+  function renderStart(props: { onStart?: () => void; startPending?: boolean } = {}) {
+    render(
+      <StudioRunBanner
+        run={MANUAL_RUN}
+        needsHuman={null}
+        recoveries={0}
+        onResume={vi.fn()}
+        resumePending={false}
+        onStart={props.onStart}
+        startPending={props.startPending}
+      />,
+    );
+  }
+
+  it("manual 且有 onStart → 渲染「开始制作」并回调", () => {
+    const onStart = vi.fn();
+    renderStart({ onStart });
+
+    const button = screen.getByRole("button", { name: /开始制作/ });
+    fireEvent.click(button);
+    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("待开始")).toBeTruthy();
+  });
+
+  it("没给 onStart（导入在飞 / 已有 run）→ 不渲染按钮", () => {
+    renderStart();
+
+    expect(screen.queryByRole("button", { name: /开始制作/ })).toBeNull();
+  });
+
+  it("startPending → 按钮禁用，防重复启动", () => {
+    renderStart({ onStart: vi.fn(), startPending: true });
+
+    const button = screen.getByRole("button", { name: /开始制作/ });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+  });
+});

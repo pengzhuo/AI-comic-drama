@@ -220,19 +220,53 @@ export async function saveStudioProjectChoices(
   );
 }
 
+/** 判定导入进度用到的那部分 `pipeline/status.global`（两个函数共用一个口径）。 */
+export interface ImportProgressGlobal {
+  ingested?: boolean;
+  screenplay_preprocess_pending?: boolean;
+  script_process_pending?: boolean;
+}
+
 /** 导入链（ingest → 剧本预处理 → 剧本处理）是否已走完，可以开始一键成片。 */
 export function isImportSettled(
-  global:
-    | {
-        ingested?: boolean;
-        screenplay_preprocess_pending?: boolean;
-        script_process_pending?: boolean;
-      }
-    | null
-    | undefined,
+  global: ImportProgressGlobal | null | undefined,
 ): boolean {
   if (!global?.ingested) return false;
   return !global.screenplay_preprocess_pending && !global.script_process_pending;
+}
+
+/** 导入链上的任务类型（摄入 / 预处理 / 剧本处理）。 */
+const IMPORT_TASK_TYPES = ["ingest_fast", "screenplay_preprocess", "script_process"];
+
+/** 还没到终态的任务状态（任务行还在，就说明这条链路有人在做）。 */
+const IMPORT_ACTIVE_STATUSES = new Set([
+  "submitting",
+  "queued",
+  "pending",
+  "starting",
+  "running",
+]);
+
+/**
+ * 导入链**正在跑**吗？
+ *
+ * `isImportSettled` 只说「还没跑完」，不区分「正在跑」与「根本没在跑」。工作台需要
+ * 三态，否则两种情况都只会渲染同一个转圈、没有任何出口——现场 `t3` 就永远卡在
+ * 「正在导入剧本」上。两个信号任一成立即算在跑：管道自己报的 `*_pending`，或任务表
+ * 里还有活的导入类任务。
+ */
+export function isImportRunning(
+  global: ImportProgressGlobal | null | undefined,
+  tasks: readonly { task_type?: string; status?: string }[] = [],
+): boolean {
+  if (global?.screenplay_preprocess_pending || global?.script_process_pending) {
+    return true;
+  }
+  return tasks.some(
+    (task) =>
+      IMPORT_TASK_TYPES.includes(String(task.task_type ?? "")) &&
+      IMPORT_ACTIVE_STATUSES.has(String(task.status ?? "")),
+  );
 }
 
 /**

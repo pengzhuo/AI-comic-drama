@@ -96,6 +96,52 @@ async def test_planned_assets_survive_a_remap(structured_store):
     assert episode.scene_menu
 
 
+# ── 按时长分集（每集≈60 秒）──────────────────────────────────────────────────
+
+
+async def test_duration_mapping_merges_short_chapters(tmp_path):
+    """三个很短的章节应合并成一集（都够不到单集下限）。"""
+    state_dir = _project(tmp_path, structured=False)
+    store = await _sqlite_store(state_dir)
+    store.save_novel_content(CHAPTERED)
+    try:
+        episodes = await store.build_episodes_by_duration()
+        assert len(episodes) == 1
+        assert episodes[0].chapter_start == 1
+        assert episodes[0].chapter_end == 3
+        assert episodes[0].raw_content.strip()
+    finally:
+        await store.close()
+
+
+async def test_duration_mapping_splits_a_long_chapter(tmp_path):
+    """明显超长的一章（>90s）应按自然边界拆成多集。"""
+    state_dir = _project(tmp_path, structured=False)
+    store = await _sqlite_store(state_dir)
+    long_chapter = "第一章 长夜\n\n" + "他走进屋子，看着窗外的雨。" * 90 + "\n"
+    store.save_novel_content(long_chapter)
+    try:
+        episodes = await store.build_episodes_by_duration()
+        assert len(episodes) >= 2
+        assert episodes[0].chapter_start == 1
+        assert episodes[0].chapter_end == 1
+    finally:
+        await store.close()
+
+
+async def test_duration_mapping_handles_text_without_chapter_markers(tmp_path):
+    """没有章节标记的“任意剧本”也能按时长切分。"""
+    state_dir = _project(tmp_path, structured=False)
+    store = await _sqlite_store(state_dir)
+    store.save_novel_content("他走进屋子。\n\n" + "雨一直下，落在青石板上。" * 200)
+    try:
+        episodes = await store.build_episodes_by_duration()
+        assert len(episodes) >= 1
+        assert episodes[0].raw_content.strip()
+    finally:
+        await store.close()
+
+
 # ── the runner, which is where the gap was ──────────────────────────────────
 
 

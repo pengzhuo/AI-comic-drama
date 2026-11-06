@@ -85,6 +85,20 @@ _CONTENT_MODERATION_MARKERS = (
     # （含 request id）原样丢给用户。
     "output video may contain sensitive",
     "copyright restrictions",
+    # 2026-11-06：图像链路（aiqy ``doubao-seedream-5.0-flash`` / Ark）判输入参考图
+    # 或提示词敏感时**只回光杆码**，不带 ``.PolicyViolation`` 子类：
+    # ``InputImageSensitiveContentDetected`` / ``InputTextSensitiveContentDetected`` /
+    # ``OutputImageSensitiveContentDetected``。缺这几条时 ``_failure_payload`` 归不出
+    # 审核类，``chat/director_auto.py`` 就会拿同一套参数（同一张参考图 + 同一段提示词）
+    # 盲重试到预算耗尽，用户只能看到「一直在制作中」。归对档之后才会走
+    # 「改写提示词 / 本地素材降级该镜 / 交回用户」这三手。
+    "inputimagesensitivecontentdetected",
+    "inputtextsensitivecontentdetected",
+    "outputimagesensitivecontentdetected",
+    # OpenAI 兼容 relay 的旧码（兜底渠道 #9 ``aigc`` / ``gpt-image-2`` 走的就是这一族）。
+    # ``generators/nanobanana_grid.py`` 早就按它做「同参重投一次」，但失败报文回到这里
+    # 一直归不出审核类，同样会掉进盲重试。
+    "content_policy_violation",
 )
 
 
@@ -98,7 +112,9 @@ def is_content_moderation_error(
 
 def content_moderation_message(exc: BaseException | None = None, message: str = "") -> str:
     text = " ".join(part for part in (str(exc) if exc else "", message) if part).lower()
-    if "inputimagesensitivecontentdetected.policyviolation" in text:
+    # 输入参考图：``.PolicyViolation`` 之外线上更常见光杆 ``InputImageSensitiveContentDetected``
+    # （含 ``.PrivacyInformation``），文案同为「换参考图」。
+    if "inputimagesensitivecontentdetected" in text:
         return INPUT_IMAGE_POLICY_FAILED_MESSAGE
     if "outputvideosensitivecontentdetected.policyviolation" in text or (
         "output video may contain sensitive" in text

@@ -177,6 +177,12 @@ def _default_project_config() -> dict:
         VIDEO_BACKEND,
         VIDEO_RESOLUTION,
     )
+    from novelvideo.pacing import (
+        DEFAULT_EPISODE_MERGE_FLOOR_SECONDS,
+        DEFAULT_EPISODE_SPLIT_THRESHOLD_SECONDS,
+        DEFAULT_EPISODE_TARGET_SECONDS,
+        DEFAULT_SHOT_TARGET_SECONDS,
+    )
 
     return {
         "spine_template": "drama",
@@ -194,6 +200,12 @@ def _default_project_config() -> dict:
         "user_grid_plan": {},
         "regen_file_map": {},
         "custom_styles": {},
+        # 节奏：每集≈目标时长、镜头尽量少。默认全局 60s，可按项目覆盖。
+        "episode_planning_mode": "duration",
+        "episode_target_seconds": DEFAULT_EPISODE_TARGET_SECONDS,
+        "episode_merge_floor_seconds": DEFAULT_EPISODE_MERGE_FLOOR_SECONDS,
+        "episode_split_threshold_seconds": DEFAULT_EPISODE_SPLIT_THRESHOLD_SECONDS,
+        "shot_target_seconds": DEFAULT_SHOT_TARGET_SECONDS,
     }
 
 

@@ -222,6 +222,30 @@ describe("isStuckLikely", () => {
   });
 });
 
+describe("认不出暂停原因也必须给出出口", () => {
+  it("paused 但 last_error 认不出 kind → 仍然置 needsHuman（横幅出现「继续制作」）", async () => {
+    server.use(
+      http.get("http://localhost:3000/api/v1/projects/demo/chat/director-auto", () =>
+        HttpResponse.json({
+          ok: true,
+          data: {
+            status: "paused",
+            episode: 1,
+            run_id: "run-unknown",
+            last_error: "生成失败",
+          },
+        }),
+      ),
+    );
+
+    const { result } = renderHook(() => useStudioRun("demo", { auto: false }), { wrapper });
+    await waitFor(() => expect(result.current.run?.status).toBe("paused"));
+    // 以前这里 needsHuman 是 null：页面只剩一句「已暂停」，客户没有任何按钮可点。
+    await waitFor(() => expect(result.current.needsHuman).toBeTruthy());
+    expect(result.current.needsHuman).toContain("生成失败");
+  });
+});
+
 describe("manual resume picks the endpoint by status", () => {
   it("awaiting_confirmation 走 /resume（resume_suspended），不再必失败", async () => {
     const calls: string[] = [];

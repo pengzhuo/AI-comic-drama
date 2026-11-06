@@ -502,6 +502,11 @@ _AUTO_CONFIG_KEYS = frozenset(
         "video_backend",
         "video_resolution",
         "add_subtitles",
+        "episode_planning_mode",
+        "episode_target_seconds",
+        "episode_merge_floor_seconds",
+        "episode_split_threshold_seconds",
+        "shot_target_seconds",
     }
 )
 

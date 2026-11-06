@@ -11,6 +11,8 @@ vi.mock("@/lib/api", () => ({
 }));
 
 import {
+  isImportRunning,
+  isImportSettled,
   regenerateStudioBeatVideo,
   startStudioIngest,
   waitForStudioBeatVideo,
@@ -87,8 +89,49 @@ describe("studio import start payload", () => {
   });
 });
 
-const TASK_GET = "http://localhost:3000/api/v1/projects/demo/tasks/single_video/1";
-const REDO_POST = "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/39/video";
+/**
+ * 导入链的**三态**判定：`isImportSettled` 只说「还没跑完」，工作台还要知道「到底在不在
+ * 跑」——在跑就转圈、没在跑就给「开始制作」出口。现场 `t3` 永远卡在「正在导入剧本」，
+ * 就是这两种情况被混成了同一个转圈。
+ */
+describe("导入三态判定", () => {
+  it("没导入完、也没在跑 → 两侧都为 false（工作台给出口）", () => {
+    const global = { ingested: false };
+    expect(isImportSettled(global)).toBe(false);
+    expect(isImportRunning(global, [])).toBe(false);
+  });
+
+  it("管道自己报 pending → 算在跑", () => {
+    expect(isImportRunning({ script_process_pending: true }, [])).toBe(true);
+    expect(isImportRunning({ screenplay_preprocess_pending: true }, [])).toBe(true);
+  });
+
+  it("任务表里还有活的导入类任务 → 也算在跑", () => {
+    expect(
+      isImportRunning({ ingested: false }, [{ task_type: "ingest_fast", status: "running" }]),
+    ).toBe(true);
+    expect(
+      isImportRunning({ ingested: false }, [{ task_type: "script_process", status: "queued" }]),
+    ).toBe(true);
+  });
+
+  it("导入类任务已到终态 / 无关任务 → 不算在跑", () => {
+    expect(
+      isImportRunning({ ingested: false }, [{ task_type: "ingest_fast", status: "completed" }]),
+    ).toBe(false);
+    expect(
+      isImportRunning({ ingested: false }, [{ task_type: "single_video", status: "running" }]),
+    ).toBe(false);
+  });
+
+  it("两端都不 pending 且已摄入 → 导入完成", () => {
+    expect(
+      isImportSettled({ ingested: true, script_process_pending: false }),
+    ).toBe(true);
+  });
+});
+
+const TASK_GET = "http://localhost:3000/api/v1/projects/demo/tasks/single_video/1";const REDO_POST = "http://localhost:3000/api/v1/projects/demo/episodes/1/beats/39/video";
 
 function makeTask(taskId: string, status: string, error?: string) {
   return {

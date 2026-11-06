@@ -22,6 +22,9 @@ export function useStudioPolling(
       void queryClient.invalidateQueries({ queryKey: queryKeys.pipelineStatus(project) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.episodes(project) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.projectSummaries() });
+      // run 状态同样要跟着走：另一台设备 / 服务端兜底把 run 启动或推进了，这个标签页
+      // 不能一直停在「待开始」上。
+      void queryClient.invalidateQueries({ queryKey: queryKeys.directorAutoRun(project) });
     };
     const id = window.setInterval(tick, intervalMs);
     return () => window.clearInterval(id);

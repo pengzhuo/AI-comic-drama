@@ -3193,6 +3193,33 @@ class DirectorAutoCoordinator:
                 # could start the step. Retry within a bounded budget and only
                 # then pause the durable run for the user's decision.
                 if taskless_continuations >= MAX_TASKLESS_CONTINUATIONS:
+                    # 空转也会停在必须由用户拍板的闸门上：缺声线策略、肖像/身份图
+                    # 时确定性派发不会产生写任务。若这里只报「未产生写任务」，前端
+                    # 认不出闸门类型、弹不出对应卡片，客户点「继续制作」只会再空转
+                    # 一轮（2026-11 现场：nn_1103_3 停在 voice_setup 反复空转）。
+                    # 所以耗尽空转预算时先问一次闸门，命中就按闸门原因暂停。
+                    if run.is_project_scope:
+                        try:
+                            gate_reason = await self._pause_gate(run)
+                        except Exception:  # noqa: BLE001 - 闸门识别失败不能拖垮续跑
+                            logger.exception(
+                                "taskless pause gate check failed (run %s)", run.run_id
+                            )
+                            gate_reason = None
+                        if gate_reason:
+                            if not await self._owns_run(run_id):
+                                return
+                            await self._pause_owned(
+                                run_id=run_id,
+                                username=username,
+                                project_id=project_id,
+                                reason=gate_reason,
+                            )
+                            await self._notify(
+                                run,
+                                f"自动成片已暂停：{_pause_reason_display(gate_reason)}。",
+                            )
+                            return
                     wrote, note = self._last_continuation(run_id)
                     reason = (
                         "自动续跑未产生新的任务"

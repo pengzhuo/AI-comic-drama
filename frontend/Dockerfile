@@ -14,9 +14,14 @@ ENV VITE_APP_VERSION=${VITE_APP_VERSION}
 ARG VITE_EDITION=ce
 ENV VITE_EDITION=${VITE_EDITION}
 
-# Instance-level UI hides. Empty (the default) keeps the shipped behavior; a
-# self-hosted instance sets a flag to "1" to drop the on-entry release popup or
-# the Piko status-bar entry. See src/lib/ui-hide-flags.ts.
+# Instance-level build-time config. Every value here is inlined into the bundle,
+# so it MUST arrive through a build arg: `.dockerignore` drops `.env` / `.env.*`,
+# which means `vite build --mode ce` cannot read `.env.ce.local` inside the build
+# context even though a local `npm run build:ce` does. Empty (the default) keeps
+# the shipped upstream behavior. See src/lib/ui-hide-flags.ts, src/lib/app-mode.ts
+# and docs/agents/web-hotpatch-deploy.md §1/§6 — a bundle built without these was
+# the 2026-11-06 incident (customer studio links started asking for the internal
+# console key). `docker-compose.yml` forwards the matching host `.env` values.
 ARG VITE_HIDE_RELEASE_POPUP=""
 ENV VITE_HIDE_RELEASE_POPUP=${VITE_HIDE_RELEASE_POPUP}
 ARG VITE_HIDE_PIKO_ENTRY=""
@@ -27,6 +32,16 @@ ARG VITE_HIDE_NOTIFICATION_CENTER=""
 ENV VITE_HIDE_NOTIFICATION_CENTER=${VITE_HIDE_NOTIFICATION_CENTER}
 ARG VITE_HIDE_MODEL_GUIDE=""
 ENV VITE_HIDE_MODEL_GUIDE=${VITE_HIDE_MODEL_GUIDE}
+ARG VITE_HIDE_GITHUB_STARS=""
+ENV VITE_HIDE_GITHUB_STARS=${VITE_HIDE_GITHUB_STARS}
+ARG VITE_HIDE_HEADER_SETTINGS=""
+ENV VITE_HIDE_HEADER_SETTINGS=${VITE_HIDE_HEADER_SETTINGS}
+ARG VITE_LOGIN_ANNOUNCEMENTS_URL=""
+ENV VITE_LOGIN_ANNOUNCEMENTS_URL=${VITE_LOGIN_ANNOUNCEMENTS_URL}
+ARG VITE_INTERNAL_ENTRY_PATH=""
+ENV VITE_INTERNAL_ENTRY_PATH=${VITE_INTERNAL_ENTRY_PATH}
+ARG VITE_BRAND_ATTRIBUTION=""
+ENV VITE_BRAND_ATTRIBUTION=${VITE_BRAND_ATTRIBUTION}
 
 # Use pnpm (matches local dev) instead of npm — a single lockfile as source of
 # truth, which removes the npm/pnpm dual-lockfile drift that made `npm ci` fail.
@@ -41,7 +56,10 @@ ARG NPM_REGISTRY=""
 RUN pnpm install --frozen-lockfile --registry="${NPM_REGISTRY:-https://registry.npmjs.org}"
 
 COPY . .
-RUN pnpm build
+# `build:ce`, not `build`: the plain production-mode build drops `.env.ce` and
+# every instance value declared above. `verify:ce` then fails the image build if
+# the produced bundle does not actually carry those values.
+RUN pnpm build:ce && pnpm verify:ce
 
 # Parse the rendered runtime template in CI without building the SPA image.
 FROM nginx:1.27-alpine AS nginx-config-test

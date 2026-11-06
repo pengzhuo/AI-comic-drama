@@ -1120,7 +1120,7 @@ _USAGE_SOURCES: tuple[tuple[str, str, str, str], ...] = (
     ("image", "get_image_request_usage_db_path", "image_request_usage", "model_name"),
     ("video", "get_video_request_usage_db_path", "video_request_usage", "model_name"),
     ("audio", "get_audio_request_usage_db_path", "audio_request_usage", "model_name"),
-    ("llm", "get_llm_request_usage_db_path", "llm_request_usage", "model"),
+    ("text", "get_llm_request_usage_db_path", "llm_request_usage", "model"),
 )
 
 

@@ -190,13 +190,17 @@ async def _run_build_episodes(
     payload = envelope.get("payload") or {}
     config = dict(payload.get("config") or {})
     target = int(config.get("target_episodes", 10))
-    planning_mode = str(config.get("planning_mode", "ai"))
     generate_metadata = bool(config.get("generate_metadata", False))
     require_imported_novel(ctx.output_dir)
     # Defence in depth: the route rejects AI modes for structured projects
     # before enqueue, but a task queued before the project's track was known
     # must not reach a planner that needs the graph.
     state_dir = getattr(ctx, "state_dir", ctx.output_dir)
+
+    # 分集模式由调用方（路由 / pipeline_auto）解析后放在 payload 里；这里保持旧的
+    # 兜底值 "ai"，避免影响直接调用者。节奏“数值”只有 duration 模式才需要，届时
+    # 再从项目配置补齐（payload 覆盖项目配置，项目配置覆盖全局默认）。
+    planning_mode = str(config.get("planning_mode", "ai"))
     if is_structured_pipeline(state_dir) and planning_mode != "chapters":
         raise KnowledgePipelineUnsupported(
             "structured_v1 only supports deterministic chapter/episode mapping"
@@ -207,7 +211,32 @@ async def _run_build_episodes(
         def update(progress: float | None, task: str) -> None:
             _progress(ctx, "build_episodes", progress, task)
 
-        if planning_mode == "chapters":
+        if planning_mode == "duration":
+            project_config: dict[str, Any] = {}
+            try:
+                from novelvideo.project_config import load_project_config_from_state_dir
+
+                project_config = load_project_config_from_state_dir(
+                    state_dir,
+                    username=getattr(ctx, "owner_username", None),
+                    project=getattr(ctx, "project_name", None),
+                )
+            except Exception:
+                project_config = {}
+            merged_pacing = {**project_config, **config}
+            if config.get("target_seconds") is not None:
+                merged_pacing["episode_target_seconds"] = config["target_seconds"]
+            episodes = await store.build_episodes_by_duration(
+                target_seconds=merged_pacing.get("episode_target_seconds"),
+                merge_floor_seconds=merged_pacing.get("episode_merge_floor_seconds"),
+                split_threshold_seconds=merged_pacing.get(
+                    "episode_split_threshold_seconds"
+                ),
+                generate_metadata=generate_metadata,
+                on_progress=update,
+                on_log=lambda message: update(None, message),
+            )
+        elif planning_mode == "chapters":
             episodes = await store.build_episodes_from_chapters(
                 generate_metadata=generate_metadata,
                 on_progress=update,

@@ -111,6 +111,16 @@ export interface PipelineProjectStatus {
   characters: number;
   episodes: number;
   portraits_done: boolean;
+  /** 剧本处理是否已有持久结果（导入链完成的稳定信号）。 */
+  script_processed?: boolean;
+  /**
+   * 剧本预处理 / 剧本处理是否还在队列里。
+   *
+   * 工作台据此把「导入还没跑完」拆成「正在导入（转圈）」与「根本没在跑（给出口）」，
+   * 否则两种情况都只渲染同一个转圈，客户看不到任何按钮。
+   */
+  screenplay_preprocess_pending?: boolean;
+  script_process_pending?: boolean;
 }
 
 export interface PipelineStepStatus {

@@ -449,12 +449,17 @@ async def run_indextts2_beat_audio_generation(
         from novelvideo.egress_context import ambient_organization_egress_context
 
         egress_context = ambient_organization_egress_context()
-    if generator is None and egress_context is not None:
+    if generator is None:
         from novelvideo.generators.indextts2_fal import IndexTTS2FalClient
 
-        generator = IndexTTS2FalClient(
-            provider="newapi",
-            egress_context=egress_context,
+        # Build one client up front and reuse it for every beat so the gateway
+        # request id captured on ``_last_provider_request_id`` can be recorded
+        # against the usage row. Creating the client lazily inside the per-beat
+        # generator hid that id and left ``gateway_request_id`` NULL.
+        generator = (
+            IndexTTS2FalClient(provider="newapi", egress_context=egress_context)
+            if egress_context is not None
+            else IndexTTS2FalClient()
         )
 
     normalized_mode = _normalize_mode(mode)

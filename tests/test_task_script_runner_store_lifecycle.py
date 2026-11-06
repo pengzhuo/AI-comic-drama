@@ -131,6 +131,11 @@ async def test_script_writer_reads_effective_scoped_config_and_closes_store(monk
         ctx,
     )
 
+    from novelvideo.pacing import PacingSettings
+
+    # runner 还会把解析出的节奏参数传给工厂（默认全局 60s/单镜 15s）。
+    pacing_settings = workflow_config.pop("pacing_settings")
+    assert isinstance(pacing_settings, PacingSettings)
     assert workflow_config == {
         "genre": "thriller",
         "story_setting": "night city",

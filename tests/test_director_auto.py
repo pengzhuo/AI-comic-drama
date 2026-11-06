@@ -488,6 +488,71 @@ async def test_completed_task_that_does_not_advance_the_stage_still_stops(
 
 
 @pytest.mark.asyncio
+async def test_taskless_pause_reports_the_gate_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """空转暂停也要报出闸门原因，否则前端弹不出声线/肖像卡。
+
+    现场（2026-11）：项目停在 ``voice_setup``（缺声线策略）时确定性派发不产生
+    写任务，暂停文案只有「自动续跑未产生写任务」——前端 ``isVoicePolicyPause``
+    认的是 ``未选择声线策略`` 子串，于是卡片不弹、客户点「继续制作」再空转一轮。
+
+    这里刻意**不给任何任务**：有完成态任务时会先走「任务完成」那条闸门分支
+    （``_run`` 里 ``3155`` 那个调用点），就测不到空转分支了。
+    """
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return []
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _continue_owned(self, run):
+            # Never writes a task: the coordinator has to stop on its own.
+            self._remember_continuation(run.run_id, wrote=False, note="skill")
+            return False
+
+        async def _pause_gate(self, run):
+            return director_auto.VOICE_POLICY_REQUIRED_ERROR
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(director_auto, "STAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path, scope="project"))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        for _ in range(600):
+            saved = store.get("alice", "project-1")
+            if saved is not None and saved.status == "paused":
+                break
+            await asyncio.sleep(0.01)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "paused"
+        # 暂停原因是闸门本身，而不是「未产生写任务」——前端靠这个子串弹声线卡。
+        assert saved.last_error == director_auto.VOICE_POLICY_REQUIRED_ERROR
+        assert saved.pause_kind == director_auto.PAUSE_KIND_VOICE
+        # 闸门在耗尽空转预算那一刻直接回报，不再多花一段「重试 3 次」。
+        assert saved.stage_attempts == 0
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("store_read_delay", [0, 0.1])
 async def test_failure_retries_before_pausing_without_agent_turn(
     monkeypatch: pytest.MonkeyPatch,

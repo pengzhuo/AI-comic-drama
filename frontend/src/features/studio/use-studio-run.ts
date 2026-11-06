@@ -187,6 +187,13 @@ export function useStudioRun(
       return;
     }
     if (status !== "paused") return;
+    if (kind === null) {
+      // 认不出暂停原因也必须给出出口：否则页面只剩一句「已暂停」，客户没有任何可点
+      // 的按钮（现场 t3 那类「打开就卡住」的观感就是这样来的）。老后端不下发
+      // `pause_kind`，这条兜底就是它唯一的出路。
+      setNeedsHuman(lastError.trim() || "制作已暂停，需要人工确认后继续。");
+      return;
+    }
     // 服务端给每类暂停打了结构化标记，这里不再靠子串猜。
     switch (kind) {
       case "blocked":

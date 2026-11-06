@@ -1929,6 +1929,163 @@ class SQLiteStore:
 
         return episodes
 
+    async def build_episodes_by_duration(
+        self,
+        novel_text: str = None,
+        *,
+        target_seconds: float | None = None,
+        merge_floor_seconds: float | None = None,
+        split_threshold_seconds: float | None = None,
+        generate_metadata: bool = False,
+        on_progress: Optional[Callable[[float, str], None]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> List[NovelEpisode]:
+        """按目标时长把原文切成剧集（默认每集≈60 秒）。
+
+        与 ``build_episodes_from_chapters`` 的区别：章节不再是“一章一集”。
+
+        - 章节短于目标：与相邻章节合并到接近目标时长；
+        - 章节略超（≤ 拆分阈值，默认 90s）：压缩到目标时长，不拆；
+        - 章节明显超长（> 拆分阈值）：按自然子边界拆成多集。
+
+        拆分/合并/压缩全部是确定性计算（见 ``novelvideo.pacing``），不调用 LLM；
+        只有 ``generate_metadata=True`` 时才用 LLM 补标题/摘要。
+        """
+        from novelvideo.cognee.chapter_detector import ChapterDetector
+        from novelvideo.pacing import build_episode_segments, resolve_pacing_settings
+
+        def report(progress: float, task: MessageLike):
+            if on_progress:
+                on_progress(progress, task)
+
+        def log(message: MessageLike):
+            if on_log:
+                on_log(message)
+            console.print(f"[dim]{message}[/dim]")
+
+        if novel_text is None:
+            log(lmsg("tasks.log.source.loading", "从文件加载原文..."))
+            novel_text = require_imported_novel(self.project_dir)
+            log(
+                lmsg(
+                    "tasks.log.source.loaded",
+                    f"原文加载完成: {len(novel_text)} 字符",
+                    charCount=len(novel_text),
+                )
+            )
+
+        settings = resolve_pacing_settings(
+            {
+                "episode_target_seconds": target_seconds,
+                "episode_merge_floor_seconds": merge_floor_seconds,
+                "episode_split_threshold_seconds": split_threshold_seconds,
+            }
+        )
+
+        report(0.1, "检测章节结构...")
+        log("检测章节结构...")
+        detector = ChapterDetector()
+        chapters = detector.detect(novel_text)
+
+        if not chapters:
+            # “任何剧本”：没有章节标记时把全文当成一章，交给时长切分拆集。
+            log("未检测到章节标记，按全文做时长切分")
+
+        log(
+            f"检测到 {len(chapters) if chapters else 1} 个章节，目标每集约 "
+            f"{settings.episode_target_seconds:.0f} 秒"
+        )
+
+        chapter_units = (
+            [(chapter.number, chapter.content) for chapter in chapters]
+            if chapters
+            else [(1, novel_text)]
+        )
+        segments = build_episode_segments(chapter_units, settings=settings)
+        if not segments:
+            raise ValueError("原文无法切分出有效内容")
+
+        total = len(segments)
+        episodes: List[NovelEpisode] = []
+        for index, segment in enumerate(segments):
+            number = index + 1
+            progress = 0.1 + (index / max(1, total)) * 0.7
+            report(progress, f"处理第 {number}/{total} 集...")
+
+            text = str(segment.get("text") or "")
+            if generate_metadata:
+                metadata = await self._generate_episode_metadata(number, text)
+            else:
+                summary = text[:200].strip()
+                if len(text) > 200:
+                    summary += "..."
+                metadata = {
+                    "title": f"第{number}集",
+                    "summary": summary,
+                    "conflict": "",
+                    "cliffhanger": "",
+                    "key_events": [],
+                    "characters": [],
+                }
+
+            episodes.append(
+                NovelEpisode(
+                    number=number,
+                    title=metadata.get("title", f"第{number}集"),
+                    chapter_start=int(segment.get("chapter_start") or 0),
+                    chapter_end=int(segment.get("chapter_end") or 0),
+                    raw_content=text,
+                    content_summary=metadata.get("summary", ""),
+                    main_conflict=metadata.get("conflict", ""),
+                    cliffhanger=metadata.get("cliffhanger", ""),
+                    key_events=metadata.get("key_events", []),
+                    character_names=metadata.get("characters", []),
+                )
+            )
+
+        report(0.82, "合并剧集数据...")
+        log("合并剧集数据（保留身份、场景、道具和颜色）...")
+        new_numbers = {ep.number for ep in episodes}
+        for ep in episodes:
+            old = self._episodes.get(ep.number)
+            if old:
+                ep.identity_ids = old.identity_ids
+                ep.scene_menu = old.scene_menu
+                ep.prop_menu = old.prop_menu
+                ep.sketch_colors_json = old.sketch_colors_json
+
+        removed = set(self._episodes.keys()) - new_numbers
+
+        report(0.88, "保存到数据库...")
+        log("保存剧集到数据库...")
+        db = await self._ensure_db()
+        try:
+            if removed:
+                placeholders = ",".join("?" for _ in removed)
+                await db.execute(
+                    f"DELETE FROM episodes WHERE number IN ({placeholders})",
+                    sorted(removed),
+                )
+            await self._upsert_episodes(db, episodes)
+            await db.commit()
+        except BaseException:
+            await asyncio.shield(db.rollback())
+            raise
+        if removed:
+            log(f"已删除 {len(removed)} 个旧剧集")
+
+        self._episodes.clear()
+        for ep in episodes:
+            self._episodes[ep.number] = ep
+
+        report(1.0, "按时长分集完成")
+        log(
+            f"按时长分集完成: {len(episodes)} 集 "
+            f"(目标每集 {settings.episode_target_seconds:.0f} 秒)"
+        )
+
+        return episodes
+
     async def _generate_episode_metadata(self, episode_num: int, content: str) -> dict:
         """使用 LLM 生成剧集元数据。"""
         try:

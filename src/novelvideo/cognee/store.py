@@ -1144,6 +1144,31 @@ class CogneeStore:
         self._sync_sqlite_caches()
         return episodes
 
+    async def build_episodes_by_duration(
+        self,
+        novel_text: str = None,
+        *,
+        target_seconds: float | None = None,
+        merge_floor_seconds: float | None = None,
+        split_threshold_seconds: float | None = None,
+        generate_metadata: bool = False,
+        on_progress: Optional[Callable[[float, str], None]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> List[NovelEpisode]:
+        """按目标时长分集（默认每集≈60 秒）。实现与章节映射同源，落在 SQLite。"""
+
+        episodes = await self.sqlite_store.build_episodes_by_duration(
+            novel_text=novel_text,
+            target_seconds=target_seconds,
+            merge_floor_seconds=merge_floor_seconds,
+            split_threshold_seconds=split_threshold_seconds,
+            generate_metadata=generate_metadata,
+            on_progress=on_progress,
+            on_log=on_log,
+        )
+        self._sync_sqlite_caches()
+        return episodes
+
     async def build_episodes_from_events(
         self,
         target_episodes: int,

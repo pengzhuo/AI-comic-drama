@@ -38,6 +38,7 @@ Log in at <http://localhost:5173/login> with a backend-provisioned account.
 | `npm run dev`           | Vite dev server on :5173 with `/api/v1` + `/static` proxy       |
 | `npm run build`         | `tsc -b && vite build` — production bundle in `dist/`           |
 | `npm run build:ce`      | Source-available CE production bundle with CE fallback env           |
+| `npm run verify:ce`     | Assert `dist/` carries the instance config (the check the image build runs) |
 | `npm run preview`       | Serve the production build locally                              |
 | `npm test`              | Vitest single run                                               |
 | `npm run test:watch`    | Vitest watch mode                                               |
@@ -67,6 +68,14 @@ built without that file silently brings every entry back — check the file is p
 before building a hot-patch bundle, and see
 [`docs/agents/web-hotpatch-deploy.md`](../docs/agents/web-hotpatch-deploy.md) for the
 build → deploy → verify checklist.
+
+A Docker image build **cannot** read `.env.ce.local`: `.dockerignore` drops `.env`/`.env.*`,
+so `vite build --mode ce` inside the image would lose every value above. The image therefore
+receives them as build args — `frontend/Dockerfile` declares an `ARG`/`ENV` pair for each one
+and `docker-compose.yml` forwards the host `.env` values — and `pnpm verify:ce`
+(`scripts/verify-ce-bundle.mjs`) runs at the end of the image build, failing it when the
+produced bundle does not carry them. `src/__tests__/dockerfile-build-args.test.ts` keeps the
+three lists in sync.
 
 Auth is cookie-backed. `AuthStore.login()` POSTs `/api/v1/auth/login` with `credentials: "include"`; the backend sets an HttpOnly `st_api_key` cookie, and the SPA persists only `{ username, role }` as a login marker. Every subsequent `ky` request uses `credentials: "include"` so the browser attaches the cookie. 401 on any request logs out + hard-redirects to `/login`.
 

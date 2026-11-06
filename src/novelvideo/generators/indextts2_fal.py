@@ -452,10 +452,13 @@ class IndexTTS2FalClient:
                         },
                         json=body,
                     )
+                    # Prefer the gateway request id (newAPI/one-api) so the usage
+                    # row can be joined to the gateway/relay bill; the generic
+                    # ``x-request-id`` is the upstream id and cannot be matched.
                     self._last_provider_request_id = (
-                        response.headers.get("x-request-id")
-                        or response.headers.get("x-newapi-request-id")
+                        response.headers.get("x-newapi-request-id")
                         or response.headers.get("x-oneapi-request-id")
+                        or response.headers.get("x-request-id")
                         or ""
                     )
                     response.raise_for_status()

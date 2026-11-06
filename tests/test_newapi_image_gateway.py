@@ -1527,6 +1527,72 @@ def test_newapi_image_content_policy_retry_can_recover(monkeypatch):
     assert attempts == 2
 
 
+def test_newapi_image_ark_bare_sensitive_code_is_retried_once(monkeypatch):
+    """2026-11-06 线上实例：Ark 只回光杆 ``*SensitiveContentDetected``。
+
+    换到 aiqy ``doubao-seedream-5.0-flash`` 后，拒绝报文里既没有 OpenAI 的
+    ``content_policy_violation``，也没有「内容政策」字样，只有
+    ``InputText/InputImage/OutputImage + SensitiveContentDetected``。缺这条标记时连
+    这一次「同参重投」都不会发生，而**输出画面**被拒是随机结果、重投有机会过审。
+    """
+
+    import httpx
+    from novelvideo.generators import nanobanana_grid
+
+    attempts = 0
+
+    class ArkSensitiveResponse:
+        status_code = 400
+        text = (
+            '{"error":{"message":"The request failed because the input text may contain '
+            'sensitive information. Request id: 021793970277069d2ec6088cd57f16be69183642d63bc7748cbb0",'
+            '"type":"BadRequest","param":"","code":"InputTextSensitiveContentDetected"}}'
+        )
+        headers = {"x-oneapi-request-id": "req-ark"}
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "bad request",
+                request=httpx.Request("POST", "http://newapi.test/v1/images/edits"),
+                response=self,
+            )
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers, json):
+            nonlocal attempts
+            attempts += 1
+            return ArkSensitiveResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(nanobanana_grid, "NEWAPI_IMAGE_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    image_bytes, _text, error = run_async(
+        nanobanana_grid._call_newapi_image_api(
+            api_key="newapi-token",
+            model="LingShan-G2",
+            prompt="benign prompt",
+            image_config={"aspect_ratio": "2:3", "image_size": "1K", "quality": "medium"},
+            base_url="http://newapi.test/v1",
+        )
+    )
+
+    assert image_bytes is None
+    assert "HTTP 400" in error
+    assert "InputTextSensitiveContentDetected" in error
+    # 如实表达「首次 + 同参重投次数」，不写死默认值：线上把
+    # ``NEWAPI_IMAGE_CONTENT_POLICY_RETRY_ATTEMPTS`` 置 0 时本用例仍应成立（attempts==1）。
+    assert attempts == 1 + nanobanana_grid.NEWAPI_IMAGE_CONTENT_POLICY_RETRY_ATTEMPTS
+
+
 def test_newapi_image_read_timeout_is_not_retried(monkeypatch):
     """A read timeout may already have paid work, so it must not be repeated."""
 
