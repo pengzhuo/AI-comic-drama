@@ -113,7 +113,7 @@ def test_legacy_video_usage_db_gains_cost_columns(tmp_path):
 
     conn = sqlite3.connect(db_path)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(video_request_usage)")}
-    assert {"gateway_request_id", "cost_quota", "quota_checked_at"} <= columns
+    assert {"gateway_request_id", "cost_quota", "quota_checked_at", "cost_source"} <= columns
     legacy = conn.execute(
         "SELECT gateway_request_id, cost_quota FROM video_request_usage"
         " WHERE request_id = 'legacy-1'"
@@ -175,7 +175,7 @@ def test_reconcile_apply_migrates_legacy_usage_table(tmp_path):
 
     conn = sqlite3.connect(db_path)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(video_request_usage)")}
-    assert {"cost_quota", "quota_checked_at"} <= columns
+    assert {"cost_quota", "quota_checked_at", "cost_source"} <= columns
     quota, checked_at = conn.execute(
         "SELECT cost_quota, quota_checked_at FROM video_request_usage"
         " WHERE request_id = 'task-1'"
@@ -642,6 +642,147 @@ def test_reconcile_rejects_unknown_source(tmp_path):
 
     with pytest.raises(ValueError):
         reconcile(gateway_db=tmp_path / "one-api.db", source="nope")
+
+
+def test_reconcile_stamps_cost_source_and_clears_unmatched(tmp_path):
+    """命中行记录口径来源；对不上的行标 unmatched 并清空，避免虚高值冒充真账。"""
+    from novelvideo.gateway_cost_reconcile import reconcile
+
+    project_dir = _seed_project(tmp_path)
+    db = project_dir / "data.db"
+    gateway_db = tmp_path / "one-api.db"
+    _write_gateway_db(gateway_db)
+
+    reconcile(gateway_db=gateway_db, project_db=db, apply=True, source="gateway")
+
+    conn = sqlite3.connect(db)
+    video = conn.execute(
+        "SELECT cost_quota, cost_source FROM video_request_usage WHERE request_id='task-1'"
+    ).fetchone()
+    image = conn.execute(
+        "SELECT cost_quota, cost_source FROM image_request_usage WHERE request_id='img-1'"
+    ).fetchone()
+    llm = conn.execute(
+        "SELECT cost_quota, cost_source FROM llm_request_usage WHERE request_id='llm-1'"
+    ).fetchone()
+    audio = conn.execute(
+        "SELECT cost_quota, cost_source FROM audio_request_usage WHERE request_id='aud-1'"
+    ).fetchone()
+    conn.close()
+    assert video == (1000, "gateway")
+    assert image == (200, "gateway")
+    assert llm == (50, "gateway")
+    # 音频没有网关单号：不能保留旧值，标成 unmatched。
+    assert audio == (None, "unmatched")
+
+    from novelvideo.api.routes.cost_report import build_cost_report
+
+    report = build_cost_report(project_output_dir=project_dir)
+    assert report["cost_source"] == "gateway"
+    by_source = {item["source"]: item for item in report["sources"]}
+    assert by_source["gateway"]["quota"] == 1250
+    assert by_source["unmatched"]["requests"] == 1
+
+
+def test_reconcile_relay_first_uses_relay_when_configured(tmp_path, monkeypatch):
+    from novelvideo import gateway_cost_reconcile, relay_billing
+
+    project_dir = _seed_project(tmp_path)
+    gateway_db = tmp_path / "one-api.db"
+    _write_gateway_db_with_upstream_ids(gateway_db)
+    monkeypatch.setattr(
+        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
+    )
+    settings = relay_billing.RelayBillingSettings(
+        base_urls=("https://aicf.example",),
+        username="u",
+        password="p",
+        cache_path=str(tmp_path / "cache.json"),
+    )
+    monkeypatch.setattr(relay_billing, "load_settings", lambda **_: settings)
+    relay = _FakeRelay(
+        base_url="https://aicf.example",
+        tasks={"up-task-1": 220_784},
+        logs={"up-log-img": 2_322, "up-log-llm": 10_213},
+    )
+
+    report = gateway_cost_reconcile.reconcile_relay_first(
+        project_db=project_dir / "data.db", apply=True, relay_transport=relay
+    )
+
+    assert report.source == "relay"
+    assert report.quota == 220_784 + 2_322 + 10_213
+    assert not [e for e in report.errors if "回退 gateway" in e]
+
+    conn = sqlite3.connect(project_dir / "data.db")
+    source = conn.execute(
+        "SELECT cost_source FROM video_request_usage WHERE request_id='task-1'"
+    ).fetchone()[0]
+    quota = conn.execute(
+        "SELECT cost_quota FROM video_request_usage WHERE request_id='task-1'"
+    ).fetchone()[0]
+    conn.close()
+    assert (quota, source) == (220_784, "relay")
+
+    from novelvideo.api.routes.cost_report import build_cost_report
+
+    assert build_cost_report(project_output_dir=project_dir)["cost_source"] == "relay"
+
+
+def test_reconcile_relay_first_falls_back_to_gateway_without_accounts(
+    tmp_path, monkeypatch
+):
+    from novelvideo import gateway_cost_reconcile, relay_billing
+
+    project_dir = _seed_project(tmp_path)
+    gateway_db = tmp_path / "one-api.db"
+    _write_gateway_db(gateway_db)
+    monkeypatch.setattr(
+        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
+    )
+    # 未配置账号 → 不触达上游，直接 gateway。
+    monkeypatch.setattr(
+        relay_billing, "load_settings", lambda **_: relay_billing.RelayBillingSettings()
+    )
+
+    report = gateway_cost_reconcile.reconcile_relay_first(
+        project_db=project_dir / "data.db", apply=True
+    )
+
+    assert report.source == "gateway"
+    assert report.quota == 1250
+    from novelvideo.api.routes.cost_report import build_cost_report
+
+    assert build_cost_report(project_output_dir=project_dir)["cost_source"] == "gateway"
+
+
+def test_reconcile_relay_first_falls_back_when_relay_has_no_hits(
+    tmp_path, monkeypatch
+):
+    from novelvideo import gateway_cost_reconcile, relay_billing
+
+    project_dir = _seed_project(tmp_path)
+    gateway_db = tmp_path / "one-api.db"
+    _write_gateway_db(gateway_db)
+    monkeypatch.setattr(
+        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
+    )
+    settings = relay_billing.RelayBillingSettings(
+        base_urls=("https://aicf.example",),
+        username="u",
+        password="p",
+        cache_path=str(tmp_path / "cache.json"),
+    )
+    monkeypatch.setattr(relay_billing, "load_settings", lambda **_: settings)
+    empty_relay = _FakeRelay(base_url="https://aicf.example", tasks={}, logs={})
+
+    report = gateway_cost_reconcile.reconcile_relay_first(
+        project_db=project_dir / "data.db", apply=True, relay_transport=empty_relay
+    )
+
+    assert report.source == "gateway"
+    assert any("回退 gateway" in err for err in report.errors)
+    assert report.quota == 1250
 
 
 def test_relay_billing_client_relogins_on_expired_token():

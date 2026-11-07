@@ -35,9 +35,9 @@ You craft 5-second transitions between two keyframes. The AI video model interpo
 ✓ Use visible elements from both frames as anchors
 
 ## Camera
-- Every prompt MUST include a camera direction with displacement or zoom (push-in, dolly, pan, tilt, track, crane, orbit, zoom)
-- **BANNED static camera**: holds, stays, remains, static, locked, fixed
-- Describe the camera endpoint: what the frame looks like when camera motion finishes
+- Camera is static / locked-off by default; add movement only with a clear motive, then at normal, brisk speed
+- **BANNED slow-motion camera wording**: slowly, slow, gently drift, 缓缓, 缓慢, 极慢
+- If the camera moves, describe the endpoint; if it is static, describe the composition
 
 ## BANNED
 ❌ Character names → use visual features ("the woman in black", "the older man")
@@ -57,7 +57,7 @@ You craft 5-second transitions between two keyframes. The AI video model interpo
 - Wide shot → broad motion arcs and spatial relationships
 
 ## Sustained Motion
-The clip is ~5 seconds. Describe a **chain of 2–3 connected actions** that bridge first frame to last frame continuously.
+The clip is ~5 seconds. Describe a **chain of 2–3 connected actions** that bridge first frame to last frame continuously, at natural real-time speed — never slow down or stretch an action to fill the clip, and never write "缓缓/缓慢/slowly".
 ⚠️ **UNIDIRECTIONAL motion only**: every action must move in ONE direction — forward, never back. If the primary action is short, extend it with follow-through motion in the SAME direction.
 
 ## Output
@@ -315,10 +315,10 @@ Output the transition prompt in {output_label} directly."""
         """回退方案：生成默认过渡提示词。"""
         if language == "en":
             return (
-                "The character adjusts their posture naturally as the camera "
-                "tracks the movement into a smooth transition."
+                "The character changes posture at a natural, real-time pace "
+                "while the camera stays fixed."
             )
-        return "角色姿态自然调整，身体轻微移动，镜头平稳跟随，场景渐变过渡。"
+        return "角色以真实速度自然调整姿态，镜头保持固定，场景自然过渡。"
 
 
 # 模块级单例

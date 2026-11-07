@@ -639,6 +639,48 @@ async def test_literal_workflow_compacts_beats_when_pacing_settings_given(monkey
 
 
 @pytest.mark.asyncio
+async def test_literal_workflow_splits_over_long_dialogue_beats(monkeypatch):
+    from novelvideo.pacing import PacingSettings
+
+    long_line = "他说" + "字" * 172  # ≈30s，远超单镜上限
+    store = _LiteralRunStore()
+    agent = _SequencedLiteralAgent(
+        [
+            LiteralBeatMetaOutput(
+                audio_type="dialogue",
+                speaker="谢铮",
+                speaker_kind="character",
+                visual_description="屋内烛火轻轻摇晃。",
+                scene_id="",
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        LiteralScriptWritingWorkflow,
+        "agent",
+        property(lambda _workflow: agent),
+    )
+    workflow = LiteralScriptWritingWorkflow(
+        cognee_store=store,
+        sqlite_store=store,
+        pacing_settings=PacingSettings(),
+    )
+
+    script = await workflow.run(
+        episode_num=1,
+        source_text="第1场 苏鸾寝殿 夜 内\n谢铮：" + long_line,
+    )
+
+    # 单条超长台词被拆成多条更短的 beat，且音色不变。
+    assert len(script.beats) >= 2
+    assert [b.beat_number for b in script.beats] == list(
+        range(1, len(script.beats) + 1)
+    )
+    assert all(b.audio_type == "dialogue" for b in script.beats)
+    assert all(b.speaker == "谢铮" for b in script.beats)
+
+
+@pytest.mark.asyncio
 async def test_literal_workflow_does_not_degrade_gateway_403(monkeypatch):
     store = _LiteralRunStore()
     agent = _SequencedLiteralAgent(

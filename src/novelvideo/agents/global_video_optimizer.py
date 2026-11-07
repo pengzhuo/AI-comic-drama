@@ -81,16 +81,17 @@ You are a cinematic motion director. Given sketch panels and character color map
 
 ## Prompt Requirements
 - Write in the requested output language, **present tense** throughout
-- Write a **single flowing paragraph** of 4–6 sentences
-- ⚠️ **Every prompt MUST include a camera direction with displacement or zoom** (e.g. "The camera pushes in…", "A slow dolly follows…", "Close-up as…", "Wide shot tracking…"). Static camera words are BANNED: holds, stays, remains, static, locked, fixed. The camera must always move.
-- ⚠️ **Camera endpoint**: describe what the frame looks like when the camera motion finishes (e.g. "…ending on a tight close-up of her trembling hands"). This gives the model a clear target for the end of the clip.
+- Write **one flowing paragraph** of 4–6 sentences; when the clip has several shots, keep them in the same paragraph but mark every cut with `HARD CUT to …`
+- ⚠️ **Camera policy — static first, brisk when motivated**: default to a **locked-off / static camera**. Only add camera movement when the shot has a concrete narrative motive (reveal a new subject, follow a strong action, reframe). A static shot is fully allowed — do NOT invent camera moves just to fill time.
+- ⚠️ **When the camera does move, move at a normal, brisk speed** (a decisive push, pan, track, or crane). NEVER write slow-motion camera language: banned words include "slowly", "slow", "gently drift", "缓缓", "缓慢", "极慢", "慢推", "极缓速度". A lazy slow drift reads as drowsy and drags the whole film. Camera movement is NOT mandatory.
+- **Camera endpoint (only if the shot moves)**: if you added a move, state what the frame looks like when it finishes (e.g. "…ending on a tight close-up of her trembling hands"). If the camera is static, describe the composition instead.
 - ⚠️ **No emotion labels**: NEVER use abstract emotion words (sad, haunting, desperate, hopeful, anxious, melancholy). Instead show emotion through BODY LANGUAGE (clenched fists, averted gaze, hunched shoulders, trembling lips).
 - ⚠️ **No non-visual senses**: NEVER describe smell, temperature, humidity, taste, or tactile sensations. The model can only generate what is VISIBLE (and audible).
-- ⚠️ **Audio layer** (superset strategy — works on models with audio, ignored by silent models): add ONE short ambient sound sentence (e.g. "rain patters on the window"). For dialogue beats, also specify voice style (e.g. "calm", "urgent", "whisper").
+- ⚠️ **Audio layer** (superset strategy — works on models with audio, ignored by silent models): add ONE short ambient sound sentence (e.g. "rain patters on the window"). For dialogue beats, also specify voice style AND a natural, brisk speaking pace (e.g. "speaks briskly and clearly, no drawl"). NEVER write "speaks evenly", "unhurried", "calm and steady", "不紧不慢", "平稳", or "缓慢" about delivery — the model copies that and produces slow, dragging speech. Spoken lines must sound like a real person talking at a normal pace.
 - ⚠️ **Detail matches shot scale**: close-up → micro details (pores, thread count, iris dilation); wide shot → broad motion arcs and spatial relationships. Do not describe micro details in a wide shot or vice versa.
-- Include: camera movement + character action + audio layer
-- ⚠️ **Sustained motion**: the video clip is ~5 seconds long. A single quick action (one lunge, one turn) will finish too early and cause the model to reverse the motion. Always describe a **chain of 2–3 connected actions** that unfold continuously across the full duration (e.g. "he lunges forward, wraps his arms around her, then slowly sinks to his knees"). Layer simultaneous details (camera drift, fabric swaying, breathing) to keep motion flowing. BANNED as primary action: freezes, stares, stands, waits, remains, holds still — these produce static video.
-- ⚠️ **UNIDIRECTIONAL motion only**: every action must move in ONE direction — forward, never back. BANNED reversal patterns: walk forward then step back, lean in then pull away, reach out then withdraw, turn left then right. If the primary action is short (a single punch, a single turn), extend it with follow-through motion in the SAME direction (e.g. "punches forward, momentum carries torso into a stumble, he catches himself on the railing").
+- Include: character action + a camera choice (static, or a motivated brisk move) + audio layer
+- ⚠️ **Natural speed, multiple shots**: every action plays at its natural real-time speed. NEVER slow a movement down, never freeze, and never stretch a single short action to fill the clip — that reads as slow motion and drag. BANNED slow-motion phrasing anywhere in the prompt: "缓缓", "缓慢", "极慢", "慢慢地", or stacking "微微地 / 轻轻地" onto one action. When the clip is longer than a single shot, split it into **2–4 shots of roughly 3–8 seconds each**, joined by explicit `HARD CUT`s, and cover a long line with cutaways (listener reaction, hands/props, environment) instead of holding one static take.
+- ⚠️ **UNIDIRECTIONAL motion only**: every action must move in ONE direction — forward, never back. BANNED reversal patterns: walk forward then step back, lean in then pull away, reach out then withdraw, turn left then right. A short action is extended with a `HARD CUT` to the next shot (or follow-through in the SAME direction), never by slowing it down.
 - Always use `first_frame` mode: describe motion and camera changes starting FROM this frame going forward
 - ⚠️ **Dialogue beats**: if a Beat is marked as dialogue, describe the speaking action (lips moving, gestures while talking). The dialogue text will be appended by the system — only describe the physical action in the prompt.
 
@@ -122,11 +123,12 @@ You are a visual quality reviewer. Compare a sketch frame against its video moti
 
 ## Prompt Requirements
 - Single flowing paragraph, 4–6 sentences (~50–90 words)
-- ⚠️ **Camera movement is mandatory with displacement/zoom**: if the prompt lacks an explicit camera direction (push-in, dolly, pan, close-up, wide shot, etc.) or uses static camera words (holds, stays, remains, static, locked, fixed), set needs_fix=true and fix it.
+- ⚠️ **Camera policy — static allowed, slow banned**: a static / locked-off camera is acceptable and does NOT need fixing. Set needs_fix=true only when the prompt uses slow-motion camera wording (slowly, slow, gently drift, 缓缓, 缓慢, 极慢, 慢推) or a lazy drift with no motive.
 - ⚠️ **No emotion labels**: if the prompt contains abstract emotion words (sad, haunting, desperate, hopeful, anxious, melancholy) instead of body language, set needs_fix=true.
 - ⚠️ **No non-visual senses**: if the prompt describes smell, temperature, humidity, taste, or tactile sensations, set needs_fix=true.
 - ⚠️ **No static primary verbs**: if the main action uses freezes, stares, stands, waits, remains, holds still, set needs_fix=true.
-- ⚠️ **Audio layer required**: the prompt must include at least one ambient sound sentence. For dialogue beats, voice style (calm/urgent/whisper) must also be present. If missing, set needs_fix=true.
+- ⚠️ **No slow motion / no drag**: if the prompt slows a movement down, uses slow-motion adverbs ("缓缓", "缓慢", "极慢", "slowly"), freezes or stretches one short action to fill the clip, or keeps a single static take where 2–4 shots joined by `HARD CUT` would fit, set needs_fix=true and rewrite it with explicit shots at natural real-time speed. (A genuinely static *camera* is fine; slow *motion* is not.)
+- ⚠️ **Audio layer required**: the prompt must include at least one ambient sound sentence. For dialogue beats, voice style and a natural, brisk speaking pace must be present. If either is missing, or if it says the speaker talks "evenly / unhurried / 不紧不慢 / 平稳 / 缓慢", set needs_fix=true and rewrite the pace as natural and brisk.
 - ⚠️ **Dialogue beat review**: if the Beat is dialogue, the prompt must include speaking action (lips moving, gestures). Dialogue text is appended by the system and not checked in prompt.
 - ⚠️ **No reversal/oscillating motion**: if the prompt contains back-and-forth or reversing motion patterns (steps forward then back, leans in then pulls away, nods then shakes head, reaches out then withdraws), set needs_fix=true. All motion must be UNIDIRECTIONAL.
 - ⚠️ **First-frame contract**: the prompt must begin from the provided Start Frame / sketch state and move forward only. If it describes actions that happened before the visible frame, set needs_fix=true.
@@ -174,6 +176,24 @@ def _format_color_mapping_descriptor(info: dict) -> str:
     if not parts:
         return "person"
     return "; ".join(parts)
+
+
+def _beat_clip_seconds(beat: dict, narration: str) -> float:
+    """Estimate the generated clip length for a beat, to size the shot plan.
+
+    Only used to decide how many shots the prompt should place inside the clip;
+    the real duration is resolved again at generation time. The estimate mirrors
+    the TTS pace so it agrees with :func:`resolve_target_video_duration`.
+    """
+
+    try:
+        from novelvideo.manual_shots import resolve_target_video_duration
+        from novelvideo.pacing import estimate_duration_seconds
+
+        estimated = estimate_duration_seconds(narration or "")
+        return float(resolve_target_video_duration(beat, estimated))
+    except Exception:
+        return 5.0
 
 
 def create_global_video_reviewer_agent(language: str = "en") -> Agent:
@@ -333,7 +353,15 @@ class GlobalVideoPromptOptimizer:
         dialogue_hint = ""
         if audio_type == "dialogue":
             spk_label = identity_to_color.get(speaker, speaker) if speaker else ""
-            dialogue_hint = f"\n## Dialogue Beat\nSpeaker: {spk_label}. Prompt MUST include speaking action (lips moving, gestures while talking). Dialogue text will be appended by the system.\n"
+            dialogue_hint = f"\n## Dialogue Beat\nSpeaker: {spk_label}. Prompt MUST include speaking action (lips moving, gestures while talking) delivered at a natural, brisk pace like a real person (never \"unhurried / 平稳 / 不紧不慢\"). Dialogue text will be appended by the system.\n"
+
+        # Clip clock: decide how many shots the clip should hold, so a long line
+        # is covered by cuts instead of one slowed-down take.
+        clip_seconds = _beat_clip_seconds(beat, narr)
+        if clip_seconds <= 8:
+            shot_plan = "1 shot (single continuous take)"
+        else:
+            shot_plan = "2–4 shots (~3–8s each), each cut marked as HARD CUT"
 
         # Build continuity context
         continuity_section = ""
@@ -362,7 +390,7 @@ class GlobalVideoPromptOptimizer:
                     f"- Next beat (B{next_beat.get('beat_number', '?')}): {next_vd[:120]}"
                 )
             continuity_section = (
-                "\n## Continuity Context (vary your camera work from previous beat)\n"
+                "\n## Continuity Context (keep continuity; vary framing/scale rather than forcing camera moves)\n"
                 + "\n".join(parts)
                 + "\n"
             )
@@ -371,7 +399,7 @@ class GlobalVideoPromptOptimizer:
         if total_beats > 0:
             position_hint = f"\nThis is Beat {bn} of {total_beats} total. "
             if bn <= 2:
-                position_hint += "This is an OPENING beat — establish the scene with a wider shot before pushing in."
+                position_hint += "This is an OPENING beat — establish the scene with a wider shot before moving closer."
             elif bn >= total_beats - 1:
                 position_hint += "This is a CLOSING beat — build to a final visual climax or cliffhanger moment."
             else:
@@ -387,12 +415,21 @@ class GlobalVideoPromptOptimizer:
 ## Beat {bn} Context
 {beat_context}
 {dialogue_hint}{continuity_section}
+## Clip Clock
+- Clip length: {clip_seconds:.1f}s
+- Shot plan: {shot_plan}
+- Natural real-time speed: never slow down, freeze, or stretch one action to fill the clip.
+- Camera: static / locked-off by default; only move with a concrete motive, and then at normal brisk speed (never "缓慢 / 缓缓 / slowly").
+- Speech: for dialogue, deliver at a natural, brisk real pace — never "不紧不慢 / 平稳 / unhurried".
+
 ## Requirements
 1. Treat the sketch frame and Start Frame as video t=0; describe only what happens after it
 2. Use Motion Prompt as the authoritative forward action chain
 3. If Motion Prompt starts with an action that contradicts the visible t=0 state, begin from the first compatible action instead
 4. Generate the motion prompt in {output_label}
 5. Use character appearance descriptions, never use character names
+6. If the shot plan has multiple shots, mark every cut as `HARD CUT to …` and cover long dialogue with cutaways (listener reaction, hands/props, environment) rather than a longer static take
+7. Default to a static camera; add movement only with a motive, and never use slow-motion camera or speech wording
 
 ## Output Language
 {language_instruction}

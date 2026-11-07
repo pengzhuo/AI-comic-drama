@@ -23,12 +23,16 @@ def beat_expects_speech(beat: dict[str, Any]) -> bool:
 
     只有「有可念文本 + 音频类型是台词/解说」的 beat 才要求声线参考：动作/静音 beat
     本来就该没有对白，不能因为音轨安静或没有声线就判不通过。
+
+    这里用的是 :func:`beat_spoken_text`（台词 + 解说）而不是字幕口径
+    :func:`beat_subtitle_text`：字幕已收紧到只角色台词，但旁白仍有人声，
+    不能跟着字幕一起被判成「无语音」。
     """
 
-    from novelvideo.seedance2_i2v.spoken_dialogue import beat_subtitle_text
+    from novelvideo.seedance2_i2v.spoken_dialogue import beat_spoken_text
     from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
 
-    if not str(beat_subtitle_text(beat) or "").strip():
+    if not str(beat_spoken_text(beat) or "").strip():
         return False
     return normalize_seedance2_audio_type(beat) in SPEECH_AUDIO_TYPES
 

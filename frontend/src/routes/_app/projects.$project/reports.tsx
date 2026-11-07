@@ -123,6 +123,10 @@ function ReportsPage() {
     report?.usd_cny_rate && report.usd_cny_rate > 0
       ? report.usd_cny_rate
       : FALLBACK_USD_CNY_RATE;
+  // 费用口径：relay=中转站真账单（结算口径）；gateway/mixed=网关默认倍率估值（偏高）。
+  const costSourceLabel = report?.cost_source
+    ? t(`reports.costSource.${report.cost_source}`, { defaultValue: "" })
+    : "";
 
   return (
     <div className="-m-6 flex h-[calc(100%+3rem)] flex-col overflow-hidden">
@@ -209,6 +213,19 @@ function ReportsPage() {
                 value={formatCount(unattributedCount)}
               />
             </div>
+
+            {costSourceLabel ? (
+              <p
+                className={cn(
+                  "text-xs leading-5",
+                  report?.cost_source === "relay"
+                    ? "text-emerald-600 dark:text-emerald-500"
+                    : "text-amber-600 dark:text-amber-500",
+                )}
+              >
+                {costSourceLabel}
+              </p>
+            ) : null}
 
             {unattributedCount > 0 ? (
               <p className="text-xs leading-5 text-muted-foreground/80">

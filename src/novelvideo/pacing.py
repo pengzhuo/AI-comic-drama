@@ -26,6 +26,9 @@ DEFAULT_EPISODE_MERGE_FLOOR_SECONDS = 45.0
 DEFAULT_EPISODE_SPLIT_THRESHOLD_SECONDS = 90.0
 # 单个镜头的目标上限，决定“最少镜头数”：取视频模型允许的最长时长（12-15s）。
 DEFAULT_SHOT_TARGET_SECONDS = 15.0
+# 拆分单条超长朗读 beat 时的保护系数：TTS 实测语速通常比字数估算略慢，直接按
+# “估算 == 模型上限”切分会卡在边界上，实际音频仍可能溢出（Seedance2 上限 15s）。
+SHOT_SPLIT_SAFETY = 0.9
 DEFAULT_INTRO_SECONDS = 3.0
 DEFAULT_OUTRO_SECONDS = 2.0
 
@@ -174,8 +177,8 @@ def resolve_pacing_settings(config: dict | None = None) -> PacingSettings:
 # ── 文本切分 ──────────────────────────────────────────────────────────────────
 
 
-def split_sentences(text: str) -> list[str]:
-    """按句末标点切句，保留标点；无标点则整段返回。"""
+def _split_keeping_delimiters(text: str, delimiters: str) -> list[str]:
+    """按给定标点集合切分，保留标点；无标点则整段返回。"""
 
     raw = (text or "").strip()
     if not raw:
@@ -184,7 +187,7 @@ def split_sentences(text: str) -> list[str]:
     buf: list[str] = []
     for ch in raw:
         buf.append(ch)
-        if ch in _SENTENCE_END:
+        if ch in delimiters:
             segment = "".join(buf).strip()
             if segment:
                 parts.append(segment)
@@ -193,6 +196,12 @@ def split_sentences(text: str) -> list[str]:
     if tail:
         parts.append(tail)
     return parts
+
+
+def split_sentences(text: str) -> list[str]:
+    """按句末标点切句，保留标点；无标点则整段返回。"""
+
+    return _split_keeping_delimiters(text, _SENTENCE_END)
 
 
 def split_natural_units(text: str) -> list[str]:
@@ -408,6 +417,16 @@ def _merge_key(beat: Any) -> tuple[str, str, str, str, str]:
     )
 
 
+def _is_silence_beat(beat: Any) -> bool:
+    """纯画面 beat（``audio_type == "silence"``，来自剧本里的 △ 空镜行）。
+
+    这类 beat 没有台词，是过场/氛围镜，不再单独成镜，而是并入相邻的对白/旁白镜，
+    只贡献名义时长；是否保留其画面由 :func:`compact_beats_for_shots` 的宿主镜决定。
+    """
+
+    return str(getattr(beat, "audio_type", "") or "").strip().lower() == "silence"
+
+
 def _join_narration(parts: Iterable[str]) -> str:
     out = ""
     for part in parts:
@@ -443,6 +462,8 @@ def compact_beats_for_shots(
 
     - 只合并音频上下文一致的相邻 beat（同 ``audio_type``/``speaker``/``speaker_kind``
       /``time_of_day``/``scene``），保证配音不串。
+    - 纯画面 ``silence`` 过场 beat（△ 空镜行）不单独成镜，直接并入相邻的对白/旁白
+      组；宿主镜取对白/旁白 beat，画面锚点也优先取对白/旁白画面。
     - 累积预估时长达到单镜目标就断开。
     - 若给 ``max_shots``，先按 ``max(单镜目标, 总时长/max_shots)`` 放宽单镜预算，
       尽量压到镜头数上限。
@@ -471,21 +492,37 @@ def compact_beats_for_shots(
     group_indices: list[int] = []
     group_seconds = 0.0
     group_key: tuple | None = None
+    group_has_speech = False
 
     def flush() -> None:
-        nonlocal group_indices, group_seconds, group_key
+        nonlocal group_indices, group_seconds, group_key, group_has_speech
         if not group_indices:
             return
-        head = items[group_indices[0]]
+        # 宿主镜：优先取组内第一个对白/旁白 beat，避免纯过场 beat 当宿主而丢掉音色。
+        head = items[
+            next(
+                (i for i in group_indices if not _is_silence_beat(items[i])),
+                group_indices[0],
+            )
+        ]
         narration = _join_narration(
             getattr(items[i], "narration_segment", "") for i in group_indices
         )
+        # 画面锚点优先取对白/旁白的画面；组内只有过场时才退回过场画面。
         visual = ""
         for i in group_indices:
             candidate = str(getattr(items[i], "visual_description", "") or "").strip()
-            if candidate:
+            if candidate and not _is_silence_beat(items[i]):
                 visual = candidate
                 break
+        if not visual:
+            for i in group_indices:
+                candidate = str(
+                    getattr(items[i], "visual_description", "") or ""
+                ).strip()
+                if candidate:
+                    visual = candidate
+                    break
         merged_seconds = sum(durations[i] for i in group_indices)
         beat_number = len(merged) + 1
         merged.append(
@@ -506,15 +543,173 @@ def compact_beats_for_shots(
         group_indices = []
         group_seconds = 0.0
         group_key = None
+        group_has_speech = False
 
     for index, beat in enumerate(items):
         key = _merge_key(beat)
-        if group_indices and key != group_key:
-            flush()
+        silence = _is_silence_beat(beat)
+        if group_indices and not silence and key != group_key:
+            # 纯过场组并入即将开始的对白/旁白组（不先 flush），其余情况照常断开。
+            if group_has_speech:
+                flush()
+            else:
+                group_key = key
         if group_indices and group_seconds + durations[index] > effective:
             flush()
         group_indices.append(index)
         group_seconds += durations[index]
-        group_key = key
+        if not silence:
+            group_key = key
+            group_has_speech = True
     flush()
     return merged
+
+
+# ── 单条超长朗读 beat 拆分 ────────────────────────────────────────────────────
+
+
+def _hard_split_by_chars(
+    text: str, *, budget_seconds: float, chars_per_second: float
+) -> list[str]:
+    """单句在标点处仍切不动时，按字数硬切（保留原标点）。"""
+
+    rate = float(chars_per_second) if chars_per_second > 0 else 1.0
+    limit = max(1, int(max(0.1, budget_seconds) * rate))
+    raw = text or ""
+    return [
+        raw[i : i + limit].strip()
+        for i in range(0, len(raw), limit)
+        if raw[i : i + limit].strip()
+    ]
+
+
+def _split_text_for_budget(
+    text: str, *, budget_seconds: float, chars_per_second: float
+) -> list[str]:
+    """把一段文本切成各 ≤ ``budget_seconds`` 的块。
+
+    优先在句末标点切、其次子句标点，单句仍超长时按字数硬切；最后把相邻小单元贪心
+    合并到尽量贴近预算（但不超过）。
+    """
+
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    budget = max(0.1, float(budget_seconds))
+    if estimate_duration_seconds(raw, chars_per_second=chars_per_second) <= budget:
+        return [raw]
+
+    units: list[str] = []
+    for sentence in split_sentences(raw):
+        if (
+            estimate_duration_seconds(sentence, chars_per_second=chars_per_second)
+            <= budget
+        ):
+            units.append(sentence)
+            continue
+        for clause in _split_keeping_delimiters(sentence, _CLAUSE_END):
+            if (
+                estimate_duration_seconds(clause, chars_per_second=chars_per_second)
+                <= budget
+            ):
+                units.append(clause)
+            else:
+                units.extend(
+                    _hard_split_by_chars(
+                        clause,
+                        budget_seconds=budget,
+                        chars_per_second=chars_per_second,
+                    )
+                )
+
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_seconds = 0.0
+    for unit in units:
+        seconds = estimate_duration_seconds(unit, chars_per_second=chars_per_second)
+        if buf and buf_seconds + seconds > budget:
+            chunks.append("".join(buf).strip())
+            buf = []
+            buf_seconds = 0.0
+        buf.append(unit)
+        buf_seconds += seconds
+    if buf:
+        chunks.append("".join(buf).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def split_long_beats_for_shots(
+    beats: Sequence[Any],
+    *,
+    max_seconds: float = DEFAULT_SHOT_TARGET_SECONDS,
+    safety: float = SHOT_SPLIT_SAFETY,
+    chars_per_second: float | None = None,
+) -> list[Any]:
+    """把单条过长的朗读 beat 拆成多条更短的 beat。
+
+    :func:`compact_beats_for_shots` 只合并、不拆分，所以“一行就是一条”的超长台词/
+    旁白仍会超过视频模型的单镜上限（Seedance2 = 15s），成片只能截断、末尾覆盖不到。
+    这里在合并之后补一刀：
+
+    - 只处理有朗读文本，且估算时长超过 ``max_seconds * safety`` 的 beat；
+    - 优先在句末标点切分，其次子句标点，单句仍超长时按字数硬切；
+    - 拆出的多条 beat 继承 speaker/``audio_type``/画面/场景/时间，序号整体重排；
+    - 手工分镜（``is_manual_shot``，或带显式 ``duration_seconds``）与纯画面 beat 不动。
+
+    ``safety`` 用来留余量：TTS 实测语速通常比字数估算略慢，直接把门槛压到估算上限
+    时，实际音频仍可能溢出。
+    """
+
+    items = list(beats)
+    if not items:
+        return items
+
+    rate = float(chars_per_second or default_chars_per_second())
+    if rate <= 0:
+        rate = 1.0
+    cap = max(0.1, float(max_seconds) * float(safety))
+
+    expanded: list[Any] = []
+    split_any = False
+    for beat in items:
+        narration = str(getattr(beat, "narration_segment", "") or "").strip()
+        if (
+            not narration
+            or getattr(beat, "is_manual_shot", False)
+            or getattr(beat, "duration_seconds", None) is not None
+        ):
+            expanded.append(beat)
+            continue
+        if estimate_duration_seconds(narration, chars_per_second=rate) <= cap:
+            expanded.append(beat)
+            continue
+        chunks = _split_text_for_budget(
+            narration, budget_seconds=cap, chars_per_second=rate
+        )
+        if len(chunks) <= 1:
+            expanded.append(beat)
+            continue
+        split_any = True
+        for chunk in chunks:
+            expanded.append(
+                _clone_beat(
+                    beat,
+                    narration_segment=chunk,
+                    estimated_duration=estimate_duration_seconds(
+                        chunk, chars_per_second=rate
+                    ),
+                    duration_seconds=None,
+                )
+            )
+
+    if not split_any:
+        return items
+
+    # 序号整体重排，保持 1..N 连续；只有序号变化的 beat 才需要克隆。
+    renumbered: list[Any] = []
+    for index, beat in enumerate(expanded, start=1):
+        if getattr(beat, "beat_number", None) == index:
+            renumbered.append(beat)
+        else:
+            renumbered.append(_clone_beat(beat, beat_number=index))
+    return renumbered

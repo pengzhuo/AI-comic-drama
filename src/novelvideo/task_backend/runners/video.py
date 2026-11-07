@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from novelvideo.project_context import ProjectContext
-from novelvideo.seedance2_i2v.spoken_dialogue import beat_subtitle_text
+from novelvideo.seedance2_i2v.spoken_dialogue import (
+    beat_subtitle_text,
+    subtitle_cue_windows,
+)
 from novelvideo.task_backend.cancel import (
     TaskTimedOut,
     await_envelope_with_cancel_watch,
@@ -176,6 +179,17 @@ def _beat_identity_reference_paths(
     return paths
 
 
+def _beat_planned_multi_shot(beat: dict[str, Any], prompt: Any = "") -> bool:
+    """本镜的提示词是否明确要求 clip 内多镜硬切。
+
+    视频优化器只在预估时长 > 8s 时才要求 ``HARD CUT`` 多镜；命中即说明「clip 内的
+    景别变化」是计划内行为，供一致性自检把景别类复核标记降噪用。
+    """
+
+    blob = f"{beat.get('video_prompt') or ''}\n{prompt or ''}".upper()
+    return "HARD CUT" in blob or "硬切" in blob
+
+
 async def _apply_video_consistency_gate(
     *,
     video_gen: Any,
@@ -210,6 +224,7 @@ async def _apply_video_consistency_gate(
 
     gate = VideoConsistencyGate()
     identity_paths = _beat_identity_reference_paths(output_dir, beat)
+    multi_shot = _beat_planned_multi_shot(beat, generate_kwargs.get("prompt"))
     attempts: list[dict[str, Any]] = []
     current = result
     notes: list[str] = []
@@ -237,6 +252,7 @@ async def _apply_video_consistency_gate(
                 identity_image_paths=identity_paths,
                 audio_type=str(beat.get("audio_type") or ""),
                 expects_speech=_beat_expects_speech(beat),
+                multi_shot=multi_shot,
                 log=on_log,
             )
             attempts.append(
@@ -917,6 +933,10 @@ def _build_srt_from_clips(entries: list[tuple[str, str]]) -> str:
     clip advances the timeline (silent beats included) so subtitle timings match
     the concatenated film; only clips with text emit a cue.
 
+    一条 beat 的台词会**按标点逐句拆开**，再按字数占比把该 beat 的说话窗口依次
+    分给各句（:func:`subtitle_cue_windows`），让字幕跟着说话一句一句出，而不是整
+    段台词一次铺满整个镜头。
+
     每条 cue 的正文前置 :data:`SUBTITLE_ALIGNMENT_TAG`（底部居中，逐行居中），
     保证"居中"既写在样式里也写在字幕本身里。该 SRT 只用于本函数调用方的临时
     烧录用文件，不交付用户，所以这些标签不会污染导出的 ``.srt``。
@@ -929,11 +949,12 @@ def _build_srt_from_clips(entries: list[tuple[str, str]]) -> str:
         start, end = cursor, cursor + duration
         cursor = end
         if text:
-            seq += 1
-            lines.append(str(seq))
-            lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
-            lines.append(f"{SUBTITLE_ALIGNMENT_TAG}{text}")
-            lines.append("")
+            for cue_text, cue_start, cue_end in subtitle_cue_windows(text, start, end):
+                seq += 1
+                lines.append(str(seq))
+                lines.append(f"{_srt_time(cue_start)} --> {_srt_time(cue_end)}")
+                lines.append(f"{SUBTITLE_ALIGNMENT_TAG}{cue_text}")
+                lines.append("")
     return "\n".join(lines)
 
 
@@ -1225,6 +1246,10 @@ def run_compose_episode(
                 "aac",
                 "-b:a",
                 "128k",
+                # 成片必须 faststart（moov 前置）：否则手机浏览器要下完整个文件才能
+                # 起播，196MB 的成片在 iPhone 上就是「无法预览/无法下载」。
+                "-movflags",
+                "+faststart",
                 str(output_path),
             ]
         )

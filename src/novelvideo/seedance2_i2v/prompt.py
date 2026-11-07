@@ -61,8 +61,8 @@ SEEDANCE2_PROMPT_GUIDANCE_TEMPLATES: dict[str, dict[AssetLanguage, str]] = {
         "en": "Lighting: Describe the key light, tonal layers, color temperature, and atmosphere while avoiding unintended flicker.",
     },
     "camera": {
-        "zh": "镜头：说明景别、视角、运镜速度和运动方向，保持镜头运动清晰可执行。",
-        "en": "Camera: Specify shot size, viewpoint, movement speed, and direction so the camera move is clear and executable.",
+        "zh": "镜头：说明景别与视角；默认固定镜头，只有存在明确动机时才运动，且运动干脆明快，禁止缓慢/缓缓等慢速运镜。",
+        "en": "Camera: Specify shot size and viewpoint; default to a static/locked-off camera and move only with a clear motive, then briskly — never slow-drift wording.",
     },
     "style": {
         "zh": "风格：限定画面质感、时代感、色彩倾向和真实度，避免风格漂移。",
@@ -81,6 +81,8 @@ Asset order is fixed. Only use existing reference tokens such as 图片1 and 音
 Never add or reorder image/audio reference numbers, and do not output @ symbols.
 Do not force every asset into the prompt; reference only assets that materially help the current shot.
 Duration, resolution, aspect ratio, and human-review controls are API parameters and must not appear in the prompt.
+Camera: default to a static / locked-off camera. Add a camera move only when the shot has a clear motive, and then at a normal, brisk speed. Never write slow-motion camera wording (缓慢、缓缓、极慢、slow, slowly, gently drift).
+Action and speech run at natural real-time speed: never stretch, drag, or slow them down. Spoken lines must sound like a real person at a normal pace — never write 不紧不慢、平稳、缓慢 for delivery.
 Output the final prompt directly without explaining the generation process."""
 
 
@@ -962,6 +964,8 @@ def build_seedance2_prompt_composer_task(
             "- Do not describe the request JSON or output @.\n"
             "- Keep resolution, ratio, generate_audio, return_last_frame, and human_review out of the prompt.\n"
             "- Express length only through the beat clock (for example 0:00–0:05), never as a duration parameter.\n"
+            "- Default to a static / locked-off camera; add a move only with a clear motive and keep it brisk — no slow-motion camera wording (slow, slowly, gently drift, 缓慢, 缓缓).\n"
+            "- Action and speech run at natural real-time speed: never drag or slow them; deliver spoken lines like a real person at a normal pace (never unhurried / evenly / 不紧不慢 / 平稳).\n"
             f"{mode_rule_en}"
             f"- {language_rule}\n"
             f"{clock_rule_en}"
@@ -982,6 +986,8 @@ def build_seedance2_prompt_composer_task(
         "- 时长只体现为节拍时钟（例如 0:00–0:05），不要把 duration 写成参数；"
         "resolution、ratio、generate_audio、return_last_frame、human_review "
         "只作为 API 请求参数，不要写进 prompt。\n"
+        "- 镜头默认固定：只有存在明确动机时才写运镜，而且要干脆明快；禁止“缓慢/缓缓/极慢/慢推”等慢速运镜，也禁止无动机的漂移。\n"
+        "- 动作与语速按真实速度写：不得放慢、拉长、拖沓；台词要像真人以正常语速说出，禁止“不紧不慢/平稳/缓慢/拖音”等投递描述。\n"
         "- 如果用户写作要求和资产清单、道具 fallback 冲突，以资产清单和 fallback 为准。\n"
         "- dialogue 或 narration_segment 属于对白时，请根据语义区分动作说明和实际说出的台词；"
         "动作可自然改写，但实际台词必须逐字完整保留，不能删减或概括。\n"

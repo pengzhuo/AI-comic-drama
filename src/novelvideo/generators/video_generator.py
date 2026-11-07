@@ -1527,7 +1527,7 @@ Convert this Chinese video motion description into an optimized English prompt f
 
 ## WAN I2V Prompt Rules:
 1. Focus on MOTION and CAMERA MOVEMENT (the image already defines the subject/scene)
-2. Use speed adverbs: "slowly", "gently", "dramatically", "subtly"
+2. Keep natural real-time speed; avoid "slowly" / "slow motion" unless the action explicitly needs it
 3. Use effective camera keywords: "push in", "pull back", "tracking shot", "static shot"
 4. AVOID: "whip pan", "crash zoom", "dolly out" (these don't work well)
 5. Add lighting if relevant: "soft lighting", "rim lighting", "backlit"

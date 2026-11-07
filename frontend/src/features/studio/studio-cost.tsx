@@ -49,6 +49,32 @@ function StatChip({
   );
 }
 
+/** 金额口径标注：让用户一眼看出数字是「真账单」还是「网关估值（偏高）」。 */
+function CostSourceNote({ source }: { source?: string }) {
+  if (source === "relay") {
+    return (
+      <p className="text-[11px] leading-relaxed text-emerald-600 dark:text-emerald-500">
+        结算口径：金额取自上游中转站真实账单。
+      </p>
+    );
+  }
+  if (source === "mixed") {
+    return (
+      <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-500">
+        混合口径：部分请求取自中转站真账单，其余仍是网关默认倍率估值，合计偏高。
+      </p>
+    );
+  }
+  if (source === "gateway") {
+    return (
+      <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-500">
+        估值口径：未取到中转站真实账单，金额按本地网关默认倍率估算，偏高，仅供参考。
+      </p>
+    );
+  }
+  return null;
+}
+
 function ReconcileButton({ project, episode }: { project: string; episode?: number }) {
   const reconcile = useReconcileCostReport(project);
   return (
@@ -153,6 +179,8 @@ export function StudioEpisodeCostDetail({
         </table>
       </div>
 
+      <CostSourceNote source={report.cost_source} />
+
       <div className="flex items-center justify-between gap-3">
         <p className="text-[11px] leading-relaxed text-muted-foreground">
           金额按账单额度折算（1 美元 = {formatQuota(report.quota_per_usd)} 额度
@@ -195,9 +223,10 @@ export function StudioCostOverview({ project }: { project: string }) {
         <StatChip label="未归因" value={`${report.unattributed.requests} 笔`} />
         <StatChip label="制作时长" value={formatDuration(report.totals.duration_seconds)} />
       </div>
+      <CostSourceNote source={report.cost_source} />
       <div className="flex items-center justify-between gap-3">
         <p className="text-[11px] text-muted-foreground">
-          未归因的请求（多为配音）没有网关单号，暂时无法计价。
+          未归因的请求（多为配音）在账单里对不上单号，暂时无法计价。
         </p>
         <ReconcileButton project={project} />
       </div>

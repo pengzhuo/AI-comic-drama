@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import re
-import unicodedata
 from typing import Any
 
 from novelvideo.freezone.video_node import validate_omni_reference_audio_durations
@@ -26,7 +24,11 @@ from novelvideo.seedance2_i2v.models import (
     dump_seedance2_config,
     parse_seedance2_config,
 )
-from novelvideo.seedance2_i2v.spoken_dialogue import required_seedance2_dialogue_texts
+from novelvideo.seedance2_i2v.spoken_dialogue import (
+    dialogue_text_key,
+    ensure_dialogue_text_mention,
+    required_seedance2_dialogue_texts,
+)
 from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
 from novelvideo.seedance2_i2v.voice_preflight import ensure_speech_voice_mention
 
@@ -147,25 +149,6 @@ def _validate_reference_audio_request(audio_paths: list[str]) -> None:
         ) from exc
 
 
-def _compact_text(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or "").strip())
-
-
-def _dialogue_text_key(value: Any) -> str:
-    """台词比对键：忽略空白与标点，只比字。
-
-    最终提示词由上游模型重排，标点常被改写（源文 ``认定书上写着，`` 在提示词里成了
-    ``认定书上写着：``）。这道闸门要防的是「漏字改字」——标点差异不该把整条 beat
-    拦在发请求之前，但少字、改字仍然必须拦住。
-    """
-
-    return "".join(
-        char
-        for char in _compact_text(value)
-        if not unicodedata.category(char).startswith("P")
-    )
-
-
 def _validate_dialogue_final_prompt(
     *,
     beat: dict[str, Any],
@@ -176,11 +159,11 @@ def _validate_dialogue_final_prompt(
         return
 
     required_texts = required_seedance2_dialogue_texts(beat)
-    prompt_text = _dialogue_text_key(final_prompt)
+    prompt_text = dialogue_text_key(final_prompt)
     missing_lines = [
         text
         for text in required_texts
-        if _dialogue_text_key(text) and _dialogue_text_key(text) not in prompt_text
+        if dialogue_text_key(text) and dialogue_text_key(text) not in prompt_text
     ]
     if missing_lines:
         raise ValueError(
@@ -348,6 +331,9 @@ async def prepare_seedance2_generation_inputs(
         assets=assets,
         seedance2_config=config,
     )
+    # 声线编号补齐后，再把漏写的台词逐字补进提示词：闸门要求提示词必须含台词，
+    # 上游 composer 偶尔只写镜头/资产约束，整条 beat 会被拦在发请求之前。
+    final_prompt = ensure_dialogue_text_mention(final_prompt, beat=beat)
     config.final_prompt = final_prompt
     assets = apply_prompt_audio_selection(assets, final_prompt)
 

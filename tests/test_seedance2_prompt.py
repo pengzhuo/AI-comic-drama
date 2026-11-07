@@ -747,11 +747,11 @@ def test_seedance2_prompt_hash_canonicalizes_structured_guidance_language():
 
     chinese_ui_hash = compute_seedance2_prompt_inputs_hash(
         **common,
-        prompt_guidance="镜头：说明景别、视角、运镜速度和运动方向，保持镜头运动清晰可执行。",
+        prompt_guidance="镜头：说明景别与视角；默认固定镜头，只有存在明确动机时才运动，且运动干脆明快，禁止缓慢/缓缓等慢速运镜。",
     )
     english_ui_hash = compute_seedance2_prompt_inputs_hash(
         **common,
-        prompt_guidance="Camera: Specify shot size, viewpoint, movement speed, and direction so the camera move is clear and executable.",
+        prompt_guidance="Camera: Specify shot size and viewpoint; default to a static/locked-off camera and move only with a clear motive, then briskly — never slow-drift wording.",
     )
 
     assert chinese_ui_hash == english_ui_hash
@@ -940,7 +940,7 @@ async def test_seedance2_english_fallback_localizes_structured_guidance():
         beat={"visual_description": "Maya opens the door."},
         assets=[],
         text_overlay={},
-        prompt_guidance="镜头：说明景别、视角、运镜速度和运动方向，保持镜头运动清晰可执行。",
+        prompt_guidance="镜头：说明景别与视角；默认固定镜头，只有存在明确动机时才运动，且运动干脆明快，禁止缓慢/缓缓等慢速运镜。",
         prompt_guidance_template_keys=["camera"],
         composer=failing_composer,
         language="en",
@@ -948,8 +948,9 @@ async def test_seedance2_english_fallback_localizes_structured_guidance():
 
     assert result.used_ai is False
     assert (
-        "Camera: Specify shot size, viewpoint, movement speed, and direction "
-        "so the camera move is clear and executable."
+        "Camera: Specify shot size and viewpoint; default to a static/locked-off "
+        "camera and move only with a clear motive, then briskly — never slow-drift "
+        "wording."
     ) in result.prompt
     assert "镜头" not in result.prompt
 
@@ -1327,3 +1328,71 @@ def test_seedance2_composer_task_states_the_overlay_centering_rule():
     assert "每一行都必须相对文字块各自居中" in off_center
 
     assert "叠加文字（text_overlay）" not in composer_task({})
+
+
+def test_ensure_dialogue_text_mention_appends_missing_line_and_passes_gate():
+    """补齐台词后必须能过闸门：复现 t3 ep1 beat 44 的现场问题。
+
+    上游 composer 只写了镜头/资产约束、漏掉台词，闸门因此把整条 beat 拦在发请求
+    之前；``ensure_dialogue_text_mention`` 在发请求前把台词逐字补回来。
+    """
+
+    from novelvideo.seedance2_i2v.assets import Seedance2ResolvedAsset
+    from novelvideo.seedance2_i2v.pipeline import _validate_dialogue_final_prompt
+    from novelvideo.seedance2_i2v.spoken_dialogue import (
+        dialogue_text_key,
+        ensure_dialogue_text_mention,
+    )
+
+    line = "白工让我把这份报告夹进来的。他说电话不接，只能走行政。"
+    beat = {
+        "audio_type": "dialogue",
+        "speaker": "方宁_青年时期",
+        "narration": line,
+    }
+    assets = [
+        Seedance2ResolvedAsset(
+            key="voice:方宁_青年时期",
+            label="方宁 · 青年时期声线",
+            media_type="audio",
+            path=Path("voice.mp3"),
+            exists=True,
+            selected=True,
+            request_field="reference_audios",
+            reference_label="音频1",
+            identity_id="方宁_青年时期",
+            audio_number=1,
+        )
+    ]
+
+    original = "【资产一致性约束】资产均以@图片1首帧为准。声音参考使用@音频1。"
+
+    # 原样提示词缺台词，闸门拦下。
+    with pytest.raises(ValueError, match="Seedance2 最终提示词缺少台词内容"):
+        _validate_dialogue_final_prompt(beat=beat, final_prompt=original, assets=assets)
+
+    repaired = ensure_dialogue_text_mention(original, beat=beat)
+    assert dialogue_text_key(line) in dialogue_text_key(repaired)
+    assert repaired.startswith(original)
+    # 补完后闸门放行。
+    _validate_dialogue_final_prompt(beat=beat, final_prompt=repaired, assets=assets)
+
+    # 幂等：再补一次不再追加。
+    assert ensure_dialogue_text_mention(repaired, beat=beat) == repaired
+
+
+def test_ensure_dialogue_text_mention_keeps_non_dialogue_and_existing_lines():
+    from novelvideo.seedance2_i2v.spoken_dialogue import ensure_dialogue_text_mention
+
+    # 非台词 beat 不动。
+    silent = {"audio_type": "action", "speaker": "方宁_青年时期", "narration": "他递出报告。"}
+    assert ensure_dialogue_text_mention("画面描述。", beat=silent) == "画面描述。"
+
+    # 提示词已含台词时不动。
+    line = "明天九点，把前台访客系统停掉。"
+    beat = {"audio_type": "dialogue", "speaker": "顾清商_青年时期", "narration": line}
+    already = f"顾清商_青年时期：{line}"
+    assert ensure_dialogue_text_mention(already, beat=beat) == already
+
+    # 空提示词不凭空补台词，交给调用方报「提示词为空」。
+    assert ensure_dialogue_text_mention("", beat=beat) == ""

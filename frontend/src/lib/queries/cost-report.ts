@@ -12,9 +12,10 @@ import type { OkResponse } from "@/types/api";
  *
  * `quota` 是账单额度快照，`usd = quota / quota_per_usd`，`cny = usd * 汇率`。
  * 口径优先取上游中转站真实账单（`cost-reconcile --source relay`）：本地捏驿网关
- * 对 DC-* / 媒体模型别名没有价格条目，会落到默认倍率而明显偏高。中转站凭据未配置
- * 时只能走本地捏驿（`--source gateway`）——客户端「一键成片」每集完成后自动跑的
- * 就是这条口径，此时金额 = 用户本地捏驿被扣的量。
+ * 对 DC-* / 媒体模型别名没有价格条目，会落到默认倍率而明显偏高。自动回填（成片后
+ * 结算钩子、前端「重新结算」按钮）现在都是 relay 优先、gateway 兜底；只有中转站
+ * 凭据未配置或一条都对不上时才会写网关口径，此时 `cost_source === "gateway"`，
+ * 前端据此把金额标注为「估值口径（偏高）」。
  *
  * `cost_quota` 尚未回填（未跑对账或没匹配上）的请求不算进 `quota`，而是计进
  * `unattributed_requests`。
@@ -53,6 +54,15 @@ export interface CostReportByDay extends CostReportBucket {
   date: string;
 }
 
+/** 金额来源分布：`relay`=中转站真账单，`gateway`=本地网关估值，`unmatched`=未命中。 */
+export interface CostReportSource {
+  source: string;
+  requests: number;
+  quota: number;
+  usd: number;
+  cny: number;
+}
+
 export interface CostReport {
   generated_at: string;
   /** 非空表示这是一次单集查询，各分组的请求都只含这一集。 */
@@ -62,6 +72,13 @@ export interface CostReport {
   currency?: string;
   /** 美元 → 人民币汇率（中转站 `usd_exchange_rate`）。 */
   usd_cny_rate?: number;
+  /**
+   * 报表金额口径：`relay`=中转站真账单（结算口径），`gateway`=本地网关默认倍率
+   * 估值（偏高），`mixed`=两者混用，空=还没有可计价的行。旧后端缺省时为 undefined。
+   */
+  cost_source?: string;
+  /** 按来源拆分的金额分布（明细），旧后端缺省。 */
+  sources?: CostReportSource[];
   project?: { id: string; name: string; owner: string };
   /** 只有对账接口（POST .../cost-report/reconcile）返回。 */
   reconcile?: CostReportReconcileSummary;

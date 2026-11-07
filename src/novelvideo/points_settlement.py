@@ -239,6 +239,7 @@ async def _episode_actual(
             task_quota=task_quota,
             log_quota=log_quota,
             apply=True,
+            source="relay",
         )
     except Exception:  # noqa: BLE001
         logger.debug("结算回写 cost_quota 失败: %s", project_db, exc_info=True)

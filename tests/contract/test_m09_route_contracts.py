@@ -98,6 +98,7 @@ class _M09Store:
                 "episode_number": 1,
                 "beat_number": 1,
                 "visual_description": "Hero walks through the alley.",
+                "audio_type": "dialogue",
                 "narration_segment": "Footsteps echo.",
                 "video_prompt": "A cinematic alley shot.",
                 "video_mode": "first_frame",

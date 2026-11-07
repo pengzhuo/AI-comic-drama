@@ -15,6 +15,11 @@
 - 图片 / 音频 / LLM：``*_usage.gateway_request_id`` /
   ``llm_request_usage.provider_request_id`` == 捏驿 ``logs.request_id``
 
+修改日志
+--------
+- 未命中的行标 ``cost_source='unmatched'`` 并清空 ``cost_quota``，避免网关默认倍率
+  的虚高值冒充真账；命中行的 ``cost_source`` 记录来源（``relay`` / ``gateway``）。
+
 设计约定
 --------
 - 捏驿库**只读**打开（``mode=ro``），本模块绝不写入网关侧数据。
@@ -306,6 +311,7 @@ def _reconcile_table(
     log_quota: dict[str, int],
     apply: bool,
     now: str,
+    source: str = "gateway",
 ) -> TableReport:
     report = TableReport(table=table)
     if not _table_exists(conn, table):
@@ -324,36 +330,47 @@ def _reconcile_table(
         key_expr = f"NULLIF({key_column}, '')"
 
     rows = list(conn.execute(f"SELECT rowid AS rid, {key_expr} AS gid FROM {table}"))
-    matched_keys: set[str] = set()
-    updates: list[tuple[int, str, int]] = []
+    updates: list[tuple[int, str, str, int]] = []
+    cleared: list[tuple[str, int]] = []
     for row in rows:
         report.rows += 1
         gid = str(row["gid"] or "").strip()
-        if not gid:
-            continue
-        quota = task_quota.get(gid)
+        quota = None
+        if gid:
+            quota = task_quota.get(gid)
+            if quota is None:
+                quota = log_quota.get(gid)
         if quota is None:
-            quota = log_quota.get(gid)
-        if quota is None:
-            if len(report.unmatched) < 20:
+            if gid and len(report.unmatched) < 20:
                 report.unmatched.append(gid)
+            # 对不上账单的行不能留着旧口径（可能是网关默认倍率的虚高值）。
+            # 标成 ``unmatched`` 并清空 quota，报表按未归因处理。
+            cleared.append((now, int(row["rid"])))
             continue
         report.matched += 1
         report.quota += quota
-        matched_keys.add(gid)
-        updates.append((quota, now, int(row["rid"])))
+        updates.append((quota, now, source, int(row["rid"])))
 
-    if apply and updates:
-        # ``cost_quota``/``quota_checked_at`` only exist once the owning usage
-        # module has migrated the table (i.e. after the first write since
-        # deploy). A project that has been idle since the upgrade still has the
-        # legacy columns, so migrate here before the UPDATE instead of failing.
+    if apply and (updates or cleared):
+        # ``cost_quota``/``quota_checked_at``/``cost_source`` only exist once the
+        # owning usage module has migrated the table (i.e. after the first write
+        # since deploy). A project that has been idle since the upgrade still has
+        # the legacy columns, so migrate here before the UPDATE instead of failing.
         add_column_if_missing(conn, table, "cost_quota", "INTEGER")
         add_column_if_missing(conn, table, "quota_checked_at", "TEXT")
-        conn.executemany(
-            f"UPDATE {table} SET cost_quota = ?, quota_checked_at = ? WHERE rowid = ?",
-            updates,
-        )
+        add_column_if_missing(conn, table, "cost_source", "TEXT")
+        if updates:
+            conn.executemany(
+                f"UPDATE {table} SET cost_quota = ?, quota_checked_at = ?,"
+                " cost_source = ? WHERE rowid = ?",
+                updates,
+            )
+        if cleared:
+            conn.executemany(
+                f"UPDATE {table} SET cost_quota = NULL, quota_checked_at = ?,"
+                " cost_source = 'unmatched' WHERE rowid = ?",
+                cleared,
+            )
         conn.commit()
     return report
 
@@ -364,6 +381,7 @@ def reconcile_project_db(
     task_quota: dict[str, int],
     log_quota: dict[str, int],
     apply: bool = False,
+    source: str = "gateway",
 ) -> ProjectReport:
     db_path = Path(db_path)
     report = ProjectReport(label=db_path.parent.name, db_path=db_path)
@@ -383,6 +401,7 @@ def reconcile_project_db(
                     log_quota=log_quota,
                     apply=apply,
                     now=now,
+                    source=source,
                 )
             )
     finally:
@@ -539,8 +558,68 @@ def reconcile(
                     task_quota=task_quota,
                     log_quota=log_quota,
                     apply=apply,
+                    source=source,
                 )
             )
         except Exception as exc:  # noqa: BLE001
             report.errors.append(f"{target}: {exc}")
     return report
+
+
+def reconcile_relay_first(
+    *,
+    gateway_db: str | Path | None = None,
+    state_dir: str | Path | None = None,
+    project_db: str | Path | None = None,
+    apply: bool = False,
+    relay_transport: Any | None = None,
+    relay_workers: int = 4,
+) -> ReconcileReport:
+    """``relay`` 优先、``gateway`` 兜底的对账（自动回填口径走这里）。
+
+    自动回填（费用报表按钮 / 成片后结算钩子）应当用**真正收钱的一方**口径：
+
+    - 中转站账号已配置且能对上至少一条单据 → 用 relay 真实账单；
+    - 账号缺失 / 一条都对不上 / 拉取全失败 → 回退本地捏驿账单库，并把原因
+      记进 ``report.errors``；``report.source`` 如实反映实际用的口径，前端据此
+      标注「结算口径」还是「估值口径」。
+    """
+
+    from novelvideo import relay_billing
+
+    settings = relay_billing.load_settings()
+    endpoints = relay_billing.configured_endpoints(settings=settings)
+    if not endpoints:
+        return reconcile(
+            gateway_db=gateway_db,
+            state_dir=state_dir,
+            project_db=project_db,
+            apply=apply,
+            source="gateway",
+        )
+
+    relay_report = reconcile(
+        gateway_db=gateway_db,
+        state_dir=state_dir,
+        project_db=project_db,
+        apply=apply,
+        source="relay",
+        relay_endpoints=endpoints,
+        relay_cache=relay_billing.billing_cache_path(settings),
+        relay_transport=relay_transport,
+        relay_workers=relay_workers,
+    )
+    matched = sum(table.matched for item in relay_report.projects for table in item.tables)
+    if matched > 0:
+        return relay_report
+
+    note = "relay 未命中任何单据，回退 gateway 口径（金额偏高，仅供参考）"
+    gateway_report = reconcile(
+        gateway_db=gateway_db,
+        state_dir=state_dir,
+        project_db=project_db,
+        apply=apply,
+        source="gateway",
+    )
+    gateway_report.errors = [note, *relay_report.errors, *gateway_report.errors]
+    return gateway_report

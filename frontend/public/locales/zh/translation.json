@@ -4679,6 +4679,11 @@
     "durationLegend": "时长为该集视频最早提交到最晚完成",
     "quotaRatio": "1 美元 = {{ratio}} 额度（按 ¥{{rate}}/美元 折算）",
     "unattributedHint": "有 {{count}} 条请求还没从上游账单回填到费用，暂不计入合计。",
+    "costSource": {
+      "relay": "结算口径：金额取自上游中转站真实账单。",
+      "gateway": "估值口径：未取到中转站真实账单，金额按本地网关默认倍率估算，偏高，仅供参考。",
+      "mixed": "混合口径：部分请求取自中转站真账单，其余仍是网关估值，合计偏高。"
+    },
     "stats": {
       "totalCost": "总费用",
       "totalDuration": "总时长",

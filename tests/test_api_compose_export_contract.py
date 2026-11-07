@@ -15,7 +15,14 @@ pytestmark = pytest.mark.m09
 class _FakeStore:
     async def get_beats_as_dicts(self, episode: int):
         assert episode == 3
-        return [{"beat_number": 1, "narration_segment": "Hello"}]
+        return [
+            {
+                "beat_number": 1,
+                "audio_type": "dialogue",
+                "speaker": "许知意",
+                "narration_segment": "Hello",
+            }
+        ]
 
 
 def _client(monkeypatch, tmp_path) -> TestClient:

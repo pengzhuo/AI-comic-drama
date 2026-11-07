@@ -16,7 +16,7 @@ from pathlib import Path
 
 from novelvideo.config import OUTPUT_DIR, STATE_DIR
 from novelvideo.sqlite_pragmas import configure_sqlite_connection
-from novelvideo.sqlite_schema import ensure_sqlite_schema
+from novelvideo.sqlite_schema import add_column_if_missing, ensure_sqlite_schema
 
 
 _SCHEMA_SQL = """
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS llm_request_usage (
     updated_at TEXT NOT NULL,
     cost_quota INTEGER,
     quota_checked_at TEXT,
+    cost_source TEXT,
     error_message TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_request_usage_model
@@ -46,7 +47,17 @@ ON llm_request_usage(provider_request_id);
 
 _SCHEMA_COMPONENT = "llm_request_usage"
 # MIGRATION CONTRACT: increment this whenever _SCHEMA_SQL changes.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+
+_ADDED_COLUMNS = (
+    ("cost_source", "TEXT"),
+)
+
+
+def _initialize(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA_SQL)
+    for name, definition in _ADDED_COLUMNS:
+        add_column_if_missing(conn, "llm_request_usage", name, definition)
 
 
 def get_llm_request_usage_db_path(project_output_dir: str | Path) -> Path:
@@ -74,7 +85,7 @@ def _connect(project_output_dir: str | Path):
         db_path,
         component=_SCHEMA_COMPONENT,
         version=_SCHEMA_VERSION,
-        initialize=lambda schema_conn: schema_conn.executescript(_SCHEMA_SQL),
+        initialize=_initialize,
     )
     conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
     configure_sqlite_connection(conn, set_journal_mode=False)
@@ -135,6 +146,7 @@ def update_llm_request_cost(
     request_id: str,
     cost_quota: int | None,
     quota_checked_at: str | None = None,
+    cost_source: str = "gateway",
 ) -> None:
     """Write the gateway quota snapshot back onto a recorded model call."""
     now = datetime.now().isoformat()
@@ -142,10 +154,10 @@ def update_llm_request_cost(
         conn.execute(
             """
             UPDATE llm_request_usage
-            SET cost_quota = ?, quota_checked_at = ?, updated_at = ?
+            SET cost_quota = ?, quota_checked_at = ?, cost_source = ?, updated_at = ?
             WHERE request_id = ?
             """,
-            (cost_quota, quota_checked_at or now, now, request_id),
+            (cost_quota, quota_checked_at or now, cost_source, now, request_id),
         )
 
 

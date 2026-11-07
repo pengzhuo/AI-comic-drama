@@ -33,7 +33,10 @@ from novelvideo.api.auth import get_api_user
 from novelvideo.api.deps import resolve_project_scope
 from novelvideo.audio_request_usage import get_audio_request_usage_db_path
 from novelvideo.config import QUOTA_PER_USD, REPORT_CURRENCY, USD_CNY_RATE
-from novelvideo.gateway_cost_reconcile import ReconcileReport, reconcile
+from novelvideo.gateway_cost_reconcile import (
+    ReconcileReport,
+    reconcile_relay_first,
+)
 from novelvideo.image_request_usage import get_image_request_usage_db_path
 from novelvideo.llm_request_usage import get_llm_request_usage_db_path
 from novelvideo.video_request_usage import get_video_request_usage_db_path
@@ -55,6 +58,7 @@ class UsageRow:
     completed_at: str | None
     quota: int | None
     status: str
+    source: str = ""
 
 
 @dataclass
@@ -114,12 +118,14 @@ def _read_rows(
         model_expr = model_column if model_column in columns else "''"
         episode_expr = "episode" if "episode" in columns else "NULL"
         quota_expr = "cost_quota" if "cost_quota" in columns else "NULL"
+        source_expr = "cost_source" if "cost_source" in columns else "''"
         completed_expr = "completed_at" if has_completed_at else "NULL"
         status_expr = "status" if "status" in columns else "''"
         query = f"""
             SELECT request_id, {model_expr} AS model_name, {episode_expr} AS episode,
                    accepted_at, {completed_expr} AS completed_at,
-                   {quota_expr} AS cost_quota, {status_expr} AS status
+                   {quota_expr} AS cost_quota, {source_expr} AS cost_source,
+                   {status_expr} AS status
             FROM {table}
         """
         for row in conn.execute(query):
@@ -134,6 +140,7 @@ def _read_rows(
                     completed_at=row["completed_at"],
                     quota=int(quota_raw) if quota_raw is not None else None,
                     status=str(row["status"] or ""),
+                    source=str(row["cost_source"] or ""),
                 )
             )
     finally:
@@ -249,6 +256,7 @@ def build_cost_report(
     by_model: dict[tuple[str, str], _Bucket] = {}
     by_episode: dict[int | None, _Bucket] = {}
     by_day: dict[str, _Bucket] = {}
+    by_source: dict[str, dict[str, int]] = {}
     unattributed: dict[str, int] = {kind: 0 for kind in _KIND_LABELS}
 
     for row in all_rows:
@@ -259,6 +267,10 @@ def build_cost_report(
         day_bucket = by_day.setdefault(day, _Bucket())
 
         attributed = row.quota is not None
+        source_key = row.source or ("unattributed" if not attributed else "unknown")
+        source_stat = by_source.setdefault(source_key, {"requests": 0, "quota": 0})
+        source_stat["requests"] += 1
+
         for bucket in (totals, kind_bucket, model_bucket, episode_bucket, day_bucket):
             bucket.requests += 1
             if attributed:
@@ -266,7 +278,9 @@ def build_cost_report(
             else:
                 bucket.unattributed_requests += 1
             _merge_span(bucket, row)
-        if not attributed:
+        if attributed:
+            source_stat["quota"] += int(row.quota or 0)
+        else:
             unattributed[row.kind] = unattributed.get(row.kind, 0) + 1
 
     models = [
@@ -297,12 +311,41 @@ def build_cost_report(
     ]
     kinds.sort(key=lambda item: item["quota"], reverse=True)
 
+    sources = [
+        {
+            "source": source,
+            "requests": stat["requests"],
+            "quota": stat["quota"],
+            "usd": stat["quota"] / QUOTA_PER_USD if QUOTA_PER_USD else 0.0,
+            "cny": (stat["quota"] / QUOTA_PER_USD if QUOTA_PER_USD else 0.0)
+            * USD_CNY_RATE,
+        }
+        for source, stat in by_source.items()
+    ]
+    sources.sort(key=lambda item: item["quota"], reverse=True)
+
+    # 结算口径：全部命中的行来源。``relay``=真账单，``gateway``=网关估值（偏高），
+    # 两者都有=混口径。前端据此标注数字可信度。
+    billed_sources = {
+        source for source in by_source if source in {"relay", "gateway"}
+    }
+    if billed_sources == {"relay"}:
+        cost_source = "relay"
+    elif billed_sources == {"gateway"}:
+        cost_source = "gateway"
+    elif billed_sources:
+        cost_source = "mixed"
+    else:
+        cost_source = ""
+
     return {
         "generated_at": datetime.now().isoformat(),
         "episode": episode,
         "quota_per_usd": QUOTA_PER_USD,
         "currency": REPORT_CURRENCY,
         "usd_cny_rate": USD_CNY_RATE,
+        "cost_source": cost_source,
+        "sources": sources,
         "totals": _as_quota_row(totals),
         "by_kind": kinds,
         "by_model": models,
@@ -338,6 +381,9 @@ async def get_project_cost_report(
 #: 同一项目在这个窗口内不重复跑对账。一集有几条请求、前端可能连点「重新结算」，
 #: 而每次对账都要读一遍网关账单库（量级 10^4 行），去抖掉重复调用即可。
 RECONCILE_DEBOUNCE_SECONDS = 20.0
+#: 一次对账（relay 优先会走几次上游 HTTP）最多花多久（秒）；超时就放弃这次、
+#: 报表照常返回，避免用户点「重新结算」时长时间挂住。
+RECONCILE_BUDGET_SECONDS = 90.0
 _reconcile_gate = asyncio.Lock()
 _reconcile_last_run: dict[str, float] = {}
 
@@ -352,11 +398,11 @@ async def reconcile_project_usage(
     *,
     force: bool = False,
 ) -> tuple[ReconcileReport | None, bool]:
-    """按本地捏驿账单增量回填一个项目的 ``cost_quota``。
+    """按上游真账单（relay 优先、gateway 兜底）回填一个项目的 ``cost_quota``。
 
     返回 ``(report, skipped)``：``skipped=True`` 表示命中去抖窗口、这次没跑对账。
-    只读网关账单库、只写本项目 ``data.db``；失败以 ``report.errors`` 形式返回，
-    不抛给请求方（费用报表本身仍然可读）。
+    只读账单库（捏驿只读、中转站只读）、只写本项目 ``data.db``；失败以
+    ``report.errors`` 形式返回，不抛给请求方（费用报表本身仍然可读）。
     """
     db_path = project_usage_db(state_dir)
     key = str(db_path)
@@ -366,9 +412,14 @@ async def reconcile_project_usage(
             return None, True
         _reconcile_last_run[key] = time.monotonic()
     try:
-        report = await asyncio.to_thread(
-            reconcile, project_db=db_path, apply=True, source="gateway"
+        report = await asyncio.wait_for(
+            asyncio.to_thread(reconcile_relay_first, project_db=db_path, apply=True),
+            timeout=RECONCILE_BUDGET_SECONDS,
         )
+    except asyncio.TimeoutError:
+        logger.warning("cost reconcile timed out for %s", db_path)
+        report = ReconcileReport(gateway_db=db_path, applied=False, source="relay")
+        report.errors.append(f"对账超时（>{RECONCILE_BUDGET_SECONDS:.0f}s）")
     except Exception as exc:  # noqa: BLE001 - 对账失败不影响报表可读
         logger.warning("cost reconcile failed for %s: %s", db_path, exc)
         report = ReconcileReport(gateway_db=db_path, applied=False)
@@ -383,11 +434,13 @@ async def reconcile_project_cost_report(
     force: bool = Query(False, description="忽略去抖窗口，强制重新对账"),
     user: dict = Depends(get_api_user),
 ):
-    """按本地捏驿账单增量对账并返回刷新后的报表。
+    """按上游真账单对账并返回刷新后的报表。
 
-    每集合成完成后由 ``director_auto`` 自动触发一次（best-effort），前端「重新
-    结算」按钮走同一条路径。只读网关账单库、只写本项目 ``data.db``，不触达上游
-    中转站；``unattributed`` 为无网关单号的请求（如 TTS），如实回报。
+    relay 优先、gateway 兜底：中转站账号已配置且能对上单据时用真实账单，否则回退
+    本地捏驿账单库（并在 ``reconcile.errors`` 里说明）。每集合成完成后由
+    ``director_auto`` 自动触发一次（best-effort），前端「重新结算」按钮走同一条
+    路径。只读账单库、只写本项目 ``data.db``；``unattributed`` 为对不上账单的
+    请求（如 TTS），如实回报。
     """
     resolution = await resolve_project_scope(project, user, required_role="editor")
     report, skipped = await reconcile_project_usage(resolution.state_dir, force=force)

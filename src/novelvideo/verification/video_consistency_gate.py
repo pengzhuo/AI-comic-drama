@@ -499,6 +499,7 @@ class VideoConsistencyGate:
         identity_image_paths: list[str] | None = None,
         audio_type: str = "",
         expects_speech: bool = False,
+        multi_shot: bool = False,
         log: Callable[[str], None] | None = None,
     ) -> VideoConsistencyVerdict:
         def emit(message: str) -> None:
@@ -588,6 +589,25 @@ class VideoConsistencyGate:
                 text = str(reason or "").strip()
                 if text and text not in deduped:
                     deduped.append(text)
+
+            # 多镜硬切：这一版按镜头计划在 clip 内切了 2–4 镜，中后段帧与首帧的景别本来
+            # 就应该不同。景别类偏差本已只标记不重跑，这里进一步降噪——挪进 notes 说明，
+            # 不再当作人工复核项；身份/服装/物理/声音等硬问题照旧拦截。
+            if multi_shot:
+                framing_reasons = [
+                    reason
+                    for reason in deduped
+                    if classify_reason(reason) == REASON_KIND_FRAMING
+                ]
+                if framing_reasons:
+                    deduped = [
+                        reason for reason in deduped if reason not in framing_reasons
+                    ]
+                    notes.append(
+                        "多镜硬切：本镜在 clip 内按计划切分，景别变化属正常，"
+                        "不计入人工复核（" + "；".join(framing_reasons) + "）"
+                    )
+
             return VideoConsistencyVerdict(
                 passed=not deduped,
                 reasons=deduped,

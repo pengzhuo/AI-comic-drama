@@ -457,3 +457,158 @@ def test_extract_frame_with_real_ffmpeg(tmp_path):
     out = tmp_path / "frame0.png"
     assert extract_frame(video, 0.0, out) is True
     assert out.exists() and out.stat().st_size > 0
+
+
+def _gate_with_vision(monkeypatch, gate, issues):
+    """把 gate 的视觉复核替换成固定输出，并让抽帧走假实现。"""
+
+    monkeypatch.setattr(
+        "novelvideo.verification.video_consistency_gate.shutil.which",
+        lambda name: "/usr/bin/ffmpeg",
+    )
+    monkeypatch.setattr(
+        "novelvideo.verification.video_consistency_gate.extract_frame",
+        lambda video_path, seconds, out_path: _write_frame(out_path),
+    )
+    monkeypatch.setattr(
+        "novelvideo.verification.video_consistency_gate.probe_duration_seconds",
+        lambda video_path: 4.0,
+    )
+    monkeypatch.setattr(
+        "novelvideo.verification.video_consistency_gate.frame_similarity",
+        lambda left, right, size=64: 0.95,
+    )
+
+    async def fake_verify(**kwargs):
+        return issues
+
+    monkeypatch.setattr(gate, "_verify_with_vision", fake_verify)
+
+
+async def test_gate_multi_shot_demotes_framing_flags_to_notes(monkeypatch, tmp_path):
+    from PIL import Image
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (64, 64), (120, 120, 120)).save(frame)
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"not-a-real-video")
+
+    gate = VideoConsistencyGate()
+    _gate_with_vision(
+        monkeypatch,
+        gate,
+        VideoConsistencyIssues(
+            framing_changed=True,
+            issues=["中段被重构为胸像特写"],
+            summary="景别变化",
+        ),
+    )
+
+    # 单镜：景别偏差照旧计入人工复核（passed=False）。
+    strict = await gate.check(video_path=video, first_frame_path=frame)
+    assert strict.passed is False
+    assert any("景别" in reason for reason in strict.reasons)
+    assert strict.marked_reasons
+
+    # 多镜硬切：clip 内切镜本就该变景别 → 降噪为 notes，不再当复核项。
+    multi = await gate.check(video_path=video, first_frame_path=frame, multi_shot=True)
+    assert multi.passed is True
+    assert multi.reasons == []
+    assert any("多镜硬切" in note for note in multi.notes)
+
+
+async def test_gate_multi_shot_still_blocks_hard_problems(monkeypatch, tmp_path):
+    from PIL import Image
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (64, 64), (120, 120, 120)).save(frame)
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"not-a-real-video")
+
+    gate = VideoConsistencyGate()
+    _gate_with_vision(
+        monkeypatch,
+        gate,
+        VideoConsistencyIssues(
+            framing_changed=True,
+            costume_changed=True,
+            summary="换装",
+        ),
+    )
+
+    verdict = await gate.check(
+        video_path=video, first_frame_path=frame, multi_shot=True
+    )
+    # 多镜只降噪景别；身份/服装等硬问题照旧拦截。
+    assert verdict.passed is False
+    assert any("服装或配饰" in reason for reason in verdict.reasons)
+    assert not any("景别" in reason for reason in verdict.reasons)
+    assert any("多镜硬切" in note for note in verdict.notes)
+
+
+def test_beat_planned_multi_shot_detects_hard_cut_prompts():
+    runners = pytest.importorskip("novelvideo.task_backend.runners.video")
+
+    assert runners._beat_planned_multi_shot(
+        {"video_prompt": "Wide shot. HARD CUT to a close-up of the hands."}
+    )
+    assert runners._beat_planned_multi_shot({}, "镜内硬切到下一镜")
+    assert not runners._beat_planned_multi_shot(
+        {"video_prompt": "One continuous take, slow push in."}
+    )
+    assert not runners._beat_planned_multi_shot({}, "")
+
+
+async def test_runner_passes_multi_shot_flag_to_gate(monkeypatch, tmp_path):
+    runners = pytest.importorskip("novelvideo.task_backend.runners.video")
+
+    seen: list[bool] = []
+
+    class FakeVerdict:
+        passed = True
+        reasons: list[str] = []
+        should_rerun = False
+        rerun_reasons: list[str] = []
+        marked_reasons: list[str] = []
+
+        def as_dict(self):
+            return {
+                "passed": True,
+                "reasons": [],
+                "should_rerun": False,
+                "rerun_reasons": [],
+                "marked_reasons": [],
+            }
+
+        def reinforce_prompt(self, prompt):
+            return prompt
+
+    class FakeGate:
+        async def check(self, **kwargs):
+            seen.append(bool(kwargs.get("multi_shot")))
+            return FakeVerdict()
+
+    class FakeResult:
+        class _Status:
+            value = "done"
+
+        status = _Status()
+        error = None
+
+    monkeypatch.setattr(
+        "novelvideo.verification.video_consistency_gate.VideoConsistencyGate",
+        lambda: FakeGate(),
+    )
+
+    await runners._apply_video_consistency_gate(
+        video_gen=object(),
+        generate_kwargs={"prompt": "Shot A. HARD CUT to Shot B.", "duration": 12},
+        result=FakeResult(),
+        frame_path=tmp_path / "frame.png",
+        video_path=tmp_path / "clip.mp4",
+        beat={"audio_type": "dialogue"},
+        output_dir=str(tmp_path),
+        on_log=lambda message: None,
+    )
+
+    assert seen == [True]

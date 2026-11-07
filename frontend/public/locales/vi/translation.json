@@ -4565,6 +4565,11 @@
     "durationLegend": "Thời lượng tính từ lần gửi video đầu tiên đến lần hoàn tất cuối cùng",
     "quotaRatio": "1 USD = {{ratio}} quota (quy đổi ¥{{rate}}/USD)",
     "unattributedHint": "{{count}} yêu cầu chưa được điền chi phí từ hóa đơn thượng nguồn và chưa được tính vào tổng.",
+    "costSource": {
+      "relay": "Cơ sở quyết toán: số tiền lấy từ hóa đơn thực của trạm trung chuyển thượng nguồn.",
+      "gateway": "Cơ sở ước tính: chưa lấy được hóa đơn thực từ trung chuyển, số tiền ước tính theo tỷ lệ mặc định của gateway nội bộ, cao hơn thực tế, chỉ để tham khảo.",
+      "mixed": "Cơ sở hỗn hợp: một phần yêu cầu lấy từ hóa đơn thực của trung chuyển, phần còn lại vẫn là ước tính của gateway, tổng cao hơn thực tế."
+    },
     "stats": {
       "totalCost": "Tổng chi phí",
       "totalDuration": "Tổng thời lượng",

@@ -41,7 +41,8 @@ def _filters(
     )
     if not zoom:
         return [static]
-    # 缓推：极缓慢放大，避免看起来像一张卡死的图片；zoompan 不可用时回退静帧。
+    # 可选缓推：极缓慢放大，避免看起来像一张卡死的图片；zoompan 不可用时回退静帧。
+    # 默认关（静态优先：没有必要就不动）；只有调用方显式需要"防呆版动感"时才开启。
     # 源只要比输出大一圈就够（2x 输出高度），既平滑又不浪费：把 1024x1536 的首帧
     # 先放大到 8000px 是 40s 的活，2x 只要 3s（实测线上 ffmpeg 7.1.5）。
     zoom_height = max(height * 2, 2)
@@ -62,7 +63,7 @@ def render_still_clip(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
-    zoom: bool = True,
+    zoom: bool = False,
     timeout: int = 180,
 ) -> bool:
     """把 ``frame_png`` 渲染成 ``out_mp4``；成功返回 True。

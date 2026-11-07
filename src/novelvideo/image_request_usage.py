@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS image_request_usage (
     error_message TEXT,
     gateway_request_id TEXT,
     cost_quota INTEGER,
-    quota_checked_at TEXT
+    quota_checked_at TEXT,
+    cost_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_image_request_usage_scope
 ON image_request_usage(task_type, scope, accepted_at DESC);
@@ -44,12 +45,13 @@ _NON_BILLABLE_FAILURE_PATTERNS = (
 
 _SCHEMA_COMPONENT = "image_request_usage"
 # MIGRATION CONTRACT: increment this whenever _SCHEMA_SQL changes.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _ADDED_COLUMNS = (
     ("gateway_request_id", "TEXT"),
     ("cost_quota", "INTEGER"),
     ("quota_checked_at", "TEXT"),
+    ("cost_source", "TEXT"),
 )
 
 
@@ -198,6 +200,7 @@ def update_image_request_cost(
     request_id: str,
     cost_quota: int | None,
     quota_checked_at: str | None = None,
+    cost_source: str = "gateway",
 ) -> None:
     """Write the gateway quota snapshot back onto a recorded request."""
     now = datetime.now().isoformat()
@@ -205,10 +208,10 @@ def update_image_request_cost(
         conn.execute(
             """
             UPDATE image_request_usage
-            SET cost_quota = ?, quota_checked_at = ?, updated_at = ?
+            SET cost_quota = ?, quota_checked_at = ?, cost_source = ?, updated_at = ?
             WHERE request_id = ?
             """,
-            (cost_quota, quota_checked_at or now, now, request_id),
+            (cost_quota, quota_checked_at or now, cost_source, now, request_id),
         )
 
 

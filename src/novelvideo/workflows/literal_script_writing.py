@@ -847,7 +847,10 @@ class LiteralScriptWritingWorkflow:
         # 仅在显式传入节奏参数时启用——生产 runner 总会传（默认全局 60s/单镜 15s），
         # 这样直接构造 workflow 的库调用/单测维持旧的“一行一镜”行为。
         if self.pacing_settings is not None:
-            from novelvideo.pacing import compact_beats_for_shots
+            from novelvideo.pacing import (
+                compact_beats_for_shots,
+                split_long_beats_for_shots,
+            )
 
             pacing = self.pacing_settings
             compacted = compact_beats_for_shots(
@@ -860,7 +863,17 @@ class LiteralScriptWritingWorkflow:
                     f"[Literal] 镜头合并: {len(beats)} -> {len(compacted)} 镜 "
                     f"(单镜上限 {pacing.shot_target_seconds:.0f}s)"
                 )
-            beats = compacted
+            # 合并只把镜头变长，单条超长台词仍可能超过视频模型单镜上限（Seedance2=15s），
+            # 成片会被截断，需再拆一刀。
+            split = split_long_beats_for_shots(
+                compacted, max_seconds=pacing.shot_target_seconds
+            )
+            if len(split) != len(compacted):
+                log(
+                    f"[Literal] 长台词拆分: {len(compacted)} -> {len(split)} 镜 "
+                    f"(单条上限 {pacing.shot_target_seconds:.0f}s)"
+                )
+            beats = split
 
         script = NarrationScript(
             episode_number=episode_num,

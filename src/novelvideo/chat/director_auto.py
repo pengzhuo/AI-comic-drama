@@ -329,6 +329,9 @@ MODERATION_REPAIR_TIMEOUT_SECONDS = 300.0
 #: 显式总超时：一旦超时就当「可重试失败」暂停，交给服务端兜底续跑/人工，绝不让一次
 #: 挂死的 turn 把 run 永久留在 ``running``（心跳还在续租，reaper 看不出来）。
 AGENT_CONTINUE_TIMEOUT_SECONDS = 1800.0
+#: 成片后成本对账（relay 优先）允许花多久（秒）。超出就放弃这次自动对账，
+#: 报表按钮/结算路径仍能补上；绝不让上游网络抖动拖住成片流程。
+EPISODE_COST_RECONCILE_TIMEOUT_SECONDS = 180.0
 
 
 def _task_moderation_text(task: TaskState) -> str:
@@ -2681,19 +2684,31 @@ class DirectorAutoCoordinator:
         return episodes[0] if episodes else None
 
     async def _reconcile_episode_cost(self, run: DirectorAutoRun) -> None:
-        """一集成片落盘后，按本地捏驿账单增量结算费用（best-effort）。
+        """一集成片落盘后结算费用（best-effort，relay 优先、gateway 兜底）。
 
-        只读网关账单库、只写本项目 ``data.db``；不需要用户操作，也不依赖上游
-        中转站。失败绝不影响成片流程——费用报表仍可读，只是这一集的 ``cost_quota``
-        还空着，前端会显示「结算中 / 未归因」。
+        用中转站真实账单口径回填 ``cost_quota``，只有中转站账号缺失 / 一条都对
+        不上时才回退本地捏驿账单库（会把原因写进 ``report.errors``）。只读账单、
+        只写本项目 ``data.db``；失败绝不影响成片流程——费用报表仍可读，只是这一集
+        的 ``cost_quota`` 还空着，前端会显示「结算中 / 未归因」。
         """
         try:
-            from novelvideo.gateway_cost_reconcile import reconcile
+            from novelvideo.gateway_cost_reconcile import reconcile_relay_first
 
             project_db = Path(run.context.state_dir) / "data.db"
-            report = await asyncio.to_thread(
-                reconcile, project_db=project_db, apply=True, source="gateway"
+            report = await asyncio.wait_for(
+                asyncio.to_thread(
+                    reconcile_relay_first, project_db=project_db, apply=True
+                ),
+                timeout=EPISODE_COST_RECONCILE_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "episode cost reconcile timed out (run %s, episode %s, %.0fs)",
+                run.run_id,
+                run.episode,
+                EPISODE_COST_RECONCILE_TIMEOUT_SECONDS,
+            )
+            return
         except Exception:  # noqa: BLE001 - 结算失败不阻塞成片
             logger.warning(
                 "episode cost reconcile failed (run %s, episode %s)",
@@ -2704,9 +2719,10 @@ class DirectorAutoCoordinator:
             return
         matched = sum(table.matched for item in report.projects for table in item.tables)
         logger.info(
-            "episode %s cost reconciled (run %s): matched=%s quota=%s errors=%s",
+            "episode %s cost reconciled (run %s): source=%s matched=%s quota=%s errors=%s",
             run.episode,
             run.run_id,
+            report.source,
             matched,
             report.quota,
             report.errors or "-",

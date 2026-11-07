@@ -10,6 +10,7 @@ from novelvideo.pacing import (
     condense_text,
     estimate_duration_seconds,
     resolve_pacing_settings,
+    split_long_beats_for_shots,
 )
 
 
@@ -123,6 +124,57 @@ def test_compact_beats_single_and_empty():
     assert compact_beats_for_shots(only) == only
 
 
+def _silence(number: int, *, scene: str = "家"):
+    return VisualBeat(
+        beat_number=number,
+        narration_segment="",
+        visual_description=f"空镜{number}",
+        audio_type="silence",
+        speaker="",
+        scene_ref=SceneRef(scene_id=scene) if scene else None,
+    )
+
+
+def test_compact_beats_folds_silence_into_neighbor():
+    beats = [
+        _beat(1, "对白一", audio_type="dialogue", speaker="甲"),
+        _silence(2),
+        _beat(3, "对白二", audio_type="dialogue", speaker="甲"),
+        _silence(4),
+        _beat(5, "对白三", audio_type="dialogue", speaker="乙"),
+    ]
+    merged = compact_beats_for_shots(beats, shot_target_seconds=15)
+    # 纯过场 beat 不再单独成镜
+    assert all(b.audio_type != "silence" for b in merged)
+    # 甲的两句 + 中间空镜并为一镜；乙单独一镜
+    assert len(merged) == 2
+    assert merged[0].speaker == "甲"
+    assert merged[0].narration_segment.count("对白") == 2
+    # 画面锚点取对白镜，而非首个空镜
+    assert merged[0].visual_description == "画面1"
+    assert merged[1].speaker == "乙"
+
+
+def test_compact_beats_leading_silence_joins_following_speech():
+    beats = [
+        _silence(1),
+        _beat(2, "唯一对白", audio_type="dialogue", speaker="甲"),
+    ]
+    merged = compact_beats_for_shots(beats, shot_target_seconds=15)
+    assert len(merged) == 1
+    assert merged[0].audio_type == "dialogue"
+    assert merged[0].speaker == "甲"
+    assert merged[0].visual_description == "画面2"
+
+
+def test_compact_beats_silence_only_keeps_one_group():
+    merged = compact_beats_for_shots(
+        [_silence(1), _silence(2)], shot_target_seconds=15
+    )
+    assert len(merged) == 1
+    assert merged[0].audio_type == "silence"
+
+
 def test_pacing_settings_normalized():
     s = PacingSettings(
         episode_target_seconds=30,
@@ -132,3 +184,64 @@ def test_pacing_settings_normalized():
     ).normalized()
     assert s.merge_floor_seconds <= s.episode_target_seconds
     assert s.split_threshold_seconds > s.episode_target_seconds
+
+
+# ── 单条超长朗读 beat 拆分 ────────────────────────────────────────────────────
+
+
+def test_split_long_beats_breaks_over_budget_line_and_renumbers():
+    long_line = "字" * 174  # 174 / 5.8 ≈ 30s，远超单镜上限
+    beats = [_beat(1, long_line, audio_type="dialogue", speaker="苏清晏")]
+    split = split_long_beats_for_shots(beats, max_seconds=15, chars_per_second=5.8)
+    assert len(split) >= 2
+    # 序号从 1 连续重排
+    assert [b.beat_number for b in split] == list(range(1, len(split) + 1))
+    cap = 15 * 0.9
+    for beat in split:
+        assert (
+            estimate_duration_seconds(beat.narration_segment, chars_per_second=5.8)
+            <= cap + 1e-6
+        )
+        # 音色/场景/画面随拆分继承
+        assert beat.audio_type == "dialogue"
+        assert beat.speaker == "苏清晏"
+        assert beat.visual_description == "画面1"
+    # 原文不丢、不重复
+    assert "".join(b.narration_segment for b in split).count("字") == 174
+
+
+def test_split_long_beats_prefers_sentence_boundaries():
+    line = "第一句话。" + "第二句话。" + "第三句话。" + "第四句话。"
+    split = split_long_beats_for_shots(
+        [_beat(1, line)], max_seconds=2, chars_per_second=5.8
+    )
+    assert len(split) >= 2
+    # 一字不差，且每刀都切在句末标点
+    assert "".join(b.narration_segment for b in split) == line
+    assert all(b.narration_segment.endswith("。") for b in split)
+
+
+def test_split_long_beats_leaves_short_and_manual_untouched():
+    short = _beat(1, "短台词", audio_type="dialogue", speaker="甲")
+    assert split_long_beats_for_shots([short], max_seconds=15) == [short]
+    assert split_long_beats_for_shots([], max_seconds=15) == []
+
+    manual = _beat(2, "字" * 174, audio_type="dialogue", speaker="甲")
+    manual.is_manual_shot = True
+    manual.duration_seconds = 20.0
+    assert split_long_beats_for_shots([manual], max_seconds=15) == [manual]
+
+
+def test_compact_then_split_keeps_every_shot_within_cap():
+    beats = [_beat(i, "字" * 58) for i in range(1, 9)]  # 每条 ≈10s，共 ≈80s
+    merged = compact_beats_for_shots(beats, shot_target_seconds=15, max_shots=4)
+    split = split_long_beats_for_shots(merged, max_seconds=15, chars_per_second=5.8)
+    cap = 15 * 0.9
+    for beat in split:
+        assert (
+            estimate_duration_seconds(beat.narration_segment, chars_per_second=5.8)
+            <= cap + 1e-6
+        )
+    # 合并 + 拆分后正文仍完整
+    assert "".join(b.narration_segment for b in split).count("字") == 8 * 58
+

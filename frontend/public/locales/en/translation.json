@@ -4679,6 +4679,11 @@
     "durationLegend": "Duration spans from the first video submit to the last completion",
     "quotaRatio": "$1 = {{ratio}} quota (converted at ¥{{rate}}/USD)",
     "unattributedHint": "{{count}} request(s) have no cost filled in from the upstream bill yet and are excluded from the totals.",
+    "costSource": {
+      "relay": "Settled basis: amounts come from the upstream relay's real bill.",
+      "gateway": "Estimated basis: no upstream real bill was available, so amounts are estimated at the local gateway's default ratio and run high — for reference only.",
+      "mixed": "Mixed basis: some requests come from the relay's real bill while others are still gateway estimates, so the total runs high."
+    },
     "stats": {
       "totalCost": "Total cost",
       "totalDuration": "Total duration",

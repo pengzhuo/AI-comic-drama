@@ -1,8 +1,12 @@
-"""字幕只显示念出来的台词，且字号不超过电影字幕带。
+"""字幕只显示角色**对话台词**，且字号不超过电影字幕带。
 
 现场问题：合成字幕直接取 ``narration_segment`` 原文，于是
 ``（神色坚定，一手撑住墙面，喘息未平便开口）今天是我的生日……`` 和
 ``许知意（os）：我已经这么努力了……`` 里的表演提示与说话人标签都被烧进了成片。
+
+口径进一步收敛：**旁白/解说（``narration``）也不出字幕**——旁白照常配 TTS 出声，
+只是不上屏。``beat_spoken_text`` 保留「台词 + 旁白」的完整人声口径，供声线预检 /
+一致性 gate 使用，不能跟着字幕一起收紧（否则旁白会被误判成无语音）。
 """
 
 import re
@@ -41,13 +45,25 @@ def test_dialogue_subtitle_drops_the_performance_note():
     assert beat_subtitle_text(beat) == "今天是我的生日……他们连一句生日快乐都不肯说。"
 
 
-def test_narration_subtitle_drops_the_speaker_label():
+def test_narration_does_not_emit_a_subtitle():
     beat = {
         "audio_type": "narration",
         "narration_segment": "许知意（os）：我已经这么努力了，为什么还是没人愿意留下？",
     }
 
-    assert beat_subtitle_text(beat) == "我已经这么努力了，为什么还是没人愿意留下？"
+    assert beat_subtitle_text(beat) == ""
+
+
+def test_narration_still_counts_as_spoken_text_for_voice_preflight():
+    from novelvideo.seedance2_i2v.spoken_dialogue import beat_spoken_text
+
+    beat = {
+        "audio_type": "narration",
+        "narration_segment": "许知意（os）：我已经这么努力了，为什么还是没人愿意留下？",
+    }
+
+    # 字幕不出旁白，但旁白仍有人声：声线预检/gate 的口径不能被字幕带着收紧。
+    assert beat_spoken_text(beat) == "我已经这么努力了，为什么还是没人愿意留下？"
 
 
 def test_label_and_note_are_both_stripped():
@@ -150,13 +166,11 @@ def test_compose_episode_burns_spoken_lines_at_movie_size(tmp_path, monkeypatch)
         "1\n"
         "00:00:00,000 --> 00:00:01,000\n"
         r"{\an2}今天是我的生日……他们连一句生日快乐都不肯说。" "\n"
-        "\n"
-        "2\n"
-        "00:00:01,000 --> 00:00:02,000\n"
-        r"{\an2}我已经这么努力了，为什么还是没人愿意留下？" "\n"
     )
     assert "（神色坚定" not in captured["srt"]
     assert "许知意（os）" not in captured["srt"]
+    # 旁白/解说也不得进字幕。
+    assert "我已经这么努力了" not in captured["srt"]
     assert "雨越下越大" not in captured["srt"]
 
     assert "FontSize=11" in captured["filter"]
@@ -185,12 +199,43 @@ def test_burned_subtitle_cues_carry_the_per_line_center_tag(monkeypatch):
         [("我不走。\n那就别回来。", "a.mp4"), ("", "b.mp4")]
     )
 
+    # 一条 beat 的台词按标点逐句拆开，按字数占比分配该 beat 的说话窗口。
     assert srt == (
         "1\n"
-        "00:00:00,000 --> 00:00:02,500\n"
+        "00:00:00,000 --> 00:00:01,000\n"
         r"{\an2}我不走。" "\n"
-        "那就别回来。" "\n"
+        "\n"
+        "2\n"
+        "00:00:01,000 --> 00:00:02,500\n"
+        r"{\an2}那就别回来。" "\n"
     )
-    # 只有真的出字幕的 cue 才带标签，静音 beat 不占位。
-    assert srt.count(video.SUBTITLE_ALIGNMENT_TAG) == 1
+    # 每个逐句 cue 都带标签；静音 beat 不占位。
+    assert srt.count(video.SUBTITLE_ALIGNMENT_TAG) == 2
+
+
+def test_subtitle_cue_windows_split_by_sentence_and_share_the_window():
+    from novelvideo.seedance2_i2v.spoken_dialogue import (
+        split_subtitle_sentences,
+        subtitle_cue_windows,
+    )
+
+    text = "第一句。这里更长的一句台词。"
+    assert split_subtitle_sentences(text) == ["第一句。", "这里更长的一句台词。"]
+
+    windows = subtitle_cue_windows(text, 0.0, 10.0)
+    assert [window[0] for window in windows] == ["第一句。", "这里更长的一句台词。"]
+    # 首句字数少，窗口也短；两句首尾相接并铺满整个 beat 窗口。
+    assert windows[0][1] == 0.0
+    assert windows[0][2] == windows[1][1]
+    assert windows[-1][2] == 10.0
+    assert windows[0][2] < windows[1][2] - windows[1][1]
+
+
+def test_subtitle_cue_windows_keeps_one_cue_when_window_is_too_short():
+    from novelvideo.seedance2_i2v.spoken_dialogue import subtitle_cue_windows
+
+    # 窗口太短撑不起逐句展示时，整句一次上屏，避免字幕一闪而过。
+    assert subtitle_cue_windows("一句。两句。", 0.0, 1.0) == [
+        ("一句。两句。", 0.0, 1.0)
+    ]
 

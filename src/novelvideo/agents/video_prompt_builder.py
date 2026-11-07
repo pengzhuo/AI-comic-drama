@@ -46,24 +46,25 @@ The first frame is video time `t=0`; the model cannot go backward to show action
 ❌ Inventing environmental dynamics (dust, fog, particles, wind-blown leaves) not visible in the frame
 ❌ Abstract emotion labels (sad, haunting, desperate, hopeful, anxious, melancholy) → show via body language (clenched fists, averted gaze, hunched shoulders)
 ❌ Non-visual senses (smell, temperature, humidity, taste, tactile) — the model generates only what is visible (and audible)
-❌ Static camera words (holds, stays, remains, static, locked, fixed) — camera must always move
+❌ Slow-motion camera wording (slowly, slow, gently drift, 缓缓, 缓慢, 极慢) — the camera is static by default and, when it moves, moves at a normal brisk speed
 ❌ Static primary verbs (freezes, stares, stands, waits, remains, holds still) as the main action — these produce frozen video
 ❌ Reversing or oscillating motion (steps forward then back, leans in then pulls away, nods then shakes head)
 
 ## Camera
-- Every prompt MUST include a camera direction with displacement or zoom (push-in, dolly, pan, tilt, track, crane, zoom)
-- Describe the camera endpoint: what the frame looks like when camera motion finishes
+- Camera is static / locked-off by default; add movement only with a clear motive, and then at normal, brisk speed
+- Never use slow-motion camera wording (slowly, slow, gently, 缓缓, 缓慢, 极慢)
+- If the camera moves, describe the endpoint; if it is static, describe the composition
 - Match detail to shot scale: close-up → micro details; wide shot → broad arcs
 
 ## Audio Layer (superset — works on audio-capable models, silently ignored by others)
 - Add ONE short ambient sound sentence (e.g. "rain patters softly on the glass")
-- For dialogue beats, also specify voice style (calm, urgent, whisper, etc.)
+- For dialogue beats, also specify voice style AND a natural, brisk speaking pace (never "unhurried / evenly / 不紧不慢 / 平稳")
 
 ## Sustained Motion
-The clip is ~5 seconds. One quick action finishes too early and the model reverses it.
-Always describe a **chain of 2–3 connected actions** across the full duration.
-Layer simultaneous details (camera drift, fabric swaying, breathing) to keep motion flowing.
-⚠️ **UNIDIRECTIONAL motion only**: every action must move in ONE direction — forward, never back. If the primary action is short (a single punch, a single turn), extend it with follow-through motion in the SAME direction.
+Keep motion at natural real-time speed. NEVER slow a movement down, freeze, or stretch a single short action to fill the clip — that reads as slow motion. BANNED slow wording: "slowly", "slow", "gently", "缓缓", "缓慢", "极慢", "轻轻地".
+When the clip is longer than one shot, split it into **2–4 shots of roughly 3–8 seconds each**, joined by explicit `HARD CUT`s, and cover a long line with cutaways (listener reaction, hands/props, environment) instead of one static take.
+Layer simultaneous details (fabric swaying, breathing, a prop settling) at real-time speed to keep life in the frame; a static camera is fine.
+⚠️ **UNIDIRECTIONAL motion only**: every action must move in ONE direction — forward, never back. A short action is extended with a `HARD CUT` to the next shot (or follow-through in the SAME direction), never by slowing it down.
 
 ## Continuity Check
 Before writing, verify the first verb of motion can naturally start from the visible first frame.
@@ -340,7 +341,7 @@ class VideoPromptBuilder:
 ⚠️ **First-frame contract**: the sketch is video frame one (t=0). Describe only what happens AFTER this frame.
 1. Use the visual_description as a strong hint for the forward action chain; do not describe actions that must have happened before the visible first frame.
 2. Only describe motion of characters and objects **actually visible** in the sketch — no invented environmental dynamics.
-3. ⚠️ **Motion must fill {duration:.1f}s** — chain of 2-3 connected forward actions.
+3. ⚠️ **Fill {duration:.1f}s at natural speed** — for clips longer than ~8s, chain 2–4 shots (~3–8s each) marked with `HARD CUT`; never slow down, freeze, or stretch one action to fill the time.
 4. Target: {word_target}
 5. If the textual visual_description implies an action moment the first frame has not yet reached, start from the next compatible action.
 6. NO character names → use appearance descriptions from the color mapping
@@ -362,7 +363,7 @@ Output the motion prompt in {output_label} directly.
 ⚠️ **First-frame contract**: the image is video frame one (t=0). Describe only what happens AFTER this frame.
 1. Use the visual_description as a strong hint for the forward action chain; do not describe actions that must have happened before the visible first frame.
 2. Only describe motion of characters and objects **actually visible** in the image — no invented environmental dynamics.
-3. ⚠️ **Motion must fill {duration:.1f}s** — describe continuous, progressive motion to avoid finishing too early.
+3. ⚠️ **Fill {duration:.1f}s at natural speed** — for clips longer than ~8s, use 2–4 shots (~3–8s each) marked with `HARD CUT`; never slow down, freeze, or stretch one action to fill the time.
 4. Target: {word_target}
 5. If the textual visual_description implies an action moment the first frame has not yet reached, start from the next compatible action.
 6. NO character names → use visual descriptions ("the woman in gray"); distinguish multiple characters by visual features
@@ -384,7 +385,7 @@ Output the motion prompt in {output_label} directly.
 1. Treat the visual_description as video frame one (t=0); describe only forward motion after it.
 2. Extract action verbs from the visual_description directly.
 3. Only describe character and object motion — no invented environmental dynamics.
-4. ⚠️ **Motion must fill {duration:.1f}s** — describe continuous, progressive motion to avoid finishing too early.
+4. ⚠️ **Fill {duration:.1f}s at natural speed** — for clips longer than ~8s, use 2–4 shots (~3–8s each) marked with `HARD CUT`; never slow down, freeze, or stretch one action to fill the time.
 5. Target: {word_target}
 6. If the textual visual_description implies an action moment the first frame has not yet reached, start from the next compatible action.
 7. NO character names → use visual descriptions ("the woman in black"); distinguish multiple characters by visual features
@@ -402,8 +403,8 @@ Output the motion prompt in {output_label} directly. No explanation.
     ) -> str:
         """回退方案：根据规则生成默认运动提示词。"""
         if language == "en":
-            return "The character moves naturally as the camera follows the action."
-        return "角色自然动作，姿态变化，自然镜头运动"
+            return "The character acts at a natural, real-time pace with a static camera."
+        return "角色以真实速度自然动作，镜头保持固定"
 
 
 # 模块级单例
