@@ -598,9 +598,10 @@ def cost_reconcile_cmd(
     apply: bool = typer.Option(False, "--apply", help="回写 cost_quota；默认只 dry-run"),
     yes: bool = typer.Option(False, "--yes", help="确认 apply；必须与 --apply 同时使用"),
     source: str = typer.Option(
-        "gateway",
+        "local",
         "--source",
-        help="quota 来源：gateway=本地捏驿账单库；relay=上游中转站真实账单",
+        help="quota 来源：local=本地按用量×单价（实测优先，不登录上游）；"
+        "gateway=本地捏驿账单库；relay=上游中转站真实账单",
     ),
     relay_base_url: list[str] = typer.Option(
         [], "--relay-base-url", help="中转站地址，可重复；默认 aicf + aigc + aiqy"
@@ -631,8 +632,8 @@ def cost_reconcile_cmd(
 
     if apply and not yes:
         raise typer.BadParameter("apply requires --yes")
-    if source not in {"gateway", "relay"}:
-        raise typer.BadParameter("--source 只能是 gateway 或 relay")
+    if source not in {"gateway", "relay", "local"}:
+        raise typer.BadParameter("--source 只能是 local、gateway 或 relay")
 
     relay_endpoints = []
     if source == "relay":

@@ -33,7 +33,7 @@ from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
 from novelvideo.seedance2_i2v.voice_preflight import ensure_speech_voice_mention
 
 SEEDANCE2_HUIMENG_BACKEND = "huimeng_seedance-2.0-fast"
-SEEDANCE2_NEWAPI_BACKEND = "newapi_seedance-2.0-fast"
+SEEDANCE2_NEWAPI_BACKEND = "newapi_seedance-2.5"
 MAX_SEEDANCE2_REFERENCE_AUDIOS = 3
 MAX_SEEDANCE2_REFERENCE_AUDIO_TOTAL_SECONDS = 15.0
 
@@ -66,7 +66,7 @@ def is_huimeng_seedance2_backend(backend: str | None) -> bool:
         return True
     for prefix in ("huimeng_", "huimengi_", "newapi_"):
         if value.startswith(prefix):
-            return value[len(prefix) :].strip().startswith("seedance-2.0")
+            return value[len(prefix) :].strip().startswith("seedance-2")
     return False
 
 
@@ -282,8 +282,9 @@ async def prepare_seedance2_generation_inputs(
     next_beat: dict[str, Any] | None = None,
     characters: list[Any] | None = None,
     prop_menu: list[Any] | None = None,
+    max_duration: int | None = None,
 ) -> Seedance2PreparedGeneration:
-    """Prepare prompt, config, and media references for one Seedance 2.0 beat."""
+    """Prepare prompt, config, and media references for one Seedance 2.x beat."""
 
     project_output = Path(project_output)
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
@@ -310,6 +311,7 @@ async def prepare_seedance2_generation_inputs(
     target_duration = resolve_seedance2_target_duration(
         config_duration=config.duration,
         requested=duration,
+        max_duration=max_duration,
     )
     config.duration = target_duration
     config.resolution = resolution or config.resolution

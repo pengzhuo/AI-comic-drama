@@ -1,0 +1,1408 @@
+diff --git a/docs/agents/relay-billing.md b/docs/agents/relay-billing.md
+index 84f0c791..45b42dda 100644
+--- a/docs/agents/relay-billing.md
++++ b/docs/agents/relay-billing.md
+@@ -1,8 +1,20 @@
+-# 捏账费用口径：以上游中转站账单为准
++# 捏账费用口径：本地按用量 × 单价（实测优先）
+ 
+ 「捏账」（项目 Reports 页 / `GET /api/v1/projects/{id}/cost-report`）的费用来自
+ 项目 `data.db` 四张用量表的 `cost_quota`，由 `novelvideo cost-reconcile` 回填。
+-默认口径已切到 **上游中转站真实账单**（`--source relay`）。
++默认口径是 **本地计价**（`--source local`）：按「用量 × 单价」算，**不登录任何上游**，
++不受中转站 429/409 影响（上游对并发会话有上限，登录后不退出会持续撞 409）。
++单价里 `actual_rules`（由真账反推）优先，因此算出来的钱与真账同口径。
++
++## 三种口径
++
++| `--source` | 含义 | 用途 |
++| --- | --- | --- |
++| `local`（默认） | 读 `/data/production-prices.json`：实测反推价 `actual_rules` > 手工折扣价 `rules`（列表价 × 折扣，如 `aiqy-5zhe`）> 上游同步价 `synced`。不触网。 | 日常结算（报表「重新结算」、成片后结算钩子、伴点结算） |
++| `relay` | 向中转站取真实 `quota`。登录后 `finally` 强制退出会话。 | 一次性标定真账 |
++| `gateway` | 读本地捏驿库 `one-api.db`，别名落默认倍率、偏高 35～212 倍。 | 仅排查/回归 |
++
++自动入口全部走 `local`；`relay` 只保留手动 CLI。
+ 
+ ## 为什么要绕开本地捏驿网关
+ 
+@@ -22,27 +34,36 @@
+ | `video_request_usage.request_id` | `tasks.task_id` | `tasks.private_data`（BLOB JSON）里的 `upstream_task_id` |
+ | `image/audio_request_usage.gateway_request_id`、`llm_request_usage.provider_request_id` | `logs.request_id` | `logs.upstream_request_id` |
+ 
+-## 取数与限制
++## relay 取数与限制（仅标定用）
+ 
+ - 上游接口：`GET /api/task/self`（分页，`p` 从 0 起、`page_size` 上限 100）、
+   `GET /api/log/self?request_id=<上游单号>`（精确 1 条）、`GET /api/status`（免鉴权）。
+ - access token **15 分钟**过期，客户端遇 401 自动重登一次再重试。
++- 上游对**并发会话数**有上限：登录不退出会一直撞 `409 AUTH_SESSION_LIMIT`。所以
++  `collect_quotas` 在 `finally` 里主动 `POST /api/user/auth/logout` + `Origin` 头退出。
++- `GET /api/log/self` 逐单号查询容易触发 `429`；`GET /api/task/self` 分页可靠，
++  视频（含 `seedance-2.5`）优先走它。
+ - 查询范围会**收窄到本项目用量行真正引用到的 id**，不会去拉全站 3 万条日志。
+ - 结果缓存在 `RELAY_BILLING_CACHE_PATH`（默认 `/data/runtime/relay_billing_cache.json`）。
+-- 匹配不上的行留 `cost_quota = NULL`，报表里计进 `unattributed`，不会静默计 0。
+ 
+-## 运行方式（凭据只走命令行，不落库、不进 git）
++## 运行方式
+ 
+ ```bash
+-# 预演
++# 本地计价（默认，不触网）；--apply 才回写 cost_quota，--yes 免二次确认
+ docker exec -w /app dramaclaw-api-1 /app/.venv/bin/novelvideo cost-reconcile \
+-  --project <project> --source relay --relay-username <u> --relay-password <p>
++  --project <project> --apply --yes
++# --all 对 state 下全部项目
+ 
+-# 回写（必须显式 --apply --yes）；--all 对 state 下全部项目
+-... --apply --yes
++# 一次性标定：取上游真账单（凭据只走命令行，不落库、不进 git；查完自动退出会话）
++docker exec -w /app dramaclaw-api-1 /app/.venv/bin/novelvideo cost-reconcile \
++  --project <project> --source relay --relay-username <u> --relay-password <p> \
++  --apply --yes
+ ```
+ 
+-`--source gateway` 保留旧行为（读本地捏驿库），仅用于排查与回归。
++标定出的真账再用
++`POST /api/v1/settings/production-prices/calibrate?project=<id>&apply=true`
++反推成 `actual_rules`（该接口只读项目库里已有的 `cost_quota`，所以 `seedance-2.5`
++这类还没回写过真账的行要单独从 task 账单补）。
+ 
+ ## 币种
+ 
+@@ -52,18 +73,19 @@ docker exec -w /app dramaclaw-api-1 /app/.venv/bin/novelvideo cost-reconcile \
+ `currency` / `usd_cny_rate` / 每行的 `cny`；前端在字段缺失（api 进程未重启）时按
+ `usd_cny_rate`、兜底常数 `7.3` 自行折算。
+ 
+-## 已知不计入的部分
++## 已知限制
+ 
+-- `audio_request_usage` 表从来没有 `gateway_request_id` 列 → 音频一律无法桥接，全部
+-  落在 `unattributed`（量级约 100 quota/条，可忽略）。
+-- 更早的项目连 `image_request_usage.gateway_request_id` 列都没有（该列是后加的），
+-  这些图片行也一律无法桥接。按 pd_1025_1 实测（约 11,000 quota/张）估算，通常只占
+-  视频费用的几个百分点。
+-- 有列但没拿到网关响应头（失败 / 校验前中止）的图片行同样无法桥接。
+-- 聊天 / Agent 的 LLM 消耗记在全局用量表，不在项目 `llm_request_usage` 里，因此
+-  **不**出现在项目捏账页。
++- **本地口径不受单号桥接限制**：只要价目表里有对应 `kind/model` 的单价，就按用量计入，
++  不依赖 `gateway_request_id` / 上游单号。
++- `relay` 口径才依赖桥接：`audio_request_usage` 曾经没有 `gateway_request_id` 列，更早的
++  项目连 `image_request_usage.gateway_request_id` 也没有，这些行在 relay 下无法桥接、
++  落到 `unattributed`；有列但没拿到网关响应头（失败 / 校验前中止）的图片行同样如此。
+ - 上游账单里查不到的上游单号（中转站已清理该任务，或当时走的是别的上游账号）会让
+-  该项目无法定价：`apply` **只覆盖匹配到的行**，匹配不到的保留库里旧值，不会清零。
++  relay 定不了价；`apply` **只覆盖匹配到的行**，匹配不到的保留库里旧值、不清零。
+   实测中转站只认识网关记录过的 2067 个上游单号里的 1533 个，约 10 个老项目属于这种
+   情况（nn1 / nn_1018_1 / new1 / new2 / cs_nn / chongsheng_test* / nanie_cs /
+   shenye_bianlidian / wenlu）。
++- 价目表里没有对应 `kind/model` 的行落 `cost_source = 'unmatched'`、`cost_quota = NULL`，
++  报表里计进 `unattributed`，不会静默计 0。
++- 聊天 / Agent 的 LLM 消耗记在全局用量表，不在项目 `llm_request_usage` 里，因此
++  **不**出现在项目捏账页。
+diff --git a/frontend/public/locales/en/translation.json b/frontend/public/locales/en/translation.json
+index 743abe15..a25f09aa 100644
+--- a/frontend/public/locales/en/translation.json
++++ b/frontend/public/locales/en/translation.json
+@@ -4682,6 +4682,8 @@
+     "costSource": {
+       "relay": "Settled basis: amounts come from the upstream relay's real bill.",
+       "relayPartial": "Settled basis: amounts come from the upstream relay's real bill; {{count}} request(s) are still unattributed and excluded from the totals, and will update automatically once reconciled.",
++      "local": "Price-book basis: amount = usage × local unit price (unit prices are derived from the upstream real bill).",
++      "localPartial": "Price-book basis: amount = usage × local unit price (measured rates); {{count}} request(s) are still unpriced and excluded from the totals, and will update automatically once priced.",
+       "gateway": "Estimated basis: no upstream real bill was available, so amounts are estimated at the local gateway's default ratio and run high — for reference only.",
+       "mixed": "Mixed basis: some requests come from the relay's real bill while others are still gateway estimates, so the total runs high."
+     },
+diff --git a/frontend/public/locales/vi/translation.json b/frontend/public/locales/vi/translation.json
+index 09b1636c..07dc9198 100644
+--- a/frontend/public/locales/vi/translation.json
++++ b/frontend/public/locales/vi/translation.json
+@@ -4568,6 +4568,8 @@
+     "costSource": {
+       "relay": "Cơ sở quyết toán: số tiền lấy từ hóa đơn thực của trạm trung chuyển thượng nguồn.",
+       "relayPartial": "Cơ sở quyết toán: số tiền lấy từ hóa đơn thực của trạm trung chuyển thượng nguồn; {{count}} yêu cầu vẫn chưa được phân bổ và chưa tính vào tổng, sẽ tự động cập nhật sau khi đối soát.",
++      "local": "Cơ sở theo bảng giá: số tiền = mức dùng × đơn giá nội bộ (đơn giá suy ra từ hóa đơn thực thượng nguồn).",
++      "localPartial": "Cơ sở theo bảng giá: số tiền = mức dùng × đơn giá nội bộ (theo giá đo được); {{count}} yêu cầu vẫn chưa có đơn giá và chưa tính vào tổng, sẽ tự động cập nhật sau khi có giá.",
+       "gateway": "Cơ sở ước tính: chưa lấy được hóa đơn thực từ trung chuyển, số tiền ước tính theo tỷ lệ mặc định của gateway nội bộ, cao hơn thực tế, chỉ để tham khảo.",
+       "mixed": "Cơ sở hỗn hợp: một phần yêu cầu lấy từ hóa đơn thực của trung chuyển, phần còn lại vẫn là ước tính của gateway, tổng cao hơn thực tế."
+     },
+diff --git a/frontend/public/locales/zh/translation.json b/frontend/public/locales/zh/translation.json
+index 44e2f82b..a2d6ce3a 100644
+--- a/frontend/public/locales/zh/translation.json
++++ b/frontend/public/locales/zh/translation.json
+@@ -4682,6 +4682,8 @@
+     "costSource": {
+       "relay": "结算口径：金额取自上游中转站真实账单。",
+       "relayPartial": "结算口径：金额取自上游中转站真实账单；另有 {{count}} 笔请求未归因，暂未计入，补齐后自动更新。",
++      "local": "按价目估算：金额 = 用量 × 本地单价（单价来自上游真账反推的实际口径）。",
++      "localPartial": "按价目估算：金额 = 用量 × 本地单价（实测口径）；另有 {{count}} 笔请求未定价，暂未计入，补齐后自动更新。",
+       "gateway": "估值口径：未取到中转站真实账单，金额按本地网关默认倍率估算，偏高，仅供参考。",
+       "mixed": "混合口径：部分请求取自中转站真账单，其余仍是网关估值，合计偏高。"
+     },
+diff --git a/frontend/src/features/studio/studio-cost.tsx b/frontend/src/features/studio/studio-cost.tsx
+index a803354b..b22d15c5 100644
+--- a/frontend/src/features/studio/studio-cost.tsx
++++ b/frontend/src/features/studio/studio-cost.tsx
+@@ -74,6 +74,21 @@ function CostSourceNote({
+       </p>
+     );
+   }
++  if (source === "local") {
++    // 本地按「用量 × 单价」计算，单价取真账反推的实测口径；仍有未定价请求时合计不完整。
++    if (partial) {
++      return (
++        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-500">
++          {`按价目估算：金额 = 用量 × 本地单价（实测口径）；另有 ${unattributed} 笔请求未定价，暂未计入，补齐后自动更新。`}
++        </p>
++      );
++    }
++    return (
++      <p className="text-[11px] leading-relaxed text-emerald-600 dark:text-emerald-500">
++        按价目估算：金额 = 用量 × 本地单价（单价来自上游真账反推的实际口径）。
++      </p>
++    );
++  }
+   if (source === "mixed") {
+     return (
+       <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-500">
+@@ -154,9 +169,9 @@ export function StudioEpisodeCostDetail({
+         />
+       </div>
+ 
+-      {!settled && !(report.cost_source === "relay" && partial) ? (
++      {!settled && !((report.cost_source === "relay" || report.cost_source === "local") && partial) ? (
+         <p className="text-xs text-amber-600 dark:text-amber-500">
+-          结算中：{unattributed} 笔请求还没有账单单价，金额偏小属正常现象；成片后会自动重新结算。
++          结算中：{unattributed} 笔请求还没有单价，金额偏小属正常现象；成片后会自动重新结算。
+         </p>
+       ) : null}
+ 
+diff --git a/frontend/src/lib/queries/cost-report.ts b/frontend/src/lib/queries/cost-report.ts
+index b9859834..e432534e 100644
+--- a/frontend/src/lib/queries/cost-report.ts
++++ b/frontend/src/lib/queries/cost-report.ts
+@@ -11,11 +11,13 @@ import type { OkResponse } from "@/types/api";
+  * 项目成本报表（捏驿「捏账」页）。
+  *
+  * `quota` 是账单额度快照，`usd = quota / quota_per_usd`，`cny = usd * 汇率`。
+- * 口径优先取上游中转站真实账单（`cost-reconcile --source relay`）：本地捏驿网关
+- * 对 DC-* / 媒体模型别名没有价格条目，会落到默认倍率而明显偏高。自动回填（成片后
+- * 结算钩子、前端「重新结算」按钮）现在都是 relay 优先、gateway 兜底；只有中转站
+- * 凭据未配置或一条都对不上时才会写网关口径，此时 `cost_source === "gateway"`，
+- * 前端据此把金额标注为「估值口径（偏高）」。
++ * 口径默认取**本地单价表**（`cost-reconcile --source local`）：按「用量 × 单价」
++ * 计算，单价里的 `actual_rules` 由真账反推（实测优先），因此合计与上游真账一致，
++ * 且**不登录上游**、不受中转站 429/409 影响。`--source relay` 仍可手动取上游真实
++ * 账单，`--source gateway` 取本地捏驿网关账单库（对 DC-* / 媒体模型别名没有价格
++ * 条目，会落到默认倍率而明显偏高）。自动回填（成片后结算钩子、前端「重新结算」
++ * 按钮）现在都走 local；`cost_source === "gateway"` 时前端把金额标注为「估值口径
++ * （偏高）」。
+  *
+  * `cost_quota` 尚未回填（未跑对账或没匹配上）的请求不算进 `quota`，而是计进
+  * `unattributed_requests`。
+@@ -73,8 +75,9 @@ export interface CostReport {
+   /** 美元 → 人民币汇率（中转站 `usd_exchange_rate`）。 */
+   usd_cny_rate?: number;
+   /**
+-   * 报表金额口径：`relay`=中转站真账单（结算口径），`gateway`=本地网关默认倍率
+-   * 估值（偏高），`mixed`=两者混用，空=还没有可计价的行。旧后端缺省时为 undefined。
++   * 报表金额口径：`local`=本地按用量 × 单价（实测优先，默认），`relay`=中转站真
++   * 账单，`gateway`=本地网关默认倍率估值（偏高），`mixed`=多种混用，空=还没有可
++   * 计价的行。旧后端缺省时为 undefined。
+    */
+   cost_source?: string;
+   /**
+diff --git a/frontend/src/routes/_app/projects.$project/reports.tsx b/frontend/src/routes/_app/projects.$project/reports.tsx
+index 98f73ce9..76b98c46 100644
+--- a/frontend/src/routes/_app/projects.$project/reports.tsx
++++ b/frontend/src/routes/_app/projects.$project/reports.tsx
+@@ -125,11 +125,18 @@ function ReportsPage() {
+     report?.usd_cny_rate && report.usd_cny_rate > 0
+       ? report.usd_cny_rate
+       : FALLBACK_USD_CNY_RATE;
+-  // 费用口径：relay=中转站真账单（结算口径）；gateway/mixed=网关默认倍率估值（偏高）。
+-  // relay 但仍有未归因请求时是「部分归因」，文案要把缺账说清楚，颜色也转琥珀。
+-  const relayPartial = report?.cost_source === "relay" && partial;
+-  const costSourceLabel = relayPartial
+-    ? t("reports.costSource.relayPartial", { count: unattributedCount })
++  // 费用口径：local=本地按用量 × 单价（实测优先，默认）；relay=中转站真账单；
++  // gateway/mixed=网关默认倍率估值（偏高）。local/relay 但仍有未归因请求时是「部分
++  // 归因」，文案要把缺账说清楚，颜色也转琥珀。
++  const sourcePartial =
++    (report?.cost_source === "relay" || report?.cost_source === "local") && partial;
++  const costSourceLabel = sourcePartial
++    ? t(
++        report?.cost_source === "local"
++          ? "reports.costSource.localPartial"
++          : "reports.costSource.relayPartial",
++        { count: unattributedCount },
++      )
+     : report?.cost_source
+       ? t(`reports.costSource.${report.cost_source}`, { defaultValue: "" })
+       : "";
+@@ -224,7 +231,7 @@ function ReportsPage() {
+               <p
+                 className={cn(
+                   "text-xs leading-5",
+-                  report?.cost_source === "relay" && !partial
++                  (report?.cost_source === "relay" || report?.cost_source === "local") && !partial
+                     ? "text-emerald-600 dark:text-emerald-500"
+                     : "text-amber-600 dark:text-amber-500",
+                 )}
+@@ -233,7 +240,7 @@ function ReportsPage() {
+               </p>
+             ) : null}
+ 
+-            {unattributedCount > 0 && !relayPartial ? (
++            {unattributedCount > 0 && !sourcePartial ? (
+               <p className="text-xs leading-5 text-muted-foreground/80">
+                 {t("reports.unattributedHint", { count: unattributedCount })}
+               </p>
+diff --git a/src/novelvideo/api/routes/cost_report.py b/src/novelvideo/api/routes/cost_report.py
+index 3baae993..35808f83 100644
+--- a/src/novelvideo/api/routes/cost_report.py
++++ b/src/novelvideo/api/routes/cost_report.py
+@@ -6,6 +6,7 @@
+ - ``llm_request_usage``
+ 
+ 费用字段 ``cost_quota`` 由 ``novelvideo cost-reconcile`` 回填：默认 ``--source
++local`` 用本地单价表按「用量 × 单价（实测优先）」计算，**不登录上游**；``--source
+ relay`` 取上游中转站（真正收钱的一方）的真实账单 quota，``--source gateway``
+ 则取本地捏驿网关账单库。USD = ``cost_quota / QUOTA_PER_USD``（捏驿默认
+ 500000）；中转站按 ¥ 展示，故同时给出 ``cny = usd * usd_cny_rate``。报告只读，
+@@ -35,7 +36,7 @@ from novelvideo.audio_request_usage import get_audio_request_usage_db_path
+ from novelvideo.config import QUOTA_PER_USD, REPORT_CURRENCY, USD_CNY_RATE
+ from novelvideo.gateway_cost_reconcile import (
+     ReconcileReport,
+-    reconcile_relay_first,
++    reconcile_local,
+ )
+ from novelvideo.image_request_usage import get_image_request_usage_db_path
+ from novelvideo.llm_request_usage import get_llm_request_usage_db_path
+@@ -324,12 +325,15 @@ def build_cost_report(
+     ]
+     sources.sort(key=lambda item: item["quota"], reverse=True)
+ 
+-    # 结算口径：全部命中的行来源。``relay``=真账单，``gateway``=网关估值（偏高），
+-    # 两者都有=混口径。前端据此标注数字可信度。
++    # 结算口径：全部命中的行来源。``local``=本地按用量×单价（实测优先，默认），
++    # ``relay``=上游真账单，``gateway``=网关估值（偏高），多种来源=混口径。前端据此
++    # 标注数字可信度。
+     billed_sources = {
+-        source for source in by_source if source in {"relay", "gateway"}
++        source for source in by_source if source in {"relay", "gateway", "local"}
+     }
+-    if billed_sources == {"relay"}:
++    if billed_sources == {"local"}:
++        cost_source = "local"
++    elif billed_sources == {"relay"}:
+         cost_source = "relay"
+     elif billed_sources == {"gateway"}:
+         cost_source = "gateway"
+@@ -403,11 +407,11 @@ async def reconcile_project_usage(
+     *,
+     force: bool = False,
+ ) -> tuple[ReconcileReport | None, bool]:
+-    """按上游真账单（relay 优先、gateway 兜底）回填一个项目的 ``cost_quota``。
++    """按本地单价表（实测优先）回填一个项目的 ``cost_quota``。
+ 
+     返回 ``(report, skipped)``：``skipped=True`` 表示命中去抖窗口、这次没跑对账。
+-    只读账单库（捏驿只读、中转站只读）、只写本项目 ``data.db``；失败以
+-    ``report.errors`` 形式返回，不抛给请求方（费用报表本身仍然可读）。
++    不触网（不登录上游）、只写本项目 ``data.db``；失败以 ``report.errors`` 形式
++    返回，不抛给请求方（费用报表本身仍然可读）。
+     """
+     db_path = project_usage_db(state_dir)
+     key = str(db_path)
+@@ -418,12 +422,12 @@ async def reconcile_project_usage(
+         _reconcile_last_run[key] = time.monotonic()
+     try:
+         report = await asyncio.wait_for(
+-            asyncio.to_thread(reconcile_relay_first, project_db=db_path, apply=True),
++            asyncio.to_thread(reconcile_local, project_db=db_path, apply=True),
+             timeout=RECONCILE_BUDGET_SECONDS,
+         )
+     except asyncio.TimeoutError:
+         logger.warning("cost reconcile timed out for %s", db_path)
+-        report = ReconcileReport(gateway_db=db_path, applied=False, source="relay")
++        report = ReconcileReport(gateway_db=db_path, applied=False, source="local")
+         report.errors.append(f"对账超时（>{RECONCILE_BUDGET_SECONDS:.0f}s）")
+     except Exception as exc:  # noqa: BLE001 - 对账失败不影响报表可读
+         logger.warning("cost reconcile failed for %s: %s", db_path, exc)
+@@ -439,13 +443,12 @@ async def reconcile_project_cost_report(
+     force: bool = Query(False, description="忽略去抖窗口，强制重新对账"),
+     user: dict = Depends(get_api_user),
+ ):
+-    """按上游真账单对账并返回刷新后的报表。
++    """按本地单价表对账并返回刷新后的报表。
+ 
+-    relay 优先、gateway 兜底：中转站账号已配置且能对上单据时用真实账单，否则回退
+-    本地捏驿账单库（并在 ``reconcile.errors`` 里说明）。每集合成完成后由
+-    ``director_auto`` 自动触发一次（best-effort），前端「重新结算」按钮走同一条
+-    路径。只读账单库、只写本项目 ``data.db``；``unattributed`` 为对不上账单的
+-    请求（如 TTS），如实回报。
++    用「用量 × 单价（实测优先）」在本地计算，**不登录上游**，因此不受上游
++    429/409 影响；``actual_rules`` 由真账反推，合计与真账同口径。每集合成完成后
++    由 ``director_auto`` 自动触发一次（best-effort），前端「重新结算」按钮走同一条
++    路径。只写本项目 ``data.db``；``unattributed`` 为未定价的请求，如实回报。
+     """
+     resolution = await resolve_project_scope(project, user, required_role="editor")
+     report, skipped = await reconcile_project_usage(resolution.state_dir, force=force)
+diff --git a/src/novelvideo/chat/director_auto.py b/src/novelvideo/chat/director_auto.py
+index 3505be18..ba1199b3 100644
+--- a/src/novelvideo/chat/director_auto.py
++++ b/src/novelvideo/chat/director_auto.py
+@@ -2684,20 +2684,20 @@ class DirectorAutoCoordinator:
+         return episodes[0] if episodes else None
+ 
+     async def _reconcile_episode_cost(self, run: DirectorAutoRun) -> None:
+-        """一集成片落盘后结算费用（best-effort，relay 优先、gateway 兜底）。
++        """一集成片落盘后结算费用（best-effort，本地按用量 × 单价计算）。
+ 
+-        用中转站真实账单口径回填 ``cost_quota``，只有中转站账号缺失 / 一条都对
+-        不上时才回退本地捏驿账单库（会把原因写进 ``report.errors``）。只读账单、
+-        只写本项目 ``data.db``；失败绝不影响成片流程——费用报表仍可读，只是这一集
+-        的 ``cost_quota`` 还空着，前端会显示「结算中 / 未归因」。
++        用本地单价表（``actual_rules`` 由真账反推，实测优先）回填 ``cost_quota``，
++        **不登录上游**，因此不受中转站 429/409 影响。只写本项目 ``data.db``；失败
++        绝不影响成片流程——费用报表仍可读，只是这一集的 ``cost_quota`` 还空着，
++        前端会显示「结算中 / 未归因」。
+         """
+         try:
+-            from novelvideo.gateway_cost_reconcile import reconcile_relay_first
++            from novelvideo.gateway_cost_reconcile import reconcile_local
+ 
+             project_db = Path(run.context.state_dir) / "data.db"
+             report = await asyncio.wait_for(
+                 asyncio.to_thread(
+-                    reconcile_relay_first, project_db=project_db, apply=True
++                    reconcile_local, project_db=project_db, apply=True
+                 ),
+                 timeout=EPISODE_COST_RECONCILE_TIMEOUT_SECONDS,
+             )
+diff --git a/src/novelvideo/cli.py b/src/novelvideo/cli.py
+index fcc44d80..d0bc167c 100644
+--- a/src/novelvideo/cli.py
++++ b/src/novelvideo/cli.py
+@@ -598,9 +598,10 @@ def cost_reconcile_cmd(
+     apply: bool = typer.Option(False, "--apply", help="回写 cost_quota；默认只 dry-run"),
+     yes: bool = typer.Option(False, "--yes", help="确认 apply；必须与 --apply 同时使用"),
+     source: str = typer.Option(
+-        "gateway",
++        "local",
+         "--source",
+-        help="quota 来源：gateway=本地捏驿账单库；relay=上游中转站真实账单",
++        help="quota 来源：local=本地按用量×单价（实测优先，不登录上游）；"
++        "gateway=本地捏驿账单库；relay=上游中转站真实账单",
+     ),
+     relay_base_url: list[str] = typer.Option(
+         [], "--relay-base-url", help="中转站地址，可重复；默认 aicf + aigc + aiqy"
+@@ -631,8 +632,8 @@ def cost_reconcile_cmd(
+ 
+     if apply and not yes:
+         raise typer.BadParameter("apply requires --yes")
+-    if source not in {"gateway", "relay"}:
+-        raise typer.BadParameter("--source 只能是 gateway 或 relay")
++    if source not in {"gateway", "relay", "local"}:
++        raise typer.BadParameter("--source 只能是 local、gateway 或 relay")
+ 
+     relay_endpoints = []
+     if source == "relay":
+diff --git a/src/novelvideo/gateway_cost_reconcile.py b/src/novelvideo/gateway_cost_reconcile.py
+index 2df3ef79..b1403a89 100644
+--- a/src/novelvideo/gateway_cost_reconcile.py
++++ b/src/novelvideo/gateway_cost_reconcile.py
+@@ -1,13 +1,18 @@
+ """网关（捏驿 / NewAPI）账单对账。
+ 
+ 把应用侧 usage 表里的请求与账单 ``quota`` 对齐，从而得到"每部剧花在哪个模型
+-上的钱"的精确值。支持两种口径（``source``）：
++上的钱"的精确值。支持三种口径（``source``）：
+ 
++- ``local``：**默认日常口径**。按「用量 × 本地单价表」计价，单价取自
++  ``production-prices.json``（``actual_rules`` 由真账反推，实测优先），**不触网**、
++  不受上游 429/409 影响；合计与上游真账一致。
+ - ``gateway``：本地捏驿账单库 ``one-api.db``。捏驿是我们自己跑的中继，对
+   ``DC-*`` / 媒体模型别名没有价格条目，会落到默认倍率，金额明显偏高。
+ - ``relay``：真正收钱的上游中转站账单。先用捏驿库把本地单号桥接成上游单号
+   （``logs.request_id → logs.upstream_request_id``、
+-  ``tasks.private_data.upstream_task_id``），再向中转站取真实 ``quota``。
++  ``tasks.private_data.upstream_task_id``），再向中转站取真实 ``quota``。登录后
++  **必须在 ``finally`` 里退出会话**（见 ``relay_billing.collect_quotas``），否则
++  占满上游并发会话额度会收到 409 ``AUTH_SESSION_LIMIT``。
+ 
+ 匹配关系：
+ 
+@@ -37,7 +42,12 @@ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any, Callable, Mapping, Sequence
+ 
+-from novelvideo.config import NEWAPI_BILLING_DB_PATH, QUOTA_PER_USD, STATE_DIR
++from novelvideo.config import (
++    NEWAPI_BILLING_DB_PATH,
++    QUOTA_PER_USD,
++    STATE_DIR,
++    USD_CNY_RATE,
++)
+ from novelvideo.relay_billing import (
+     RelayBillingCache,
+     RelayEndpoint,
+@@ -105,6 +115,24 @@ _USAGE_TABLES = (
+     ("llm_request_usage", "provider_request_id", "log"),
+ )
+ 
++#: 本地计价（``source=local``）口径：表 -> (kind, 模型列)。
++_LOCAL_KINDS: tuple[tuple[str, str, str], ...] = (
++    ("video_request_usage", "video", "model_name"),
++    ("image_request_usage", "image", "model_name"),
++    ("audio_request_usage", "audio", "model_name"),
++    ("llm_request_usage", "text", "model"),
++)
++
++#: 这些状态的行不计费（生成失败不该算钱）；其余按用量计价。
++_NON_BILLABLE_STATUSES = {"failed", "error", "cancelled", "canceled", "timeout"}
++
++
++def _as_number(value: Any) -> float:
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return 0.0
++
+ 
+ def _open_gateway_ro(path: Path) -> sqlite3.Connection:
+     """Open the gateway billing DB read-only; never creates or writes it."""
+@@ -375,6 +403,139 @@ def _reconcile_table(
+     return report
+ 
+ 
++def _local_action(kind: str, model: str, row: sqlite3.Row) -> Any:
++    """把一行用量构造成计费动作（只用库里真实记下的量）。"""
++
++    from novelvideo.production_prices import ActionRequest
++
++    if kind == "video":
++        metrics = {
++            "duration_seconds": _as_number(row["duration_seconds"]),
++            "call_count": 1,
++        }
++    elif kind == "text":
++        prompt = _as_number(row["input_tokens"])
++        completion = _as_number(row["output_tokens"])
++        metrics = {
++            "prompt_tokens": prompt,
++            "completion_tokens": completion,
++            "tokens": prompt + completion,
++        }
++    else:  # image / audio：每行一次调用
++        metrics = {"call_count": 1}
++    return ActionRequest(kind=kind, model=model, quantity=1, metrics=metrics)
++
++
++def _reconcile_table_local(
++    conn: sqlite3.Connection,
++    *,
++    table: str,
++    kind: str,
++    model_column: str,
++    book: Any,
++    apply: bool,
++    now: str,
++) -> TableReport:
++    """按本地单价表逐行计价，回写 ``cost_quota``（不触网）。"""
++
++    report = TableReport(table=table)
++    if not _table_exists(conn, table):
++        return report
++    columns = _columns(conn, table)
++    if model_column not in columns:
++        return report
++    status_expr = "status" if "status" in columns else "''"
++    duration_expr = "duration_seconds" if "duration_seconds" in columns else "0"
++    input_expr = "input_tokens" if "input_tokens" in columns else "0"
++    output_expr = "output_tokens" if "output_tokens" in columns else "0"
++    rows = list(
++        conn.execute(
++            f"SELECT rowid AS rid, {model_column} AS model, {status_expr} AS status, "
++            f"{duration_expr} AS duration_seconds, {input_expr} AS input_tokens, "
++            f"{output_expr} AS output_tokens FROM {table}"
++        )
++    )
++    updates: list[tuple[int, str, str, int]] = []
++    cleared: list[tuple[str, int]] = []
++    for row in rows:
++        report.rows += 1
++        status = str(row["status"] or "").strip().lower()
++        model = str(row["model"] or "").strip()
++        if status in _NON_BILLABLE_STATUSES:
++            cleared.append((now, int(row["rid"])))
++            continue
++        # 实测反推价 > 手工规则 > 同步价目；未定价则落 unmatched，绝不按 0 计。
++        priced = book.price(_local_action(kind, model, row), prefer_measured=True)
++        if priced.cny is None or priced.cny <= 0:
++            if model and len(report.unmatched) < 20:
++                report.unmatched.append(model)
++            cleared.append((now, int(row["rid"])))
++            continue
++        quota = (
++            int(round(priced.cny * QUOTA_PER_USD / USD_CNY_RATE))
++            if USD_CNY_RATE
++            else 0
++        )
++        report.matched += 1
++        report.quota += quota
++        updates.append((quota, now, "local", int(row["rid"])))
++
++    if apply and (updates or cleared):
++        add_column_if_missing(conn, table, "cost_quota", "INTEGER")
++        add_column_if_missing(conn, table, "quota_checked_at", "TEXT")
++        add_column_if_missing(conn, table, "cost_source", "TEXT")
++        if updates:
++            conn.executemany(
++                f"UPDATE {table} SET cost_quota = ?, quota_checked_at = ?,"
++                " cost_source = ? WHERE rowid = ?",
++                updates,
++            )
++        if cleared:
++            conn.executemany(
++                f"UPDATE {table} SET cost_quota = NULL, quota_checked_at = ?,"
++                " cost_source = 'unmatched' WHERE rowid = ?",
++                cleared,
++            )
++        conn.commit()
++    return report
++
++
++def reconcile_local_project_db(
++    db_path: str | Path,
++    *,
++    apply: bool = False,
++    book: Any | None = None,
++) -> ProjectReport:
++    """按本地单价表（实测价优先）回填一个项目的 ``cost_quota``，全程不触网。"""
++
++    from novelvideo.production_prices import load as load_prices
++
++    db_path = Path(db_path)
++    report = ProjectReport(label=db_path.parent.name, db_path=db_path)
++    if not db_path.is_file():
++        return report
++    price_book = book or load_prices()
++    now = datetime.now(timezone.utc).isoformat()
++    conn = sqlite3.connect(db_path, timeout=10)
++    conn.row_factory = sqlite3.Row
++    try:
++        for table, kind, model_column in _LOCAL_KINDS:
++            report.tables.append(
++                _reconcile_table_local(
++                    conn,
++                    table=table,
++                    kind=kind,
++                    model_column=model_column,
++                    book=price_book,
++                    apply=apply,
++                    now=now,
++                )
++            )
++    finally:
++        conn.close()
++    return report
++
++
+ def reconcile_project_db(
+     db_path: str | Path,
+     *,
+@@ -514,8 +675,10 @@ def reconcile(
+     relay_workers: int = 4,
+     progress: Callable[[int, int], None] | None = None,
+ ) -> ReconcileReport:
+-    if source not in {"gateway", "relay"}:
+-        raise ValueError(f"unknown source: {source!r} (expected gateway|relay)")
++    if source not in {"gateway", "relay", "local"}:
++        raise ValueError(
++            f"unknown source: {source!r} (expected gateway|relay|local)"
++        )
+ 
+     gateway_path = Path(gateway_db or NEWAPI_BILLING_DB_PATH)
+     report = ReconcileReport(gateway_db=gateway_path, applied=apply, source=source)
+@@ -525,6 +688,20 @@ def reconcile(
+     else:
+         targets = discover_project_dbs(state_dir)
+ 
++    if source == "local":
++        # 本地计价：只读项目用量 + 本地单价表，完全不触网（不登录任何上游）。
++        from novelvideo.production_prices import load as load_prices
++
++        book = load_prices()
++        for target in targets:
++            try:
++                report.projects.append(
++                    reconcile_local_project_db(target, apply=apply, book=book)
++                )
++            except Exception as exc:  # noqa: BLE001
++                report.errors.append(f"{target}: {exc}")
++        return report
++
+     try:
+         if source == "relay":
+             needed: set[str] = set()
+@@ -623,3 +800,24 @@ def reconcile_relay_first(
+     )
+     gateway_report.errors = [note, *relay_report.errors, *gateway_report.errors]
+     return gateway_report
++
++
++def reconcile_local(
++    *,
++    state_dir: str | Path | None = None,
++    project_db: str | Path | None = None,
++    apply: bool = False,
++) -> ReconcileReport:
++    """本地按「用量 × 单价（实测优先）」计价，**不登录任何上游**。
++
++    日常口径（费用报表「重新结算」按钮 / 成片后结算钩子 / 伴点结算）都走这里：
++    不触网、不受上游 429/409 影响。单价来自本地 ``production-prices.json``，其中
++    ``actual_rules`` 由真账反推，因此合计与上游真账一致；未定价的行落 ``unmatched``。
++    """
++
++    return reconcile(
++        state_dir=state_dir,
++        project_db=project_db,
++        apply=apply,
++        source="local",
++    )
+diff --git a/src/novelvideo/points_settlement.py b/src/novelvideo/points_settlement.py
+index ac3e04b8..e8a3932b 100644
+--- a/src/novelvideo/points_settlement.py
++++ b/src/novelvideo/points_settlement.py
+@@ -3,10 +3,10 @@
+ 预扣（:mod:`novelvideo.points_client`）在客户确认「制作成本预估」闸门时按
+ **计划售价**扣一次；成片落盘后这里按**实际用量**重算售价，多退少补：
+ 
+-- 实际成本 = 该集四张用量表里**能在中转站账单对上的** ``quota`` 之和
+-  （``quota / QUOTA_PER_USD * USD_CNY_RATE``，与
+-  :func:`novelvideo.production_prices.calibrate_from_project` 同口径）；
+-  只认 relay 真值，不把网关侧虚高的默认倍率算给客户。
++- 实际成本 = 该集四张用量表里的用量 × 本地单价（``production-prices.json``，
++  ``actual_rules`` 由真账反推、实测优先），合计 ``quota / QUOTA_PER_USD *
++  USD_CNY_RATE``（与 :func:`novelvideo.production_prices.calibrate_from_project`
++  同口径）；**不登录上游**，因此不受中转站 429/409 影响，且与真账同口径。
+ - 售价 = 实际成本 × (1 + ``contingency_pct``/100) × 客户倍率，再按
+   ``100 伴点 = ¥1`` 折算，与报价卡完全一致。
+ - 差额 = 结算伴点 − 预扣伴点，四舍五入到整数；``|差额| < 1`` 直接忽略。
+@@ -17,7 +17,7 @@
+     settled          已结清（含退款成功、差额在容差内）→ 放行
+     settled_manual   运营手动核销/放行 → 放行
+     refund_pending   退款失败 → 放行（不重复退，等人核销）
+-    pending          已预扣、但实际用量算不出来（relay 缺失/超时/对不上）→ 放行
++    pending          已预扣、但实际用量算不出来（未定价/超时）→ 放行
+     owed             待补缴（余额不足 / 渠道不可用）→ **拦成片**
+     unpriced         从未预扣、实际用量又算不出来 → **拦成片**（fail-closed）
+     （无台账但应收费 = 正在核算）→ **短暂拦**，并触发一次后台结算
+@@ -31,8 +31,9 @@
+   一次补收（``prepaid=0`` ⇒ 差额即全额），不再放行。内部项目、闸门关闭的项目
+   与这个功能无关。
+ - **交付后成本再涨不再追扣**：终态一次写死，重复触发直接返回台账。
+-- 凭据走 :mod:`novelvideo.relay_billing`（环境变量优先，其次
+-  ``/data/relay-billing.json``）；取不到账号照样可以命中账单缓存。
++- **不登录上游**：本地按用量 × 单价计算（单价来自真账反推的 ``actual_rules``）。
++  需要与上游真账重新标定时，运维另用 ``novelvideo cost-reconcile --source relay``
++  （凭据走 :mod:`novelvideo.relay_billing`；登录后会自动退出会话）。
+ """
+ 
+ from __future__ import annotations
+@@ -175,34 +176,10 @@ def _unprepaid_client_phone(state_dir: str | Path) -> str:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# 实际成本（relay 口径，只读）
++# 实际成本（本地口径：用量 × 单价，实测优先）
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def _relay_maps(project_db: Path, *, workers: int = 4) -> tuple[dict[str, int], dict[str, int], list[str]]:
+-    """问中转站要这一集用到的单据账单（缓存命中就直接用，miss 才需要账号）。"""
+-
+-    from novelvideo import relay_billing
+-    from novelvideo.config import NEWAPI_BILLING_DB_PATH
+-    from novelvideo.gateway_cost_reconcile import (
+-        build_relay_index,
+-        collect_usage_gateway_ids,
+-    )
+-
+-    settings = relay_billing.load_settings()
+-    endpoints = relay_billing.configured_endpoints(settings=settings)
+-    cache_path = relay_billing.billing_cache_path(settings)
+-    needed = collect_usage_gateway_ids(project_db)
+-    task_quota, log_quota, errors, _statuses = build_relay_index(
+-        NEWAPI_BILLING_DB_PATH,
+-        endpoints=endpoints,
+-        only_ids=needed,
+-        cache_path=cache_path,
+-        workers=workers,
+-    )
+-    return task_quota, log_quota, errors
+-
+-
+ def _actual_cny_from_quota(quota: int) -> float:
+     from novelvideo.config import QUOTA_PER_USD, USD_CNY_RATE
+ 
+@@ -214,46 +191,33 @@ def _actual_cny_from_quota(quota: int) -> float:
+ async def _episode_actual(
+     state_dir: str | Path, episode: int, *, budget_seconds: float
+ ) -> dict[str, Any] | None:
+-    """该集 relay 口径的实际成本；算不出来返回 ``None``（→ ``pending`` 放行）。"""
++    """该集本地口径的实际成本（用量 × 单价，实测优先）；算不出来返回 ``None``。"""
+ 
+-    from novelvideo.gateway_cost_reconcile import episode_quota, reconcile_project_db
++    from novelvideo.gateway_cost_reconcile import (
++        episode_quota,
++        reconcile_local_project_db,
++    )
+ 
+     project_db = Path(state_dir) / "data.db"
+     try:
+-        task_quota, log_quota, errors = await asyncio.wait_for(
+-            asyncio.to_thread(_relay_maps, project_db),
++        await asyncio.wait_for(
++            asyncio.to_thread(reconcile_local_project_db, project_db, apply=True),
+             timeout=budget_seconds,
+         )
+     except asyncio.TimeoutError:
+-        logger.warning("结算对账超时（%ss），按算不出来处理: %s", budget_seconds, project_db)
++        logger.warning("结算本地计价超时（%ss），按算不出来处理: %s", budget_seconds, project_db)
+         return None
+-    except Exception:  # noqa: BLE001 - 对账失败不影响成片，也不锁客户
+-        logger.warning("结算对账失败，按算不出来处理: %s", project_db, exc_info=True)
++    except Exception:  # noqa: BLE001 - 计价失败不影响成片，也不锁客户
++        logger.warning("结算本地计价失败，按算不出来处理: %s", project_db, exc_info=True)
+         return None
+ 
+-    # 把 relay 真值回写台账库，运营报表与客户账单同口径（best-effort）。
+-    try:
+-        await asyncio.to_thread(
+-            reconcile_project_db,
+-            project_db,
+-            task_quota=task_quota,
+-            log_quota=log_quota,
+-            apply=True,
+-            source="relay",
+-        )
+-    except Exception:  # noqa: BLE001
+-        logger.debug("结算回写 cost_quota 失败: %s", project_db, exc_info=True)
+-
+-    stat = episode_quota(
+-        project_db, episode, task_quota=task_quota, log_quota=log_quota
+-    )
++    stat = episode_quota(project_db, episode)
+     if int(stat.get("matched") or 0) <= 0 or int(stat.get("quota") or 0) <= 0:
+         logger.info(
+-            "结算无可用 relay 账单 episode=%s rows=%s matched=%s errors=%s",
++            "结算无可用本地价 episode=%s rows=%s matched=%s",
+             episode,
+             stat.get("rows"),
+             stat.get("matched"),
+-            errors or "-",
+         )
+         return None
+     return {
+@@ -261,7 +225,7 @@ async def _episode_actual(
+         "quota": int(stat["quota"]),
+         "matched": int(stat["matched"]),
+         "rows": int(stat["rows"]),
+-        "errors": len(errors or []),
++        "errors": 0,
+     }
+ 
+ 
+diff --git a/src/novelvideo/production_prices.py b/src/novelvideo/production_prices.py
+index f3eac33d..83a00eab 100644
+--- a/src/novelvideo/production_prices.py
++++ b/src/novelvideo/production_prices.py
+@@ -552,16 +552,26 @@ class PriceBook:
+         return DEFAULT_MARKUP, "default"
+ 
+     # -- 定价 -------------------------------------------------------------
+-    def price(self, action: ActionRequest) -> PricedAction:
+-        """按优先级定价一个动作。"""
++    def price(self, action: ActionRequest, *, prefer_measured: bool = False) -> PricedAction:
++        """按优先级定价一个动作。
+ 
+-        manual = _match_rule(self.rules, action)
+-        if manual is not None:
+-            return _price_with_rule(action, manual, source="manual")
++        ``prefer_measured=True`` 时把「实测反推价」（``actual_rules``）提到手工规则
++        之前。台账/结算要求与上游真账一致，而实测价正是从真账反推的；手工 ``rules``
++        （列表价 × 折扣）退居报价兜底。
++        """
+ 
++        manual = _match_rule(self.rules, action)
+         actual = _match_rule(self.actual_rules, action, key="unit")
+-        if actual is not None:
+-            return _price_with_rule(action, actual, source="actual")
++        if prefer_measured:
++            if actual is not None:
++                return _price_with_rule(action, actual, source="actual")
++            if manual is not None:
++                return _price_with_rule(action, manual, source="manual")
++        else:
++            if manual is not None:
++                return _price_with_rule(action, manual, source="manual")
++            if actual is not None:
++                return _price_with_rule(action, actual, source="actual")
+ 
+         synced = self._price_synced(action)
+         if synced is not None:
+diff --git a/src/novelvideo/relay_billing.py b/src/novelvideo/relay_billing.py
+index 7e671646..a15e7e81 100644
+--- a/src/novelvideo/relay_billing.py
++++ b/src/novelvideo/relay_billing.py
+@@ -39,6 +39,9 @@ PAGE_SIZE = 100
+ #: 分页保险丝，防止上游返回异常数据时死循环。
+ MAX_PAGES = 5000
+ 
++#: 客户端 UA：便于在上游 ``GET /api/user/sessions`` 里认出本程序建立的会话。
++CLIENT_USER_AGENT = "novelvideo-relay/1.0"
++
+ DEFAULT_RELAY_BASE_URLS = (
+     "https://aicf.nanie168.com",
+     "https://aigc.nanie168.com",
+@@ -219,7 +222,11 @@ class RelayBillingClient:
+             status, text = self._transport(
+                 "POST",
+                 url,
+-                {"Content-Type": "application/json", "Accept": "application/json"},
++                {
++                    "Content-Type": "application/json",
++                    "Accept": "application/json",
++                    "User-Agent": CLIENT_USER_AGENT,
++                },
+                 {
+                     "username": self.endpoint.username,
+                     "password": self.endpoint.password,
+@@ -235,6 +242,47 @@ class RelayBillingClient:
+             self._token = token
+             return token
+ 
++    def logout(self, *, best_effort: bool = True) -> bool:
++        """吊销当前会话（``POST /api/user/auth/logout``）。
++
++        上游对同一账号有并发会话上限，登录后不退出会把额度占满（后续登录收到
++        ``HTTP 409 AUTH_SESSION_LIMIT``）。账单只在查询时短暂登录，查完必须调用
++        本方法释放；退出后 ``self._token`` 失效。``best_effort=True`` 时不抛异常
++        （退出失败不该影响对账结果，但会记 warning）。
++        """
++
++        with self._token_lock:
++            token = self._token
++            self._token = ""
++        if not token:
++            return False
++        url = self.endpoint.base_url + "/api/user/auth/logout"
++        headers = {
++            "Accept": "application/json",
++            "Authorization": f"Bearer {token}",
++            # 上游对退出接口做 Origin 校验：缺 Origin 会返回 AUTH_ORIGIN_FORBIDDEN。
++            "Origin": self.endpoint.base_url,
++            "User-Agent": CLIENT_USER_AGENT,
++        }
++        try:
++            status, text = self._transport("POST", url, headers, None)
++            payload = _load_json(text)
++        except Exception as exc:  # noqa: BLE001 - 退出失败不阻塞调用方
++            if not best_effort:
++                raise
++            logger.warning("%s: 退出会话异常 %s", self.endpoint.label, exc)
++            return False
++        ok = status == 200 and not (
++            isinstance(payload, dict) and payload.get("success") is False
++        )
++        if not ok:
++            message = f"{self.endpoint.label}: logout HTTP {status} {str(text)[:160]}"
++            if best_effort:
++                logger.warning("%s", message)
++                return False
++            raise RelayBillingError(message)
++        return True
++
+     def _call(
+         self,
+         method: str,
+@@ -248,7 +296,7 @@ class RelayBillingClient:
+         if params:
+             url = f"{url}?{urlencode(params)}"
+         for attempt in (0, 1):
+-            headers = {"Accept": "application/json"}
++            headers = {"Accept": "application/json", "User-Agent": CLIENT_USER_AGENT}
+             if auth:
+                 headers["Authorization"] = f"Bearer {self.login()}"
+             if body is not None:
+@@ -293,7 +341,12 @@ class RelayBillingClient:
+         """
+ 
+         url = self.endpoint.base_url + "/api/pricing"
+-        status, text = self._transport("GET", url, {"Accept": "application/json"}, None)
++        status, text = self._transport(
++            "GET",
++            url,
++            {"Accept": "application/json", "User-Agent": CLIENT_USER_AGENT},
++            None,
++        )
+         payload = _load_json(text)
+         if status != 200 or not isinstance(payload, dict):
+             raise RelayBillingError(
+@@ -558,29 +611,34 @@ def collect_quotas(
+             continue
+         client = RelayBillingClient(endpoint, transport=transport)
+         try:
+-            snapshot.statuses.append(client.status())
+-        except RelayBillingError as exc:
+-            snapshot.errors.append(str(exc))
+-        try:
+-            snapshot.tasks.update(client.task_quotas())
+-        except RelayBillingError as exc:
+-            snapshot.errors.append(str(exc))
+-        if needed_logs:
+-            missing = needed_logs.difference(snapshot.logs)
+-            if missing:
+-                try:
+-                    snapshot.logs.update(
+-                        client.log_quotas_for(
+-                            missing,
+-                            cache=cache,
+-                            workers=workers,
+-                            progress=progress,
++            try:
++                snapshot.statuses.append(client.status())
++            except RelayBillingError as exc:
++                snapshot.errors.append(str(exc))
++            try:
++                snapshot.tasks.update(client.task_quotas())
++            except RelayBillingError as exc:
++                snapshot.errors.append(str(exc))
++            if needed_logs:
++                missing = needed_logs.difference(snapshot.logs)
++                if missing:
++                    try:
++                        snapshot.logs.update(
++                            client.log_quotas_for(
++                                missing,
++                                cache=cache,
++                                workers=workers,
++                                progress=progress,
++                            )
+                         )
+-                    )
+-                except RelayBillingError as exc:
+-                    snapshot.errors.append(str(exc))
+-        if cache is not None:
+-            cache.tasks.update(snapshot.tasks)
+-            cache.logs.update(snapshot.logs)
+-            cache.save()
++                    except RelayBillingError as exc:
++                        snapshot.errors.append(str(exc))
++            if cache is not None:
++                cache.tasks.update(snapshot.tasks)
++                cache.logs.update(snapshot.logs)
++                cache.save()
++        finally:
++            # 账单查询一结束就退出会话：本模块只在查询时短暂登录，若不退出会占满
++            # 上游并发会话额度，导致后续登录收到 HTTP 409 AUTH_SESSION_LIMIT。
++            client.logout()
+     return snapshot
+diff --git a/tests/test_cost_report.py b/tests/test_cost_report.py
+index f22a248a..bafbcbc3 100644
+--- a/tests/test_cost_report.py
++++ b/tests/test_cost_report.py
+@@ -19,6 +19,41 @@ def _project_dir(tmp_path):
+     return tmp_path / "output" / "alice" / "demo"
+ 
+ 
++def _write_price_book(path, rules) -> None:
++    path.write_text(
++        json.dumps(
++            {"currency": "CNY", "markup_default": 1, "rules": list(rules)},
++            ensure_ascii=False,
++        ),
++        encoding="utf-8",
++    )
++
++
++def _quota_for_cny(cny: float) -> int:
++    """本地口径：¥ → quota（与 reconcile 同换算）。"""
++
++    from novelvideo.config import QUOTA_PER_USD, USD_CNY_RATE
++
++    return int(round(cny * QUOTA_PER_USD / USD_CNY_RATE))
++
++
++#: 本地计价测试用价目：视频按秒、图片/音频按次、文本按千 token。
++_LOCAL_PRICE_RULES = [
++    {
++        "match": {"kind": "video", "model": "seedance-2.0-fast"},
++        "unit": "second",
++        "price": 0.4,
++    },
++    {"match": {"kind": "image", "model": "LingShan-G2"}, "unit": "call", "price": 0.12},
++    {"match": {"kind": "audio", "model": "IndexTTS2"}, "unit": "call", "price": 0.05},
++    {
++        "match": {"kind": "text", "model": "DC-hermes-LLM"},
++        "unit": "1k_token",
++        "price": 0.01,
++    },
++]
++
++
+ def _write_gateway_db(path) -> None:
+     conn = sqlite3.connect(path)
+     conn.executescript(
+@@ -478,6 +513,8 @@ class _FakeRelay:
+         params = dict(parse_qsl(query))
+         if path == "/api/user/login":
+             return 200, json.dumps({"success": True, "data": {"access_token": "tok-1"}})
++        if path == "/api/user/auth/logout":
++            return 200, json.dumps({"success": True, "data": {"revoked_sid": "sid-1"}})
+         if path == "/api/status":
+             return 200, json.dumps(
+                 {
+@@ -522,6 +559,9 @@ class _FakeRelay:
+     def log_calls(self) -> list[str]:
+         return [call for call in self.calls if "/api/log/self" in call]
+ 
++    def logout_calls(self) -> list[str]:
++        return [call for call in self.calls if "/api/user/auth/logout" in call]
++
+ 
+ def _relay_endpoints(base_url="https://aicf.example"):
+     from novelvideo.relay_billing import build_endpoints
+@@ -838,6 +878,28 @@ def test_relay_billing_client_relogins_on_expired_token():
+     assert len(logins) == 2  # 首次登录 + 401 后重登
+ 
+ 
++def test_collect_quotas_logs_out_after_query():
++    """登录只为查账单：抓完必须退出会话，否则占满上游并发会话额度（409）。"""
++    from novelvideo import relay_billing
++
++    relay = _FakeRelay(
++        base_url="https://aicf.example",
++        tasks={"up-task-1": 7},
++        logs={"up-log-1": 9},
++    )
++    snapshot = relay_billing.collect_quotas(
++        _relay_endpoints(),
++        upstream_log_ids={"up-log-1"},
++        transport=relay,
++    )
++
++    assert snapshot.tasks == {"up-task-1": 7}
++    assert snapshot.logs == {"up-log-1": 9}
++    # 用完即退：登录一次、退出一次。
++    assert len([c for c in relay.calls if "/api/user/login" in c]) == 1
++    assert relay.logout_calls()
++
++
+ def _cost_report_client(tmp_path, monkeypatch, project_dir):
+     """带项目解析桩的 TestClient，state_dir 指向项目目录（即 data.db 所在处）。"""
+     from novelvideo.api.routes import cost_report
+@@ -862,16 +924,24 @@ def _cost_report_client(tmp_path, monkeypatch, project_dir):
+     return TestClient(app), cost_report
+ 
+ 
+-def test_cost_report_reconcile_route_backfills_gateway_quota(tmp_path, monkeypatch):
+-    """POST .../cost-report/reconcile 增量回填 cost_quota 并返回刷新后的明细。"""
+-    from novelvideo import gateway_cost_reconcile
++def test_cost_report_reconcile_route_prices_locally(tmp_path, monkeypatch):
++    """POST .../cost-report/reconcile 按本地价目回填 cost_quota 并返回刷新后的明细。
+ 
++    默认口径已切到本地（``source=local``）：不登录上游，按「用量 × 单价」算。
++    """
+     project_dir = _seed_project(tmp_path)
+-    gateway_db = tmp_path / "one-api.db"
+-    _write_gateway_db(gateway_db)
+-    monkeypatch.setattr(
+-        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
++    # 文本按 token 计价：给这条 LLM 记录补上真实用量（seed 时未记 token）。
++    conn = sqlite3.connect(project_dir / "data.db")
++    conn.execute(
++        "UPDATE llm_request_usage SET input_tokens = 1000, output_tokens = 2000"
++        " WHERE request_id = 'llm-1'"
+     )
++    conn.commit()
++    conn.close()
++
++    book = tmp_path / "prices.json"
++    _write_price_book(book, _LOCAL_PRICE_RULES)
++    monkeypatch.setenv("PRODUCTION_PRICES_PATH", str(book))
+ 
+     client, _ = _cost_report_client(tmp_path, monkeypatch, project_dir)
+ 
+@@ -889,28 +959,32 @@ def test_cost_report_reconcile_route_backfills_gateway_quota(tmp_path, monkeypat
+ 
+     assert data["reconcile"]["applied"] is True
+     assert data["reconcile"]["skipped"] is False
+-    assert data["reconcile"]["source"] == "gateway"
+-    assert data["reconcile"]["matched"] == 3
++    assert data["reconcile"]["source"] == "local"
++    assert data["reconcile"]["matched"] == 4
+     assert data["reconcile"]["errors"] == []
+ 
+-    # 视频 1000 + 图片 200 + 文本 50；音频无网关单号仍归入未归因。
+-    assert data["totals"]["quota"] == 1250
++    expected = {
++        "seedance-2.0-fast": _quota_for_cny(5.0 * 0.4),
++        "LingShan-G2": _quota_for_cny(0.12),
++        "IndexTTS2": _quota_for_cny(0.05),
++        "DC-hermes-LLM": _quota_for_cny(3.0 * 0.01),
++    }
++    models = {item["model"]: item["quota"] for item in data["by_model"]}
++    assert models == expected
++    assert data["totals"]["quota"] == sum(expected.values())
+     assert data["totals"]["cny"] == pytest.approx(
+         data["totals"]["usd"] * data["usd_cny_rate"]
+     )
+-    assert data["unattributed"]["requests"] == 1
+-    assert data["unattributed"]["by_kind"]["audio"] == 1
+-    models = {item["model"]: item["quota"] for item in data["by_model"]}
+-    assert models["seedance-2.0-fast"] == 1000
+-    assert models["LingShan-G2"] == 200
+-    assert models["DC-hermes-LLM"] == 50
++    assert data["unattributed"]["requests"] == 0
++    assert data["cost_source"] == "local"
++    assert data["partial"] is False
+ 
+     # 第二次调用命中去抖窗口：不再重复对账，但报表照样返回。
+     second = client.post(
+         "/api/v1/projects/demo/cost-report/reconcile", params={"episode": 1}
+     ).json()["data"]
+     assert second["reconcile"]["skipped"] is True
+-    assert second["totals"]["quota"] == 1250
++    assert second["totals"]["quota"] == sum(expected.values())
+ 
+     forced = client.post(
+         "/api/v1/projects/demo/cost-report/reconcile",
+@@ -919,9 +993,76 @@ def test_cost_report_reconcile_route_backfills_gateway_quota(tmp_path, monkeypat
+     assert forced["reconcile"]["skipped"] is False
+ 
+ 
++def test_reconcile_local_prefers_measured_rules(tmp_path, monkeypatch):
++    """``--source local`` 按用量 × 单价计价；``actual_rules``（实测）优先于手工 ``rules``。"""
++    from novelvideo.gateway_cost_reconcile import reconcile
++
++    project_dir = _seed_project(tmp_path)
++    db_path = project_dir / "data.db"
++
++    book = tmp_path / "prices.json"
++    _write_price_book(
++        book,
++        [
++            # 手工报价：视频 1.0 元/秒（报价兜底）。
++            {
++                "match": {"kind": "video", "model": "seedance-2.0-fast"},
++                "unit": "second",
++                "price": 1.0,
++            },
++            {
++                "match": {"kind": "image", "model": "LingShan-G2"},
++                "unit": "call",
++                "price": 0.12,
++            },
++            {
++                "match": {"kind": "audio", "model": "IndexTTS2"},
++                "unit": "call",
++                "price": 0.05,
++            },
++        ],
++    )
++    payload = json.loads(book.read_text(encoding="utf-8"))
++    # 实测反推价：视频 0.4 元/秒 → 应盖过上面 1.0 的手工报价。
++    payload["actual_rules"] = [
++        {
++            "id": "actual:video:seedance-2.0-fast",
++            "kind": "video",
++            "model": "seedance-2.0-fast",
++            "unit": "second",
++            "price": 0.4,
++        }
++    ]
++    book.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
++    monkeypatch.setenv("PRODUCTION_PRICES_PATH", str(book))
++
++    report = reconcile(project_db=db_path, apply=True, source="local")
++    assert report.source == "local"
++    assert not report.errors
++    # 视频 5s×0.4=2.0；图片 0.12；音频 0.05；文本无规则 → 未归因。
++    assert report.quota == (
++        _quota_for_cny(2.0) + _quota_for_cny(0.12) + _quota_for_cny(0.05)
++    )
++
++    conn = sqlite3.connect(db_path)
++    video_quota = conn.execute(
++        "SELECT cost_quota FROM video_request_usage WHERE request_id='task-1'"
++    ).fetchone()[0]
++    image_source = conn.execute(
++        "SELECT cost_source FROM image_request_usage WHERE request_id='img-1'"
++    ).fetchone()[0]
++    llm = conn.execute(
++        "SELECT cost_quota, cost_source FROM llm_request_usage WHERE request_id='llm-1'"
++    ).fetchone()
++    conn.close()
++
++    assert video_quota == _quota_for_cny(2.0)  # 实测 0.4/秒，非手工 1.0
++    assert image_source == "local"
++    assert llm == (None, "unmatched")
++
++
+ def test_director_auto_episode_cost_hook_applies_quota(tmp_path, monkeypatch):
+-    """一集成片落盘后 coordinator 自动结算，无需用户操作。"""
+-    from novelvideo import gateway_cost_reconcile
++    """一集成片落盘后 coordinator 自动按本地价目结算，无需用户操作。"""
+     from novelvideo.chat import director_auto
+     from novelvideo.chat.director_auto import (
+         DirectorAutoCoordinator,
+@@ -931,11 +1072,18 @@ def test_director_auto_episode_cost_hook_applies_quota(tmp_path, monkeypatch):
+     from novelvideo.project_context import ProjectContext
+ 
+     project_dir = _seed_project(tmp_path)
+-    gateway_db = tmp_path / "one-api.db"
+-    _write_gateway_db(gateway_db)
+-    monkeypatch.setattr(
+-        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
++    book = tmp_path / "prices.json"
++    _write_price_book(
++        book,
++        [
++            {
++                "match": {"kind": "video", "model": "seedance-2.0-fast"},
++                "unit": "second",
++                "price": 0.4,
++            }
++        ],
+     )
++    monkeypatch.setenv("PRODUCTION_PRICES_PATH", str(book))
+ 
+     ctx = ProjectContext(
+         project_id="proj_demo",
+@@ -978,12 +1126,11 @@ def test_director_auto_episode_cost_hook_applies_quota(tmp_path, monkeypatch):
+         "SELECT cost_quota FROM video_request_usage WHERE request_id = 'task-1'"
+     ).fetchone()[0]
+     conn.close()
+-    assert quota == 1000
++    assert quota == _quota_for_cny(5.0 * 0.4)
+ 
+ 
+ def test_director_auto_episode_cost_hook_never_raises(tmp_path, monkeypatch):
+-    """网关账单库不可用时只记日志，绝不把成片流程拖垮。"""
+-    from novelvideo import gateway_cost_reconcile
++    """价目表不可用时只记日志，绝不把成片流程拖垮。"""
+     from novelvideo.chat import director_auto
+     from novelvideo.chat.director_auto import (
+         DirectorAutoCoordinator,
+@@ -993,10 +1140,9 @@ def test_director_auto_episode_cost_hook_never_raises(tmp_path, monkeypatch):
+     from novelvideo.project_context import ProjectContext
+ 
+     project_dir = _seed_project(tmp_path)
+-    monkeypatch.setattr(
+-        gateway_cost_reconcile,
+-        "NEWAPI_BILLING_DB_PATH",
+-        str(tmp_path / "missing-one-api.db"),
++    # 价目表缺失 → load() 退回默认空表 → 全部未定价，但绝不抛异常。
++    monkeypatch.setenv(
++        "PRODUCTION_PRICES_PATH", str(tmp_path / "missing-prices.json")
+     )
+ 
+     ctx = ProjectContext(
+diff --git a/tests/test_points_settlement.py b/tests/test_points_settlement.py
+index 51b41089..1e830d52 100644
+--- a/tests/test_points_settlement.py
++++ b/tests/test_points_settlement.py
+@@ -1,7 +1,7 @@
+ """成片完成后按实际用量多退少补（伴点结算）。
+ 
+ 覆盖：状态机（settled/owed/pending/refund_pending）、幂等、补缴重试、交付闸门、
+-按集 relay 口径汇总。全部用假件，绝不出网。
++按集本地口径汇总。全部用假件，绝不出网。
+ """
+ 
+ from __future__ import annotations
+@@ -161,12 +161,32 @@ def env(monkeypatch, tmp_path):
+         production_prices, "load", lambda **kwargs: store.booked
+     )
+ 
+-    def fake_relay_maps(project_db, *, workers=4):  # noqa: ARG001
++    def fake_local_reconcile(project_db, *, apply=False, book=None):  # noqa: ARG001
++        """假本地计价：把 ``store.maps``（request_id → quota）写进用量库。"""
++
+         if store.errors:
+-            raise RuntimeError("relay down")
+-        return dict(store.maps), {}, []
++            raise RuntimeError("price book down")
++        db = Path(project_db)
++        if apply and db.is_file():
++            conn = sqlite3.connect(db)
++            try:
++                conn.execute("UPDATE video_request_usage SET cost_quota = NULL")
++                for request_id, quota in store.maps.items():
++                    conn.execute(
++                        "UPDATE video_request_usage SET cost_quota = ?"
++                        " WHERE request_id = ?",
++                        (quota, request_id),
++                    )
++                conn.commit()
++            finally:
++                conn.close()
++        return SimpleNamespace()
++
++    from novelvideo import gateway_cost_reconcile
+ 
+-    monkeypatch.setattr(points_settlement, "_relay_maps", fake_relay_maps)
++    monkeypatch.setattr(
++        gateway_cost_reconcile, "reconcile_local_project_db", fake_local_reconcile
++    )
+     return SimpleNamespace(state_dir=state_dir, maps=store.maps, booked=store.booked, errors=store.errors)
+ 
+ 
+diff --git a/tests/test_production_prices.py b/tests/test_production_prices.py
+index 5f3bbde7..18f8570a 100644
+--- a/tests/test_production_prices.py
++++ b/tests/test_production_prices.py
+@@ -159,6 +159,40 @@ def test_unpriced_is_not_silently_zero():
+     assert priced.source == "unpriced"
+ 
+ 
++def test_prefer_measured_puts_actual_rules_first():
++    """结算口径：``prefer_measured=True`` 时实测反推价盖过手工报价（报价兜底）。"""
++    book = PriceBook(
++        raw={
++            "rules": [
++                {
++                    "match": {"kind": "video", "model": "seedance-2.0-fast"},
++                    "unit": "second",
++                    "price": 1.0,
++                }
++            ],
++            "actual_rules": [
++                {
++                    "kind": "video",
++                    "model": "seedance-2.0-fast",
++                    "unit": "second",
++                    "price": 0.4,
++                }
++            ],
++        }
++    )
++    action = ActionRequest(
++        kind="video", model="seedance-2.0-fast", metrics={"duration_seconds": 5}
++    )
++
++    quoted = book.price(action)
++    assert quoted.source == "manual"
++    assert quoted.cny == pytest.approx(5.0)
++
++    settled = book.price(action, prefer_measured=True)
++    assert settled.source == "actual"
++    assert settled.cny == pytest.approx(2.0)
++
++
+ def test_rule_without_metrics_is_unpriced():
+     book = _book({"id": "v", "match": {"kind": "video"}, "unit": "second", "price": 0.5})
+     priced = book.price(ActionRequest(kind="video"))

@@ -1,15 +1,14 @@
-"""Seedance 2.0 clip-duration rules shared by the panel and the pipeline.
+"""Seedance 2.x clip-duration rules shared by the panel and the pipeline.
 
-The product basis is a 5 second shot. That is also what the configured backend
-actually delivers: every Seedance 2.0 clip produced through the instance gateway
-comes back at ~5.09s no matter which duration the request asked for, so a longer
-request only inflates the beat clock written into the prompt (and the per-second
-gateway billing) while the delivered clip stays 5s.
+The product basis is a 5 second floor. Seedance 2.0 tops out at 15s and Seedance
+2.5 at 30s, so the effective request is the shot's own content length (dub length
+or explicit manual length) clamped into the model's supported range.
 
-The dub length therefore must not raise the generated duration. ``duration_floor``
-still reports the length a talking beat would need so the panel can point out a
-line that does not fit, while ``resolve_seedance2_target_duration`` keeps the
-generated shot on the 5s basis unless a user explicitly asked for more.
+``resolve_seedance2_target_duration`` raises the request to the beat's content
+length instead of pinning every shot to the 5s basis, and callers that know the
+selected video backend pass ``max_duration`` so a 2.0 model still stops at 15s
+while a 2.5 model can reach 30s. ``duration_floor`` keeps reporting the length a
+talking beat would need for the panel's "台词比镜头长" hint.
 """
 
 from __future__ import annotations
@@ -21,7 +20,9 @@ from typing import Any
 from novelvideo.manual_shots import resolve_target_video_duration
 
 SEEDANCE2_BASE_DURATION_SECONDS = 5
-SEEDANCE2_MAX_DURATION_SECONDS = 15
+# Seedance 2.5 常规单次上限 30s（2.0 系列仍由各自的 NEWAPI_VIDEO_DURATION_BOUNDS
+# 在生成器处回落到 15s）。这里给的是不指定模型时的全局上限。
+SEEDANCE2_MAX_DURATION_SECONDS = 30
 _SPOKEN_AUDIO_TYPES = frozenset({"narration", "dialogue"})
 
 
@@ -73,10 +74,10 @@ def seedance2_duration_floor(
 ) -> int:
     """Minimum length a talking beat would need for its spoken line.
 
-    Informational only: it feeds the panel's "台词比镜头长" hint. It must not be
-    used as the generated duration, because the backend ignores requests above
-    its ~5s ceiling and the prompt's beat clock would then describe a clip that
-    never arrives.
+    Informational only: it feeds the panel's "台词比镜头长" hint. It mirrors the
+    length :func:`resolve_target_video_duration` would pick (explicit manual
+    length, else the spoken track, else the by-text estimate), clamped into the
+    Seedance range.
 
     ``resolve_target_video_duration`` already prefers an explicit beat duration
     and otherwise falls back to the spoken track, so the floor respects a manual
@@ -98,13 +99,15 @@ def resolve_seedance2_target_duration(
     *,
     config_duration: Any = None,
     requested: Any = None,
+    max_duration: int | None = None,
 ) -> int:
     """Pick the effective clip seconds sent to the backend for one beat.
 
-    The product basis is 5 seconds and the configured backend caps its output at
-    about 5 seconds regardless of the requested value, so the dub length is not a
-    candidate here (see the module docstring). Only an explicit user value can
-    raise the shot above the basis.
+    The request is the beat's own content length (dub length / explicit manual
+    length), never below the 5s basis and never above the model's ceiling.
+    ``max_duration`` lets a caller that knows the selected backend pin the
+    ceiling to that model (Seedance 2.0 -> 15s, Seedance 2.5 -> 30s); otherwise
+    the global :data:`SEEDANCE2_MAX_DURATION_SECONDS` applies.
     """
 
     candidates = [SEEDANCE2_BASE_DURATION_SECONDS]
@@ -115,15 +118,30 @@ def resolve_seedance2_target_duration(
             continue
         if parsed > 0:
             candidates.append(parsed)
-    return _clamp_duration(max(candidates), minimum=SEEDANCE2_BASE_DURATION_SECONDS)
+    ceiling = SEEDANCE2_MAX_DURATION_SECONDS
+    if max_duration is not None:
+        try:
+            ceiling = max(SEEDANCE2_BASE_DURATION_SECONDS, int(max_duration))
+        except (TypeError, ValueError):
+            ceiling = SEEDANCE2_MAX_DURATION_SECONDS
+    return _clamp_duration(
+        max(candidates),
+        minimum=SEEDANCE2_BASE_DURATION_SECONDS,
+        maximum=ceiling,
+    )
 
 
-def _clamp_duration(value: Any, *, minimum: int) -> int:
+def _clamp_duration(
+    value: Any,
+    *,
+    minimum: int,
+    maximum: int = SEEDANCE2_MAX_DURATION_SECONDS,
+) -> int:
     try:
         seconds = int(math.ceil(float(value)))
     except (TypeError, ValueError):
         seconds = minimum
-    return max(minimum, min(seconds, SEEDANCE2_MAX_DURATION_SECONDS))
+    return max(minimum, min(seconds, maximum))
 
 
 __all__ = [

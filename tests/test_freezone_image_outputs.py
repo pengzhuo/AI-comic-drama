@@ -78,10 +78,10 @@ async def test_animate_uses_locked_frame_and_requests_gif(
         # Default EE Seedance Fast runtime projection: ratioOptions is absent.
         return [
             {
-                "id": "newapi_seedance-2.0-fast",
-                "apiModel": "newapi_seedance-2.0-fast",
-                "gatewayModel": "seedance-2.0-fast",
-                "catalogId": "ee-seedance-fast",
+                "id": "newapi_seedance-2.5",
+                "apiModel": "newapi_seedance-2.5",
+                "gatewayModel": "seedance-2.5",
+                "catalogId": "ee-seedance-2.5",
                 "request": {"endpoint": "video/generations", "parameters": []},
                 "supportedModes": [
                     "text_to_video", "first_frame", "first_last_frame", "all_reference"

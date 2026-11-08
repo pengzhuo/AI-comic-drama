@@ -773,11 +773,14 @@ async def _prepare_seedance2_api_beat(
 ) -> _gen.Any:
     from novelvideo.manual_shots import resolve_target_video_duration
     from novelvideo.seedance2_i2v.models import parse_seedance2_config
+    from novelvideo.video_duration import video_duration_bounds_for_backend
 
     beat_num = int(beat.get("beat_number") or index + 1)
     video_mode = str(beat.get("video_mode") or "first_frame")
     audio_duration = await _gen._api_audio_duration_seconds(output_dir, episode, beat_num)
     target_duration = resolve_target_video_duration(beat, audio_duration)
+    # 单镜时长按所选模型的上限收敛：2.0 系列 ≤15s，2.5 ≤30s。
+    configured_max = video_duration_bounds_for_backend(video_backend)[1]
     current_config = parse_seedance2_config(beat.get("seedance2_config_json"))
     requested_resolution = (
         _gen._seedance2_api_resolution(resolution)
@@ -799,6 +802,7 @@ async def _prepare_seedance2_api_beat(
         ),
         ratio=ratio,
         prop_menu=prop_menu,
+        max_duration=configured_max,
     )
     if not str(prepared.prompt or "").strip():
         raise ValueError(
@@ -1321,6 +1325,8 @@ def _api_video_backend_options() -> list[_gen.VideoBackendOption]:
     for value, label in options.items():
         model = parse_newapi_video_backend(value)
         bounds = duration_bounds.get(model or "")
+        if model == "seedance-2.5" and not bounds:
+            bounds = (4, 30)
         if model == "seedance-2.0-mini" and not bounds:
             bounds = (4, 15)
         if model == "happyhorse-1.0" and not bounds:

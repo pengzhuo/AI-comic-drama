@@ -19,6 +19,41 @@ def _project_dir(tmp_path):
     return tmp_path / "output" / "alice" / "demo"
 
 
+def _write_price_book(path, rules) -> None:
+    path.write_text(
+        json.dumps(
+            {"currency": "CNY", "markup_default": 1, "rules": list(rules)},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _quota_for_cny(cny: float) -> int:
+    """本地口径：¥ → quota（与 reconcile 同换算）。"""
+
+    from novelvideo.config import QUOTA_PER_USD, USD_CNY_RATE
+
+    return int(round(cny * QUOTA_PER_USD / USD_CNY_RATE))
+
+
+#: 本地计价测试用价目：视频按秒、图片/音频按次、文本按千 token。
+_LOCAL_PRICE_RULES = [
+    {
+        "match": {"kind": "video", "model": "seedance-2.0-fast"},
+        "unit": "second",
+        "price": 0.4,
+    },
+    {"match": {"kind": "image", "model": "LingShan-G2"}, "unit": "call", "price": 0.12},
+    {"match": {"kind": "audio", "model": "IndexTTS2"}, "unit": "call", "price": 0.05},
+    {
+        "match": {"kind": "text", "model": "DC-hermes-LLM"},
+        "unit": "1k_token",
+        "price": 0.01,
+    },
+]
+
+
 def _write_gateway_db(path) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(
@@ -478,6 +513,8 @@ class _FakeRelay:
         params = dict(parse_qsl(query))
         if path == "/api/user/login":
             return 200, json.dumps({"success": True, "data": {"access_token": "tok-1"}})
+        if path == "/api/user/auth/logout":
+            return 200, json.dumps({"success": True, "data": {"revoked_sid": "sid-1"}})
         if path == "/api/status":
             return 200, json.dumps(
                 {
@@ -521,6 +558,9 @@ class _FakeRelay:
 
     def log_calls(self) -> list[str]:
         return [call for call in self.calls if "/api/log/self" in call]
+
+    def logout_calls(self) -> list[str]:
+        return [call for call in self.calls if "/api/user/auth/logout" in call]
 
 
 def _relay_endpoints(base_url="https://aicf.example"):
@@ -679,6 +719,7 @@ def test_reconcile_stamps_cost_source_and_clears_unmatched(tmp_path):
 
     report = build_cost_report(project_output_dir=project_dir)
     assert report["cost_source"] == "gateway"
+    assert report["partial"] is True
     by_source = {item["source"]: item for item in report["sources"]}
     assert by_source["gateway"]["quota"] == 1250
     assert by_source["unmatched"]["requests"] == 1
@@ -726,7 +767,41 @@ def test_reconcile_relay_first_uses_relay_when_configured(tmp_path, monkeypatch)
 
     from novelvideo.api.routes.cost_report import build_cost_report
 
-    assert build_cost_report(project_output_dir=project_dir)["cost_source"] == "relay"
+    report = build_cost_report(project_output_dir=project_dir)
+    assert report["cost_source"] == "relay"
+    # 音频没有网关单号 → 仍有未归因请求，属「部分归因」：口径是 relay，但合计不完整。
+    assert report["unattributed"]["requests"] == 1
+    assert report["partial"] is True
+
+
+def test_cost_report_partial_flag_tracks_unattributed(tmp_path):
+    """`partial` 跟随未归因数：有未归因=True；全部回填后=False。"""
+    from novelvideo.api.routes.cost_report import build_cost_report
+
+    project_dir = _seed_project(tmp_path)
+
+    # 4 条请求还没对账 → 全部未归因，合计不完整。
+    report = build_cost_report(project_output_dir=project_dir)
+    assert report["unattributed"]["requests"] == 4
+    assert report["partial"] is True
+
+    # 全部回填账单额度 → 合计完整。
+    conn = sqlite3.connect(project_dir / "data.db")
+    for table, rid in (
+        ("video_request_usage", "task-1"),
+        ("image_request_usage", "img-1"),
+        ("llm_request_usage", "llm-1"),
+        ("audio_request_usage", "aud-1"),
+    ):
+        conn.execute(
+            f"UPDATE {table} SET cost_quota = ? WHERE request_id = ?", (100, rid)
+        )
+    conn.commit()
+    conn.close()
+
+    report = build_cost_report(project_output_dir=project_dir)
+    assert report["unattributed"]["requests"] == 0
+    assert report["partial"] is False
 
 
 def test_reconcile_relay_first_falls_back_to_gateway_without_accounts(
@@ -803,6 +878,28 @@ def test_relay_billing_client_relogins_on_expired_token():
     assert len(logins) == 2  # 首次登录 + 401 后重登
 
 
+def test_collect_quotas_logs_out_after_query():
+    """登录只为查账单：抓完必须退出会话，否则占满上游并发会话额度（409）。"""
+    from novelvideo import relay_billing
+
+    relay = _FakeRelay(
+        base_url="https://aicf.example",
+        tasks={"up-task-1": 7},
+        logs={"up-log-1": 9},
+    )
+    snapshot = relay_billing.collect_quotas(
+        _relay_endpoints(),
+        upstream_log_ids={"up-log-1"},
+        transport=relay,
+    )
+
+    assert snapshot.tasks == {"up-task-1": 7}
+    assert snapshot.logs == {"up-log-1": 9}
+    # 用完即退：登录一次、退出一次。
+    assert len([c for c in relay.calls if "/api/user/login" in c]) == 1
+    assert relay.logout_calls()
+
+
 def _cost_report_client(tmp_path, monkeypatch, project_dir):
     """带项目解析桩的 TestClient，state_dir 指向项目目录（即 data.db 所在处）。"""
     from novelvideo.api.routes import cost_report
@@ -827,16 +924,24 @@ def _cost_report_client(tmp_path, monkeypatch, project_dir):
     return TestClient(app), cost_report
 
 
-def test_cost_report_reconcile_route_backfills_gateway_quota(tmp_path, monkeypatch):
-    """POST .../cost-report/reconcile 增量回填 cost_quota 并返回刷新后的明细。"""
-    from novelvideo import gateway_cost_reconcile
+def test_cost_report_reconcile_route_prices_locally(tmp_path, monkeypatch):
+    """POST .../cost-report/reconcile 按本地价目回填 cost_quota 并返回刷新后的明细。
 
+    默认口径已切到本地（``source=local``）：不登录上游，按「用量 × 单价」算。
+    """
     project_dir = _seed_project(tmp_path)
-    gateway_db = tmp_path / "one-api.db"
-    _write_gateway_db(gateway_db)
-    monkeypatch.setattr(
-        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
+    # 文本按 token 计价：给这条 LLM 记录补上真实用量（seed 时未记 token）。
+    conn = sqlite3.connect(project_dir / "data.db")
+    conn.execute(
+        "UPDATE llm_request_usage SET input_tokens = 1000, output_tokens = 2000"
+        " WHERE request_id = 'llm-1'"
     )
+    conn.commit()
+    conn.close()
+
+    book = tmp_path / "prices.json"
+    _write_price_book(book, _LOCAL_PRICE_RULES)
+    monkeypatch.setenv("PRODUCTION_PRICES_PATH", str(book))
 
     client, _ = _cost_report_client(tmp_path, monkeypatch, project_dir)
 
@@ -854,28 +959,32 @@ def test_cost_report_reconcile_route_backfills_gateway_quota(tmp_path, monkeypat
 
     assert data["reconcile"]["applied"] is True
     assert data["reconcile"]["skipped"] is False
-    assert data["reconcile"]["source"] == "gateway"
-    assert data["reconcile"]["matched"] == 3
+    assert data["reconcile"]["source"] == "local"
+    assert data["reconcile"]["matched"] == 4
     assert data["reconcile"]["errors"] == []
 
-    # 视频 1000 + 图片 200 + 文本 50；音频无网关单号仍归入未归因。
-    assert data["totals"]["quota"] == 1250
+    expected = {
+        "seedance-2.0-fast": _quota_for_cny(5.0 * 0.4),
+        "LingShan-G2": _quota_for_cny(0.12),
+        "IndexTTS2": _quota_for_cny(0.05),
+        "DC-hermes-LLM": _quota_for_cny(3.0 * 0.01),
+    }
+    models = {item["model"]: item["quota"] for item in data["by_model"]}
+    assert models == expected
+    assert data["totals"]["quota"] == sum(expected.values())
     assert data["totals"]["cny"] == pytest.approx(
         data["totals"]["usd"] * data["usd_cny_rate"]
     )
-    assert data["unattributed"]["requests"] == 1
-    assert data["unattributed"]["by_kind"]["audio"] == 1
-    models = {item["model"]: item["quota"] for item in data["by_model"]}
-    assert models["seedance-2.0-fast"] == 1000
-    assert models["LingShan-G2"] == 200
-    assert models["DC-hermes-LLM"] == 50
+    assert data["unattributed"]["requests"] == 0
+    assert data["cost_source"] == "local"
+    assert data["partial"] is False
 
     # 第二次调用命中去抖窗口：不再重复对账，但报表照样返回。
     second = client.post(
         "/api/v1/projects/demo/cost-report/reconcile", params={"episode": 1}
     ).json()["data"]
     assert second["reconcile"]["skipped"] is True
-    assert second["totals"]["quota"] == 1250
+    assert second["totals"]["quota"] == sum(expected.values())
 
     forced = client.post(
         "/api/v1/projects/demo/cost-report/reconcile",
@@ -884,9 +993,76 @@ def test_cost_report_reconcile_route_backfills_gateway_quota(tmp_path, monkeypat
     assert forced["reconcile"]["skipped"] is False
 
 
+def test_reconcile_local_prefers_measured_rules(tmp_path, monkeypatch):
+    """``--source local`` 按用量 × 单价计价；``actual_rules``（实测）优先于手工 ``rules``。"""
+    from novelvideo.gateway_cost_reconcile import reconcile
+
+    project_dir = _seed_project(tmp_path)
+    db_path = project_dir / "data.db"
+
+    book = tmp_path / "prices.json"
+    _write_price_book(
+        book,
+        [
+            # 手工报价：视频 1.0 元/秒（报价兜底）。
+            {
+                "match": {"kind": "video", "model": "seedance-2.0-fast"},
+                "unit": "second",
+                "price": 1.0,
+            },
+            {
+                "match": {"kind": "image", "model": "LingShan-G2"},
+                "unit": "call",
+                "price": 0.12,
+            },
+            {
+                "match": {"kind": "audio", "model": "IndexTTS2"},
+                "unit": "call",
+                "price": 0.05,
+            },
+        ],
+    )
+    payload = json.loads(book.read_text(encoding="utf-8"))
+    # 实测反推价：视频 0.4 元/秒 → 应盖过上面 1.0 的手工报价。
+    payload["actual_rules"] = [
+        {
+            "id": "actual:video:seedance-2.0-fast",
+            "kind": "video",
+            "model": "seedance-2.0-fast",
+            "unit": "second",
+            "price": 0.4,
+        }
+    ]
+    book.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("PRODUCTION_PRICES_PATH", str(book))
+
+    report = reconcile(project_db=db_path, apply=True, source="local")
+    assert report.source == "local"
+    assert not report.errors
+    # 视频 5s×0.4=2.0；图片 0.12；音频 0.05；文本无规则 → 未归因。
+    assert report.quota == (
+        _quota_for_cny(2.0) + _quota_for_cny(0.12) + _quota_for_cny(0.05)
+    )
+
+    conn = sqlite3.connect(db_path)
+    video_quota = conn.execute(
+        "SELECT cost_quota FROM video_request_usage WHERE request_id='task-1'"
+    ).fetchone()[0]
+    image_source = conn.execute(
+        "SELECT cost_source FROM image_request_usage WHERE request_id='img-1'"
+    ).fetchone()[0]
+    llm = conn.execute(
+        "SELECT cost_quota, cost_source FROM llm_request_usage WHERE request_id='llm-1'"
+    ).fetchone()
+    conn.close()
+
+    assert video_quota == _quota_for_cny(2.0)  # 实测 0.4/秒，非手工 1.0
+    assert image_source == "local"
+    assert llm == (None, "unmatched")
+
+
 def test_director_auto_episode_cost_hook_applies_quota(tmp_path, monkeypatch):
-    """一集成片落盘后 coordinator 自动结算，无需用户操作。"""
-    from novelvideo import gateway_cost_reconcile
+    """一集成片落盘后 coordinator 自动按本地价目结算，无需用户操作。"""
     from novelvideo.chat import director_auto
     from novelvideo.chat.director_auto import (
         DirectorAutoCoordinator,
@@ -896,11 +1072,18 @@ def test_director_auto_episode_cost_hook_applies_quota(tmp_path, monkeypatch):
     from novelvideo.project_context import ProjectContext
 
     project_dir = _seed_project(tmp_path)
-    gateway_db = tmp_path / "one-api.db"
-    _write_gateway_db(gateway_db)
-    monkeypatch.setattr(
-        gateway_cost_reconcile, "NEWAPI_BILLING_DB_PATH", str(gateway_db)
+    book = tmp_path / "prices.json"
+    _write_price_book(
+        book,
+        [
+            {
+                "match": {"kind": "video", "model": "seedance-2.0-fast"},
+                "unit": "second",
+                "price": 0.4,
+            }
+        ],
     )
+    monkeypatch.setenv("PRODUCTION_PRICES_PATH", str(book))
 
     ctx = ProjectContext(
         project_id="proj_demo",
@@ -943,12 +1126,11 @@ def test_director_auto_episode_cost_hook_applies_quota(tmp_path, monkeypatch):
         "SELECT cost_quota FROM video_request_usage WHERE request_id = 'task-1'"
     ).fetchone()[0]
     conn.close()
-    assert quota == 1000
+    assert quota == _quota_for_cny(5.0 * 0.4)
 
 
 def test_director_auto_episode_cost_hook_never_raises(tmp_path, monkeypatch):
-    """网关账单库不可用时只记日志，绝不把成片流程拖垮。"""
-    from novelvideo import gateway_cost_reconcile
+    """价目表不可用时只记日志，绝不把成片流程拖垮。"""
     from novelvideo.chat import director_auto
     from novelvideo.chat.director_auto import (
         DirectorAutoCoordinator,
@@ -958,10 +1140,9 @@ def test_director_auto_episode_cost_hook_never_raises(tmp_path, monkeypatch):
     from novelvideo.project_context import ProjectContext
 
     project_dir = _seed_project(tmp_path)
-    monkeypatch.setattr(
-        gateway_cost_reconcile,
-        "NEWAPI_BILLING_DB_PATH",
-        str(tmp_path / "missing-one-api.db"),
+    # 价目表缺失 → load() 退回默认空表 → 全部未定价，但绝不抛异常。
+    monkeypatch.setenv(
+        "PRODUCTION_PRICES_PATH", str(tmp_path / "missing-prices.json")
     )
 
     ctx = ProjectContext(

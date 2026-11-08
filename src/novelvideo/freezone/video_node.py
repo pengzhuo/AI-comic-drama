@@ -114,12 +114,13 @@ LEGACY_FREEZONE_VIDEO_LABEL_ALIASES: dict[str, str] = {
     "seedance 1.5 无声": "newapi_seedance-1.5-pro",
 }
 
-FREEZONE_DEFAULT_VIDEO_BACKEND = "newapi_seedance-2.0-fast"
+FREEZONE_DEFAULT_VIDEO_BACKEND = "newapi_seedance-2.5"
 FREEZONE_NEWAPI_VIDEO_BACKENDS = {
     "newapi_seedance-2.0",
     "newapi_seedance-2.0-fast",
     "newapi_seedance-2.0-value",
     "newapi_seedance-2.0-fast-value",
+    "newapi_seedance-2.5",
     "newapi_seedance-1.0-pro-fast",
     "newapi_seedance-1.5-pro",
     "newapi_happyhorse-1.0",
@@ -189,6 +190,7 @@ FREEZONE_SEEDANCE2_RESOLUTION_OPTIONS_BY_MODEL: dict[str, tuple[str, ...]] = {
     "seedance-2.0": ("480p", "720p", "1080p"),
     "seedance-2.0-value": ("720p", "1080p"),
     "seedance-2.0-fast-value": ("720p", "1080p"),
+    "seedance-2.5": ("480p", "720p", "1080p"),
 }
 FREEZONE_DEFAULT_VIDEO_RESOLUTION_OPTIONS = ("480p", "720p", "1080p")
 FREEZONE_DEFAULT_SEEDANCE2_RESOLUTION_OPTIONS = ("480p", "720p")
@@ -210,7 +212,7 @@ def freezone_video_resolution_options(backend: str | None) -> tuple[str, ...]:
         return FREEZONE_GROK_VIDEO_CHANNEL_RESOLUTION_OPTIONS
     if model == "happyhorse-1.0":
         return FREEZONE_HAPPYHORSE_RESOLUTION_OPTIONS
-    if model.startswith("seedance-2.0"):
+    if model.startswith("seedance-2"):
         return FREEZONE_SEEDANCE2_RESOLUTION_OPTIONS_BY_MODEL.get(
             model,
             FREEZONE_DEFAULT_SEEDANCE2_RESOLUTION_OPTIONS,
@@ -382,7 +384,7 @@ def is_freezone_seedance2_backend(backend: str | None) -> bool:
     from novelvideo.generators.video_generator import parse_newapi_video_backend
 
     model = parse_newapi_video_backend(text) or parse_huimeng_video_backend(text)
-    return bool(model and model.startswith("seedance-2.0"))
+    return bool(model and model.startswith("seedance-2"))
 
 
 def is_freezone_seedance_backend(backend: str | None) -> bool:

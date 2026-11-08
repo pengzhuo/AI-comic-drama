@@ -1537,7 +1537,7 @@ def test_recommended_video_switch_clears_unsupported_inherited_audio(monkeypatch
     monkeypatch.setattr(
         plugin, "_request",
         lambda *_args, **_kwargs: {"ok": True, "data": [{
-            "id": "seedance-2.0-fast", "aliases": ["newapi_seedance-2.0-fast"],
+            "id": "seedance-2.5", "aliases": ["newapi_seedance-2.5"],
             "ratioOptions": ["9:16"], "resolutionOptions": ["720P"],
             "minDuration": 4, "maxDuration": 15,
             "supportsGenerateAudio": False,
@@ -1554,7 +1554,7 @@ def test_recommended_video_switch_clears_unsupported_inherited_audio(monkeypatch
 
     assert error is None
     assert commands[0]["data"] == {
-        "model": "seedance-2.0-fast", "aspectRatio": "9:16",
+        "model": "seedance-2.5", "aspectRatio": "9:16",
         "quality": "720P", "durationSec": 5, "generateAudio": False,
         "count": 1,
     }
@@ -4194,7 +4194,7 @@ def test_generation_recommendation_uses_explicit_specs_and_keeps_delivery_separa
                         lambda _project, _canvas, event: events.append(event) or "shown")
     monkeypatch.setattr(plugin, "_request", lambda method, path, **_kwargs: {
         "ok": True, "data": [{
-            "id": "newapi_seedance-2.0-fast", "ratioOptions": ["9:16", "16:9"],
+            "id": "newapi_seedance-2.5", "ratioOptions": ["9:16", "16:9"],
             "resolutionOptions": ["720P", "1080P"], "minDuration": 4,
             "maxDuration": 15, "supportsGenerateAudio": True,
         }] if "/video/models" in path else [{
@@ -4366,7 +4366,7 @@ def test_generation_recommendation_shares_one_sided_ratio_for_image_video_card(m
                         lambda _project, _canvas, event: events.append(event) or "shown")
     monkeypatch.setattr(plugin, "_request", lambda method, path, **_kwargs: {
         "ok": True, "data": [{
-            "id": "newapi_seedance-2.0-fast", "ratioOptions": ["9:16", "16:9"],
+            "id": "newapi_seedance-2.5", "ratioOptions": ["9:16", "16:9"],
             "resolutionOptions": ["720P", "1080P"], "minDuration": 4,
             "maxDuration": 15, "supportsGenerateAudio": True,
         }] if "/video/models" in path else [{
@@ -4432,7 +4432,7 @@ def test_generation_recommendation_keeps_distinct_shot_durations_out_of_global_c
                         lambda _project, _canvas, event: events.append(event) or "shown")
     monkeypatch.setattr(plugin, "_request", lambda *_args, **_kwargs: {
         "ok": True, "data": [{
-            "id": "newapi_seedance-2.0-fast", "ratioOptions": ["16:9"],
+            "id": "newapi_seedance-2.5", "ratioOptions": ["16:9"],
             "resolutionOptions": ["720P"], "minDuration": 4,
             "maxDuration": 15, "supportsGenerateAudio": True,
         }],
@@ -4503,7 +4503,7 @@ def test_use_recommended_ignores_stale_frontend_answer_for_explicit_audio(monkey
     })
     monkeypatch.setattr(plugin, "_request", lambda *_args, **_kwargs: {
         "ok": True, "data": [{
-            "id": "newapi_seedance-2.0-fast", "ratioOptions": ["16:9"],
+            "id": "newapi_seedance-2.5", "ratioOptions": ["16:9"],
             "resolutionOptions": ["720P"], "minDuration": 4,
             "maxDuration": 15, "supportsGenerateAudio": True,
         }],
@@ -4537,7 +4537,7 @@ _ISSUE_674_VIDEO_CATALOG = {
     "ok": True, "data": [
         {
             # The default video model declares resolutions but no ratioOptions.
-            "id": "newapi_seedance-2.0-fast", "resolutionOptions": ["480P", "720P"],
+            "id": "newapi_seedance-2.5", "resolutionOptions": ["480P", "720P"],
             "minDuration": 4, "maxDuration": 15, "supportsGenerateAudio": False,
         },
         {
@@ -4570,7 +4570,7 @@ def test_generation_clarification_offers_recommendation_without_catalog_ratio_op
     event = captured[0]
     assert event["allow_recommended"] is True
     recommended = event["recommended_answers"]
-    assert recommended["video_model"] == {"option_ids": ["newapi_seedance-2.0-fast"]}
+    assert recommended["video_model"] == {"option_ids": ["newapi_seedance-2.5"]}
     # Unconstrained by the catalog: the product default ratio, which the frontend
     # also lists for manual selection when a model declares no ratioOptions.
     assert recommended["video_aspect_ratio"] == {"option_ids": ["9:16"]}

@@ -1,4 +1,4 @@
-"""Seedance 2.0 clip-duration rules: 5 秒基准，台词长度只做提示不拉长镜头。"""
+"""Seedance 2.x clip-duration rules: 5 秒下限，镜头时长跟随内容并在模型上限内收敛。"""
 
 from __future__ import annotations
 
@@ -41,9 +41,12 @@ def test_target_duration_is_clamped_to_model_range():
         resolve_seedance2_target_duration,
     )
 
-    assert SEEDANCE2_MAX_DURATION_SECONDS == 15
-    assert resolve_seedance2_target_duration(config_duration=99) == 15
+    assert SEEDANCE2_MAX_DURATION_SECONDS == 30
+    assert resolve_seedance2_target_duration(config_duration=99) == 30
     assert resolve_seedance2_target_duration(config_duration="bad") == 5
+    # 2.0 系列仍按各自模型上限收敛到 15s，2.5 可到 30s。
+    assert resolve_seedance2_target_duration(config_duration=99, max_duration=15) == 15
+    assert resolve_seedance2_target_duration(config_duration=99, max_duration=30) == 30
 
 
 def test_duration_floor_follows_the_dubbing_track(monkeypatch, tmp_path):

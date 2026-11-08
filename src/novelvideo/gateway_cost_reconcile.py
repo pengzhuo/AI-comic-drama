@@ -1,13 +1,18 @@
 """网关（捏驿 / NewAPI）账单对账。
 
 把应用侧 usage 表里的请求与账单 ``quota`` 对齐，从而得到"每部剧花在哪个模型
-上的钱"的精确值。支持两种口径（``source``）：
+上的钱"的精确值。支持三种口径（``source``）：
 
+- ``local``：**默认日常口径**。按「用量 × 本地单价表」计价，单价取自
+  ``production-prices.json``（``actual_rules`` 由真账反推，实测优先），**不触网**、
+  不受上游 429/409 影响；合计与上游真账一致。
 - ``gateway``：本地捏驿账单库 ``one-api.db``。捏驿是我们自己跑的中继，对
   ``DC-*`` / 媒体模型别名没有价格条目，会落到默认倍率，金额明显偏高。
 - ``relay``：真正收钱的上游中转站账单。先用捏驿库把本地单号桥接成上游单号
   （``logs.request_id → logs.upstream_request_id``、
-  ``tasks.private_data.upstream_task_id``），再向中转站取真实 ``quota``。
+  ``tasks.private_data.upstream_task_id``），再向中转站取真实 ``quota``。登录后
+  **必须在 ``finally`` 里退出会话**（见 ``relay_billing.collect_quotas``），否则
+  占满上游并发会话额度会收到 409 ``AUTH_SESSION_LIMIT``。
 
 匹配关系：
 
@@ -37,7 +42,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from novelvideo.config import NEWAPI_BILLING_DB_PATH, QUOTA_PER_USD, STATE_DIR
+from novelvideo.config import (
+    NEWAPI_BILLING_DB_PATH,
+    QUOTA_PER_USD,
+    STATE_DIR,
+    USD_CNY_RATE,
+)
 from novelvideo.relay_billing import (
     RelayBillingCache,
     RelayEndpoint,
@@ -104,6 +114,24 @@ _USAGE_TABLES = (
     ("audio_request_usage", "gateway_request_id", "log"),
     ("llm_request_usage", "provider_request_id", "log"),
 )
+
+#: 本地计价（``source=local``）口径：表 -> (kind, 模型列)。
+_LOCAL_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("video_request_usage", "video", "model_name"),
+    ("image_request_usage", "image", "model_name"),
+    ("audio_request_usage", "audio", "model_name"),
+    ("llm_request_usage", "text", "model"),
+)
+
+#: 这些状态的行不计费（生成失败不该算钱）；其余按用量计价。
+_NON_BILLABLE_STATUSES = {"failed", "error", "cancelled", "canceled", "timeout"}
+
+
+def _as_number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _open_gateway_ro(path: Path) -> sqlite3.Connection:
@@ -375,6 +403,139 @@ def _reconcile_table(
     return report
 
 
+def _local_action(kind: str, model: str, row: sqlite3.Row) -> Any:
+    """把一行用量构造成计费动作（只用库里真实记下的量）。"""
+
+    from novelvideo.production_prices import ActionRequest
+
+    if kind == "video":
+        metrics = {
+            "duration_seconds": _as_number(row["duration_seconds"]),
+            "call_count": 1,
+        }
+    elif kind == "text":
+        prompt = _as_number(row["input_tokens"])
+        completion = _as_number(row["output_tokens"])
+        metrics = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "tokens": prompt + completion,
+        }
+    else:  # image / audio：每行一次调用
+        metrics = {"call_count": 1}
+    return ActionRequest(kind=kind, model=model, quantity=1, metrics=metrics)
+
+
+def _reconcile_table_local(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    kind: str,
+    model_column: str,
+    book: Any,
+    apply: bool,
+    now: str,
+) -> TableReport:
+    """按本地单价表逐行计价，回写 ``cost_quota``（不触网）。"""
+
+    report = TableReport(table=table)
+    if not _table_exists(conn, table):
+        return report
+    columns = _columns(conn, table)
+    if model_column not in columns:
+        return report
+    status_expr = "status" if "status" in columns else "''"
+    duration_expr = "duration_seconds" if "duration_seconds" in columns else "0"
+    input_expr = "input_tokens" if "input_tokens" in columns else "0"
+    output_expr = "output_tokens" if "output_tokens" in columns else "0"
+    rows = list(
+        conn.execute(
+            f"SELECT rowid AS rid, {model_column} AS model, {status_expr} AS status, "
+            f"{duration_expr} AS duration_seconds, {input_expr} AS input_tokens, "
+            f"{output_expr} AS output_tokens FROM {table}"
+        )
+    )
+    updates: list[tuple[int, str, str, int]] = []
+    cleared: list[tuple[str, int]] = []
+    for row in rows:
+        report.rows += 1
+        status = str(row["status"] or "").strip().lower()
+        model = str(row["model"] or "").strip()
+        if status in _NON_BILLABLE_STATUSES:
+            cleared.append((now, int(row["rid"])))
+            continue
+        # 实测反推价 > 手工规则 > 同步价目；未定价则落 unmatched，绝不按 0 计。
+        priced = book.price(_local_action(kind, model, row), prefer_measured=True)
+        if priced.cny is None or priced.cny <= 0:
+            if model and len(report.unmatched) < 20:
+                report.unmatched.append(model)
+            cleared.append((now, int(row["rid"])))
+            continue
+        quota = (
+            int(round(priced.cny * QUOTA_PER_USD / USD_CNY_RATE))
+            if USD_CNY_RATE
+            else 0
+        )
+        report.matched += 1
+        report.quota += quota
+        updates.append((quota, now, "local", int(row["rid"])))
+
+    if apply and (updates or cleared):
+        add_column_if_missing(conn, table, "cost_quota", "INTEGER")
+        add_column_if_missing(conn, table, "quota_checked_at", "TEXT")
+        add_column_if_missing(conn, table, "cost_source", "TEXT")
+        if updates:
+            conn.executemany(
+                f"UPDATE {table} SET cost_quota = ?, quota_checked_at = ?,"
+                " cost_source = ? WHERE rowid = ?",
+                updates,
+            )
+        if cleared:
+            conn.executemany(
+                f"UPDATE {table} SET cost_quota = NULL, quota_checked_at = ?,"
+                " cost_source = 'unmatched' WHERE rowid = ?",
+                cleared,
+            )
+        conn.commit()
+    return report
+
+
+def reconcile_local_project_db(
+    db_path: str | Path,
+    *,
+    apply: bool = False,
+    book: Any | None = None,
+) -> ProjectReport:
+    """按本地单价表（实测价优先）回填一个项目的 ``cost_quota``，全程不触网。"""
+
+    from novelvideo.production_prices import load as load_prices
+
+    db_path = Path(db_path)
+    report = ProjectReport(label=db_path.parent.name, db_path=db_path)
+    if not db_path.is_file():
+        return report
+    price_book = book or load_prices()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        for table, kind, model_column in _LOCAL_KINDS:
+            report.tables.append(
+                _reconcile_table_local(
+                    conn,
+                    table=table,
+                    kind=kind,
+                    model_column=model_column,
+                    book=price_book,
+                    apply=apply,
+                    now=now,
+                )
+            )
+    finally:
+        conn.close()
+    return report
+
+
 def reconcile_project_db(
     db_path: str | Path,
     *,
@@ -514,8 +675,10 @@ def reconcile(
     relay_workers: int = 4,
     progress: Callable[[int, int], None] | None = None,
 ) -> ReconcileReport:
-    if source not in {"gateway", "relay"}:
-        raise ValueError(f"unknown source: {source!r} (expected gateway|relay)")
+    if source not in {"gateway", "relay", "local"}:
+        raise ValueError(
+            f"unknown source: {source!r} (expected gateway|relay|local)"
+        )
 
     gateway_path = Path(gateway_db or NEWAPI_BILLING_DB_PATH)
     report = ReconcileReport(gateway_db=gateway_path, applied=apply, source=source)
@@ -524,6 +687,20 @@ def reconcile(
         targets = [Path(project_db)]
     else:
         targets = discover_project_dbs(state_dir)
+
+    if source == "local":
+        # 本地计价：只读项目用量 + 本地单价表，完全不触网（不登录任何上游）。
+        from novelvideo.production_prices import load as load_prices
+
+        book = load_prices()
+        for target in targets:
+            try:
+                report.projects.append(
+                    reconcile_local_project_db(target, apply=apply, book=book)
+                )
+            except Exception as exc:  # noqa: BLE001
+                report.errors.append(f"{target}: {exc}")
+        return report
 
     try:
         if source == "relay":
@@ -623,3 +800,24 @@ def reconcile_relay_first(
     )
     gateway_report.errors = [note, *relay_report.errors, *gateway_report.errors]
     return gateway_report
+
+
+def reconcile_local(
+    *,
+    state_dir: str | Path | None = None,
+    project_db: str | Path | None = None,
+    apply: bool = False,
+) -> ReconcileReport:
+    """本地按「用量 × 单价（实测优先）」计价，**不登录任何上游**。
+
+    日常口径（费用报表「重新结算」按钮 / 成片后结算钩子 / 伴点结算）都走这里：
+    不触网、不受上游 429/409 影响。单价来自本地 ``production-prices.json``，其中
+    ``actual_rules`` 由真账反推，因此合计与上游真账一致；未定价的行落 ``unmatched``。
+    """
+
+    return reconcile(
+        state_dir=state_dir,
+        project_db=project_db,
+        apply=apply,
+        source="local",
+    )

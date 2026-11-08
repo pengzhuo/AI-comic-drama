@@ -568,6 +568,7 @@ async def test_freezone_video_omni_gen_rejects_audio_total_duration(
             project="58",
             body=freezone_routes.FreezoneVideoOmniGenRequest(
                 prompt="雨夜街头，人物缓慢回头。",
+                model="newapi_seedance-2.0-fast",
                 references=references,
             ),
             user={"username": "admin"},
@@ -600,6 +601,7 @@ async def test_freezone_video_omni_gen_allows_audio_within_total_duration(
             project="58",
             body=freezone_routes.FreezoneVideoOmniGenRequest(
                 prompt="雨夜街头，人物缓慢回头。",
+                model="newapi_seedance-2.0-fast",
                 references=references,
             ),
             user={"username": "admin"},

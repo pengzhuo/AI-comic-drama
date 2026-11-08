@@ -1622,7 +1622,7 @@ class HuimengVideoGenerator(VideoGeneratorBase):
         return self.model in {"seedance-2.0", "seedance-2.0-fast", "seedance-1.5-pro"}
 
     def _is_seedance2_model(self) -> bool:
-        return self.model.startswith("seedance-2.0")
+        return self.model.startswith("seedance-2")
 
     def _is_happyhorse_model(self) -> bool:
         return self.model.strip().lower() == "happyhorse-1.0"
@@ -2864,7 +2864,7 @@ class NewApiVideoGenerator(VideoGeneratorBase):
         return int(bounds[0]), int(bounds[1])
 
     def _is_seedance2_model(self) -> bool:
-        return self.model.strip().startswith("seedance-2.0")
+        return self.model.strip().startswith("seedance-2")
 
     def _is_happyhorse_model(self) -> bool:
         return self.model.strip().lower() == "happyhorse-1.0"
@@ -5251,6 +5251,7 @@ NEWAPI_VIDEO_DISPLAY_LABELS = {
     "seedance-2.0-value": "Seedance2.0 Value",
     "seedance-2.0-fast-value": "Seedance2.0 Fast Value",
     "seedance-2.0-mini": "Seedance2.0 Mini",
+    "seedance-2.5": "Seedance2.5",
     "happyhorse-1.0": "HappyHorse 1.0",
     "grok-video-channel": "Grok Video Channel",
 }

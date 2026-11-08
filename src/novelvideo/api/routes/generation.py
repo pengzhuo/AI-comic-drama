@@ -203,6 +203,7 @@ SEEDANCE2_RESOLUTION_OPTIONS_BY_MODEL = {
     "seedance-2.0": ("480p", "720p", "1080p"),
     "seedance-2.0-value": ("720p", "1080p"),
     "seedance-2.0-fast-value": ("720p", "1080p"),
+    "seedance-2.5": ("480p", "720p", "1080p"),
     # Seedance 1.5 Pro（有声）清晰度，来源 huimengi /api/v1/models（480p/720p/1080p）
     "seedance-1.5-pro": ("480p", "720p", "1080p"),
 }

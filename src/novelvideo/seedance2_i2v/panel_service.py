@@ -31,6 +31,7 @@ from novelvideo.seedance2_i2v.character_voice_storage import (
 from novelvideo.seedance2_i2v.duration import (
     seedance2_duration_floor,
     resolve_seedance2_target_duration,
+    spoken_audio_seconds,
 )
 from novelvideo.seedance2_i2v.models import (
     SEEDANCE2_PROMPT_GUIDANCE_TEMPLATE_KEYS,
@@ -328,8 +329,21 @@ async def generate_seedance2_prompt_for_panel(
     ).strip()
     prompt_beat = _beat_with_seedance2_initial_prompt(beat, initial_prompt)
     output_language = language or detect_seedance2_prompt_language(prompt_beat)
+    # 提示词里的节拍时钟要和实际出片时长一致：取配音时长/内容预估，而不是只信
+    # 配置里可能仍是默认值的 duration。
+    from novelvideo.manual_shots import resolve_target_video_duration
+
+    beat_content_duration = resolve_target_video_duration(
+        beat,
+        spoken_audio_seconds(
+            project_dir=project_dir,
+            episode=episode,
+            beat=beat,
+        ),
+    )
     effective_duration = resolve_seedance2_target_duration(
         config_duration=config.duration,
+        requested=beat_content_duration,
     )
     inputs_hash = _seedance2_prompt_inputs_hash(
         config=config,

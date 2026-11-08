@@ -4567,6 +4567,9 @@
     "unattributedHint": "{{count}} yêu cầu chưa được điền chi phí từ hóa đơn thượng nguồn và chưa được tính vào tổng.",
     "costSource": {
       "relay": "Cơ sở quyết toán: số tiền lấy từ hóa đơn thực của trạm trung chuyển thượng nguồn.",
+      "relayPartial": "Cơ sở quyết toán: số tiền lấy từ hóa đơn thực của trạm trung chuyển thượng nguồn; {{count}} yêu cầu vẫn chưa được phân bổ và chưa tính vào tổng, sẽ tự động cập nhật sau khi đối soát.",
+      "local": "Cơ sở theo bảng giá: số tiền = mức dùng × đơn giá nội bộ (đơn giá suy ra từ hóa đơn thực thượng nguồn).",
+      "localPartial": "Cơ sở theo bảng giá: số tiền = mức dùng × đơn giá nội bộ (theo giá đo được); {{count}} yêu cầu vẫn chưa có đơn giá và chưa tính vào tổng, sẽ tự động cập nhật sau khi có giá.",
       "gateway": "Cơ sở ước tính: chưa lấy được hóa đơn thực từ trung chuyển, số tiền ước tính theo tỷ lệ mặc định của gateway nội bộ, cao hơn thực tế, chỉ để tham khảo.",
       "mixed": "Cơ sở hỗn hợp: một phần yêu cầu lấy từ hóa đơn thực của trung chuyển, phần còn lại vẫn là ước tính của gateway, tổng cao hơn thực tế."
     },

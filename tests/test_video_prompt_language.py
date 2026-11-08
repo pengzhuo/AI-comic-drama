@@ -73,8 +73,8 @@ def test_global_video_optimizer_applies_language_to_system_and_task(
 @pytest.mark.parametrize(
     ("language", "required", "expected_fallback"),
     [
-        ("en", "English", "The character acts at a natural, real-time pace"),
-        ("zh", "中文", "角色以真实速度自然动作"),
+        ("en", "English", "The character moves and emotes at a natural, real-time pace"),
+        ("zh", "中文", "角色以真实速度自然动作并带有可见表情"),
     ],
 )
 def test_video_prompt_builder_applies_language_to_task_and_fallback(
@@ -111,8 +111,8 @@ def test_video_prompt_builder_applies_language_to_task_and_fallback(
 @pytest.mark.parametrize(
     ("language", "required", "expected_fallback"),
     [
-        ("en", "English", "The character changes posture at a natural, real-time pace"),
-        ("zh", "中文", "角色以真实速度自然调整姿态"),
+        ("en", "English", "The character changes posture and expression at a natural, real-time pace"),
+        ("zh", "中文", "角色以真实速度自然调整姿态与表情"),
     ],
 )
 def test_keyframe_prompt_builder_applies_language_to_task_and_fallback(

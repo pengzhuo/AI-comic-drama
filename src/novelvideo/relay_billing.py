@@ -39,6 +39,9 @@ PAGE_SIZE = 100
 #: 分页保险丝，防止上游返回异常数据时死循环。
 MAX_PAGES = 5000
 
+#: 客户端 UA：便于在上游 ``GET /api/user/sessions`` 里认出本程序建立的会话。
+CLIENT_USER_AGENT = "novelvideo-relay/1.0"
+
 DEFAULT_RELAY_BASE_URLS = (
     "https://aicf.nanie168.com",
     "https://aigc.nanie168.com",
@@ -219,7 +222,11 @@ class RelayBillingClient:
             status, text = self._transport(
                 "POST",
                 url,
-                {"Content-Type": "application/json", "Accept": "application/json"},
+                {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": CLIENT_USER_AGENT,
+                },
                 {
                     "username": self.endpoint.username,
                     "password": self.endpoint.password,
@@ -235,6 +242,47 @@ class RelayBillingClient:
             self._token = token
             return token
 
+    def logout(self, *, best_effort: bool = True) -> bool:
+        """吊销当前会话（``POST /api/user/auth/logout``）。
+
+        上游对同一账号有并发会话上限，登录后不退出会把额度占满（后续登录收到
+        ``HTTP 409 AUTH_SESSION_LIMIT``）。账单只在查询时短暂登录，查完必须调用
+        本方法释放；退出后 ``self._token`` 失效。``best_effort=True`` 时不抛异常
+        （退出失败不该影响对账结果，但会记 warning）。
+        """
+
+        with self._token_lock:
+            token = self._token
+            self._token = ""
+        if not token:
+            return False
+        url = self.endpoint.base_url + "/api/user/auth/logout"
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            # 上游对退出接口做 Origin 校验：缺 Origin 会返回 AUTH_ORIGIN_FORBIDDEN。
+            "Origin": self.endpoint.base_url,
+            "User-Agent": CLIENT_USER_AGENT,
+        }
+        try:
+            status, text = self._transport("POST", url, headers, None)
+            payload = _load_json(text)
+        except Exception as exc:  # noqa: BLE001 - 退出失败不阻塞调用方
+            if not best_effort:
+                raise
+            logger.warning("%s: 退出会话异常 %s", self.endpoint.label, exc)
+            return False
+        ok = status == 200 and not (
+            isinstance(payload, dict) and payload.get("success") is False
+        )
+        if not ok:
+            message = f"{self.endpoint.label}: logout HTTP {status} {str(text)[:160]}"
+            if best_effort:
+                logger.warning("%s", message)
+                return False
+            raise RelayBillingError(message)
+        return True
+
     def _call(
         self,
         method: str,
@@ -248,7 +296,7 @@ class RelayBillingClient:
         if params:
             url = f"{url}?{urlencode(params)}"
         for attempt in (0, 1):
-            headers = {"Accept": "application/json"}
+            headers = {"Accept": "application/json", "User-Agent": CLIENT_USER_AGENT}
             if auth:
                 headers["Authorization"] = f"Bearer {self.login()}"
             if body is not None:
@@ -293,7 +341,12 @@ class RelayBillingClient:
         """
 
         url = self.endpoint.base_url + "/api/pricing"
-        status, text = self._transport("GET", url, {"Accept": "application/json"}, None)
+        status, text = self._transport(
+            "GET",
+            url,
+            {"Accept": "application/json", "User-Agent": CLIENT_USER_AGENT},
+            None,
+        )
         payload = _load_json(text)
         if status != 200 or not isinstance(payload, dict):
             raise RelayBillingError(
@@ -558,29 +611,34 @@ def collect_quotas(
             continue
         client = RelayBillingClient(endpoint, transport=transport)
         try:
-            snapshot.statuses.append(client.status())
-        except RelayBillingError as exc:
-            snapshot.errors.append(str(exc))
-        try:
-            snapshot.tasks.update(client.task_quotas())
-        except RelayBillingError as exc:
-            snapshot.errors.append(str(exc))
-        if needed_logs:
-            missing = needed_logs.difference(snapshot.logs)
-            if missing:
-                try:
-                    snapshot.logs.update(
-                        client.log_quotas_for(
-                            missing,
-                            cache=cache,
-                            workers=workers,
-                            progress=progress,
+            try:
+                snapshot.statuses.append(client.status())
+            except RelayBillingError as exc:
+                snapshot.errors.append(str(exc))
+            try:
+                snapshot.tasks.update(client.task_quotas())
+            except RelayBillingError as exc:
+                snapshot.errors.append(str(exc))
+            if needed_logs:
+                missing = needed_logs.difference(snapshot.logs)
+                if missing:
+                    try:
+                        snapshot.logs.update(
+                            client.log_quotas_for(
+                                missing,
+                                cache=cache,
+                                workers=workers,
+                                progress=progress,
+                            )
                         )
-                    )
-                except RelayBillingError as exc:
-                    snapshot.errors.append(str(exc))
-        if cache is not None:
-            cache.tasks.update(snapshot.tasks)
-            cache.logs.update(snapshot.logs)
-            cache.save()
+                    except RelayBillingError as exc:
+                        snapshot.errors.append(str(exc))
+            if cache is not None:
+                cache.tasks.update(snapshot.tasks)
+                cache.logs.update(snapshot.logs)
+                cache.save()
+        finally:
+            # 账单查询一结束就退出会话：本模块只在查询时短暂登录，若不退出会占满
+            # 上游并发会话额度，导致后续登录收到 HTTP 409 AUTH_SESSION_LIMIT。
+            client.logout()
     return snapshot

@@ -182,6 +182,7 @@ const HAPPYHORSE_RATIO_OPTIONS = ["16:9", "9:16", "1:1", "4:3", "3:4"] as const;
 const GROK_VIDEO_RESOLUTION_OPTIONS = ["720p", "480p"] as const;
 const GROK_VIDEO_RATIO_OPTIONS = ["16:9", "9:16", "1:1", "2:3", "3:2"] as const;
 const SEEDANCE2_RESOLUTION_OPTIONS_BY_MODEL = {
+  "seedance-2.5": ["480p", "720p", "1080p"],
   "seedance-2.0-fast": ["480p", "720p"],
   "seedance-2.0": ["480p", "720p", "1080p"],
   "seedance-2.0-value": ["720p", "1080p"],

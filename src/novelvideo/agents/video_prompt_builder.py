@@ -25,6 +25,8 @@ VIDEO_PROMPT_BUILDER_INSTRUCTIONS_EN = """# I2V Motion Director (SuperPower)
 You only describe **temporal changes**: character and object motion, plus camera movement.
 The first frame is video time `t=0`; the model cannot go backward to show actions that happened before this frame.
 
+Write the clip as **live-action footage of a real performer** — natural motion and rich facial performance, never a stiff puppet and never an animated clip.
+
 ## Field Contract
 - `visual_description` describes the beat painting. Use it as the visual anchor for first frame composition and as a strong hint for the action that should follow.
 
@@ -36,7 +38,21 @@ The first frame is video time `t=0`; the model cannot go backward to show action
 ✓ Start motion from the first-frame state and continue forward only
 ✓ Use simple, direct verbs
 ✓ When image is provided: use the image for composition/layout; the sketch's body language may be inaccurate, prefer the `visual_description` text for action direction
-✓ Dialogue beats: speaking is the primary motion — describe lips moving, gestures while talking. Dialogue text is appended by the system; only describe physical action.
+✓ Dialogue beats: speaking is the primary motion — lips moving PLUS visible expression, gesture, and gaze. Dialogue text is appended by the system; only describe physical action.
+
+## Performance First
+- Every on-screen character must perform. Name concrete VISIBLE micro-expressions: gaze focus and eye movement, a blink, brow lift/furrow, cheek/nose/jaw movement, lip articulation, a swallow, a breath, a weight shift, shoulder/torso rotation, hand/finger action, a head turn, a reaction beat.
+- ⚠️ NEVER leave a blank, neutral, frozen face — a moving mouth on a still face is a failure.
+- Motion is continuous and physical: anticipation → action → follow-through → settle. No robotic, mechanical, or pose-held movement.
+
+## Camera — keep the frame alive
+- A locked-off camera is allowed when the beat truly needs stillness, but default to a camera that **breathes**: a subtle handheld micro-drift, or a normal-speed motivated push/pan/follow. Do not fall back to motionless, card-like shots by habit.
+- When the camera moves, move at normal real-time pace and describe the endpoint.
+- ❌ BANNED slow-motion / drowsy pacing (camera, action, speech): "slowly", "slow", "gently drift", "缓缓", "缓慢", "极慢", "慢推", "慢慢地".
+
+## Look — photoreal live-action (no cartoon)
+- State the look is photorealistic live-action film with real skin texture (pores, subtle imperfections, restrained filmic grade).
+- ❌ BANNED look: animated / cartoon / illustration / 3D-render / plastic or wax skin / beauty-smoothing / face morphing.
 
 ## BANNED
 ❌ Character names (narrator, father, mother, etc.) → use visual features: "the woman in black", "the older man"
@@ -44,17 +60,10 @@ The first frame is video time `t=0`; the model cannot go backward to show action
 ❌ Describing how the subject arrived at the first frame
 ❌ Starting with an action that contradicts the first-frame posture or object state
 ❌ Inventing environmental dynamics (dust, fog, particles, wind-blown leaves) not visible in the frame
-❌ Abstract emotion labels (sad, haunting, desperate, hopeful, anxious, melancholy) → show via body language (clenched fists, averted gaze, hunched shoulders)
+❌ Abstract emotion labels (sad, haunting, desperate, hopeful, anxious, melancholy) → show via the concrete facial/body cues above
 ❌ Non-visual senses (smell, temperature, humidity, taste, tactile) — the model generates only what is visible (and audible)
-❌ Slow-motion camera wording (slowly, slow, gently drift, 缓缓, 缓慢, 极慢) — the camera is static by default and, when it moves, moves at a normal brisk speed
 ❌ Static primary verbs (freezes, stares, stands, waits, remains, holds still) as the main action — these produce frozen video
-❌ Reversing or oscillating motion (steps forward then back, leans in then pulls away, nods then shakes head)
-
-## Camera
-- Camera is static / locked-off by default; add movement only with a clear motive, and then at normal, brisk speed
-- Never use slow-motion camera wording (slowly, slow, gently, 缓缓, 缓慢, 极慢)
-- If the camera moves, describe the endpoint; if it is static, describe the composition
-- Match detail to shot scale: close-up → micro details; wide shot → broad arcs
+❌ Robotic or pose-held motion; pointless back-and-forth oscillation
 
 ## Audio Layer (superset — works on audio-capable models, silently ignored by others)
 - Add ONE short ambient sound sentence (e.g. "rain patters softly on the glass")
@@ -63,8 +72,7 @@ The first frame is video time `t=0`; the model cannot go backward to show action
 ## Sustained Motion
 Keep motion at natural real-time speed. NEVER slow a movement down, freeze, or stretch a single short action to fill the clip — that reads as slow motion. BANNED slow wording: "slowly", "slow", "gently", "缓缓", "缓慢", "极慢", "轻轻地".
 When the clip is longer than one shot, split it into **2–4 shots of roughly 3–8 seconds each**, joined by explicit `HARD CUT`s, and cover a long line with cutaways (listener reaction, hands/props, environment) instead of one static take.
-Layer simultaneous details (fabric swaying, breathing, a prop settling) at real-time speed to keep life in the frame; a static camera is fine.
-⚠️ **UNIDIRECTIONAL motion only**: every action must move in ONE direction — forward, never back. A short action is extended with a `HARD CUT` to the next shot (or follow-through in the SAME direction), never by slowing it down.
+Layer simultaneous details (fabric swaying, breathing, a prop settling) at real-time speed to keep life in the frame.
 
 ## Continuity Check
 Before writing, verify the first verb of motion can naturally start from the visible first frame.
@@ -323,7 +331,7 @@ class VideoPromptBuilder:
 
         dialogue_hint = ""
         if audio_type == "dialogue" and dialogue_line:
-            dialogue_hint = '\n⚠️ This Beat is DIALOGUE — speaking is the primary motion. Describe lips moving, gestures while talking. Dialogue text is appended by the system; only describe physical action.\n'
+            dialogue_hint = '\n⚠️ This Beat is DIALOGUE — speaking is the primary motion. Describe lips moving PLUS a visible expression, a gesture, and a locked gaze. Dialogue text is appended by the system; only describe physical action.\n'
 
         if has_image and color_map_text:
             return f"""Generate I2V motion prompt in {output_label} (target: {word_target}, {sentence_target}):
@@ -345,6 +353,9 @@ class VideoPromptBuilder:
 4. Target: {word_target}
 5. If the textual visual_description implies an action moment the first frame has not yet reached, start from the next compatible action.
 6. NO character names → use appearance descriptions from the color mapping
+7. Give every character a visible performance (gaze, blink, brow/cheek/jaw, gesture, breath) at natural speed — no blank or frozen faces, no robotic or pose-held motion
+8. Keep the frame alive: prefer a living camera (subtle micro-drift or a normal-speed motivated move); a locked-off shot only when the beat truly needs stillness
+9. State the look is photorealistic live-action with real skin texture — no cartoon / animated / 3D-render / plastic wording
 
 ## Output Language
 {language_instruction}
@@ -367,6 +378,9 @@ Output the motion prompt in {output_label} directly.
 4. Target: {word_target}
 5. If the textual visual_description implies an action moment the first frame has not yet reached, start from the next compatible action.
 6. NO character names → use visual descriptions ("the woman in gray"); distinguish multiple characters by visual features
+7. Give every character a visible performance (gaze, blink, brow/cheek/jaw, gesture, breath) at natural speed — no blank or frozen faces, no robotic or pose-held motion
+8. Keep the frame alive: prefer a living camera (subtle micro-drift or a normal-speed motivated move); a locked-off shot only when the beat truly needs stillness
+9. State the look is photorealistic live-action with real skin texture — no cartoon / animated / 3D-render / plastic wording
 
 ## Output Language
 {language_instruction}
@@ -389,6 +403,9 @@ Output the motion prompt in {output_label} directly.
 5. Target: {word_target}
 6. If the textual visual_description implies an action moment the first frame has not yet reached, start from the next compatible action.
 7. NO character names → use visual descriptions ("the woman in black"); distinguish multiple characters by visual features
+8. Give every character a visible performance (gaze, blink, brow/cheek/jaw, gesture, breath) at natural speed — no blank or frozen faces, no robotic or pose-held motion
+9. Keep the frame alive: prefer a living camera (subtle micro-drift or a normal-speed motivated move); a locked-off shot only when the beat truly needs stillness
+10. State the look is photorealistic live-action with real skin texture — no cartoon / animated / 3D-render / plastic wording
 
 ## Output Language
 {language_instruction}
@@ -403,8 +420,8 @@ Output the motion prompt in {output_label} directly. No explanation.
     ) -> str:
         """回退方案：根据规则生成默认运动提示词。"""
         if language == "en":
-            return "The character acts at a natural, real-time pace with a static camera."
-        return "角色以真实速度自然动作，镜头保持固定"
+            return "The character moves and emotes at a natural, real-time pace with a living camera."
+        return "角色以真实速度自然动作并带有可见表情，镜头自然呼吸。"
 
 
 # 模块级单例

@@ -470,6 +470,7 @@ async def _run_single_video_async(
         from novelvideo.seedance2_i2v.pipeline import (
             prepare_seedance2_generation_inputs,
         )
+        from novelvideo.video_duration import video_duration_bounds_for_backend
 
         prepared = await prepare_seedance2_generation_inputs(
             project_output=output_dir,
@@ -487,6 +488,7 @@ async def _run_single_video_async(
             ),
             ratio=str(config["ratio"]) if config.get("ratio") is not None else None,
             prop_menu=config.get("prop_menu"),
+            max_duration=video_duration_bounds_for_backend(backend_str)[1],
         )
         prompt = prepared.prompt
         video_duration = prepared.duration

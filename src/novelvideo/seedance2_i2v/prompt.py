@@ -61,8 +61,8 @@ SEEDANCE2_PROMPT_GUIDANCE_TEMPLATES: dict[str, dict[AssetLanguage, str]] = {
         "en": "Lighting: Describe the key light, tonal layers, color temperature, and atmosphere while avoiding unintended flicker.",
     },
     "camera": {
-        "zh": "镜头：说明景别与视角；默认固定镜头，只有存在明确动机时才运动，且运动干脆明快，禁止缓慢/缓缓等慢速运镜。",
-        "en": "Camera: Specify shot size and viewpoint; default to a static/locked-off camera and move only with a clear motive, then briskly — never slow-drift wording.",
+        "zh": "镜头：说明景别与视角；保持画面鲜活——只有需要静止时才用固定机位，否则让镜头自然呼吸或做有动机的正常速度运动，禁止缓慢/缓缓等慢速运镜。",
+        "en": "Camera: Specify shot size and viewpoint; keep the frame alive — a locked-off shot only when stillness is needed, otherwise let the camera breathe or move with motive at normal pace; never slow-drift wording.",
     },
     "style": {
         "zh": "风格：限定画面质感、时代感、色彩倾向和真实度，避免风格漂移。",
@@ -81,8 +81,11 @@ Asset order is fixed. Only use existing reference tokens such as 图片1 and 音
 Never add or reorder image/audio reference numbers, and do not output @ symbols.
 Do not force every asset into the prompt; reference only assets that materially help the current shot.
 Duration, resolution, aspect ratio, and human-review controls are API parameters and must not appear in the prompt.
-Camera: default to a static / locked-off camera. Add a camera move only when the shot has a clear motive, and then at a normal, brisk speed. Never write slow-motion camera wording (缓慢、缓缓、极慢、slow, slowly, gently drift).
-Action and speech run at natural real-time speed: never stretch, drag, or slow them down. Spoken lines must sound like a real person at a normal pace — never write 不紧不慢、平稳、缓慢 for delivery.
+Write the clip as photorealistic live-action footage of a real performer: real skin texture (pores, subtle imperfections), a restrained cinematic film grade with natural contrast and subtle grain. Never write words that pull the render toward animation, cartoon, illustration, 3D-render, plastic or wax skin, over-bright glossy beauty-smoothing, or over-clean retouching.
+Lighting and artifacts: keep the first frame's lighting, colour temperature and light direction unchanged. Never invent new light sources, coloured glows or light patches on skin or props, lens flares, projected rectangles, floating graphics, sparkles, or on-screen UI/boxes; never add fog, smoke, dust, embers or particles that are not in the first frame.
+Performance: every on-screen character must show concrete visible micro-expressions (gaze focus and eye movement, blink, brow/cheek/jaw, lip articulation, breath, weight shift, gesture). Never leave a blank, neutral, frozen face. Motion is continuous and physical with anticipation and follow-through — never robotic, mechanical, or pose-held.
+Camera: keep the frame alive. A locked-off shot is allowed when the beat needs stillness; otherwise let the camera breathe or move with motive at a normal pace and describe the endpoint. Never write slow-motion / drowsy camera wording (缓慢、缓缓、极慢、慢推、slow, slowly, gently drift).
+Action and speech run at natural real-time speed: never stretch, drag, freeze, or slow them down, and never hold a pose. Spoken lines must sound like a real person at a normal pace — never write 不紧不慢、平稳、缓慢 for delivery.
 Output the final prompt directly without explaining the generation process."""
 
 
@@ -886,17 +889,21 @@ def build_seedance2_prompt_composer_task(
     payload_mode = Seedance2I2VMode(mode).value
     if payload_mode == Seedance2I2VMode.FIRST_FRAME.value:
         mode_rule_zh = (
-            "- 本次是严格首帧模式：prompt 必须写明视频第 0 帧与首帧完全一致"
-            "（景别、取景、人物占比、服装、发型、妆容、道具、场景与光线不变），"
-            "并写明禁止推近、禁止裁掉首帧已可见的身体部位与地标、禁止换装/换色/换妆容/换脸，"
+            "- 本次是严格首帧模式：第 0 帧必须与首帧完全一致"
+            "（景别、取景、人物占比、服装、发型、妆容、道具、场景与光线不变）；"
+            "第 0 帧之后允许一次不裁掉首帧已见人物或地标的、有动机的轻微运镜"
+            "（轻微手持呼吸或小幅横移/环绕），但禁止大幅推近、"
+            "禁止裁掉首帧已可见的身体部位与地标、禁止换装/换色/换妆容/换脸，"
             "姿态与画面支撑面必须真实接触；只能引用图片1，不得引用图片2及以后编号。\n"
         )
         mode_rule_en = (
-            "- This run is strict first frame: state that frame 0 matches the first "
-            "frame exactly (framing, subject scale, wardrobe, hairstyle, makeup, props, "
-            "scene, lighting unchanged), forbid push-in, cropping already-visible body "
-            "parts or landmarks, costume/colour/makeup/face changes, and require poses in "
-            "real contact with their supporting surface; reference 图片1 only.\n"
+            "- This run is strict first frame: frame 0 must match the first frame "
+            "exactly (framing, subject scale, wardrobe, hairstyle, makeup, props, scene, "
+            "lighting unchanged); after frame 0 one motivated, gentle camera move is "
+            "allowed (a subtle handheld breath or a small lateral/orbit move) but never a "
+            "large push-in, never cropping already-visible body parts or landmarks, never "
+            "costume/colour/makeup/face changes, and poses must stay in real contact with "
+            "their supporting surface; reference 图片1 only.\n"
         )
     else:
         mode_rule_zh = ""
@@ -964,8 +971,11 @@ def build_seedance2_prompt_composer_task(
             "- Do not describe the request JSON or output @.\n"
             "- Keep resolution, ratio, generate_audio, return_last_frame, and human_review out of the prompt.\n"
             "- Express length only through the beat clock (for example 0:00–0:05), never as a duration parameter.\n"
-            "- Default to a static / locked-off camera; add a move only with a clear motive and keep it brisk — no slow-motion camera wording (slow, slowly, gently drift, 缓慢, 缓缓).\n"
-            "- Action and speech run at natural real-time speed: never drag or slow them; deliver spoken lines like a real person at a normal pace (never unhurried / evenly / 不紧不慢 / 平稳).\n"
+            "- Keep the frame alive: a locked-off shot only when the beat needs stillness; otherwise let the camera breathe or move with motive at normal pace — no slow-motion camera wording (slow, slowly, gently drift, 缓慢, 缓缓).\n"
+            "- Give every character a visible performance (gaze, blink, brow/cheek/jaw, gesture, breath) — never a blank or frozen face, never robotic or pose-held motion.\n"
+            "- State the look is photorealistic live-action with real skin texture and a restrained cinematic film grade; never use cartoon / animated / illustration / 3D-render / plastic-wax / over-bright glossy beauty-retouch wording.\n"
+            "- Lighting and artifacts: keep the first frame's lighting, colour temperature and direction unchanged; never invent new light sources, coloured glows or light patches on skin/props, flares, projected rectangles, floating graphics, UI/boxes, sparkles, or fog/smoke/dust that are not in the first frame.\n"
+            "- Action and speech run at natural real-time speed: never drag, freeze, or slow them; deliver spoken lines like a real person at a normal pace (never unhurried / evenly / 不紧不慢 / 平稳).\n"
             f"{mode_rule_en}"
             f"- {language_rule}\n"
             f"{clock_rule_en}"
@@ -986,8 +996,11 @@ def build_seedance2_prompt_composer_task(
         "- 时长只体现为节拍时钟（例如 0:00–0:05），不要把 duration 写成参数；"
         "resolution、ratio、generate_audio、return_last_frame、human_review "
         "只作为 API 请求参数，不要写进 prompt。\n"
-        "- 镜头默认固定：只有存在明确动机时才写运镜，而且要干脆明快；禁止“缓慢/缓缓/极慢/慢推”等慢速运镜，也禁止无动机的漂移。\n"
-        "- 动作与语速按真实速度写：不得放慢、拉长、拖沓；台词要像真人以正常语速说出，禁止“不紧不慢/平稳/缓慢/拖音”等投递描述。\n"
+        "- 保持画面鲜活：只有需要静止时才写固定机位，否则让镜头自然呼吸或做有动机的正常速度运动；禁止“缓慢/缓缓/极慢/慢推”等慢速运镜，也禁止无动机的漂移。\n"
+        "- 每个人物都要有可见表演（眼神、眨眼、眉/颧/下颌、手势、呼吸），禁止中性静止脸、禁止机械僵硬的摆拍。\n"
+        "- 写明是写实真人实拍、真实皮肤质感与克制的电影胶片调色；禁止出现卡通/动画/插画/3D 渲染/塑料磨皮/过亮过干净的美颜感等字样。\n"
+        "- 光线与伪影：沿用首帧的光线、色温与光向不变；禁止发明新光源、皮肤或道具上的彩色光斑/反光、光晕、投映矩形、漂浮图形、屏幕 UI/方框、火花粒子，也禁止新增首帧没有的雾/烟/尘。\n"
+        "- 动作与语速按真实速度写：不得放慢、拉长、拖沓或定格；台词要像真人以正常语速说出，禁止“不紧不慢/平稳/缓慢/拖音”等投递描述。\n"
         "- 如果用户写作要求和资产清单、道具 fallback 冲突，以资产清单和 fallback 为准。\n"
         "- dialogue 或 narration_segment 属于对白时，请根据语义区分动作说明和实际说出的台词；"
         "动作可自然改写，但实际台词必须逐字完整保留，不能删减或概括。\n"

@@ -18,7 +18,7 @@ from novelvideo.utils.source_language import asset_language_instruction
 # 首尾帧过渡提示词生成器指令（英文版 SuperPower）
 KEYFRAME_PROMPT_BUILDER_INSTRUCTIONS_EN = """# Cinematic Transition Director (SuperPower)
 
-You craft 5-second transitions between two keyframes. The AI video model interpolates between them; your prompt guides the cinematic journey.
+You craft 5-second transitions between two keyframes. The AI video model interpolates between them; your prompt guides the cinematic journey as **live-action footage of a real performer** — natural motion and rich facial performance, never a stiff puppet or an animated clip.
 
 ## Input
 - Image 1: first frame (starting point)
@@ -33,32 +33,37 @@ You craft 5-second transitions between two keyframes. The AI video model interpo
 ✓ 4–6 sentences, with length appropriate for the requested language
 ✓ Describe the *journey* between frames, not just start/end
 ✓ Use visible elements from both frames as anchors
+✓ Give every character a visible performance: gaze, blink, brow/cheek/jaw, gesture, breath — no blank or frozen faces
 
-## Camera
-- Camera is static / locked-off by default; add movement only with a clear motive, then at normal, brisk speed
-- **BANNED slow-motion camera wording**: slowly, slow, gently drift, 缓缓, 缓慢, 极慢
+## Camera — keep the frame alive
+- A locked-off camera is allowed when the beat truly needs stillness; otherwise let the camera breathe or move with motive at normal pace
+- **BANNED slow-motion / drowsy pacing** (camera, action, speech): slowly, slow, gently drift, 缓缓, 缓慢, 极慢, 慢慢地
 - If the camera moves, describe the endpoint; if it is static, describe the composition
+
+## Look — photoreal live-action (no cartoon)
+- State the look is photorealistic live-action film with real skin texture (pores, subtle imperfections, restrained filmic grade)
+- BANNED look: animated / cartoon / illustration / 3D-render / plastic or wax skin / beauty-smoothing / face morphing
 
 ## BANNED
 ❌ Character names → use visual features ("the woman in black", "the older man")
-❌ Abstract emotion labels (sad, haunting, desperate, hopeful, anxious, melancholy) → show via body language
+❌ Abstract emotion labels (sad, haunting, desperate, hopeful, anxious, melancholy) → show via concrete facial/body cues
 ❌ Non-visual senses (smell, temperature, humidity, taste, tactile)
 ❌ Static primary verbs (freezes, stares, stands, waits, remains, holds still) as main action
-❌ Reversing or oscillating motion (steps forward then back, leans in then pulls away, nods then shakes head)
 ❌ Inventing elements absent from both frames
 ❌ Multiple conflicting camera movements simultaneously
+❌ Robotic or pose-held motion; pointless back-and-forth oscillation
 
 ## Audio Layer (superset — works on audio-capable models, ignored by others)
 - Add ONE short ambient sound sentence
-- For dialogue beats, also specify voice style (calm, urgent, whisper, etc.)
+- For dialogue beats, also specify voice style AND a natural, brisk pace
 
 ## Detail ↔ Shot Scale
-- Close-up → micro details (pores, thread count, iris dilation)
+- Close-up → micro expression / skin texture
 - Wide shot → broad motion arcs and spatial relationships
 
 ## Sustained Motion
 The clip is ~5 seconds. Describe a **chain of 2–3 connected actions** that bridge first frame to last frame continuously, at natural real-time speed — never slow down or stretch an action to fill the clip, and never write "缓缓/缓慢/slowly".
-⚠️ **UNIDIRECTIONAL motion only**: every action must move in ONE direction — forward, never back. If the primary action is short, extend it with follow-through motion in the SAME direction.
+Motion is physical, with anticipation and follow-through; never robotic, mechanical, or pose-held.
 
 ## Output
 Output ONLY the transition prompt in the requested language.
@@ -195,7 +200,7 @@ class KeyframePromptBuilder:
         # 构建 dialogue 提示
         dialogue_hint = ""
         if audio_type == "dialogue" and dialogue_line:
-            dialogue_hint = "\n⚠️ This Beat is DIALOGUE — speaking is the primary motion. Describe lips moving, gestures while talking. Dialogue text is appended by the system; only describe physical action.\n"
+            dialogue_hint = "\n⚠️ This Beat is DIALOGUE — speaking is the primary motion. Describe lips moving PLUS a visible expression, a gesture, and a locked gaze. Dialogue text is appended by the system; only describe physical action.\n"
 
         # 构建任务提示
         if language == "en":
@@ -230,8 +235,10 @@ class KeyframePromptBuilder:
             task += f"""{dialogue_hint}
 ## Rules
 - Identify characters by color marks, NEVER use character names
-- Camera must have displacement/zoom, describe camera endpoint
-- NO emotion labels → use body language
+- Keep the frame alive: allow a breathing camera or a motivated move at normal speed; if the camera moves, describe the endpoint
+- Give every character a visible performance (gaze, blink, brow/jaw, gesture, breath) — no blank or frozen faces, no robotic motion
+- State the look is photorealistic live-action with real skin texture — no cartoon / animated / 3D / plastic wording
+- NO emotion labels → use concrete facial/body cues
 - Include ambient audio layer
 - {length_target}
 
@@ -254,9 +261,11 @@ Output the transition prompt in {output_label} directly."""
             task += f"""{dialogue_hint}
 ## Rules
 - Describe visible element transitions from the frames
-- Camera must have displacement/zoom, describe camera endpoint
+- Keep the frame alive: allow a breathing camera or a motivated move at normal speed; if the camera moves, describe the endpoint
+- Give every character a visible performance (gaze, blink, brow/jaw, gesture, breath) — no blank or frozen faces, no robotic motion
+- State the look is photorealistic live-action with real skin texture — no cartoon / animated / 3D / plastic wording
 - NO character names → use visual features
-- NO emotion labels → use body language
+- NO emotion labels → use concrete facial/body cues
 - Include ambient audio layer
 - {length_target}
 
@@ -315,10 +324,10 @@ Output the transition prompt in {output_label} directly."""
         """回退方案：生成默认过渡提示词。"""
         if language == "en":
             return (
-                "The character changes posture at a natural, real-time pace "
-                "while the camera stays fixed."
+                "The character changes posture and expression at a natural, real-time pace "
+                "while the camera breathes."
             )
-        return "角色以真实速度自然调整姿态，镜头保持固定，场景自然过渡。"
+        return "角色以真实速度自然调整姿态与表情，镜头自然呼吸，场景自然过渡。"
 
 
 # 模块级单例

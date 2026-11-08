@@ -2684,20 +2684,20 @@ class DirectorAutoCoordinator:
         return episodes[0] if episodes else None
 
     async def _reconcile_episode_cost(self, run: DirectorAutoRun) -> None:
-        """一集成片落盘后结算费用（best-effort，relay 优先、gateway 兜底）。
+        """一集成片落盘后结算费用（best-effort，本地按用量 × 单价计算）。
 
-        用中转站真实账单口径回填 ``cost_quota``，只有中转站账号缺失 / 一条都对
-        不上时才回退本地捏驿账单库（会把原因写进 ``report.errors``）。只读账单、
-        只写本项目 ``data.db``；失败绝不影响成片流程——费用报表仍可读，只是这一集
-        的 ``cost_quota`` 还空着，前端会显示「结算中 / 未归因」。
+        用本地单价表（``actual_rules`` 由真账反推，实测优先）回填 ``cost_quota``，
+        **不登录上游**，因此不受中转站 429/409 影响。只写本项目 ``data.db``；失败
+        绝不影响成片流程——费用报表仍可读，只是这一集的 ``cost_quota`` 还空着，
+        前端会显示「结算中 / 未归因」。
         """
         try:
-            from novelvideo.gateway_cost_reconcile import reconcile_relay_first
+            from novelvideo.gateway_cost_reconcile import reconcile_local
 
             project_db = Path(run.context.state_dir) / "data.db"
             report = await asyncio.wait_for(
                 asyncio.to_thread(
-                    reconcile_relay_first, project_db=project_db, apply=True
+                    reconcile_local, project_db=project_db, apply=True
                 ),
                 timeout=EPISODE_COST_RECONCILE_TIMEOUT_SECONDS,
             )

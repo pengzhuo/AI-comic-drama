@@ -401,7 +401,7 @@ def test_video_model_options_and_resolution_work() -> None:
     labels = {item["label"] for item in options}
     api_models = {item["apiModel"] for item in options}
 
-    assert names[0] == "newapi_seedance-2.0-fast"
+    assert names[0] == "newapi_seedance-2.5"
     assert {
         "newapi_seedance-2.0-fast",
         "newapi_seedance-1.0-pro-fast",
@@ -517,7 +517,7 @@ def test_resolve_freezone_video_backend_accepts_id_and_label() -> None:
     assert resolve_freezone_video_backend("huimeng_seedance20_fast") == "newapi_seedance-2.0-fast"
     assert resolve_freezone_video_backend("seedance_fast") == "newapi_seedance-1.0-pro-fast"
     assert resolve_freezone_video_backend("Seedance 1.5 有声") == "newapi_seedance-1.5-pro"
-    assert resolve_freezone_video_backend(None) == "newapi_seedance-2.0-fast"
+    assert resolve_freezone_video_backend(None) == "newapi_seedance-2.5"
 
 
 def test_seedance2_backend_detection_accepts_newapi_and_legacy_values() -> None:

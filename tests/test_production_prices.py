@@ -159,6 +159,40 @@ def test_unpriced_is_not_silently_zero():
     assert priced.source == "unpriced"
 
 
+def test_prefer_measured_puts_actual_rules_first():
+    """结算口径：``prefer_measured=True`` 时实测反推价盖过手工报价（报价兜底）。"""
+    book = PriceBook(
+        raw={
+            "rules": [
+                {
+                    "match": {"kind": "video", "model": "seedance-2.0-fast"},
+                    "unit": "second",
+                    "price": 1.0,
+                }
+            ],
+            "actual_rules": [
+                {
+                    "kind": "video",
+                    "model": "seedance-2.0-fast",
+                    "unit": "second",
+                    "price": 0.4,
+                }
+            ],
+        }
+    )
+    action = ActionRequest(
+        kind="video", model="seedance-2.0-fast", metrics={"duration_seconds": 5}
+    )
+
+    quoted = book.price(action)
+    assert quoted.source == "manual"
+    assert quoted.cny == pytest.approx(5.0)
+
+    settled = book.price(action, prefer_measured=True)
+    assert settled.source == "actual"
+    assert settled.cny == pytest.approx(2.0)
+
+
 def test_rule_without_metrics_is_unpriced():
     book = _book({"id": "v", "match": {"kind": "video"}, "unit": "second", "price": 0.5})
     priced = book.price(ActionRequest(kind="video"))

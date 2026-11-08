@@ -4681,6 +4681,9 @@
     "unattributedHint": "{{count}} request(s) have no cost filled in from the upstream bill yet and are excluded from the totals.",
     "costSource": {
       "relay": "Settled basis: amounts come from the upstream relay's real bill.",
+      "relayPartial": "Settled basis: amounts come from the upstream relay's real bill; {{count}} request(s) are still unattributed and excluded from the totals, and will update automatically once reconciled.",
+      "local": "Price-book basis: amount = usage × local unit price (unit prices are derived from the upstream real bill).",
+      "localPartial": "Price-book basis: amount = usage × local unit price (measured rates); {{count}} request(s) are still unpriced and excluded from the totals, and will update automatically once priced.",
       "gateway": "Estimated basis: no upstream real bill was available, so amounts are estimated at the local gateway's default ratio and run high — for reference only.",
       "mixed": "Mixed basis: some requests come from the relay's real bill while others are still gateway estimates, so the total runs high."
     },

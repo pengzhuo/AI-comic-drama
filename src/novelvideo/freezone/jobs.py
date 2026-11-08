@@ -1682,7 +1682,7 @@ async def run_freezone_video_gen(
     generate_audio: bool = False,
     human_review: bool = False,
     scene_optimize: str | None = None,
-    backend: str = "huimeng_seedance-2.0-fast",
+    backend: str = "newapi_seedance-2.5",
     last_frame_path: Optional[str] = None,
     audio_setting: Optional[str] = None,
     gen_mode: Optional[str] = None,

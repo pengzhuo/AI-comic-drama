@@ -24,10 +24,11 @@ DEFAULT_EPISODE_TARGET_SECONDS = 60.0
 DEFAULT_EPISODE_MERGE_FLOOR_SECONDS = 45.0
 # 单集（或单个自然单元）超过该值视为“超过太多”，按自然子边界拆分。
 DEFAULT_EPISODE_SPLIT_THRESHOLD_SECONDS = 90.0
-# 单个镜头的目标上限，决定“最少镜头数”：取视频模型允许的最长时长（12-15s）。
-DEFAULT_SHOT_TARGET_SECONDS = 15.0
+# 单个镜头的目标上限，决定“最少镜头数”：取视频模型允许的最长时长
+# （Seedance2.5 = 30s；2.0 系列仍由各自的时长边界在生成器处回落到 15s）。
+DEFAULT_SHOT_TARGET_SECONDS = 30.0
 # 拆分单条超长朗读 beat 时的保护系数：TTS 实测语速通常比字数估算略慢，直接按
-# “估算 == 模型上限”切分会卡在边界上，实际音频仍可能溢出（Seedance2 上限 15s）。
+# “估算 == 模型上限”切分会卡在边界上，实际音频仍可能溢出。
 SHOT_SPLIT_SAFETY = 0.9
 DEFAULT_INTRO_SECONDS = 3.0
 DEFAULT_OUTRO_SECONDS = 2.0
@@ -648,7 +649,7 @@ def split_long_beats_for_shots(
     """把单条过长的朗读 beat 拆成多条更短的 beat。
 
     :func:`compact_beats_for_shots` 只合并、不拆分，所以“一行就是一条”的超长台词/
-    旁白仍会超过视频模型的单镜上限（Seedance2 = 15s），成片只能截断、末尾覆盖不到。
+    旁白仍会超过视频模型的单镜上限（Seedance2.5 = 30s），成片只能截断、末尾覆盖不到。
     这里在合并之后补一刀：
 
     - 只处理有朗读文本，且估算时长超过 ``max_seconds * safety`` 的 beat；

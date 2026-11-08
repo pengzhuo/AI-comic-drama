@@ -552,16 +552,26 @@ class PriceBook:
         return DEFAULT_MARKUP, "default"
 
     # -- 定价 -------------------------------------------------------------
-    def price(self, action: ActionRequest) -> PricedAction:
-        """按优先级定价一个动作。"""
+    def price(self, action: ActionRequest, *, prefer_measured: bool = False) -> PricedAction:
+        """按优先级定价一个动作。
+
+        ``prefer_measured=True`` 时把「实测反推价」（``actual_rules``）提到手工规则
+        之前。台账/结算要求与上游真账一致，而实测价正是从真账反推的；手工 ``rules``
+        （列表价 × 折扣）退居报价兜底。
+        """
 
         manual = _match_rule(self.rules, action)
-        if manual is not None:
-            return _price_with_rule(action, manual, source="manual")
-
         actual = _match_rule(self.actual_rules, action, key="unit")
-        if actual is not None:
-            return _price_with_rule(action, actual, source="actual")
+        if prefer_measured:
+            if actual is not None:
+                return _price_with_rule(action, actual, source="actual")
+            if manual is not None:
+                return _price_with_rule(action, manual, source="manual")
+        else:
+            if manual is not None:
+                return _price_with_rule(action, manual, source="manual")
+            if actual is not None:
+                return _price_with_rule(action, actual, source="actual")
 
         synced = self._price_synced(action)
         if synced is not None:

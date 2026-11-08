@@ -747,11 +747,11 @@ def test_seedance2_prompt_hash_canonicalizes_structured_guidance_language():
 
     chinese_ui_hash = compute_seedance2_prompt_inputs_hash(
         **common,
-        prompt_guidance="镜头：说明景别与视角；默认固定镜头，只有存在明确动机时才运动，且运动干脆明快，禁止缓慢/缓缓等慢速运镜。",
+        prompt_guidance="镜头：说明景别与视角；保持画面鲜活——只有需要静止时才用固定机位，否则让镜头自然呼吸或做有动机的正常速度运动，禁止缓慢/缓缓等慢速运镜。",
     )
     english_ui_hash = compute_seedance2_prompt_inputs_hash(
         **common,
-        prompt_guidance="Camera: Specify shot size and viewpoint; default to a static/locked-off camera and move only with a clear motive, then briskly — never slow-drift wording.",
+        prompt_guidance="Camera: Specify shot size and viewpoint; keep the frame alive — a locked-off shot only when stillness is needed, otherwise let the camera breathe or move with motive at normal pace; never slow-drift wording.",
     )
 
     assert chinese_ui_hash == english_ui_hash
@@ -940,7 +940,7 @@ async def test_seedance2_english_fallback_localizes_structured_guidance():
         beat={"visual_description": "Maya opens the door."},
         assets=[],
         text_overlay={},
-        prompt_guidance="镜头：说明景别与视角；默认固定镜头，只有存在明确动机时才运动，且运动干脆明快，禁止缓慢/缓缓等慢速运镜。",
+        prompt_guidance="镜头：说明景别与视角；保持画面鲜活——只有需要静止时才用固定机位，否则让镜头自然呼吸或做有动机的正常速度运动，禁止缓慢/缓缓等慢速运镜。",
         prompt_guidance_template_keys=["camera"],
         composer=failing_composer,
         language="en",
@@ -948,9 +948,9 @@ async def test_seedance2_english_fallback_localizes_structured_guidance():
 
     assert result.used_ai is False
     assert (
-        "Camera: Specify shot size and viewpoint; default to a static/locked-off "
-        "camera and move only with a clear motive, then briskly — never slow-drift "
-        "wording."
+        "Camera: Specify shot size and viewpoint; keep the frame alive — a "
+        "locked-off shot only when stillness is needed, otherwise let the camera "
+        "breathe or move with motive at normal pace; never slow-drift wording."
     ) in result.prompt
     assert "镜头" not in result.prompt
 

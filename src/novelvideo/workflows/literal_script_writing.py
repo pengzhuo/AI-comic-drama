@@ -863,7 +863,7 @@ class LiteralScriptWritingWorkflow:
                     f"[Literal] 镜头合并: {len(beats)} -> {len(compacted)} 镜 "
                     f"(单镜上限 {pacing.shot_target_seconds:.0f}s)"
                 )
-            # 合并只把镜头变长，单条超长台词仍可能超过视频模型单镜上限（Seedance2=15s），
+            # 合并只把镜头变长，单条超长台词仍可能超过视频模型单镜上限（Seedance2.5=30s），
             # 成片会被截断，需再拆一刀。
             split = split_long_beats_for_shots(
                 compacted, max_seconds=pacing.shot_target_seconds

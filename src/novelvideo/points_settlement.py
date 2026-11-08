@@ -3,10 +3,10 @@
 预扣（:mod:`novelvideo.points_client`）在客户确认「制作成本预估」闸门时按
 **计划售价**扣一次；成片落盘后这里按**实际用量**重算售价，多退少补：
 
-- 实际成本 = 该集四张用量表里**能在中转站账单对上的** ``quota`` 之和
-  （``quota / QUOTA_PER_USD * USD_CNY_RATE``，与
-  :func:`novelvideo.production_prices.calibrate_from_project` 同口径）；
-  只认 relay 真值，不把网关侧虚高的默认倍率算给客户。
+- 实际成本 = 该集四张用量表里的用量 × 本地单价（``production-prices.json``，
+  ``actual_rules`` 由真账反推、实测优先），合计 ``quota / QUOTA_PER_USD *
+  USD_CNY_RATE``（与 :func:`novelvideo.production_prices.calibrate_from_project`
+  同口径）；**不登录上游**，因此不受中转站 429/409 影响，且与真账同口径。
 - 售价 = 实际成本 × (1 + ``contingency_pct``/100) × 客户倍率，再按
   ``100 伴点 = ¥1`` 折算，与报价卡完全一致。
 - 差额 = 结算伴点 − 预扣伴点，四舍五入到整数；``|差额| < 1`` 直接忽略。
@@ -17,7 +17,7 @@
     settled          已结清（含退款成功、差额在容差内）→ 放行
     settled_manual   运营手动核销/放行 → 放行
     refund_pending   退款失败 → 放行（不重复退，等人核销）
-    pending          已预扣、但实际用量算不出来（relay 缺失/超时/对不上）→ 放行
+    pending          已预扣、但实际用量算不出来（未定价/超时）→ 放行
     owed             待补缴（余额不足 / 渠道不可用）→ **拦成片**
     unpriced         从未预扣、实际用量又算不出来 → **拦成片**（fail-closed）
     （无台账但应收费 = 正在核算）→ **短暂拦**，并触发一次后台结算
@@ -31,8 +31,9 @@
   一次补收（``prepaid=0`` ⇒ 差额即全额），不再放行。内部项目、闸门关闭的项目
   与这个功能无关。
 - **交付后成本再涨不再追扣**：终态一次写死，重复触发直接返回台账。
-- 凭据走 :mod:`novelvideo.relay_billing`（环境变量优先，其次
-  ``/data/relay-billing.json``）；取不到账号照样可以命中账单缓存。
+- **不登录上游**：本地按用量 × 单价计算（单价来自真账反推的 ``actual_rules``）。
+  需要与上游真账重新标定时，运维另用 ``novelvideo cost-reconcile --source relay``
+  （凭据走 :mod:`novelvideo.relay_billing`；登录后会自动退出会话）。
 """
 
 from __future__ import annotations
@@ -175,32 +176,8 @@ def _unprepaid_client_phone(state_dir: str | Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 实际成本（relay 口径，只读）
+# 实际成本（本地口径：用量 × 单价，实测优先）
 # ---------------------------------------------------------------------------
-
-
-def _relay_maps(project_db: Path, *, workers: int = 4) -> tuple[dict[str, int], dict[str, int], list[str]]:
-    """问中转站要这一集用到的单据账单（缓存命中就直接用，miss 才需要账号）。"""
-
-    from novelvideo import relay_billing
-    from novelvideo.config import NEWAPI_BILLING_DB_PATH
-    from novelvideo.gateway_cost_reconcile import (
-        build_relay_index,
-        collect_usage_gateway_ids,
-    )
-
-    settings = relay_billing.load_settings()
-    endpoints = relay_billing.configured_endpoints(settings=settings)
-    cache_path = relay_billing.billing_cache_path(settings)
-    needed = collect_usage_gateway_ids(project_db)
-    task_quota, log_quota, errors, _statuses = build_relay_index(
-        NEWAPI_BILLING_DB_PATH,
-        endpoints=endpoints,
-        only_ids=needed,
-        cache_path=cache_path,
-        workers=workers,
-    )
-    return task_quota, log_quota, errors
 
 
 def _actual_cny_from_quota(quota: int) -> float:
@@ -214,46 +191,33 @@ def _actual_cny_from_quota(quota: int) -> float:
 async def _episode_actual(
     state_dir: str | Path, episode: int, *, budget_seconds: float
 ) -> dict[str, Any] | None:
-    """该集 relay 口径的实际成本；算不出来返回 ``None``（→ ``pending`` 放行）。"""
+    """该集本地口径的实际成本（用量 × 单价，实测优先）；算不出来返回 ``None``。"""
 
-    from novelvideo.gateway_cost_reconcile import episode_quota, reconcile_project_db
+    from novelvideo.gateway_cost_reconcile import (
+        episode_quota,
+        reconcile_local_project_db,
+    )
 
     project_db = Path(state_dir) / "data.db"
     try:
-        task_quota, log_quota, errors = await asyncio.wait_for(
-            asyncio.to_thread(_relay_maps, project_db),
+        await asyncio.wait_for(
+            asyncio.to_thread(reconcile_local_project_db, project_db, apply=True),
             timeout=budget_seconds,
         )
     except asyncio.TimeoutError:
-        logger.warning("结算对账超时（%ss），按算不出来处理: %s", budget_seconds, project_db)
+        logger.warning("结算本地计价超时（%ss），按算不出来处理: %s", budget_seconds, project_db)
         return None
-    except Exception:  # noqa: BLE001 - 对账失败不影响成片，也不锁客户
-        logger.warning("结算对账失败，按算不出来处理: %s", project_db, exc_info=True)
+    except Exception:  # noqa: BLE001 - 计价失败不影响成片，也不锁客户
+        logger.warning("结算本地计价失败，按算不出来处理: %s", project_db, exc_info=True)
         return None
 
-    # 把 relay 真值回写台账库，运营报表与客户账单同口径（best-effort）。
-    try:
-        await asyncio.to_thread(
-            reconcile_project_db,
-            project_db,
-            task_quota=task_quota,
-            log_quota=log_quota,
-            apply=True,
-            source="relay",
-        )
-    except Exception:  # noqa: BLE001
-        logger.debug("结算回写 cost_quota 失败: %s", project_db, exc_info=True)
-
-    stat = episode_quota(
-        project_db, episode, task_quota=task_quota, log_quota=log_quota
-    )
+    stat = episode_quota(project_db, episode)
     if int(stat.get("matched") or 0) <= 0 or int(stat.get("quota") or 0) <= 0:
         logger.info(
-            "结算无可用 relay 账单 episode=%s rows=%s matched=%s errors=%s",
+            "结算无可用本地价 episode=%s rows=%s matched=%s",
             episode,
             stat.get("rows"),
             stat.get("matched"),
-            errors or "-",
         )
         return None
     return {
@@ -261,7 +225,7 @@ async def _episode_actual(
         "quota": int(stat["quota"]),
         "matched": int(stat["matched"]),
         "rows": int(stat["rows"]),
-        "errors": len(errors or []),
+        "errors": 0,
     }
 
 

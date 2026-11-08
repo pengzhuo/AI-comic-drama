@@ -6,6 +6,7 @@
 - ``llm_request_usage``
 
 费用字段 ``cost_quota`` 由 ``novelvideo cost-reconcile`` 回填：默认 ``--source
+local`` 用本地单价表按「用量 × 单价（实测优先）」计算，**不登录上游**；``--source
 relay`` 取上游中转站（真正收钱的一方）的真实账单 quota，``--source gateway``
 则取本地捏驿网关账单库。USD = ``cost_quota / QUOTA_PER_USD``（捏驿默认
 500000）；中转站按 ¥ 展示，故同时给出 ``cny = usd * usd_cny_rate``。报告只读，
@@ -35,7 +36,7 @@ from novelvideo.audio_request_usage import get_audio_request_usage_db_path
 from novelvideo.config import QUOTA_PER_USD, REPORT_CURRENCY, USD_CNY_RATE
 from novelvideo.gateway_cost_reconcile import (
     ReconcileReport,
-    reconcile_relay_first,
+    reconcile_local,
 )
 from novelvideo.image_request_usage import get_image_request_usage_db_path
 from novelvideo.llm_request_usage import get_llm_request_usage_db_path
@@ -324,12 +325,15 @@ def build_cost_report(
     ]
     sources.sort(key=lambda item: item["quota"], reverse=True)
 
-    # 结算口径：全部命中的行来源。``relay``=真账单，``gateway``=网关估值（偏高），
-    # 两者都有=混口径。前端据此标注数字可信度。
+    # 结算口径：全部命中的行来源。``local``=本地按用量×单价（实测优先，默认），
+    # ``relay``=上游真账单，``gateway``=网关估值（偏高），多种来源=混口径。前端据此
+    # 标注数字可信度。
     billed_sources = {
-        source for source in by_source if source in {"relay", "gateway"}
+        source for source in by_source if source in {"relay", "gateway", "local"}
     }
-    if billed_sources == {"relay"}:
+    if billed_sources == {"local"}:
+        cost_source = "local"
+    elif billed_sources == {"relay"}:
         cost_source = "relay"
     elif billed_sources == {"gateway"}:
         cost_source = "gateway"
@@ -338,6 +342,10 @@ def build_cost_report(
     else:
         cost_source = ""
 
+    # 有未归因请求（含 unmatched 与被清空的行）时合计并不完整：金额口径本身可能
+    # 仍是 relay，但报表要能标出「部分归因」，避免看起来像已经结清。
+    unattributed_total = sum(unattributed.values())
+
     return {
         "generated_at": datetime.now().isoformat(),
         "episode": episode,
@@ -345,6 +353,7 @@ def build_cost_report(
         "currency": REPORT_CURRENCY,
         "usd_cny_rate": USD_CNY_RATE,
         "cost_source": cost_source,
+        "partial": unattributed_total > 0,
         "sources": sources,
         "totals": _as_quota_row(totals),
         "by_kind": kinds,
@@ -352,7 +361,7 @@ def build_cost_report(
         "by_episode": episodes,
         "by_day": days,
         "unattributed": {
-            "requests": sum(unattributed.values()),
+            "requests": unattributed_total,
             "by_kind": unattributed,
         },
     }
@@ -398,11 +407,11 @@ async def reconcile_project_usage(
     *,
     force: bool = False,
 ) -> tuple[ReconcileReport | None, bool]:
-    """按上游真账单（relay 优先、gateway 兜底）回填一个项目的 ``cost_quota``。
+    """按本地单价表（实测优先）回填一个项目的 ``cost_quota``。
 
     返回 ``(report, skipped)``：``skipped=True`` 表示命中去抖窗口、这次没跑对账。
-    只读账单库（捏驿只读、中转站只读）、只写本项目 ``data.db``；失败以
-    ``report.errors`` 形式返回，不抛给请求方（费用报表本身仍然可读）。
+    不触网（不登录上游）、只写本项目 ``data.db``；失败以 ``report.errors`` 形式
+    返回，不抛给请求方（费用报表本身仍然可读）。
     """
     db_path = project_usage_db(state_dir)
     key = str(db_path)
@@ -413,12 +422,12 @@ async def reconcile_project_usage(
         _reconcile_last_run[key] = time.monotonic()
     try:
         report = await asyncio.wait_for(
-            asyncio.to_thread(reconcile_relay_first, project_db=db_path, apply=True),
+            asyncio.to_thread(reconcile_local, project_db=db_path, apply=True),
             timeout=RECONCILE_BUDGET_SECONDS,
         )
     except asyncio.TimeoutError:
         logger.warning("cost reconcile timed out for %s", db_path)
-        report = ReconcileReport(gateway_db=db_path, applied=False, source="relay")
+        report = ReconcileReport(gateway_db=db_path, applied=False, source="local")
         report.errors.append(f"对账超时（>{RECONCILE_BUDGET_SECONDS:.0f}s）")
     except Exception as exc:  # noqa: BLE001 - 对账失败不影响报表可读
         logger.warning("cost reconcile failed for %s: %s", db_path, exc)
@@ -434,13 +443,12 @@ async def reconcile_project_cost_report(
     force: bool = Query(False, description="忽略去抖窗口，强制重新对账"),
     user: dict = Depends(get_api_user),
 ):
-    """按上游真账单对账并返回刷新后的报表。
+    """按本地单价表对账并返回刷新后的报表。
 
-    relay 优先、gateway 兜底：中转站账号已配置且能对上单据时用真实账单，否则回退
-    本地捏驿账单库（并在 ``reconcile.errors`` 里说明）。每集合成完成后由
-    ``director_auto`` 自动触发一次（best-effort），前端「重新结算」按钮走同一条
-    路径。只读账单库、只写本项目 ``data.db``；``unattributed`` 为对不上账单的
-    请求（如 TTS），如实回报。
+    用「用量 × 单价（实测优先）」在本地计算，**不登录上游**，因此不受上游
+    429/409 影响；``actual_rules`` 由真账反推，合计与真账同口径。每集合成完成后
+    由 ``director_auto`` 自动触发一次（best-effort），前端「重新结算」按钮走同一条
+    路径。只写本项目 ``data.db``；``unattributed`` 为未定价的请求，如实回报。
     """
     resolution = await resolve_project_scope(project, user, required_role="editor")
     report, skipped = await reconcile_project_usage(resolution.state_dir, force=force)

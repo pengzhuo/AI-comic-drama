@@ -1,7 +1,7 @@
 """成片完成后按实际用量多退少补（伴点结算）。
 
 覆盖：状态机（settled/owed/pending/refund_pending）、幂等、补缴重试、交付闸门、
-按集 relay 口径汇总。全部用假件，绝不出网。
+按集本地口径汇总。全部用假件，绝不出网。
 """
 
 from __future__ import annotations
@@ -161,12 +161,32 @@ def env(monkeypatch, tmp_path):
         production_prices, "load", lambda **kwargs: store.booked
     )
 
-    def fake_relay_maps(project_db, *, workers=4):  # noqa: ARG001
-        if store.errors:
-            raise RuntimeError("relay down")
-        return dict(store.maps), {}, []
+    def fake_local_reconcile(project_db, *, apply=False, book=None):  # noqa: ARG001
+        """假本地计价：把 ``store.maps``（request_id → quota）写进用量库。"""
 
-    monkeypatch.setattr(points_settlement, "_relay_maps", fake_relay_maps)
+        if store.errors:
+            raise RuntimeError("price book down")
+        db = Path(project_db)
+        if apply and db.is_file():
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute("UPDATE video_request_usage SET cost_quota = NULL")
+                for request_id, quota in store.maps.items():
+                    conn.execute(
+                        "UPDATE video_request_usage SET cost_quota = ?"
+                        " WHERE request_id = ?",
+                        (quota, request_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        return SimpleNamespace()
+
+    from novelvideo import gateway_cost_reconcile
+
+    monkeypatch.setattr(
+        gateway_cost_reconcile, "reconcile_local_project_db", fake_local_reconcile
+    )
     return SimpleNamespace(state_dir=state_dir, maps=store.maps, booked=store.booked, errors=store.errors)
 
 

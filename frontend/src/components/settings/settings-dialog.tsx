@@ -1617,6 +1617,7 @@ const MEDIA_MODEL_ROWS: readonly {
   { model: "seedance-2.0", kind: "video" },
   { model: "seedance-2.0-fast", kind: "video" },
   { model: "seedance-2.0-mini", kind: "video" },
+  { model: "seedance-2.5", kind: "video" },
   { model: "happyhorse-1.0", kind: "video" },
   { model: "index-tts-2", kind: "audio" },
   { model: "LingShan-MU-11", kind: "audio" },

@@ -118,15 +118,28 @@ function ReportsPage() {
     [episodesRes?.data],
   );
   const unattributedCount = report?.unattributed.requests ?? 0;
+  // 后端下发 `partial`；旧后端缺省时按未归因数兜底。
+  const partial = report?.partial ?? unattributedCount > 0;
   // 后端（重启后）会带上中转站汇率；旧进程还没生效时前端按同一汇率兜底。
   const usdCnyRate =
     report?.usd_cny_rate && report.usd_cny_rate > 0
       ? report.usd_cny_rate
       : FALLBACK_USD_CNY_RATE;
-  // 费用口径：relay=中转站真账单（结算口径）；gateway/mixed=网关默认倍率估值（偏高）。
-  const costSourceLabel = report?.cost_source
-    ? t(`reports.costSource.${report.cost_source}`, { defaultValue: "" })
-    : "";
+  // 费用口径：local=本地按用量 × 单价（实测优先，默认）；relay=中转站真账单；
+  // gateway/mixed=网关默认倍率估值（偏高）。local/relay 但仍有未归因请求时是「部分
+  // 归因」，文案要把缺账说清楚，颜色也转琥珀。
+  const sourcePartial =
+    (report?.cost_source === "relay" || report?.cost_source === "local") && partial;
+  const costSourceLabel = sourcePartial
+    ? t(
+        report?.cost_source === "local"
+          ? "reports.costSource.localPartial"
+          : "reports.costSource.relayPartial",
+        { count: unattributedCount },
+      )
+    : report?.cost_source
+      ? t(`reports.costSource.${report.cost_source}`, { defaultValue: "" })
+      : "";
 
   return (
     <div className="-m-6 flex h-[calc(100%+3rem)] flex-col overflow-hidden">
@@ -218,7 +231,7 @@ function ReportsPage() {
               <p
                 className={cn(
                   "text-xs leading-5",
-                  report?.cost_source === "relay"
+                  (report?.cost_source === "relay" || report?.cost_source === "local") && !partial
                     ? "text-emerald-600 dark:text-emerald-500"
                     : "text-amber-600 dark:text-amber-500",
                 )}
@@ -227,7 +240,7 @@ function ReportsPage() {
               </p>
             ) : null}
 
-            {unattributedCount > 0 ? (
+            {unattributedCount > 0 && !sourcePartial ? (
               <p className="text-xs leading-5 text-muted-foreground/80">
                 {t("reports.unattributedHint", { count: unattributedCount })}
               </p>

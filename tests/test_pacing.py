@@ -36,18 +36,18 @@ def test_resolve_pacing_settings_defaults_and_overrides():
     assert settings.episode_target_seconds == 60.0
     assert settings.merge_floor_seconds == 45.0
     assert settings.split_threshold_seconds == 90.0
-    assert settings.shot_target_seconds == 15.0
+    assert settings.shot_target_seconds == 30.0
     # 正片预算 = 60 - 3 - 2
     assert settings.content_budget_seconds == 55.0
-    # 55 / 15 -> 4 镜
-    assert settings.max_shots == 4
+    # 55 / 30 -> 2 镜
+    assert settings.max_shots == 2
 
     overridden = resolve_pacing_settings({"shot_target_seconds": 8})
     assert overridden.shot_target_seconds == 8.0
     assert overridden.max_shots == 7  # ceil(55/8)
 
     # 非法值回退默认
-    assert resolve_pacing_settings({"shot_target_seconds": -1}).shot_target_seconds == 15.0
+    assert resolve_pacing_settings({"shot_target_seconds": -1}).shot_target_seconds == 30.0
 
 
 def test_condense_text_keeps_head_and_last_sentence():

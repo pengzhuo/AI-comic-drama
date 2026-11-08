@@ -621,7 +621,7 @@ def test_standard_tutorial_recommends_and_verifies_a_missing_video_model(monkeyp
         model_responses={
             "imageGenNode": {"ok": True, "data": [{"id": "image-model"}]},
             "videoNode": {"ok": True, "data": [{
-                "id": "seedance-2.0-fast", "aliases": ["newapi_seedance-2.0-fast"],
+                "id": "seedance-2.5", "aliases": ["newapi_seedance-2.5"],
                 "supportedModes": ["image_to_video"], "minDuration": 4,
                 "maxDuration": 15, "ratioOptions": ["16:9"],
                 "resolutionOptions": ["720P"],
@@ -632,9 +632,9 @@ def test_standard_tutorial_recommends_and_verifies_a_missing_video_model(monkeyp
     )
     assert result["status"] == "ready", result["blockers"]
     video = next(node for node in compiled["plan"]["nodes"] if node["node_type"] == "videoNode")
-    assert video["data"]["model"] == "seedance-2.0-fast"
+    assert video["data"]["model"] == "seedance-2.5"
     assert result["runtime_checks"]["videoNode.models"] == {
-        "requested": ["seedance-2.0-fast"], "available": True,
+        "requested": ["seedance-2.5"], "available": True,
     }
 
 

@@ -586,11 +586,11 @@ def _build_plan_preflight(nodes: list[Any]) -> dict[str, Any]:
             duration = data.get("durationSec")
             if isinstance(duration, (int, float)) and duration > 0:
                 planned_video_duration += int(duration)
-                if duration > 15:
+                if duration > 30:
                     warnings.append(
                         _issue(
                             f"nodes[{index}].data.durationSec",
-                            "video duration exceeds 15 seconds and will be split or clamped by the runtime",
+                            "video duration exceeds 30 seconds and will be split or clamped by the runtime",
                         )
                     )
             else:

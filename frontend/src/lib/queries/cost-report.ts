@@ -11,11 +11,13 @@ import type { OkResponse } from "@/types/api";
  * 项目成本报表（捏驿「捏账」页）。
  *
  * `quota` 是账单额度快照，`usd = quota / quota_per_usd`，`cny = usd * 汇率`。
- * 口径优先取上游中转站真实账单（`cost-reconcile --source relay`）：本地捏驿网关
- * 对 DC-* / 媒体模型别名没有价格条目，会落到默认倍率而明显偏高。自动回填（成片后
- * 结算钩子、前端「重新结算」按钮）现在都是 relay 优先、gateway 兜底；只有中转站
- * 凭据未配置或一条都对不上时才会写网关口径，此时 `cost_source === "gateway"`，
- * 前端据此把金额标注为「估值口径（偏高）」。
+ * 口径默认取**本地单价表**（`cost-reconcile --source local`）：按「用量 × 单价」
+ * 计算，单价里的 `actual_rules` 由真账反推（实测优先），因此合计与上游真账一致，
+ * 且**不登录上游**、不受中转站 429/409 影响。`--source relay` 仍可手动取上游真实
+ * 账单，`--source gateway` 取本地捏驿网关账单库（对 DC-* / 媒体模型别名没有价格
+ * 条目，会落到默认倍率而明显偏高）。自动回填（成片后结算钩子、前端「重新结算」
+ * 按钮）现在都走 local；`cost_source === "gateway"` 时前端把金额标注为「估值口径
+ * （偏高）」。
  *
  * `cost_quota` 尚未回填（未跑对账或没匹配上）的请求不算进 `quota`，而是计进
  * `unattributed_requests`。
@@ -73,10 +75,16 @@ export interface CostReport {
   /** 美元 → 人民币汇率（中转站 `usd_exchange_rate`）。 */
   usd_cny_rate?: number;
   /**
-   * 报表金额口径：`relay`=中转站真账单（结算口径），`gateway`=本地网关默认倍率
-   * 估值（偏高），`mixed`=两者混用，空=还没有可计价的行。旧后端缺省时为 undefined。
+   * 报表金额口径：`local`=本地按用量 × 单价（实测优先，默认），`relay`=中转站真
+   * 账单，`gateway`=本地网关默认倍率估值（偏高），`mixed`=多种混用，空=还没有可
+   * 计价的行。旧后端缺省时为 undefined。
    */
   cost_source?: string;
+  /**
+   * 是否还有未归因请求：true 表示合计不完整（`unattributed.requests > 0`），
+   * 即便 `cost_source === "relay"` 也只是「部分归因」。旧后端缺省时为 undefined。
+   */
+  partial?: boolean;
   /** 按来源拆分的金额分布（明细），旧后端缺省。 */
   sources?: CostReportSource[];
   project?: { id: string; name: string; owner: string };

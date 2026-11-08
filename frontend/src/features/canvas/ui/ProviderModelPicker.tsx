@@ -144,6 +144,16 @@ export const VIDEO_PROVIDERS: ProviderOption[] = [
 // 顶上，能力字段随行以保证兜底状态下参数面板仍有档位可选。
 export const VIDEO_MODELS: ModelOption[] = [
   {
+    id: 'newapi_seedance-2.5',
+    providerId: 'seedance',
+    apiModel: 'newapi_seedance-2.5',
+    label: 'Seedance2.5',
+    resolutionOptions: ['480p', '720p', '1080p'],
+    ratioOptions: [...FALLBACK_VIDEO_ASPECT_OPTIONS],
+    minDuration: 4,
+    maxDuration: 30,
+  },
+  {
     id: 'newapi_seedance-2.0-fast',
     providerId: 'seedance',
     apiModel: 'newapi_seedance-2.0-fast',
@@ -211,7 +221,7 @@ export const VIDEO_MODELS: ModelOption[] = [
 // hydrates the live list via /freezone/video/models, but this id is what the
 // canvas store uses on first node creation before that fetch resolves (and
 // when no previously-picked model has been remembered).
-export const DEFAULT_VIDEO_MODEL_ID = 'newapi_seedance-2.0';
+export const DEFAULT_VIDEO_MODEL_ID = 'newapi_seedance-2.5';
 
 export type ProviderModelDomain = 'image' | 'video';
 

@@ -123,7 +123,7 @@ def test_recommended_video_uses_video_capabilities_and_concrete_resolution():
     result = evaluate_workflow_preflight(
         {"plan": plan},
         model_responses={"videoNode": {"ok": True, "data": [{
-            "id": "seedance-2.0-fast", "aliases": ["newapi_seedance-2.0-fast"],
+            "id": "seedance-2.5", "aliases": ["newapi_seedance-2.5"],
             "ratioOptions": ["16:9", "9:16"], "resolutionOptions": ["480P", "720P"],
             "minDuration": 4, "maxDuration": 15,
             "supportsGenerateAudio": False,
@@ -132,7 +132,7 @@ def test_recommended_video_uses_video_capabilities_and_concrete_resolution():
     )
     assert result["status"] == "ready"
     assert plan["nodes"][0]["data"] == {
-        "model": "seedance-2.0-fast", "aspectRatio": "9:16",
+        "model": "seedance-2.5", "aspectRatio": "9:16",
         "quality": "720P", "durationSec": 5, "count": 1,
     }
 
@@ -143,7 +143,7 @@ def test_recommended_video_without_catalog_ratio_options_still_resolves(ratio_op
     exactly as runtime preflight already treats aspectRatio, so the remaining
     recommendations resolve and the ratio falls back to the product default."""
     entry = {
-        "id": "seedance-2.0-fast", "aliases": ["newapi_seedance-2.0-fast"],
+        "id": "seedance-2.5", "aliases": ["newapi_seedance-2.5"],
         "resolutionOptions": ["480P", "720P"],
         "minDuration": 4, "maxDuration": 15, "supportsGenerateAudio": False,
     }
@@ -160,7 +160,7 @@ def test_recommended_video_without_catalog_ratio_options_still_resolves(ratio_op
     )
     assert result["status"] == "ready", result["blockers"]
     assert plan["nodes"][0]["data"] == {
-        "model": "seedance-2.0-fast", "aspectRatio": "9:16",
+        "model": "seedance-2.5", "aspectRatio": "9:16",
         "quality": "720P", "durationSec": 5, "count": 1,
     }
 
@@ -194,7 +194,7 @@ def test_recommended_ratio_still_requires_a_declared_catalog_option_when_constra
     result = evaluate_workflow_preflight(
         {"plan": plan},
         model_responses={"videoNode": {"ok": True, "data": [{
-            "id": "seedance-2.0-fast", "aliases": ["newapi_seedance-2.0-fast"],
+            "id": "seedance-2.5", "aliases": ["newapi_seedance-2.5"],
             "ratioOptions": ["21:9", "4:3"], "resolutionOptions": ["720P"],
             "minDuration": 4, "maxDuration": 15, "supportsGenerateAudio": False,
         }]}},

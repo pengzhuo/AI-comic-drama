@@ -50,11 +50,42 @@ function StatChip({
 }
 
 /** 金额口径标注：让用户一眼看出数字是「真账单」还是「网关估值（偏高）」。 */
-function CostSourceNote({ source }: { source?: string }) {
+function CostSourceNote({
+  source,
+  partial = false,
+  unattributed = 0,
+}: {
+  source?: string;
+  partial?: boolean;
+  unattributed?: number;
+}) {
   if (source === "relay") {
+    // relay 但仍有没有账单单号的请求 → 只是「部分归因」：金额是真账单，合计不完整。
+    if (partial) {
+      return (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-500">
+          {`结算口径：金额取自上游中转站真实账单；另有 ${unattributed} 笔请求未归因，暂未计入，补齐后自动更新。`}
+        </p>
+      );
+    }
     return (
       <p className="text-[11px] leading-relaxed text-emerald-600 dark:text-emerald-500">
         结算口径：金额取自上游中转站真实账单。
+      </p>
+    );
+  }
+  if (source === "local") {
+    // 本地按「用量 × 单价」计算，单价取真账反推的实测口径；仍有未定价请求时合计不完整。
+    if (partial) {
+      return (
+        <p className="text-[11px] leading-relaxed text-amber-600 dark:text-amber-500">
+          {`按价目估算：金额 = 用量 × 本地单价（实测口径）；另有 ${unattributed} 笔请求未定价，暂未计入，补齐后自动更新。`}
+        </p>
+      );
+    }
+    return (
+      <p className="text-[11px] leading-relaxed text-emerald-600 dark:text-emerald-500">
+        按价目估算：金额 = 用量 × 本地单价（单价来自上游真账反推的实际口径）。
       </p>
     );
   }
@@ -110,6 +141,8 @@ export function StudioEpisodeCostDetail({
   const report = reportQuery.data?.data;
   const rate = reportRate(report);
   const unattributed = report?.unattributed.requests ?? 0;
+  // 后端下发 `partial`；旧后端缺省时按未归因数兜底。
+  const partial = report?.partial ?? unattributed > 0;
   const settled = (report?.totals.requests ?? 0) > 0 && unattributed === 0;
 
   if (reportQuery.isLoading) {
@@ -136,9 +169,9 @@ export function StudioEpisodeCostDetail({
         />
       </div>
 
-      {!settled ? (
+      {!settled && !((report.cost_source === "relay" || report.cost_source === "local") && partial) ? (
         <p className="text-xs text-amber-600 dark:text-amber-500">
-          结算中：{unattributed} 笔请求还没有账单单价，金额偏小属正常现象；成片后会自动重新结算。
+          结算中：{unattributed} 笔请求还没有单价，金额偏小属正常现象；成片后会自动重新结算。
         </p>
       ) : null}
 
@@ -179,7 +212,11 @@ export function StudioEpisodeCostDetail({
         </table>
       </div>
 
-      <CostSourceNote source={report.cost_source} />
+      <CostSourceNote
+        source={report.cost_source}
+        partial={partial}
+        unattributed={unattributed}
+      />
 
       <div className="flex items-center justify-between gap-3">
         <p className="text-[11px] leading-relaxed text-muted-foreground">
@@ -197,6 +234,8 @@ export function StudioCostOverview({ project }: { project: string }) {
   const reportQuery = useCostReport(project);
   const report = reportQuery.data?.data;
   const rate = reportRate(report);
+  const unattributed = report?.unattributed.requests ?? 0;
+  const partial = report?.partial ?? unattributed > 0;
 
   if (reportQuery.isLoading) {
     return <div className="text-sm text-muted-foreground">正在读取费用…</div>;
@@ -223,7 +262,11 @@ export function StudioCostOverview({ project }: { project: string }) {
         <StatChip label="未归因" value={`${report.unattributed.requests} 笔`} />
         <StatChip label="制作时长" value={formatDuration(report.totals.duration_seconds)} />
       </div>
-      <CostSourceNote source={report.cost_source} />
+      <CostSourceNote
+        source={report.cost_source}
+        partial={partial}
+        unattributed={unattributed}
+      />
       <div className="flex items-center justify-between gap-3">
         <p className="text-[11px] text-muted-foreground">
           未归因的请求（多为配音）在账单里对不上单号，暂时无法计价。

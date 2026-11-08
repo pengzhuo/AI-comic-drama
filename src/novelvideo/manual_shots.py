@@ -200,21 +200,20 @@ def resolve_target_video_duration(
     *,
     default: float = DEFAULT_VIDEO_DURATION,
 ) -> float:
-    duration = beat.get("duration_seconds")
-    if duration is not None:
+    # 优先级：手工显式时长 > 实际配音时长 > 按字数预估时长 > 兜底默认。
+    # 合并后的旁白 beat 往往没有独立配音文件，靠 ``estimated_duration`` 才能让镜头
+    # 长度贴合内容，而不是一律回落到 5 秒。
+    for value in (
+        beat.get("duration_seconds"),
+        audio_duration,
+        beat.get("estimated_duration"),
+    ):
         try:
-            parsed = float(duration)
-            if parsed > 0:
-                return parsed
+            parsed = float(value)
         except (TypeError, ValueError):
-            pass
-    if audio_duration is not None:
-        try:
-            parsed = float(audio_duration)
-            if parsed > 0:
-                return parsed
-        except (TypeError, ValueError):
-            pass
+            continue
+        if parsed > 0:
+            return parsed
     return float(default)
 
 
