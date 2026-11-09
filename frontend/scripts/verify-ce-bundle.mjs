@@ -20,6 +20,14 @@
  * catch "the instance env never reached the build", which is the failure mode
  * that matters.
  *
+ * Real instance builds opt into a stricter check with
+ * ``VITE_REQUIRE_INSTANCE_CONFIG=1``: every required key must then be non-empty,
+ * so losing a line from the host ``.env`` fails the image build instead of
+ * silently shipping a degraded bundle (the 2026-11-06 studio-link incident, or
+ * the 2026-11-09 repeat where the same loss re-exposed the header settings
+ * entry). Generic CE/upstream builds leave it unset and keep the historical
+ * "unset = upstream as shipped" behavior.
+ *
  * Usage: node scripts/verify-ce-bundle.mjs [distDir=dist]
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -43,10 +51,20 @@ const INSTANCE_VARS = [
   "VITE_BRAND_ATTRIBUTION",
 ];
 
+/**
+ * Keys that must be non-empty once an instance opts into strict mode.
+ * `VITE_EDITION` is excluded (its Dockerfile default is `ce`) and checked
+ * separately below.
+ */
+const REQUIRED_INSTANCE_VARS = INSTANCE_VARS.filter((name) => name !== "VITE_EDITION");
+
 const escapeRe = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const valueOf = (name) => String(process.env[name] ?? "").trim();
 
 const problems = [];
+
+/** Instance build: the host `.env` must carry the whole instance config. */
+const strict = ["1", "true"].includes(valueOf("VITE_REQUIRE_INSTANCE_CONFIG"));
 
 if (!existsSync(assetsDir)) {
   problems.push(`no JS assets at ${assetsDir} — build the bundle first`);
@@ -61,6 +79,7 @@ const filesWith = (needle) =>
   assets.filter((a) => a.text.includes(needle)).map((a) => a.name);
 
 console.log(`verify-ce-bundle: ${distDir} (${assets.length} js assets)`);
+if (strict) console.log("  mode      strict (VITE_REQUIRE_INSTANCE_CONFIG=1)");
 for (const name of INSTANCE_VARS) {
   const value = valueOf(name);
   if (value) console.log(`  supplied  ${name}=${value}`);
@@ -111,13 +130,33 @@ if (entryPath) {
   }
 }
 
+// 5. Strict instance build: the whole instance config must be present, so a lost
+//    `.env` line fails the build instead of shipping a degraded bundle.
+if (strict) {
+  const missing = REQUIRED_INSTANCE_VARS.filter((name) => !valueOf(name));
+  if (missing.length) {
+    problems.push(
+      `VITE_REQUIRE_INSTANCE_CONFIG=1 but these instance vars are empty/missing: ${missing.join(", ")}`,
+    );
+  }
+  if (valueOf("VITE_EDITION") !== "ce") {
+    problems.push(
+      `VITE_REQUIRE_INSTANCE_CONFIG=1 but VITE_EDITION=${valueOf("VITE_EDITION") || "(empty)"} (expected "ce")`,
+    );
+  }
+}
+
 if (problems.length) {
   console.error("\nverify-ce-bundle: FAILED");
   for (const problem of problems) console.error(`  - ${problem}`);
   console.error(
     "\nInstance config is build-time only: build with `pnpm build:ce` and pass the" +
       "\nvalues as build args (frontend/Dockerfile, docker-compose.yml) — see" +
-      "\ndocs/agents/web-hotpatch-deploy.md §1/§6.",
+      "\ndocs/agents/web-hotpatch-deploy.md §1/§6." +
+      (strict
+        ? "\nThis is a strict instance build (VITE_REQUIRE_INSTANCE_CONFIG=1): every" +
+          "\ninstance key above must be set in the host `.env`."
+        : ""),
   );
   process.exit(1);
 }

@@ -21,6 +21,7 @@ UI 隐藏开关弄丢（2026-10-21 出过一次：用不带 `.env.ce.local` 的�
 | `VITE_HIDE_MODEL_GUIDE=1` | 去掉「配置手册」引导链接 |
 | `VITE_HIDE_GITHUB_STARS=1` | 不请求 `api.github.com` 拿星标数 |
 | `VITE_LOGIN_ANNOUNCEMENTS_URL=/announcements.empty.json` | 公告改读本站空列表（完全静默，不出网） |
+| `VITE_REQUIRE_INSTANCE_CONFIG=1` | **不是隐藏开关**：开启构建期严格校验——本节整组键（含 `VITE_INTERNAL_ENTRY_PATH`）必须齐全，缺任何一个镜像构建直接失败 |
 | `VITE_BRAND_ATTRIBUTION=基于(Dramaclaw)开发` | **内容型**（不是隐藏开关）：底部状态栏右端的署名文案；未设置则不渲染 |
 
 其中 `VITE_BRAND_ATTRIBUTION` 与其余「=1 即隐藏」的开关不同，它读的是**任意字符串**
@@ -32,6 +33,15 @@ UI 隐藏开关弄丢（2026-10-21 出过一次：用不带 `.env.ce.local` 的�
 `/root/dramaclaw/.env` 第 370 行附近也留着同一组值（供源码 `docker compose build web`
 使用）；从服务器源码构建出来的镜像天然带这些开关，而本机热补丁产物**不会**自动继承
 它们 —— 这就是 `.env.ce.local` 存在的意义。
+
+> **整组键必须一起存在，一个都不能少。** 2026-11-09 又复发过一次：服务器 `.env` 里
+> 少了 `VITE_INTERNAL_ENTRY_PATH=/console`（同时少了 `VITE_HIDE_GITHUB_STARS`、
+> `VITE_LOGIN_ANNOUNCEMENTS_URL`、`VITE_BRAND_ATTRIBUTION`、`VITE_HIDE_HEADER_SETTINGS`），
+> `docker compose build web` 于是产出**单入口内部产物**：客户 `/studio?phone=&code=`
+> 被弹回内部端要内部口令，右上「设置」也重新露出来。旧脚本只对「非空」的值下断言，
+> 空值静默通过 —— 所以现在**必须**在服务器 `.env` 设 `VITE_REQUIRE_INSTANCE_CONFIG=1`，
+> 让 `verify:ce` 在缺键时硬失败（见 `frontend/scripts/verify-ce-bundle.mjs`）。
+> 本机 `.env.ce.local` 同样要带全这组键。
 
 ## 2. 构建（在开发机）
 
@@ -75,7 +85,9 @@ Test-Path dist\announcements.empty.json        # 应为 True（26 B）
 - `frontend/Dockerfile` 用 `RUN pnpm build:ce`（不是 `build`），并为每个实例开关声明
   `ARG`/`ENV` —— `.dockerignore` 排除 `.env`/`.env.*`，镜像里读不到 `.env.ce.local`，
   只能靠 build args 传；每个 `ARG` 都写了注释说明为什么必须有。
-- `docker-compose.yml` 的 `web.build.args` 从宿主 `.env` 转发同一组值（默认空 = 官方原样）。
+- `docker-compose.yml` 的 `web.build.args` 从宿主 `.env` 转发同一组值（默认空 = 官方原样），
+  并转发 `VITE_REQUIRE_INSTANCE_CONFIG`：实例在 `.env` 里设 `=1` 后，`verify:ce` 进入严格
+  模式，缺任何一个实例键就让构建失败，而不是静默产出降级产物。
 - 构建末尾 `RUN pnpm verify:ce`（= `frontend/scripts/verify-ce-bundle.mjs`）断言产物确实带上
   了这些值：`api.github.com` 必须 0 命中、公告源与署名必须命中、
   `VITE_INTERNAL_ENTRY_PATH` 必须进了内联的 `import.meta.env` 对象。不符直接

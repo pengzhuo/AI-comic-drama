@@ -1745,6 +1745,61 @@ def test_newapi_identity_image_sends_portrait_then_costume_references(
     ]
 
 
+def test_character_portrait_records_gateway_request_id(monkeypatch, tmp_path):
+    """角色基准图生成后要把网关单号回写进用量表，否则真账对不上。
+
+    历史 bug：``nanobanana_character`` 记录了用量却从不回写
+    ``gateway_request_id``，留下一批无单号的图片行。这里锁定修复：``trace`` 透传到
+    ``_call_newapi_image_api`` 并写回 ``image_request_usage``。
+    """
+    import sqlite3
+
+    from novelvideo.generators import nanobanana_character
+
+    async def fake_call_newapi_image_api(**kwargs):
+        trace = kwargs.get("trace")
+        if trace is not None:
+            trace["request_id"] = "gw-req-42"
+        return b"portrait-bytes", "", ""
+
+    monkeypatch.setattr(
+        nanobanana_character,
+        "_call_newapi_image_api",
+        fake_call_newapi_image_api,
+    )
+
+    generator = nanobanana_character.NanoBananaCharacterGenerator(
+        config={
+            "provider": "newapi",
+            "api_key": "newapi-token",
+            "model": "LingShan-G2",
+            "base_url": "http://newapi.test/v1",
+        }
+    )
+
+    result = run_async(
+        generator.generate_character_portrait(
+            character_name="李雷",
+            character_prompt="young man",
+            output_dir=str(tmp_path),
+            project_dir=str(tmp_path),
+        )
+    )
+    assert result.success is True
+
+    conn = sqlite3.connect(str(tmp_path / "data.db"))
+    try:
+        row = conn.execute(
+            "SELECT gateway_request_id, status FROM image_request_usage "
+            "WHERE task_type = 'character_portrait'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == "gw-req-42"
+    assert row[1] == "completed"
+
+
 @pytest.mark.parametrize(
     "InsufficientCreditsError",
     [

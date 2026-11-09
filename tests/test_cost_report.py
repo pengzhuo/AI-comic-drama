@@ -499,12 +499,14 @@ class _FakeRelay:
         tasks: dict[str, int],
         logs: dict[str, int],
         reject_first_authed_call: bool = False,
+        rate_limit_first_calls: int = 0,
     ) -> None:
         self.base_url = base_url
         self.tasks = dict(tasks)
         self.logs = dict(logs)
         self.calls: list[str] = []
         self._reject_next = reject_first_authed_call
+        self._rate_limit_remaining = max(0, int(rate_limit_first_calls))
 
     def __call__(self, method, url, headers, payload):
         self.calls.append(f"{method} {url}")
@@ -529,6 +531,10 @@ class _FakeRelay:
             )
         if not headers.get("Authorization"):
             return 401, json.dumps({"success": False, "code": "AUTH_TOKEN_EXPIRED"})
+        if self._rate_limit_remaining > 0:
+            # 上游对逐单号账单查询限流：先回几次 429 再放行。
+            self._rate_limit_remaining -= 1
+            return 429, json.dumps({"success": False, "message": "rate limited"})
         if self._reject_next:
             # access token 只有 15 分钟，过期一次应自动重登再重试。
             self._reject_next = False
@@ -876,6 +882,129 @@ def test_relay_billing_client_relogins_on_expired_token():
     assert client.task_quotas() == {"up-task-1": 7}
     logins = [call for call in relay.calls if "/api/user/login" in call]
     assert len(logins) == 2  # 首次登录 + 401 后重登
+
+
+def test_rate_gate_spaces_requests(monkeypatch):
+    """限速闸门：首次放行，紧接着的下一次要等到最小间隔之后。"""
+    from novelvideo import relay_billing
+
+    clock = {"now": 0.0}
+    sleeps: list[float] = []
+
+    def fake_monotonic():
+        return clock["now"]
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(relay_billing.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(relay_billing.time, "sleep", fake_sleep)
+
+    gate = relay_billing._RateGate(0.5)
+    gate.wait()  # 首次立即放行
+    gate.wait()  # 与上一次相隔不足 0.5s，必须补眠
+    assert sleeps == [0.5]
+
+
+def test_relay_billing_client_retries_on_rate_limit(monkeypatch):
+    """``_call`` 遇 429 指数退避后重试，而不是直接让整批标定失败。"""
+    from novelvideo import relay_billing
+
+    monkeypatch.setattr(relay_billing, "RELAY_RATE_BACKOFF_BASE_SECONDS", 0.0)
+    relay = _FakeRelay(
+        base_url="https://aicf.example",
+        tasks={},
+        logs={"up-log-1": 9},
+        rate_limit_first_calls=2,
+    )
+    client = relay_billing.RelayBillingClient(
+        _relay_endpoints()[0],
+        transport=relay,
+        page_size=100,
+        min_interval=0.0,
+        max_rate_retries=3,
+    )
+
+    assert client.log_quota("up-log-1") == 9
+    assert len(relay.log_calls()) == 3  # 429 ×2 + 成功 ×1
+
+
+def test_relay_billing_client_retries_logout_on_rate_limit(monkeypatch):
+    """退出会话被 429 时也要重试，否则会话泄漏会挤占下一次登录额度。"""
+    from novelvideo import relay_billing
+
+    monkeypatch.setattr(relay_billing, "RELAY_RATE_BACKOFF_BASE_SECONDS", 0.0)
+    calls: list[str] = []
+    state = {"logout_429": 1}
+
+    def transport(method, url, headers, payload):
+        calls.append(url)
+        if url.endswith("/api/user/login"):
+            return 200, json.dumps({"success": True, "data": {"access_token": "tok"}})
+        if url.endswith("/api/user/auth/logout"):
+            if state["logout_429"] > 0:
+                state["logout_429"] -= 1
+                return 429, json.dumps({"success": False, "message": "rate limited"})
+            return 200, json.dumps({"success": True, "data": {}})
+        return 404, "{}"
+
+    client = relay_billing.RelayBillingClient(
+        _relay_endpoints()[0],
+        transport=transport,
+        min_interval=0.0,
+        max_rate_retries=2,
+    )
+    client.login()
+    assert client.logout() is True
+    assert len([c for c in calls if c.endswith("/api/user/auth/logout")]) == 2
+
+
+def test_relay_billing_client_retries_login_on_rate_limit(monkeypatch):
+    """登录接口也会 429；应退避重试而不是直接失败。"""
+    from novelvideo import relay_billing
+
+    monkeypatch.setattr(relay_billing, "RELAY_RATE_BACKOFF_BASE_SECONDS", 0.0)
+    calls: list[str] = []
+    state = {"login_429": 1}
+
+    def transport(method, url, headers, payload):
+        calls.append(url)
+        if url.endswith("/api/user/login"):
+            if state["login_429"] > 0:
+                state["login_429"] -= 1
+                return 429, json.dumps({"success": False, "message": "rate limited"})
+            return 200, json.dumps({"success": True, "data": {"access_token": "tok"}})
+        return 404, "{}"
+
+    client = relay_billing.RelayBillingClient(
+        _relay_endpoints()[0],
+        transport=transport,
+        min_interval=0.0,
+        max_rate_retries=2,
+    )
+    assert client.login() == "tok"
+    assert len([c for c in calls if c.endswith("/api/user/login")]) == 2
+
+
+def test_log_quotas_for_aborts_batch_when_login_fails():
+    """登录失败（如 409 AUTH_SESSION_LIMIT）时整批跳过，不按单号反复重登。"""
+    from novelvideo.relay_billing import RelayBillingClient
+
+    logins = {"count": 0}
+
+    def transport(method, url, headers, payload):
+        if url.endswith("/api/user/login"):
+            logins["count"] += 1
+            return 409, json.dumps({"success": False, "code": "AUTH_SESSION_LIMIT"})
+        return 200, json.dumps({"success": True, "data": {"items": []}})
+
+    client = RelayBillingClient(
+        _relay_endpoints()[0], transport=transport, min_interval=0.0
+    )
+    assert client.log_quotas_for(["a", "b", "c", "d"]) == {}
+    assert logins["count"] == 1
+
 
 
 def test_collect_quotas_logs_out_after_query():

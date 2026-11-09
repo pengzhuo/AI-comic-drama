@@ -41,7 +41,10 @@
 - access token **15 分钟**过期，客户端遇 401 自动重登一次再重试。
 - 上游对**并发会话数**有上限：登录不退出会一直撞 `409 AUTH_SESSION_LIMIT`。所以
   `collect_quotas` 在 `finally` 里主动 `POST /api/user/auth/logout` + `Origin` 头退出。
-- `GET /api/log/self` 逐单号查询容易触发 `429`；`GET /api/task/self` 分页可靠，
+- `GET /api/log/self` 逐单号查询容易触发 `429`；客户端默认在账单请求之间留最小间隔
+  （`RELAY_MIN_REQUEST_INTERVAL_SECONDS`，默认 0.25s），并对 429 做指数退避重试
+  （`RELAY_MAX_RATE_RETRIES` 次，退避基数 `RELAY_RATE_BACKOFF_BASE_SECONDS`）；退出
+  会话被 429 时同样重试，避免会话泄漏挤占登录额度。`GET /api/task/self` 分页可靠，
   视频（含 `seedance-2.5`）优先走它。
 - 查询范围会**收窄到本项目用量行真正引用到的 id**，不会去拉全站 3 万条日志。
 - 结果缓存在 `RELAY_BILLING_CACHE_PATH`（默认 `/data/runtime/relay_billing_cache.json`）。
@@ -73,6 +76,19 @@ docker exec -w /app dramaclaw-api-1 /app/.venv/bin/novelvideo cost-reconcile \
 `currency` / `usd_cny_rate` / 每行的 `cny`；前端在字段缺失（api 进程未重启）时按
 `usd_cny_rate`、兜底常数 `7.3` 自行折算。
 
+## 失败任务口径（A 口径）
+
+**失败任务不计成本**：`failed` / `error` / `cancelled`（含 `canceled`）/ `timeout` 等
+非成功状态的用量行一律不计费，与线上既有口径一致（下称 **A 口径**）。
+
+- 本地口径：`_reconcile_table_local` 直接跳过这些状态的行，回填时置
+  `cost_quota = NULL`、`cost_source = 'unmatched'`，报表里落进 `unattributed`。
+- relay 口径：逐单号取真账，上游若对某条失败请求仍收过费（例如视频超时但上游已计费），
+  该行会带上真账 `quota`。
+- 因此「本地估价 vs 中转站真账」要**同口径**比较：成功行的单价与真账精确一致，差额
+  来自失败行（A 口径少计）与单号未桥接的行，不是单价算错。实测 t3：视频 12 条 failed
+  未计，本地比 relay 少 ¥6.79。
+
 ## 已知限制
 
 - **本地口径不受单号桥接限制**：只要价目表里有对应 `kind/model` 的单价，就按用量计入，
@@ -80,6 +96,9 @@ docker exec -w /app dramaclaw-api-1 /app/.venv/bin/novelvideo cost-reconcile \
 - `relay` 口径才依赖桥接：`audio_request_usage` 曾经没有 `gateway_request_id` 列，更早的
   项目连 `image_request_usage.gateway_request_id` 也没有，这些行在 relay 下无法桥接、
   落到 `unattributed`；有列但没拿到网关响应头（失败 / 校验前中止）的图片行同样如此。
+- 角色基准图（`nanobanana_character` 的 portrait / identity）过去记录用量后**从不回写**
+  `gateway_request_id`，留下一批无单号的图片行；现已透传 `trace` 并在生成成功后回写，
+  新行能正常桥接，**历史行仍无法补齐**。
 - 上游账单里查不到的上游单号（中转站已清理该任务，或当时走的是别的上游账号）会让
   relay 定不了价；`apply` **只覆盖匹配到的行**，匹配不到的保留库里旧值、不清零。
   实测中转站只认识网关记录过的 2067 个上游单号里的 1533 个，约 10 个老项目属于这种

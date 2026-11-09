@@ -43,6 +43,14 @@ ENV VITE_INTERNAL_ENTRY_PATH=${VITE_INTERNAL_ENTRY_PATH}
 ARG VITE_BRAND_ATTRIBUTION=""
 ENV VITE_BRAND_ATTRIBUTION=${VITE_BRAND_ATTRIBUTION}
 
+# Opt-in strict build-time check (see scripts/verify-ce-bundle.mjs): when "1",
+# `pnpm verify:ce` fails unless every instance value above is non-empty, so a
+# line lost from the host `.env` can never ship a degraded bundle again
+# (single-entry studio link, re-exposed header settings). Generic CE/upstream
+# builds leave it unset. `docker-compose.yml` forwards the host `.env` value.
+ARG VITE_REQUIRE_INSTANCE_CONFIG=""
+ENV VITE_REQUIRE_INSTANCE_CONFIG=${VITE_REQUIRE_INSTANCE_CONFIG}
+
 # Use pnpm (matches local dev) instead of npm — a single lockfile as source of
 # truth, which removes the npm/pnpm dual-lockfile drift that made `npm ci` fail.
 # corepack picks the version pinned in package.json's "packageManager" field.

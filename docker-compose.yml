@@ -69,6 +69,9 @@ services:
         VITE_LOGIN_ANNOUNCEMENTS_URL: "${VITE_LOGIN_ANNOUNCEMENTS_URL:-}"
         VITE_INTERNAL_ENTRY_PATH: "${VITE_INTERNAL_ENTRY_PATH:-}"
         VITE_BRAND_ATTRIBUTION: "${VITE_BRAND_ATTRIBUTION:-}"
+        # 实例镜像开启严格校验：整组实例键必须齐全，缺任何一个就构建失败。
+        # 见 frontend/scripts/verify-ce-bundle.mjs 与 docs/agents/web-hotpatch-deploy.md §1。
+        VITE_REQUIRE_INSTANCE_CONFIG: "${VITE_REQUIRE_INSTANCE_CONFIG:-}"
 
 # extends 不带顶层 volumes，需在此重申（名字与 release 文件一致，数据卷共用）。
 volumes:

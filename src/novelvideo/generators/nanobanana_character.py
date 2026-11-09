@@ -33,6 +33,7 @@ from novelvideo.config import (
 from novelvideo.shared.billing_errors import is_fatal_billing_error
 from novelvideo.image_request_usage import (
     record_image_request,
+    update_image_request_gateway_id,
     update_image_request_status,
 )
 from novelvideo.services.style_service import StyleService
@@ -320,11 +321,13 @@ class NanoBananaCharacterGenerator:
             portrait_ref_path = (
                 os.path.join(output_dir, "reference_portrait.png") if output_dir else None
             )
+            portrait_trace: dict[str, str] = {}
             portrait_bytes = await self._generate_single_image(
                 client=client,
                 prompt=front_prompt,
                 output_path=portrait_ref_path,
                 image_size="0.5K",
+                trace=portrait_trace,
             )
 
             if portrait_bytes and portrait_ref_path:
@@ -349,6 +352,13 @@ class NanoBananaCharacterGenerator:
                 f"[NanoBanana Character] {character_name} portrait 生成完成，耗时 {generation_time:.1f}s"
             )
             if usage_recorded and project_output_dir:
+                update_image_request_gateway_id(
+                    project_output_dir=project_output_dir,
+                    request_id=request_id,
+                    gateway_request_id=portrait_trace.get("request_id")
+                    or portrait_trace.get("response_id")
+                    or "",
+                )
                 update_image_request_status(
                     project_output_dir=project_output_dir,
                     request_id=request_id,
@@ -592,6 +602,7 @@ class NanoBananaCharacterGenerator:
             temp_body_path = output_path.replace(".png", "_body_temp.png")
             print(f"[NanoBanana Character] 生成{body_label}到临时文件: {temp_body_path}")
 
+            identity_trace: dict[str, str] = {}
             image_bytes = await self._generate_with_reference(
                 client=client,
                 prompt=prompt,
@@ -604,6 +615,7 @@ class NanoBananaCharacterGenerator:
                 additional_images=[costume_image] if costume_image else None,
                 additional_image_bytes=[costume_image_bytes] if costume_image_bytes else None,
                 additional_image_names=[costume_image_path] if costume_image_bytes else None,
+                trace=identity_trace,
             )
 
             if image_bytes:
@@ -618,6 +630,13 @@ class NanoBananaCharacterGenerator:
                     f"[NanoBanana Character] 复合身份图已生成: {output_path}，耗时 {generation_time:.1f}s"
                 )
                 if usage_recorded and project_output_dir:
+                    update_image_request_gateway_id(
+                        project_output_dir=project_output_dir,
+                        request_id=request_id,
+                        gateway_request_id=identity_trace.get("request_id")
+                        or identity_trace.get("response_id")
+                        or "",
+                    )
                     update_image_request_status(
                         project_output_dir=project_output_dir,
                         request_id=request_id,
@@ -1155,6 +1174,7 @@ STRICT REQUIREMENTS (MUST AVOID):
         output_path: Optional[str] = None,
         aspect_ratio: str = "3:4",
         image_size: str = "1K",
+        trace: Optional[dict] = None,
     ) -> Optional[bytes]:
         """生成单张图像（无参考图）。
 
@@ -1164,6 +1184,7 @@ STRICT REQUIREMENTS (MUST AVOID):
             output_path: 输出路径
             aspect_ratio: 图像宽高比（默认 "3:4"）
             image_size: 图像尺寸（默认 "1K"）
+            trace: 出参，newAPI 分支回填网关单号（``request_id``/``response_id``）
 
         Returns:
             图像字节数据，失败返回 None
@@ -1269,6 +1290,7 @@ STRICT REQUIREMENTS (MUST AVOID):
                     base_url=self.base_url,
                     delivery_path=output_path,
                     delivery_state=(image_delivery_state := {}),
+                    trace=trace,
                 )
                 if not image_bytes and error_detail:
                     print(f"[NanoBanana Character] DramaClawAPI 失败详情: {error_detail}")
@@ -1365,6 +1387,7 @@ STRICT REQUIREMENTS (MUST AVOID):
         additional_images: list = None,  # 额外参考图 Part 对象列表（Google 模式）
         additional_image_bytes: list = None,  # 额外参考图字节列表（OpenRouter 模式）
         additional_image_names: list[str] = None,
+        trace: Optional[dict] = None,
     ) -> Optional[bytes]:
         """使用参考图生成图像（Identity Locking）。
 
@@ -1539,6 +1562,7 @@ STRICT REQUIREMENTS (MUST AVOID):
                     base_url=self.base_url,
                     delivery_path=output_path,
                     delivery_state=(image_delivery_state := {}),
+                    trace=trace,
                 )
                 if not image_bytes and error_detail:
                     print(f"[NanoBanana Character] DramaClawAPI 失败详情: {error_detail}")

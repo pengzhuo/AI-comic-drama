@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,13 @@ Transport = Callable[[str, str, dict[str, str], "dict[str, Any] | None"], "tuple
 PAGE_SIZE = 100
 #: 分页保险丝，防止上游返回异常数据时死循环。
 MAX_PAGES = 5000
+
+#: 上游 ``GET /api/log/self`` 是逐单号查询，对频率敏感（猛打会 429）。默认在每次
+#: 账单请求之间留最小间隔，并对 429 做指数退避重试，避免整批真账标定被限流打断。
+#: 两者都可经 ``RelayBillingClient`` 构造参数覆盖（测试传 0 / 0）。
+RELAY_MIN_REQUEST_INTERVAL_SECONDS = 0.25
+RELAY_MAX_RATE_RETRIES = 4
+RELAY_RATE_BACKOFF_BASE_SECONDS = 2.0
 
 #: 客户端 UA：便于在上游 ``GET /api/user/sessions`` 里认出本程序建立的会话。
 CLIENT_USER_AGENT = "novelvideo-relay/1.0"
@@ -195,6 +203,32 @@ def _default_transport(
         return 0, json.dumps({"error": str(exc)})
 
 
+class _RateGate:
+    """进程内「最小请求间隔」闸门；同一客户端的多线程共用。
+
+    上游对逐单号账单查询限流（429），并发线程各自猛打会持续触发。这里让请求按
+    ``min_interval`` 串行起步，把瞬时并发摊成稳定速率。计算与睡眠都放在锁外，
+    避免持锁睡眠把其他线程也卡住。
+    """
+
+    def __init__(self, min_interval: float) -> None:
+        self._min_interval = max(0.0, float(min_interval or 0.0))
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def wait(self) -> None:
+        if self._min_interval <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now >= self._next_at:
+                    self._next_at = now + self._min_interval
+                    return
+                delay = self._next_at - now
+            time.sleep(delay)
+
+
 class RelayBillingClient:
     """单个中转站的账单读取客户端（同步，可多线程共用）。"""
 
@@ -204,12 +238,16 @@ class RelayBillingClient:
         *,
         transport: Transport | None = None,
         page_size: int = PAGE_SIZE,
+        min_interval: float = RELAY_MIN_REQUEST_INTERVAL_SECONDS,
+        max_rate_retries: int = RELAY_MAX_RATE_RETRIES,
     ) -> None:
         self.endpoint = endpoint
         self._transport: Transport = transport or _default_transport
         self.page_size = max(1, min(int(page_size or PAGE_SIZE), PAGE_SIZE))
         self._token = ""
         self._token_lock = threading.Lock()
+        self.max_rate_retries = max(0, int(max_rate_retries))
+        self._gate = _RateGate(min_interval)
 
     # ------------------------------------------------------------------ auth
     def login(self, *, force: bool = False) -> str:
@@ -219,19 +257,32 @@ class RelayBillingClient:
             if not self.endpoint.configured:
                 raise RelayBillingError(f"{self.endpoint.label}: 缺少中转站账号")
             url = self.endpoint.base_url + "/api/user/login"
-            status, text = self._transport(
-                "POST",
-                url,
-                {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "User-Agent": CLIENT_USER_AGENT,
-                },
-                {
-                    "username": self.endpoint.username,
-                    "password": self.endpoint.password,
-                },
-            )
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": CLIENT_USER_AGENT,
+            }
+            body = {
+                "username": self.endpoint.username,
+                "password": self.endpoint.password,
+            }
+            status = 0
+            text = ""
+            for index in range(self.max_rate_retries + 1):
+                self._gate.wait()
+                status, text = self._transport("POST", url, headers, body)
+                if status != 429 or index >= self.max_rate_retries:
+                    break
+                # 登录接口也会被限流（429）；退避重试，别让批量查询反复撞。
+                delay = RELAY_RATE_BACKOFF_BASE_SECONDS * (2 ** index)
+                logger.warning(
+                    "%s: 登录 HTTP 429，%.1fs 后重试 (%d/%d)",
+                    self.endpoint.label,
+                    delay,
+                    index + 1,
+                    self.max_rate_retries,
+                )
+                time.sleep(delay)
             payload = _load_json(text)
             data = payload.get("data") if isinstance(payload, dict) else None
             token = str((data or {}).get("access_token") or "") if isinstance(data, dict) else ""
@@ -272,6 +323,11 @@ class RelayBillingClient:
                 raise
             logger.warning("%s: 退出会话异常 %s", self.endpoint.label, exc)
             return False
+        if status == 429 and self.max_rate_retries > 0:
+            # 退出也被限流时重试几次，尽量把会话释放掉（否则会挤占登录额度）。
+            status, text, payload = self._retry_on_rate_limit(
+                url, headers, status=status, text=text, payload=payload
+            )
         ok = status == 200 and not (
             isinstance(payload, dict) and payload.get("success") is False
         )
@@ -282,6 +338,34 @@ class RelayBillingClient:
                 return False
             raise RelayBillingError(message)
         return True
+
+    def _retry_on_rate_limit(
+        self,
+        url: str,
+        headers: dict[str, str],
+        *,
+        status: int,
+        text: str,
+        payload: Any,
+    ) -> tuple[int, str, Any]:
+        """对 429 做指数退避重试（退出等无 body 请求用）。"""
+        for index in range(self.max_rate_retries):
+            delay = RELAY_RATE_BACKOFF_BASE_SECONDS * (2 ** index)
+            logger.warning(
+                "%s: %s HTTP 429，%.1fs 后重试 (%d/%d)",
+                self.endpoint.label,
+                url,
+                delay,
+                index + 1,
+                self.max_rate_retries,
+            )
+            time.sleep(delay)
+            self._gate.wait()
+            status, text = self._transport("POST", url, headers, None)
+            payload = _load_json(text)
+            if status != 429:
+                break
+        return status, text, payload
 
     def _call(
         self,
@@ -295,17 +379,35 @@ class RelayBillingClient:
         url = self.endpoint.base_url + path
         if params:
             url = f"{url}?{urlencode(params)}"
-        for attempt in (0, 1):
+        relogin_done = False
+        rate_retries = 0
+        while True:
             headers = {"Accept": "application/json", "User-Agent": CLIENT_USER_AGENT}
             if auth:
                 headers["Authorization"] = f"Bearer {self.login()}"
             if body is not None:
                 headers["Content-Type"] = "application/json"
+            self._gate.wait()
             status, text = self._transport(method, url, headers, body)
             payload = _load_json(text)
-            if auth and attempt == 0 and status == 401:
+            if auth and status == 401 and not relogin_done:
                 # access token 只有 15 分钟，过期就重登一次再试。
+                relogin_done = True
                 self.login(force=True)
+                continue
+            if status == 429 and rate_retries < self.max_rate_retries:
+                # 上游对逐单号账单查询限流：指数退避后重试，别让整批标定中断。
+                delay = RELAY_RATE_BACKOFF_BASE_SECONDS * (2 ** rate_retries)
+                rate_retries += 1
+                logger.warning(
+                    "%s: %s HTTP 429，%.1fs 后重试 (%d/%d)",
+                    self.endpoint.label,
+                    path,
+                    delay,
+                    rate_retries,
+                    self.max_rate_retries,
+                )
+                time.sleep(delay)
                 continue
             if status != 200:
                 raise RelayBillingError(
@@ -318,7 +420,6 @@ class RelayBillingClient:
             if isinstance(payload, dict) and "data" in payload:
                 return payload["data"]
             return payload
-        raise RelayBillingError(f"{self.endpoint.label}: {path} 重试后仍失败")
 
     # ---------------------------------------------------------------- public
     def status(self) -> RelayStatus:
@@ -403,6 +504,17 @@ class RelayBillingClient:
             else:
                 found[request_id] = cached
         if pending:
+            # 先单独登录一次：登录失败（429 / 409 AUTH_SESSION_LIMIT）就整批跳过，
+            # 而不是让每个单号都去撞一次登录，把上游登录限流彻底打满。
+            try:
+                self.login()
+            except RelayBillingError as exc:
+                logger.warning(
+                    "中转站登录失败，跳过 %d 条日志查询: %s", len(pending), exc
+                )
+                if cache is not None:
+                    cache.logs.update(found)
+                return found
 
             def _one(request_id: str) -> tuple[str, int | None]:
                 try:
