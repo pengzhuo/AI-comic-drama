@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from copy import copy
 from hashlib import sha256
@@ -30,6 +31,7 @@ from novelvideo.cognee.screenplay_normalizer import (
     normalize_time_of_day,
 )
 from novelvideo.utils.derived_scenes import compose_derived_scene_name
+from novelvideo.utils.model_context_budget import TextContextBudget, estimate_tokens
 from novelvideo.skills.ai_film_process import append_pack
 from novelvideo.workflows.literal_script_writing import (
     LiteralScriptWritingWorkflow,
@@ -58,6 +60,43 @@ PROP_OUTPUT_SCHEMA_HINT = (
     "道具规划结构化输出校验失败: requirements 必须是对象数组，每项必须包含 "
     "prop_name 和 visual_prompt；不能是字符串数组；prop_name 必须逐字来自当前场景块文本或候选道具"
 )
+
+
+#: ``_input_upper_bound`` measures the JSON-serialized request (escaped newlines,
+#: message/tool wrappers) plus ``framing_tokens``, so the raw text sizes alone do
+#: not capture a request's true cost. This margin absorbs JSON escaping and the
+#: function-calling schema wrapper; ~4 KB was observed on a full-size chunk, so
+#: leave generous headroom rather than sit one byte under the window.
+_PROMPT_BUDGET_OVERHEAD_MARGIN = 16_384
+
+
+def _prompt_budget_reserve(
+    budget: TextContextBudget,
+    system_prompt: str,
+    output_schema: type[BaseModel] | None = None,
+    *,
+    margin_tokens: int = _PROMPT_BUDGET_OVERHEAD_MARGIN,
+) -> int:
+    """Framing/output reserve plus the fixed system-prompt and schema overhead.
+
+    Chunking by the raw budget alone is not enough: the injected skill pack, the
+    task framing and the structured-output schema all ride on every request, so a
+    chunk that "fits" the raw input budget still overflows once the system prompt
+    is prepended (``MODEL_CONTEXT_BUDGET_EXCEEDED``, fatal and not retried).
+    Accounting for them here keeps every per-chunk request inside the window.
+    """
+
+    reserve = budget.framing_tokens + budget.default_output_tokens
+    reserve += estimate_tokens(system_prompt)
+    if output_schema is not None:
+        try:
+            schema_json = json.dumps(
+                output_schema.model_json_schema(), ensure_ascii=False
+            )
+        except Exception:  # pragma: no cover - defensive; schemas are serializable
+            schema_json = ""
+        reserve += estimate_tokens(schema_json)
+    return reserve + margin_tokens
 
 
 class PropRequirement(BaseModel):
@@ -811,17 +850,18 @@ class AssetCompiler:
                 parts.append(f"描述: {prompt[:120]}")
             existing_lines.append("；".join(part for part in parts if part))
 
+        scene_system_prompt = append_pack(
+            "episode_scene_planner",
+            BASE_SCENE_RECONCILE_PROMPT,
+            model_env="EPISODE_SCENE_RECONCILE_MODEL",
+        )
         agent = Agent(
             get_newapi_text_pydantic_model(
                 "EPISODE_SCENE_RECONCILE_MODEL",
                 brainclaw_profile=BrainClawProfile.EPISODE_SCENE_RECONCILIATION,
                 capability="text.generate.agent",
             ),
-            system_prompt=append_pack(
-                "episode_scene_planner",
-                BASE_SCENE_RECONCILE_PROMPT,
-                model_env="EPISODE_SCENE_RECONCILE_MODEL",
-            ),
+            system_prompt=scene_system_prompt,
             model_settings=get_newapi_structured_output_model_settings(),
             output_type=EpisodeBaseSceneReconcileOutput,
             output_retries=model_gateway_output_retries(2),
@@ -838,14 +878,14 @@ class AssetCompiler:
 """
 
         from novelvideo.utils.long_text import chunk_by_budget, map_reduce
-        from novelvideo.utils.model_context_budget import (
-            TextContextBudget,
-            estimate_tokens,
-        )
 
         budget = TextContextBudget.from_env("EPISODE_SCENE_RECONCILE_MODEL")
         base_reserve = (
-            budget.framing_tokens + budget.default_output_tokens if budget else 0
+            _prompt_budget_reserve(
+                budget, scene_system_prompt, EpisodeBaseSceneReconcileOutput
+            )
+            if budget
+            else 0
         )
         if budget is None or estimate_tokens(_task(source_text)) <= budget.available_input_tokens(
             base_reserve
@@ -882,6 +922,7 @@ class AssetCompiler:
             budget=budget,
             chunker=lambda _text: chunks,
             require_all=True,
+            stage="asset",
         )
         return await self._apply_base_scene_reconcile_output(
             merged, source_text, episode, log
@@ -1258,32 +1299,84 @@ class AssetCompiler:
         block_text = "\n".join(content_lines)
         if not block_text:
             return []
-        task = f"""分析场景 `{scene_name}` 在当前场景块里的视觉状态。
+
+        def _task(text: str) -> str:
+            return f"""分析场景 `{scene_name}` 在当前场景块里的视觉状态。
 
 ## 场次头
 {block.header_line or "无"}
 
 ## 当前场景块文本
-{block_text}
+{text}
 """
+
+        system_prompt = append_pack(
+            "episode_scene_planner",
+            DERIVED_SCENE_PROMPT,
+            model_env="EPISODE_SCENE_PLANNER_MODEL",
+        )
         agent = Agent(
             get_newapi_text_pydantic_model(
                 "EPISODE_SCENE_PLANNER_MODEL",
                 brainclaw_profile=BrainClawProfile.EPISODE_SCENE_PLANNING,
                 capability="text.generate.agent",
             ),
-            system_prompt=append_pack(
-                "episode_scene_planner",
-                DERIVED_SCENE_PROMPT,
-                model_env="EPISODE_SCENE_PLANNER_MODEL",
-            ),
+            system_prompt=system_prompt,
             model_settings=get_newapi_structured_output_model_settings(),
             output_type=BlockDerivedSceneOutput,
             output_retries=model_gateway_output_retries(2),
             name="派生场景分析师",
         )
-        result = await agent.run(task)
-        return result.output.derived_scenes
+
+        from novelvideo.utils.long_text import chunk_by_budget, map_reduce
+
+        budget = TextContextBudget.from_env("EPISODE_SCENE_PLANNER_MODEL")
+        reserve = (
+            _prompt_budget_reserve(budget, system_prompt, BlockDerivedSceneOutput)
+            if budget
+            else 0
+        )
+        if budget is None or estimate_tokens(
+            _task(block_text)
+        ) <= budget.available_input_tokens(reserve):
+            result = await agent.run(_task(block_text))
+            return result.output.derived_scenes
+
+        # Oversized block (a headerless novel is a single scene block): analyze
+        # per chunk and merge, deduping by label so overlapping chunks stay safe.
+        chunks = chunk_by_budget(
+            block_text,
+            budget,
+            reserve_tokens=reserve + estimate_tokens(_task("")) + 64,
+        )
+        errors: list[BaseException] = []
+
+        async def _analyze_once(chunk: str) -> list[DerivedSceneRequirement]:
+            result = await agent.run(_task(chunk))
+            return result.output.derived_scenes
+
+        def _reduce(results) -> list[DerivedSceneRequirement]:
+            if errors:
+                raise errors[0]
+            merged: list[DerivedSceneRequirement] = []
+            seen: set[str] = set()
+            for items in results:
+                for item in items or []:
+                    label = str(getattr(item, "label", "") or "").strip()
+                    if not label or label in seen:
+                        continue
+                    seen.add(label)
+                    merged.append(item)
+            return merged
+
+        return await map_reduce(
+            block_text,
+            map_fn=_analyze_once,
+            reduce_fn=_reduce,
+            budget=budget,
+            chunker=lambda _text: chunks,
+            on_error=lambda _chunk, exc: errors.append(exc),
+        )
 
     async def _compile_props(
         self,
@@ -1446,28 +1539,31 @@ class AssetCompiler:
         candidate_section = (
             "\n".join(candidate_lines) if candidate_lines else "（无预筛候选）"
         )
-        task = f"""分析当前场景块中的关键道具。
+        def _task(text: str) -> str:
+            return f"""分析当前场景块中的关键道具。
 
 ## 场次头
 {block.header_line or "无"}
 
 ## 当前场景块文本
-{block_text}
+{text}
 
 ## 预筛命中的已有道具
 {candidate_section}
 """
+
+        system_prompt = append_pack(
+            "episode_prop_planner",
+            BLOCK_PROP_PROMPT,
+            model_env="EPISODE_PROP_PLANNER_MODEL",
+        )
         agent = Agent(
             get_newapi_text_pydantic_model(
                 "EPISODE_PROP_PLANNER_MODEL",
                 brainclaw_profile=BrainClawProfile.EPISODE_PROP_PLANNING,
                 capability="text.generate.agent",
             ),
-            system_prompt=append_pack(
-                "episode_prop_planner",
-                BLOCK_PROP_PROMPT,
-                model_env="EPISODE_PROP_PLANNER_MODEL",
-            ),
+            system_prompt=system_prompt,
             model_settings=get_newapi_structured_output_model_settings(),
             output_type=BlockPropRequirements,
             output_retries=model_gateway_output_retries(2),
@@ -1477,11 +1573,61 @@ class AssetCompiler:
             },
             name="场景块道具分析师",
         )
-        try:
-            result = await agent.run(task)
-        except (UnexpectedModelBehavior, ValidationError) as exc:
-            raise ValueError(f"{PROP_OUTPUT_SCHEMA_HINT}；原始错误: {exc}") from exc
-        return result.output.requirements
+
+        async def _run_once(text: str) -> list[PropRequirement]:
+            try:
+                result = await agent.run(_task(text))
+            except (UnexpectedModelBehavior, ValidationError) as exc:
+                raise ValueError(f"{PROP_OUTPUT_SCHEMA_HINT}；原始错误: {exc}") from exc
+            return result.output.requirements
+
+        from novelvideo.utils.long_text import chunk_by_budget, map_reduce
+
+        budget = TextContextBudget.from_env("EPISODE_PROP_PLANNER_MODEL")
+        reserve = (
+            _prompt_budget_reserve(budget, system_prompt, BlockPropRequirements)
+            if budget
+            else 0
+        )
+        if budget is None or estimate_tokens(
+            _task(block_text)
+        ) <= budget.available_input_tokens(reserve):
+            return await _run_once(block_text)
+
+        # Oversized block (a headerless novel is a single scene block): analyze
+        # per chunk and merge by prop_name so no prop is dropped. The validator
+        # still checks names against the full block text, so cross-chunk reuse is
+        # allowed while per-chunk invention stays filtered.
+        chunks = chunk_by_budget(
+            block_text,
+            budget,
+            reserve_tokens=reserve + estimate_tokens(_task("")) + 64,
+        )
+        errors: list[BaseException] = []
+
+        def _reduce(results) -> list[PropRequirement]:
+            if errors:
+                raise errors[0]
+            merged: list[PropRequirement] = []
+            seen: set[str] = set()
+            for items in results:
+                for item in items or []:
+                    name = str(getattr(item, "prop_name", "") or "").strip()
+                    if not name or name in seen:
+                        continue
+                    seen.add(name)
+                    merged.append(item)
+            return merged
+
+        return await map_reduce(
+            block_text,
+            map_fn=_run_once,
+            reduce_fn=_reduce,
+            budget=budget,
+            chunker=lambda _text: chunks,
+            on_error=lambda _chunk, exc: errors.append(exc),
+            stage="asset",
+        )
 
     @classmethod
     def _has_interaction_evidence(cls, prop_name: str, block_text: str) -> bool:

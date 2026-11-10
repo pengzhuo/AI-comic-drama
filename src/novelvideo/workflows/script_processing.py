@@ -38,12 +38,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Awaitable, Callable, Iterable, Optional, TypeVar
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Iterable, Optional, TypeVar
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -59,7 +62,10 @@ from novelvideo.config import (
     get_newapi_structured_output_model_settings,
     get_newapi_text_pydantic_model,
 )
+from novelvideo.pipeline_timing import record_event
 from novelvideo.skills import ai_film_process
+from novelvideo.shared import stage_runtime as _stage_runtime
+from novelvideo.shared.global_llm_gate import global_llm_slot
 from novelvideo.shared.transient_retry import (
     is_retryable_transient,
     transient_retry_delay,
@@ -77,6 +83,8 @@ from novelvideo.utils.source_language import (
 
 STAGE = "script_process"
 
+_log = logging.getLogger("novelvideo.script_process")
+
 #: 单段原文的字符预算。分段只影响调用次数，不改变覆盖范围。
 #: 片段越小，单次调用的输出越不易触顶；片段越大，跨场上下文越完整。
 #: 中文长稿的实测结论：3,000 字左右能让「理解账 + 逐场制作剧本」在默认输出
@@ -91,13 +99,20 @@ SCRIPT_PROCESS_MAX_OUTPUT_TOKENS = 16384
 SCRIPT_PROCESS_MIN_OUTPUT_TOKENS = 4096
 #: 归并输入（分段摘要 + 事实清单）的字符上限（还会再受上下文预算约束）。
 SCRIPT_PROCESS_DIGEST_MAX_INPUT_CHARS = 24000
-#: 每段摘要在归并输入中的截断长度。
+#: 每段摘要在归并输入中的截断长度（字符；``SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS``
+#: 或热调参键 ``digest_segment_chars`` 可覆盖）。
 SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS = 2000
+SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS_ENV = "SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS"
+#: 归并输入里每段「事实 JSON」的字节上限；``0`` = 不限（历史行为）。
+#: 调小可让每批塞进更多段、减少归并批次数与输入 token，但可能损失细节。
+SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS_ENV = "SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS"
+SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS_DEFAULT = 0
 #: 使用的模型路由（与逐行脚本标注共用剧本域文本模型）。
 SCRIPT_PROCESS_MODEL_ENV = "LITERAL_BEAT_META_MODEL"
 
 #: 使用同一份原文的并发段数上限（``SCRIPT_PROCESS_CONCURRENCY`` 可覆盖）。
-#: 默认沿用部署统一的 ``STRUCTURED_LLM_CONCURRENCY``（网关是共享瓶颈）。
+#: 默认取 :data:`SCRIPT_PROCESS_DEFAULT_CONCURRENCY`（见下），不再沿用全局
+#: ``STRUCTURED_LLM_CONCURRENCY``——该阶段是逐段串行热点，需要更进取的并发。
 SCRIPT_PROCESS_CONCURRENCY_ENV = "SCRIPT_PROCESS_CONCURRENCY"
 
 #: 上游瞬时故障（429/5xx/连接失败）的同尺寸重试次数；用尽后照常上抛，
@@ -114,6 +129,27 @@ SCRIPT_PROCESS_OVERLOAD_STREAK = 3
 #: 过载冷却时长（秒）。冷却期间只放行一个在飞调用（有效并发降为 1）。
 SCRIPT_PROCESS_OVERLOAD_COOLDOWN_ENV = "SCRIPT_PROCESS_OVERLOAD_COOLDOWN_SECONDS"
 SCRIPT_PROCESS_OVERLOAD_COOLDOWN_SECONDS = 60.0
+
+#: 「剧本处理」运行期热调参文件（改文件即生效，无需重启容器）。
+#: 允许的键：``concurrency`` / ``chunk_max_chars`` / ``skill_injection`` /
+#: ``parallel_digest`` / ``digest_segment_chars`` / ``digest_facts_max_chars``。
+#: 解析优先级：环境变量（``SCRIPT_PROCESS_*``）> 本文件 > 代码常量。
+SCRIPT_PROCESS_TUNING_FILE_ENV = "SCRIPT_PROCESS_TUNING_FILE"
+SCRIPT_PROCESS_TUNING_FILENAME = "script_process.json"
+
+#: 分段并发兜底。本阶段是「长稿逐段、每段一次调用」的串行热点，独立于全局
+#: ``STRUCTURED_LLM_CONCURRENCY``（默认 2）取一个更进取的默认值（护花铃_2 实测
+#: 4→6→8 近线性提速，8 相对 6 span −29% 且覆盖不降）；仍可被
+#: ``SCRIPT_PROCESS_CONCURRENCY`` 或热调参文件覆盖，过载闸门照常生效。
+SCRIPT_PROCESS_DEFAULT_CONCURRENCY = 12
+
+#: 技能注入形态兜底：``full`` 注入整份第 02 份正文（约 28.7 KB）；
+#: ``condensed`` 注入随包的精简规范块（约 2.2 KB）。可被热调参文件覆盖。
+SCRIPT_PROCESS_SKILL_INJECTION_ENV = "SCRIPT_PROCESS_SKILL_INJECTION"
+SCRIPT_PROCESS_SKILL_INJECTION_DEFAULT = "full"
+
+#: 归并分批是否并发（``SCRIPT_PROCESS_PARALLEL_DIGEST`` / 热调参文件）。
+SCRIPT_PROCESS_PARALLEL_DIGEST_ENV = "SCRIPT_PROCESS_PARALLEL_DIGEST"
 
 #: 预算规划时给协议封装留的余量（字节）。
 _PLANNING_MARGIN_BYTES = 2048
@@ -205,22 +241,55 @@ class ScriptProcessResult:
 
 
 def _env_positive_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
+    """正整数环境变量（实现见 :mod:`novelvideo.shared.stage_runtime`）。"""
+
+    return _stage_runtime.env_positive_int(name, default)
+
+
+def _runtime_tuning_path() -> Path:
+    """热调参文件位置：显式 env > ``NOVELVIDEO_RUNTIME_DIR`` > state 同级 runtime。"""
+
+    return _stage_runtime.runtime_tuning_path(
+        STAGE, explicit_env=SCRIPT_PROCESS_TUNING_FILE_ENV
+    )
+
+
+def _load_runtime_tuning() -> dict[str, Any]:
+    """读取热调参文件；缺失或损坏一律返回空字典（绝不抛错）。"""
+
+    return _stage_runtime.load_runtime_tuning(
+        STAGE, explicit_env=SCRIPT_PROCESS_TUNING_FILE_ENV
+    )
+
+
+def _coerce_positive_int(raw: Any) -> int | None:
+    """把热调参文件里的值收成正整数；非法返回 ``None``。"""
+
+    return _stage_runtime.coerce_positive_int(raw)
+
+
+def _env_flag(name: str) -> bool | None:
+    """解析布尔环境变量；未设置或非法返回 ``None``。"""
+
+    return _stage_runtime.env_flag(name)
+
+
+def _tuning_bool(raw: Any, default: bool) -> bool:
+    """把热调参文件里的值收成布尔；非法返回 ``default``。"""
+
+    return _stage_runtime.tuning_bool(raw, default)
 
 
 def default_chunk_max_chars() -> int:
-    """分段字符预算（``SCRIPT_PROCESS_CHUNK_MAX_CHARS`` 可覆盖）。"""
+    """分段字符预算（env > 热调参文件 > 常量，``SCRIPT_PROCESS_CHUNK_MAX_CHARS``）。"""
 
-    return _env_positive_int(
-        "SCRIPT_PROCESS_CHUNK_MAX_CHARS", SCRIPT_PROCESS_CHUNK_MAX_CHARS
-    )
+    env = _env_positive_int("SCRIPT_PROCESS_CHUNK_MAX_CHARS", 0)
+    if env > 0:
+        return env
+    tuned = _coerce_positive_int(_load_runtime_tuning().get("chunk_max_chars"))
+    if tuned is not None:
+        return tuned
+    return SCRIPT_PROCESS_CHUNK_MAX_CHARS
 
 
 def default_max_output_tokens() -> int:
@@ -232,11 +301,73 @@ def default_max_output_tokens() -> int:
 
 
 def default_concurrency() -> int:
-    """并发段数（``SCRIPT_PROCESS_CONCURRENCY``，默认沿用全局 LLM 并发）。"""
+    """并发段数（env > 热调参文件 > 常量，默认 :data:`SCRIPT_PROCESS_DEFAULT_CONCURRENCY`）。"""
 
-    from novelvideo.utils.bounded_concurrency import default_llm_concurrency
+    env = _env_positive_int(SCRIPT_PROCESS_CONCURRENCY_ENV, 0)
+    if env > 0:
+        return env
+    tuned = _coerce_positive_int(_load_runtime_tuning().get("concurrency"))
+    if tuned is not None:
+        return tuned
+    return SCRIPT_PROCESS_DEFAULT_CONCURRENCY
 
-    return _env_positive_int(SCRIPT_PROCESS_CONCURRENCY_ENV, default_llm_concurrency())
+
+def default_skill_injection() -> str:
+    """技能注入形态：``full`` / ``condensed``（env > 热调参文件 > 常量）。"""
+
+    env = os.environ.get(SCRIPT_PROCESS_SKILL_INJECTION_ENV, "").strip().lower()
+    if env in {"full", "condensed"}:
+        return env
+    tuned = str(_load_runtime_tuning().get("skill_injection") or "").strip().lower()
+    if tuned in {"full", "condensed"}:
+        return tuned
+    return SCRIPT_PROCESS_SKILL_INJECTION_DEFAULT
+
+
+def default_parallel_digest() -> bool:
+    """归并分批是否并发（env > 热调参文件 > 默认 ``True``）。"""
+
+    env = _env_flag(SCRIPT_PROCESS_PARALLEL_DIGEST_ENV)
+    if env is not None:
+        return env
+    return _tuning_bool(_load_runtime_tuning().get("parallel_digest"), True)
+
+
+def default_digest_segment_chars() -> int:
+    """每段摘要在归并输入中的截断长度（env > 热调参文件 > 常量）。"""
+
+    env = _env_positive_int(SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS_ENV, 0)
+    if env > 0:
+        return env
+    tuned = _coerce_positive_int(_load_runtime_tuning().get("digest_segment_chars"))
+    if tuned is not None:
+        return tuned
+    return SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS
+
+
+def default_digest_facts_max_chars() -> int:
+    """每段事实 JSON 的字节上限；``0`` = 不限（env > 热调参文件 > 常量）。"""
+
+    raw = os.environ.get(SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS_ENV, "").strip()
+    if raw:
+        try:
+            env = int(raw)
+        except ValueError:
+            env = None
+        if env is not None and env >= 0:
+            return env
+    tuned = _load_runtime_tuning().get("digest_facts_max_chars")
+    if not isinstance(tuned, bool):
+        if isinstance(tuned, int) and tuned >= 0:
+            return tuned
+        if isinstance(tuned, str):
+            try:
+                value = int(tuned.strip())
+            except ValueError:
+                value = None
+            if value is not None and value >= 0:
+                return value
+    return SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS_DEFAULT
 
 
 def default_transient_attempts() -> int:
@@ -499,71 +630,8 @@ def chunk_source_text(
 T = TypeVar("T")
 
 
-class _SegmentLimiter:
-    """分段并发闸门，兼做「上游过载」降速。
-
-    正常时按配置并发放行；连续 ``streak`` 次瞬时失败（429/5xx/连接失败）后进入
-    ``cooldown_seconds`` 秒冷却，冷却期间新调用必须先拿到串行闸门，于是有效并发
-    降到 1。这样在网关自己报 ``system_cpu_overloaded`` 时不会继续加压。
-
-    ``acquire`` 返回本次是否持有了串行闸门，释放时原样传回 :meth:`release`
-    （同步释放，取消路径上不会因为 await 再抛错）。
-    """
-
-    def __init__(
-        self,
-        limit: int,
-        *,
-        streak: int,
-        cooldown_seconds: float,
-    ) -> None:
-        self._limit = max(1, int(limit))
-        self._streak_threshold = max(1, int(streak))
-        self._cooldown_seconds = max(0.0, float(cooldown_seconds))
-        self._consecutive = 0
-        self._resume_at = 0.0
-        self._semaphore = asyncio.Semaphore(self._limit)
-        self._serial = asyncio.Semaphore(1)
-
-    @staticmethod
-    def _now() -> float:
-        return asyncio.get_running_loop().time()
-
-    @property
-    def cooling_down(self) -> bool:
-        """当前是否处于过载冷却中。"""
-
-        return self._resume_at > self._now()
-
-    def note_success(self) -> None:
-        self._consecutive = 0
-
-    def note_transient_failure(self) -> bool:
-        """记一次瞬时失败；返回 ``True`` 表示本次触发了过载冷却。"""
-
-        self._consecutive += 1
-        if self._consecutive < self._streak_threshold or self._cooldown_seconds <= 0:
-            return False
-        self._consecutive = 0
-        self._resume_at = self._now() + self._cooldown_seconds
-        return True
-
-    async def acquire(self) -> bool:
-        serial = self.cooling_down
-        if serial:
-            await self._serial.acquire()
-        try:
-            await self._semaphore.acquire()
-        except BaseException:
-            if serial:
-                self._serial.release()
-            raise
-        return serial
-
-    def release(self, serial: bool) -> None:
-        self._semaphore.release()
-        if serial:
-            self._serial.release()
+#: 分段/归并共用的并发闸门；通用实现见 :mod:`novelvideo.shared.stage_runtime`。
+_SegmentLimiter = _stage_runtime.StageLimiter
 
 
 class ScriptProcessWorkflow:
@@ -578,7 +646,11 @@ class ScriptProcessWorkflow:
         min_chunk_chars: int | None = None,
         max_output_tokens: int | None = None,
         digest_max_input_chars: int | None = None,
+        digest_segment_chars: int | None = None,
+        digest_facts_max_chars: int | None = None,
         concurrency: int | None = None,
+        skill_injection: str | None = None,
+        parallel_digest: bool | None = None,
         transient_attempts: int | None = None,
         transient_backoff: tuple[float, ...] | None = None,
         overload_streak: int | None = None,
@@ -601,7 +673,30 @@ class ScriptProcessWorkflow:
             if digest_max_input_chars
             else SCRIPT_PROCESS_DIGEST_MAX_INPUT_CHARS
         )
+        self.digest_segment_chars = (
+            int(digest_segment_chars)
+            if digest_segment_chars
+            else default_digest_segment_chars()
+        )
+        self.digest_facts_max_chars = (
+            int(digest_facts_max_chars)
+            if digest_facts_max_chars is not None
+            else default_digest_facts_max_chars()
+        )
         self.concurrency = max(1, int(concurrency) if concurrency else default_concurrency())
+        requested_injection = str(skill_injection or "").strip().lower()
+        self.skill_injection = (
+            requested_injection
+            if requested_injection in {"full", "condensed"}
+            else default_skill_injection()
+        )
+        if self.skill_injection not in {"full", "condensed"}:
+            self.skill_injection = SCRIPT_PROCESS_SKILL_INJECTION_DEFAULT
+        self.parallel_digest = (
+            bool(parallel_digest)
+            if parallel_digest is not None
+            else default_parallel_digest()
+        )
         self.transient_attempts = max(
             1,
             int(transient_attempts)
@@ -651,7 +746,7 @@ class ScriptProcessWorkflow:
             f"第 {code} 份：{ai_film_process.PART_TITLES.get(code, code)}"
             for code in codes
         )
-        pack = ai_film_process.stage_scope_pack(STAGE, scope)
+        pack = self._skill_pack(scope)
         header = (
             f"{SYSTEM_PROMPT_HEADER}\n"
             f"## 流程包正文（版本 {ai_film_process.PACK_VERSION}；本次注入 {titles}）"
@@ -662,6 +757,21 @@ class ScriptProcessWorkflow:
             f"{header}\n{pack}\n\n"
             f"{asset_language_instruction(self._output_language)}"
         )
+
+    def _skill_pack(self, scope: str) -> str:
+        """按当前技能注入形态取流程包正文。
+
+        ``condensed`` 优先用随包的精简规范块（体积小、预填更快）；该作用域没有
+        精简块、或注入被关闭/超窗时回落整份正文，保证不会「空注入」。
+        """
+
+        if self.skill_injection == "condensed":
+            block = ai_film_process.pack_directive(
+                STAGE, scope, model_env=SCRIPT_PROCESS_MODEL_ENV
+            )
+            if block:
+                return block
+        return ai_film_process.stage_scope_pack(STAGE, scope)
 
     @staticmethod
     def _scope_for(output_type: type[BaseModel]) -> str:
@@ -819,10 +929,21 @@ class ScriptProcessWorkflow:
         total = len(planned)
         log(
             f"[ScriptProcess] 流程包 {ai_film_process.PACK_VERSION}；"
-            f"分段注入 {list(ai_film_process.stage_scope_parts(STAGE, 'segment'))}，"
+            f"分段注入 {list(ai_film_process.stage_scope_parts(STAGE, 'segment'))}"
+            f"/{self.skill_injection}，"
             f"归并注入 {list(ai_film_process.stage_scope_parts(STAGE, 'digest'))}；"
             f"原文 {len(text)} 字，计划 {total} 段（每段 ≤{self.chunk_max_chars} 字，"
-            f"并发 {self.concurrency}）"
+            f"并发 {self.concurrency}，归并并发 {'on' if self.parallel_digest else 'off'}）"
+        )
+        _log.info(
+            "[ScriptProcess] 启动：原文 %s 字，计划 %s 段，并发 %s，注入 %s，"
+            "归并并发 %s，调参文件 %s",
+            len(text),
+            total,
+            self.concurrency,
+            self.skill_injection,
+            self.parallel_digest,
+            _runtime_tuning_path(),
         )
 
         completed = 0
@@ -938,18 +1059,22 @@ class ScriptProcessWorkflow:
                 if attempt >= attempts or not _is_transient(exc):
                     raise
                 if self._limiter.note_transient_failure():
-                    log(
+                    overload_msg = (
                         f"[ScriptProcess][WARN] 上游连续 {self.overload_streak} 次过载，"
                         f"暂停 {self.overload_cooldown_seconds:.0f}s 冷却"
                         f"（冷却期间并发降为 1）"
                     )
+                    log(overload_msg)
+                    _log.warning(overload_msg)
                 delay = transient_retry_delay(attempt, self.transient_backoff)
                 hint = "，保持原片段大小重试" if same_size else ""
-                log(
+                retry_msg = (
                     f"[ScriptProcess][WARN] {label}命中上游瞬时故障"
                     f"（{_transient_reason(exc)}），{delay:.0f}s 后重试"
                     f"（{attempt}/{attempts}）{hint}"
                 )
+                log(retry_msg)
+                _log.warning(retry_msg)
                 await asyncio.sleep(delay)
                 continue
             self._limiter.note_success()
@@ -983,7 +1108,8 @@ class ScriptProcessWorkflow:
         async def one(item: tuple[int, str]):
             serial = await limiter.acquire()
             try:
-                return await process(item)
+                async with global_llm_slot():
+                    return await process(item)
             finally:
                 limiter.release(serial)
 
@@ -1099,8 +1225,41 @@ class ScriptProcessWorkflow:
         prompt = self._segment_prompt(
             body=chunk, index=index, total=total, spine_label=spine_label
         )
-        result = await self.segment_agent.run(prompt)
+        started = time.monotonic()
+        try:
+            result = await self.segment_agent.run(prompt)
+        except BaseException:
+            self._record_call(
+                "segment", index=index, total=total, started=started, ok=False
+            )
+            raise
+        self._record_call(
+            "segment", index=index, total=total, started=started, ok=True
+        )
         return result.output
+
+    def _record_call(
+        self,
+        phase: str,
+        *,
+        started: float,
+        ok: bool,
+        index: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        """把一次模型调用的墙钟耗时写进 ``runtime/pipeline_timing.jsonl``（仅观测）。"""
+
+        record_event(
+            self.output_dir,
+            "script_process_call",
+            phase=phase,
+            index=index,
+            total=total,
+            ok=ok,
+            concurrency=self.concurrency,
+            injection=self.skill_injection,
+            duration_seconds=round(time.monotonic() - started, 3),
+        )
 
     def _segment_prompt(
         self, *, body: str, index: int, total: int, spine_label: str
@@ -1183,6 +1342,11 @@ class ScriptProcessWorkflow:
             return self._merge_without_model(segments)
 
         groups = self._digest_groups(segments, limit)
+        log(
+            f"[ScriptProcess] 归并输入 {len(segments)} 段 → {len(groups)} 批"
+            f"（预算 {limit} 字节/批，摘要截断 {self.digest_segment_chars} 字，"
+            f"事实上限 {self.digest_facts_max_chars or '不限'} 字节）"
+        )
         if len(groups) == 1:
             digest = await self._run_digest_prompt(
                 blocks=groups[0],
@@ -1202,58 +1366,12 @@ class ScriptProcessWorkflow:
                 list(digest.gaps),
             )
 
-        partials: list[ScriptProcessDigestOutput] = []
-        pending: deque[tuple[int, str]] = deque(enumerate(groups, start=1))
-        while pending:
-            group_index, blocks = pending.popleft()
-            label = (
-                f"下面是同一部剧本第 {group_index}/{len(groups)} 批"
-                f"（全剧共 {len(segments)} 段）的读审摘要与事实清单。"
-                "请只在本批范围内归并，不要臆造本批未给出的段落。"
-            )
-            try:
-                digest = await self._run_digest_prompt(
-                    blocks=blocks,
-                    spine_label=spine_label,
-                    label=label,
-                    unit="本批",
-                    log=log,
-                )
-            except ContentFilterError as exc:
-                log(
-                    f"[ScriptProcess][WARN] 第 {group_index} 批归并被内容审核拦截，"
-                    f"已跳过该批：{exc}"
-                )
-                continue
-            except Exception as exc:  # noqa: BLE001 - 先分类再决定是否重抛
-                if not _is_recoverable(exc):
-                    raise
-                # 批次输出被截断是「本批塞了太多段」，把这一批拆小再来，
-                # 不要因为一批失败就丢掉其它批已经归并好的结果。
-                try:
-                    left, right = split_chunk_in_half(blocks)
-                except ValueError:
-                    left = right = ""
-                if (
-                    not left
-                    or not right
-                    or estimate_tokens(left) < _MIN_BODY_BYTES
-                    or estimate_tokens(right) < _MIN_BODY_BYTES
-                ):
-                    log(
-                        f"[ScriptProcess][WARN] 第 {group_index} 批归并失败且无法再拆，"
-                        f"已跳过该批：{exc}"
-                    )
-                    continue
-                log(
-                    f"[ScriptProcess][WARN] 第 {group_index} 批归并失败"
-                    f"（{type(exc).__name__}），已拆成两个子批重试"
-                )
-                pending.extendleft([(group_index, right), (group_index, left)])
-                continue
-            partials.append(digest)
-            log(f"[ScriptProcess] 分批归并 {group_index}/{len(groups)} 完成")
-
+        partials = await self._collect_digest_partials(
+            groups,
+            spine_label=spine_label,
+            log=log,
+            total_segments=len(segments),
+        )
         if not partials:
             log("[ScriptProcess][WARN] 所有分批归并都未产出结果，改用确定性合并")
             return self._merge_without_model(segments)
@@ -1261,6 +1379,238 @@ class ScriptProcessWorkflow:
         return await self._merge_partials_via_model(
             partials=partials, spine_label=spine_label, log=log
         )
+
+    async def _collect_digest_partials(
+        self,
+        groups: list[str],
+        *,
+        spine_label: str,
+        log: Callable[[str], None],
+        total_segments: int,
+    ) -> list[ScriptProcessDigestOutput]:
+        """归并各批，返回按原文顺序排列的批次结果。
+
+        ``parallel_digest`` 开启且并发 > 1 时各批成波并行（共用同一个并发闸门）；
+        否则严格按旧的深度优先串行语义执行（子批插队、逐批推进），行为不变。
+        """
+
+        total_groups = len(groups)
+        if self.parallel_digest and max(1, self.concurrency) > 1:
+            return await self._collect_digest_partials_parallel(
+                groups,
+                total_groups=total_groups,
+                total_segments=total_segments,
+                spine_label=spine_label,
+                log=log,
+            )
+        return await self._collect_digest_partials_serial(
+            groups,
+            total_groups=total_groups,
+            total_segments=total_segments,
+            spine_label=spine_label,
+            log=log,
+        )
+
+    async def _collect_digest_partials_serial(
+        self,
+        groups: list[str],
+        *,
+        total_groups: int,
+        total_segments: int,
+        spine_label: str,
+        log: Callable[[str], None],
+    ) -> list[ScriptProcessDigestOutput]:
+        partials: list[ScriptProcessDigestOutput] = []
+        pending: deque[tuple[int, str]] = deque(enumerate(groups, start=1))
+        while pending:
+            group_index, blocks = pending.popleft()
+            digest, error = await self._run_digest_batch(
+                group_index,
+                blocks,
+                total_groups=total_groups,
+                total_segments=total_segments,
+                spine_label=spine_label,
+                log=log,
+            )
+            if digest is not None:
+                partials.append(digest)
+                log(f"[ScriptProcess] 分批归并 {group_index}/{total_groups} 完成")
+                continue
+            children = self._classify_digest_failure(
+                error, group_index=group_index, blocks=blocks, log=log
+            )
+            # 旧语义：拆出的子批插到队首（左半在前）先跑。
+            for child in reversed(children):
+                pending.appendleft((group_index, child))
+        return partials
+
+    async def _collect_digest_partials_parallel(
+        self,
+        groups: list[str],
+        *,
+        total_groups: int,
+        total_segments: int,
+        spine_label: str,
+        log: Callable[[str], None],
+    ) -> list[ScriptProcessDigestOutput]:
+        # 各批互相独立，按并发上限成波并行；子批并入下一波。结果按
+        # (批序号, 子批次序号) 排序，最终顺序与串行版一致。
+        partials: list[tuple[tuple[int, int], ScriptProcessDigestOutput]] = []
+        pending: list[tuple[int, int, str]] = []
+        batch_sequence = 0
+        for group_index, blocks in enumerate(groups, start=1):
+            pending.append((group_index, batch_sequence, blocks))
+            batch_sequence += 1
+
+        while pending:
+            wave = pending
+            pending = []
+            outcomes = await self._map_digest_batches(
+                wave,
+                total_groups=total_groups,
+                total_segments=total_segments,
+                spine_label=spine_label,
+                log=log,
+            )
+            for (group_index, sequence, blocks), (digest, error) in zip(wave, outcomes):
+                if digest is not None:
+                    partials.append(((group_index, sequence), digest))
+                    log(f"[ScriptProcess] 分批归并 {group_index}/{total_groups} 完成")
+                    continue
+                for child in self._classify_digest_failure(
+                    error, group_index=group_index, blocks=blocks, log=log
+                ):
+                    pending.append((group_index, batch_sequence, child))
+                    batch_sequence += 1
+
+        partials.sort(key=lambda item: item[0])
+        return [digest for _, digest in partials]
+
+    def _classify_digest_failure(
+        self,
+        exc: BaseException | None,
+        *,
+        group_index: int,
+        blocks: str,
+        log: Callable[[str], None],
+    ) -> list[str]:
+        """把一次批次失败分类：返回拆分后的子批（空列表=跳过），致命则直接抛出。"""
+
+        if exc is None:  # pragma: no cover - 调用方保证二者必有其一
+            return []
+        if isinstance(exc, ContentFilterError):
+            log(
+                f"[ScriptProcess][WARN] 第 {group_index} 批归并被内容审核拦截，"
+                f"已跳过该批：{exc}"
+            )
+            return []
+        if not _is_recoverable(exc):
+            raise exc
+        # 批次输出被截断是「本批塞了太多段」，把这一批拆小再来，
+        # 不要因为一批失败就丢掉其它批已经归并好的结果。
+        try:
+            left, right = split_chunk_in_half(blocks)
+        except ValueError:
+            left = right = ""
+        if (
+            not left
+            or not right
+            or estimate_tokens(left) < _MIN_BODY_BYTES
+            or estimate_tokens(right) < _MIN_BODY_BYTES
+        ):
+            log(
+                f"[ScriptProcess][WARN] 第 {group_index} 批归并失败且无法再拆，"
+                f"已跳过该批：{exc}"
+            )
+            return []
+        log(
+            f"[ScriptProcess][WARN] 第 {group_index} 批归并失败"
+            f"（{type(exc).__name__}），已拆成两个子批重试"
+        )
+        return [left, right]
+
+    def _digest_batch_label(
+        self, group_index: int, *, total_groups: int, total_segments: int
+    ) -> str:
+        return (
+            f"下面是同一部剧本第 {group_index}/{total_groups} 批"
+            f"（全剧共 {total_segments} 段）的读审摘要与事实清单。"
+            "请只在本批范围内归并，不要臆造本批未给出的段落。"
+        )
+
+    async def _run_digest_batch(
+        self,
+        group_index: int,
+        blocks: str,
+        *,
+        total_groups: int,
+        total_segments: int,
+        spine_label: str,
+        log: Callable[[str], None],
+    ) -> tuple[ScriptProcessDigestOutput | None, BaseException | None]:
+        """跑一个归并批次，返回 ``(结果, 异常)``（异常不在此处分类）。"""
+
+        try:
+            digest = await self._run_digest_prompt(
+                blocks=blocks,
+                spine_label=spine_label,
+                label=self._digest_batch_label(
+                    group_index,
+                    total_groups=total_groups,
+                    total_segments=total_segments,
+                ),
+                unit="本批",
+                log=log,
+            )
+            return (digest, None)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - 分类交给调用方
+            return (None, exc)
+
+    async def _map_digest_batches(
+        self,
+        items: list[tuple[int, int, str]],
+        *,
+        total_groups: int,
+        total_segments: int,
+        spine_label: str,
+        log: Callable[[str], None],
+    ) -> list[tuple[ScriptProcessDigestOutput | None, BaseException | None]]:
+        """有界并发地跑一波归并批次，返回与 ``items`` 同序的 ``(结果, 异常)``。
+
+        与 :meth:`_map_segments` 共用 :class:`_SegmentLimiter`，过载时同样降为单并发。
+        异常不在此处分类：「拆小重试 / 跳过」留给 :meth:`_classify_digest_failure`。
+        """
+
+        limiter = self._limiter
+
+        async def one(
+            item: tuple[int, int, str],
+        ) -> tuple[ScriptProcessDigestOutput | None, BaseException | None]:
+            group_index, _sequence, blocks = item
+            serial = await limiter.acquire()
+            try:
+                async with global_llm_slot():
+                    return await self._run_digest_batch(
+                        group_index,
+                        blocks,
+                        total_groups=total_groups,
+                        total_segments=total_segments,
+                        spine_label=spine_label,
+                        log=log,
+                    )
+            finally:
+                limiter.release(bool(serial))
+
+        tasks = [asyncio.create_task(one(item)) for item in items]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def _merge_partials_via_model(
         self,
@@ -1325,12 +1675,18 @@ class ScriptProcessWorkflow:
         prompt = self._digest_prompt(
             blocks=blocks, spine_label=spine_label, label=label, unit=unit
         )
-        result = await self._retry_transient(
-            lambda: self.digest_agent.run(prompt),
-            label="归并调用",
-            log=log,
-            same_size=False,
-        )
+        started = time.monotonic()
+        try:
+            result = await self._retry_transient(
+                lambda: self.digest_agent.run(prompt),
+                label="归并调用",
+                log=log,
+                same_size=False,
+            )
+        except BaseException:
+            self._record_call("digest", started=started, ok=False)
+            raise
+        self._record_call("digest", started=started, ok=True)
         return result.output
 
     def _digest_prompt(
@@ -1362,11 +1718,12 @@ class ScriptProcessWorkflow:
         for index, segment in enumerate(segments, start=1):
             summary = (segment.understanding_delta or "").strip()
             if summary:
-                summary = summary[:SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS]
-            facts = json.dumps(
+                summary = summary[: self.digest_segment_chars]
+            facts_payload = self._slim_facts(
                 self._facts_payload(segment.characters, segment.scenes, segment.gaps),
-                ensure_ascii=False,
+                self.digest_facts_max_chars,
             )
+            facts = json.dumps(facts_payload, ensure_ascii=False)
             blocks.append(
                 _truncate_to_bytes(
                     f"### 第 {index} 段理解\n{summary or '（无）'}"
@@ -1401,6 +1758,65 @@ class ScriptProcessWorkflow:
             "scenes": [item.model_dump() for item in scenes],
             "gaps": list(gaps),
         }
+
+    @staticmethod
+    def _slim_facts(payload: dict[str, object], max_chars: int) -> dict[str, object]:
+        """把一段事实 JSON 收敛到 ``max_chars`` 字节内；``0`` = 原样返回。
+
+        只做「保结构的收敛」——别名限长、长文本截断、条目截尾——保证结果仍是合法
+        JSON，digest 仍能看到每段人物/场景/未决项的骨架。用于把更多段塞进同一批、
+        减少归并批次数；默认 ``0``（关闭）时与历史输入逐字节一致。
+        """
+
+        if max_chars <= 0:
+            return payload
+        if len(json.dumps(payload, ensure_ascii=False)) <= max_chars:
+            return payload
+
+        def trim_items(
+            items: object, text_fields: tuple[str, ...]
+        ) -> list[dict[str, object]]:
+            out: list[dict[str, object]] = []
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                trimmed = dict(item)
+                aliases = trimmed.get("aliases")
+                if isinstance(aliases, list) and len(aliases) > 3:
+                    trimmed["aliases"] = aliases[:3]
+                for field in text_fields:
+                    value = trimmed.get(field)
+                    if isinstance(value, str) and len(value) > 120:
+                        trimmed[field] = value[:120] + "…"
+                out.append(trimmed)
+            return out
+
+        characters = trim_items(
+            payload.get("characters"), ("role", "notes", "first_appearance")
+        )
+        scenes = trim_items(payload.get("scenes"), ("time_of_day", "description"))
+        gaps_raw = payload.get("gaps")
+        gaps = [str(gap) for gap in gaps_raw] if isinstance(gaps_raw, list) else []
+        if len(gaps) > 12:
+            gaps = gaps[:12]
+
+        slim: dict[str, object] = {
+            "characters": characters,
+            "scenes": scenes,
+            "gaps": gaps,
+        }
+        # 仍超预算：按比例丢尾，保留骨架的前若干条。
+        while len(json.dumps(slim, ensure_ascii=False)) > max_chars:
+            if len(gaps) > 3:
+                gaps = gaps[: max(3, len(gaps) // 2)]
+            elif len(characters) > 1:
+                characters = characters[: max(1, len(characters) // 2)]
+            elif len(scenes) > 1:
+                scenes = scenes[: max(1, len(scenes) // 2)]
+            else:
+                break
+            slim = {"characters": characters, "scenes": scenes, "gaps": gaps}
+        return slim
 
     @classmethod
     def _merge_without_model(
@@ -1463,14 +1879,20 @@ class ScriptProcessWorkflow:
 __all__ = [
     "STAGE",
     "SCRIPT_PROCESS_CHUNK_MAX_CHARS",
+    "SCRIPT_PROCESS_DEFAULT_CONCURRENCY",
     "SCRIPT_PROCESS_DIGEST_MAX_INPUT_CHARS",
     "SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS",
+    "SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS_ENV",
+    "SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS_ENV",
+    "SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS_DEFAULT",
     "SCRIPT_PROCESS_MAX_OUTPUT_TOKENS",
     "SCRIPT_PROCESS_MIN_CHUNK_CHARS",
     "SCRIPT_PROCESS_MIN_OUTPUT_TOKENS",
     "SCRIPT_PROCESS_MODEL_ENV",
     "SCRIPT_PROCESS_OVERLOAD_COOLDOWN_SECONDS",
     "SCRIPT_PROCESS_OVERLOAD_STREAK",
+    "SCRIPT_PROCESS_SKILL_INJECTION_DEFAULT",
+    "SCRIPT_PROCESS_TUNING_FILENAME",
     "SCRIPT_PROCESS_TRANSIENT_ATTEMPTS",
     "SCRIPT_PROCESS_TRANSIENT_BACKOFF_SECONDS",
     "SYSTEM_PROMPT_HEADER",
@@ -1483,9 +1905,14 @@ __all__ = [
     "chunk_source_text",
     "context_budget",
     "default_chunk_max_chars",
+    "default_concurrency",
+    "default_digest_facts_max_chars",
+    "default_digest_segment_chars",
     "default_max_output_tokens",
     "default_overload_cooldown",
     "default_overload_streak",
+    "default_parallel_digest",
+    "default_skill_injection",
     "default_transient_attempts",
     "default_transient_backoff",
     "split_chunk_in_half",

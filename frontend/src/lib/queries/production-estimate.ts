@@ -73,6 +73,8 @@ export interface ProductionEstimate {
   calibrated_at?: string;
   prices_synced_at?: string;
   project?: string;
+  /** 本集/本项目估价所用的视频模型（目录 id，如 `seedance-2.5`）。 */
+  video_model?: string;
 }
 
 export interface ProductionEstimateParams {
@@ -120,6 +122,77 @@ export function useProductionEstimate(
         .json<OkResponse<ProductionEstimate>>(),
     enabled: !!project && enabled,
     staleTime: 15_000,
+  });
+}
+
+export interface EpisodeVideoModelOption {
+  id: string;
+  backend: string;
+  label: string;
+}
+
+export interface EpisodeVideoModel {
+  episode: number;
+  /** 该集实际生效的视频模型（覆盖 > 项目默认）。 */
+  video_model: string;
+  /** 该集的显式覆盖；没覆盖时为空串。 */
+  override_model: string;
+  /** 项目级默认模型。 */
+  default_model: string;
+  options: EpisodeVideoModelOption[];
+}
+
+/** 某一集当前的视频模型（含可用选项与项目默认）。 */
+export function useEpisodeVideoModel(
+  project: string,
+  episode: number,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: queryKeys.episodeVideoModel(project, episode),
+    queryFn: ({ signal }) =>
+      api
+        .get(p`api/v1/projects/${project}/episodes/${episode}/video-model`, {
+          signal,
+        })
+        .json<OkResponse<EpisodeVideoModel>>(),
+    enabled: !!project && episode > 0 && enabled,
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * 设置（或清除）某一集的视频模型覆盖。空串 = 回落到项目默认。
+ *
+ * 改选后要让报价重算（`production-estimate` 的缓存按 `stage` 分片），所以这里
+ * 失效整个项目的 `production-estimate` 前缀，而不只是当前 refined 那一项。
+ */
+export function useUpdateEpisodeVideoModel(project: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      episode,
+      videoModel,
+    }: {
+      episode: number;
+      videoModel: string;
+    }) =>
+      api
+        .put(p`api/v1/projects/${project}/episodes/${episode}/video-model`, {
+          json: { video_model: videoModel },
+        })
+        .json<OkResponse<EpisodeVideoModel>>(),
+    onSuccess: (res, variables) => {
+      if (res.ok) {
+        qc.setQueryData(
+          queryKeys.episodeVideoModel(project, variables.episode),
+          res,
+        );
+      }
+      qc.invalidateQueries({
+        queryKey: ["projects", project, "production-estimate"],
+      });
+    },
   });
 }
 

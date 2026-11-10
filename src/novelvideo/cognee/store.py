@@ -1216,19 +1216,39 @@ class CogneeStore:
         extractor = EventExtractor()
         all_events: List[NovelEvent] = []
 
-        for i, chapter in enumerate(chapters):
-            progress = 0.1 + 0.3 * (i / len(chapters))
-            report(progress, f"提取第 {chapter.number} 章事件...")
-
-            events = await extractor.extract_events(
+        async def _extract_one(chapter) -> List[NovelEvent]:
+            return await extractor.extract_events(
                 chapter_num=chapter.number,
                 chapter_content=chapter.content,
                 on_log=log,
             )
-            all_events.extend(events)
-            log(f"第 {chapter.number} 章: {len(events)} 个事件")
+
+        # 各章提取独立且无共享状态，按阶段有界并发；结果保序 → 合并顺序不变。
+        from novelvideo.utils.bounded_concurrency import map_bounded
+
+        errors: list[BaseException] = []
+
+        def _on_error(_chapter, exc: BaseException) -> None:
+            errors.append(exc)
+
+        report(0.15, f"并发提取 {len(chapters)} 章事件...")
+        extracted = await map_bounded(
+            chapters,
+            _extract_one,
+            stage="cognee",
+            on_error=_on_error,
+        )
+        # map_bounded 默认吞掉异常槽位；还原「任一失败即抛出」的语义。
+        if errors:
+            raise errors[0]
+
+        for chapter, events in zip(chapters, extracted):
+            if events:
+                all_events.extend(events)
+                log(f"第 {chapter.number} 章: {len(events)} 个事件")
 
         log(f"共提取 {len(all_events)} 个事件")
+        report(0.4, "事件提取完成")
 
         # 事件存储在内存中（不再写 Redis）
         report(0.45, "存储事件...")

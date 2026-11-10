@@ -3180,13 +3180,18 @@ async def enqueue_single_video_task(
     runner expects, and the fast path cannot drift from the product surface.
     """
 
-    # 未显式指定视频后端时，跟随项目配置的默认视频模型（其本身回落到实例的
-    # VIDEO_BACKEND）。请求模型写死会让单镜/批量工具落到与实例网关不匹配的模型。
-    # 走模块级 ``load_project_config``，既有测试用它注入项目配置。
+    # 该集若在报价卡上选过模型，优先用它（``episode_video_backends``）；否则跟随项目
+    # 配置的默认视频模型（其本身回落到实例 VIDEO_BACKEND）。请求模型写死会让单镜/批量
+    # 工具落到与实例网关不匹配的模型。走模块级 ``load_project_config``，既有测试用它
+    # 注入项目配置。
     if "video_backend" not in body.model_fields_set:
-        default_video_backend = str(
-            load_project_config(username, project_name).get("video_backend") or ""
-        ).strip()
+        from novelvideo.project_config import episode_video_backend
+
+        video_config = load_project_config(username, project_name)
+        default_video_backend = (
+            episode_video_backend(video_config, episode_num)
+            or str(video_config.get("video_backend") or "").strip()
+        )
         if default_video_backend:
             body.video_backend = default_video_backend
 

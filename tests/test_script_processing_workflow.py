@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +136,9 @@ _TWO_CHUNK_TEXT = "第一段内容一\n第二段内容二\n"
 
 #: 在 ``chunk_max_chars=10`` 下正好切成三段的原文。
 _THREE_CHUNK_TEXT = "第一段内容一\n第二段内容二\n第三段内容三\n"
+
+#: 在 ``chunk_max_chars=10`` 下正好切成四段的原文。
+_FOUR_CHUNK_TEXT = "第一段内容一\n第二段内容二\n第三段内容三\n第四段内容四\n"
 
 _LONG_TEXT = "\n".join(
     f"第{i}行：这是用来测试预算规划的较长中文内容，需要按上下文预算切分。" for i in range(1, 201)
@@ -976,3 +981,357 @@ async def test_failed_digest_batch_is_split_and_other_batches_are_kept(
     assert "第 1 段理解" in digest_agent.prompts[1]
     assert "第 1 段理解" not in digest_agent.prompts[2]
     assert result.understanding == "账5"
+
+
+# ── 运行期热调参 ──────────────────────────────────────────────────────────────
+
+
+def _clear_script_process_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "SCRIPT_PROCESS_CONCURRENCY",
+        "SCRIPT_PROCESS_CHUNK_MAX_CHARS",
+        "SCRIPT_PROCESS_SKILL_INJECTION",
+        "SCRIPT_PROCESS_PARALLEL_DIGEST",
+        "SCRIPT_PROCESS_TUNING_FILE",
+        "SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS",
+        "SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS",
+        "NOVELVIDEO_RUNTIME_DIR",
+        "NOVELVIDEO_STATE_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_runtime_tuning_file_fills_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """热调参文件在 env 未设时生效，并被工作流读取。"""
+
+    _clear_script_process_env(monkeypatch)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / script_processing.SCRIPT_PROCESS_TUNING_FILENAME).write_text(
+        json.dumps(
+            {
+                "concurrency": 6,
+                "chunk_max_chars": 6000,
+                "skill_injection": "condensed",
+                "parallel_digest": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(runtime))
+
+    assert script_processing.default_concurrency() == 6
+    assert script_processing.default_chunk_max_chars() == 6000
+    assert script_processing.default_skill_injection() == "condensed"
+    assert script_processing.default_parallel_digest() is False
+
+    workflow = script_processing.ScriptProcessWorkflow(output_dir=str(tmp_path))
+    assert workflow.concurrency == 6
+    assert workflow.chunk_max_chars == 6000
+    assert workflow.skill_injection == "condensed"
+    assert workflow.parallel_digest is False
+
+
+def test_env_wins_over_the_runtime_tuning_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_script_process_env(monkeypatch)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / script_processing.SCRIPT_PROCESS_TUNING_FILENAME).write_text(
+        json.dumps({"concurrency": 9, "skill_injection": "condensed"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("SCRIPT_PROCESS_CONCURRENCY", "3")
+    monkeypatch.setenv("SCRIPT_PROCESS_SKILL_INJECTION", "full")
+
+    assert script_processing.default_concurrency() == 3
+    assert script_processing.default_skill_injection() == "full"
+
+
+def test_missing_or_corrupt_tuning_file_falls_back_to_constants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_script_process_env(monkeypatch)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(runtime))
+
+    # 缺文件 → 代码常量。
+    assert (
+        script_processing.default_concurrency()
+        == script_processing.SCRIPT_PROCESS_DEFAULT_CONCURRENCY
+    )
+    assert script_processing.default_parallel_digest() is True
+
+    # 坏文件也不该抛错。
+    (runtime / script_processing.SCRIPT_PROCESS_TUNING_FILENAME).write_text(
+        "{not json", encoding="utf-8"
+    )
+    assert (
+        script_processing.default_concurrency()
+        == script_processing.SCRIPT_PROCESS_DEFAULT_CONCURRENCY
+    )
+    assert (
+        script_processing.default_skill_injection()
+        == script_processing.SCRIPT_PROCESS_SKILL_INJECTION_DEFAULT
+    )
+
+
+def test_condensed_injection_uses_the_directive_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``condensed`` 分段注入精简块；归并没有精简块时回落整份 01。"""
+
+    monkeypatch.setattr(ai_film_process, "fits_window", lambda *a, **k: True)
+    monkeypatch.delenv("DIRECTOR_PACK_INJECTION", raising=False)
+
+    full = script_processing.ScriptProcessWorkflow(
+        output_dir=".", skill_injection="full"
+    )
+    condensed = script_processing.ScriptProcessWorkflow(
+        output_dir=".", skill_injection="condensed"
+    )
+
+    full_prompt = full._system_prompt("segment")
+    condensed_prompt = condensed._system_prompt("segment")
+
+    assert "===== 流程包第02份" in full_prompt
+    assert "===== 流程包第02份" not in condensed_prompt
+    assert "【制作流程包规范" in condensed_prompt
+    assert "## 事实边界" in condensed_prompt
+    assert estimate_tokens(condensed_prompt) < estimate_tokens(full_prompt) / 2
+
+    # 归并作用域没有精简块 → 回落整份第 01 份。
+    assert "===== 流程包第01份" in condensed._system_prompt("digest")
+
+
+def test_classify_digest_failure_splits_skips_or_raises(tmp_path: Path) -> None:
+    workflow = script_processing.ScriptProcessWorkflow(output_dir=str(tmp_path))
+    blocks = "甲" * 600 + "\n" + "乙" * 600
+    logs: list[str] = []
+
+    # 可恢复（结构化输出失败）→ 拆成两个子批。
+    children = workflow._classify_digest_failure(
+        UnexpectedModelBehavior("Exceeded maximum output retries (0)"),
+        group_index=1,
+        blocks=blocks,
+        log=logs.append,
+    )
+    assert len(children) == 2
+    assert "甲" in children[0]
+    assert "乙" in children[1]
+
+    # 内容审核 → 跳过该批。
+    assert (
+        workflow._classify_digest_failure(
+            ContentFilterError("拦截"),
+            group_index=2,
+            blocks=blocks,
+            log=logs.append,
+        )
+        == []
+    )
+
+    # 不可恢复（计费）→ 直接抛出。
+    with pytest.raises(RuntimeError, match="INSUFFICIENT_CREDITS"):
+        workflow._classify_digest_failure(
+            RuntimeError("INSUFFICIENT_CREDITS"),
+            group_index=3,
+            blocks=blocks,
+            log=logs.append,
+        )
+
+    # 已经细到不能再拆 → 跳过。
+    assert (
+        workflow._classify_digest_failure(
+            UnexpectedModelBehavior("boom"),
+            group_index=4,
+            blocks="甲" * 10,
+            log=logs.append,
+        )
+        == []
+    )
+
+
+# ── 归并并发 ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_parallel_digest_batches_overlap_and_keep_source_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """并发 > 1 时归并各批并行，但最终顺序与串行版本完全一致。"""
+
+    segments = [
+        _segment(f"第{index}段理解" + "详" * 200, f"第{index}段剧本")
+        for index in range(1, 5)
+    ]
+    holder: dict[str, object] = {}
+
+    class _ProbeDigest:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        async def run(self, prompt: str):
+            group_match = re.search(r"第 (\d+)/\d+ 批", prompt)
+            group_index = int(group_match.group(1)) if group_match else 0
+            segment_match = re.search(r"第 (\d+) 段理解", prompt)
+            segment_index = int(segment_match.group(1)) if segment_match else 0
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            self.prompts.append(prompt)
+            try:
+                await asyncio.sleep(0.05)
+            finally:
+                self.in_flight -= 1
+            return SimpleNamespace(
+                output=script_processing.ScriptProcessDigestOutput(
+                    understanding=f"账{group_index}-{segment_index}" + "归" * 300
+                )
+            )
+
+    def fake_build_agent(self, output_type, name):
+        if output_type is script_processing.ScriptProcessDigestOutput:
+            return holder["probe"]
+        return _FakeAgent(list(segments))
+
+    monkeypatch.setattr(
+        script_processing.ScriptProcessWorkflow, "_build_agent", fake_build_agent
+    )
+
+    async def _exercise(parallel: bool) -> tuple[str, int]:
+        probe = _ProbeDigest()
+        holder["probe"] = probe
+        workflow = script_processing.ScriptProcessWorkflow(
+            output_dir=str(tmp_path),
+            chunk_max_chars=10,
+            digest_max_input_chars=700,
+            concurrency=2,
+            parallel_digest=parallel,
+        )
+        result = await workflow.run(source_text=_FOUR_CHUNK_TEXT)
+        return result.understanding, probe.max_in_flight
+
+    parallel_understanding, max_in_flight = await _exercise(True)
+    serial_understanding, _ = await _exercise(False)
+
+    # 两个批次同时在飞（并发闸门放行 2）。
+    assert max_in_flight >= 2
+    # 并行与串行的合并结果逐字一致（顺序被还原）。
+    assert parallel_understanding == serial_understanding
+    prefixes = [
+        part.split("归", 1)[0] for part in parallel_understanding.split("\n\n")
+    ]
+    groups = [int(prefix[1:].split("-", 1)[0]) for prefix in prefixes]
+    assert len(groups) >= 2
+    assert groups == sorted(groups)
+
+
+# ── 归并输入瘦身 ──────────────────────────────────────────────────────────
+
+
+def test_default_digest_segment_chars_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_script_process_env(monkeypatch)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(runtime))
+
+    assert (
+        script_processing.default_digest_segment_chars()
+        == script_processing.SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS
+    )
+    (runtime / script_processing.SCRIPT_PROCESS_TUNING_FILENAME).write_text(
+        json.dumps({"digest_segment_chars": 900}), encoding="utf-8"
+    )
+    assert script_processing.default_digest_segment_chars() == 900
+    monkeypatch.setenv("SCRIPT_PROCESS_DIGEST_SEGMENT_CHARS", "1500")
+    assert script_processing.default_digest_segment_chars() == 1500
+
+
+def test_default_digest_facts_max_chars_allows_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_script_process_env(monkeypatch)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(runtime))
+
+    assert script_processing.default_digest_facts_max_chars() == 0
+    (runtime / script_processing.SCRIPT_PROCESS_TUNING_FILENAME).write_text(
+        json.dumps({"digest_facts_max_chars": 4000}), encoding="utf-8"
+    )
+    assert script_processing.default_digest_facts_max_chars() == 4000
+    (runtime / script_processing.SCRIPT_PROCESS_TUNING_FILENAME).write_text(
+        json.dumps({"digest_facts_max_chars": 0}), encoding="utf-8"
+    )
+    assert script_processing.default_digest_facts_max_chars() == 0
+    monkeypatch.setenv("SCRIPT_PROCESS_DIGEST_FACTS_MAX_CHARS", "2500")
+    assert script_processing.default_digest_facts_max_chars() == 2500
+
+
+def test_slim_facts_keeps_valid_json_and_shrinks() -> None:
+    payload = {
+        "characters": [
+            {
+                "name": "萧忆情",
+                "aliases": [f"别名{i}" for i in range(20)],
+                "role": "主" * 400,
+                "first_appearance": "第 1 段",
+                "notes": "备注" * 400,
+            }
+            for _ in range(6)
+        ],
+        "scenes": [
+            {"name": "听雪楼", "time_of_day": "夜", "description": "描述" * 400}
+            for _ in range(6)
+        ],
+        "gaps": [f"未决问题 {i} " * 20 for i in range(30)],
+    }
+    big = len(json.dumps(payload, ensure_ascii=False))
+    slim = script_processing.ScriptProcessWorkflow._slim_facts(payload, 3000)
+    small = len(json.dumps(slim, ensure_ascii=False))
+    assert small <= 3000 < big
+    assert isinstance(json.loads(json.dumps(slim, ensure_ascii=False)), dict)
+    assert set(slim) == {"characters", "scenes", "gaps"}
+    assert all(len(item["aliases"]) <= 3 for item in slim["characters"])
+    assert len(slim["characters"][0]["notes"]) <= 121
+
+    # 0 = 原样返回（历史行为）。
+    assert script_processing.ScriptProcessWorkflow._slim_facts(payload, 0) is payload
+
+
+def test_digest_groups_shrink_with_slimming() -> None:
+    workflow = script_processing.ScriptProcessWorkflow(output_dir=".")
+    segments = [
+        script_processing.ScriptProcessSegmentOutput(
+            understanding_delta="理解" * 800,
+            characters=[
+                script_processing.CharacterFact(
+                    name=f"角色{i}",
+                    aliases=["a", "b"],
+                    role="主" * 300,
+                    notes="备注" * 300,
+                )
+            ],
+            scenes=[
+                script_processing.SceneFact(name=f"场景{i}", description="描述" * 300)
+            ],
+            gaps=["未决"],
+        )
+        for i in range(8)
+    ]
+    limit = 24000
+    fat = workflow._digest_groups(segments, limit)
+    workflow.digest_segment_chars = 600
+    workflow.digest_facts_max_chars = 800
+    slim = workflow._digest_groups(segments, limit)
+    assert slim
+    assert len(slim) < len(fat)

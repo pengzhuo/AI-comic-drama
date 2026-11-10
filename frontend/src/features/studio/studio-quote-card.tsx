@@ -8,7 +8,11 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { formatCny, formatQuota } from "@/lib/cost-format";
 import { useConfirmDirectorGate } from "@/lib/queries/director-auto";
-import { useProductionEstimate } from "@/lib/queries/production-estimate";
+import {
+  useEpisodeVideoModel,
+  useProductionEstimate,
+  useUpdateEpisodeVideoModel,
+} from "@/lib/queries/production-estimate";
 
 /**
  * 客户端工作室的「本集制作报价」确认卡。
@@ -30,9 +34,11 @@ export function StudioQuoteCard({
   episode: number;
   onDismiss: () => void;
 }) {
+  const [dismissed, setDismissed] = useState(false);
   const estimateQuery = useProductionEstimate(project, { episode, stage: "refined" });
   const confirmGate = useConfirmDirectorGate(project);
-  const [dismissed, setDismissed] = useState(false);
+  const videoModelQuery = useEpisodeVideoModel(project, episode, !dismissed);
+  const updateVideoModel = useUpdateEpisodeVideoModel(project);
 
   const estimate = estimateQuery.data?.data;
   const isClient = estimate?.view === "client";
@@ -104,6 +110,29 @@ export function StudioQuoteCard({
           </p>
         </div>
       </div>
+
+      {videoModelQuery.data?.data ? (
+        <label className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-background px-3 py-2">
+          <span className="text-xs font-medium text-muted-foreground">视频模型</span>
+          <select
+            value={videoModelQuery.data.data.video_model}
+            disabled={updateVideoModel.isPending}
+            onChange={(event) =>
+              updateVideoModel.mutate({
+                episode,
+                videoModel: event.target.value,
+              })
+            }
+            className="h-8 max-w-[60%] rounded-lg border border-border bg-background px-2 text-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40 disabled:opacity-60"
+          >
+            {videoModelQuery.data.data.options.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
 
       {estimateQuery.isLoading ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">

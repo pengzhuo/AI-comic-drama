@@ -32,10 +32,7 @@ from typing import Any, Callable, Iterable, Optional
 from pydantic import BaseModel, Field
 
 from novelvideo.story_analysis import SourceChunk
-from novelvideo.utils.bounded_concurrency import (
-    default_llm_concurrency,
-    map_bounded,
-)
+from novelvideo.utils.bounded_concurrency import map_bounded
 from novelvideo.utils.source_language import (
     AssetLanguage,
     asset_language_instruction,
@@ -425,7 +422,8 @@ async def extract_characters_from_chunks(
     outcomes = await map_bounded(
         chunks,
         analyse,
-        limit=default_llm_concurrency() if concurrency is None else concurrency,
+        limit=concurrency,
+        stage=None if concurrency is not None else "structured",
         on_error=record_failure,
     )
     # Reported after the batch so the callback may be async without turning the
@@ -1537,7 +1535,8 @@ async def enrich_character_appearances(
     outcomes = await map_bounded(
         batches,
         run_batch,
-        limit=default_llm_concurrency() if concurrency is None else concurrency,
+        limit=concurrency,
+        stage=None if concurrency is not None else "structured",
     )
     for outcome in outcomes:
         if isinstance(outcome, dict):

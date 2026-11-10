@@ -184,20 +184,41 @@ class EventExtractor:
         Returns:
             所有事件列表
         """
-        all_events = []
+        all_events: List[NovelEvent] = []
         total = len(chapters)
 
-        for i, chapter in enumerate(chapters):
-            if on_progress:
-                progress = i / total
-                on_progress(progress, f"提取第 {chapter['number']} 章事件...")
-
-            events = await self.extract_events(
+        async def _extract_one(chapter: dict) -> List[NovelEvent]:
+            return await self.extract_events(
                 chapter_num=chapter["number"],
                 chapter_content=chapter["content"],
                 on_log=on_log,
             )
-            all_events.extend(events)
+
+        # 各章提取彼此独立（每次新建 Agent、无共享状态），按阶段有界并发；
+        # 结果保序，故合并顺序与原串行循环一致。曾为逐个 await 的串行循环。
+        from novelvideo.utils.bounded_concurrency import map_bounded
+
+        errors: list[BaseException] = []
+
+        def _on_error(_chapter: dict, exc: BaseException) -> None:
+            errors.append(exc)
+
+        if on_progress:
+            on_progress(0.0, f"开始提取 {total} 章事件...")
+
+        results = await map_bounded(
+            chapters,
+            _extract_one,
+            stage="cognee",
+            on_error=_on_error,
+        )
+        # map_bounded 默认吞掉异常槽位；这里还原「任一失败即抛出」的语义。
+        if errors:
+            raise errors[0]
+
+        for events in results:
+            if events:
+                all_events.extend(events)
 
         if on_progress:
             on_progress(1.0, f"事件提取完成，共 {len(all_events)} 个事件")

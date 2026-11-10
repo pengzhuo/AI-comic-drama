@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable, Sequence, TypeVar
 
-from novelvideo.utils.bounded_concurrency import default_llm_concurrency, map_bounded
+from novelvideo.utils.bounded_concurrency import map_bounded
 from novelvideo.utils.model_context_budget import (
     DEFAULT_CONTEXT_TOKENS,
     DEFAULT_OUTPUT_TOKENS,
@@ -80,6 +80,7 @@ async def map_reduce(
     on_error: Callable[[str, BaseException], None] | None = None,
     chunker: Callable[[str], list[str]] | None = None,
     require_all: bool = False,
+    stage: str | None = None,
 ) -> T:
     """Chunk ``text``, map ``map_fn`` over the chunks, then ``reduce_fn``.
 
@@ -97,7 +98,8 @@ async def map_reduce(
     results = await map_bounded(
         chunks,
         map_fn,
-        limit=limit if limit is not None else default_llm_concurrency(),
+        limit=limit,
+        stage=stage,
         on_error=on_error,
     )
     if require_all:

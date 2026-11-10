@@ -58,6 +58,7 @@ from novelvideo.task_diagnostics import (
     task_diagnostics_scope,
 )
 from novelvideo.task_state import project_task_run_context
+from novelvideo.pipeline_timing import record_span
 from novelvideo.utils.document_parsers import count_billable_text_chars
 
 logger = logging.getLogger(__name__)
@@ -1163,8 +1164,24 @@ def run_project_task_core_sync(
                 # 唯一派发点，绑定本次投递的身份，使闸门总有一个请求作用域的
                 # 身份可读——否则「平台任务，允许」与「调用点漏传参数」都是 None。
                 # 5 个 runner 在自己函数体内另有绑定，嵌套安全（set/reset 成对）。
-                with model_gateway_scope_for_runner(envelope):
-                    result = runner(envelope, ctx)
+                span_started = time.time()
+                span_error: BaseException | None = None
+                try:
+                    with model_gateway_scope_for_runner(envelope):
+                        result = runner(envelope, ctx)
+                except BaseException as exc:
+                    span_error = exc
+                    raise
+                finally:
+                    # 每个阶段任务都留一条墙钟事件，供按阶段汇总定位热点（绝不抛错）。
+                    record_span(
+                        getattr(ctx, "output_dir", None),
+                        task_type,
+                        started=span_started,
+                        episode=episode,
+                        ok=span_error is None,
+                        error=type(span_error).__name__ if span_error else None,
+                    )
                 if task_type == "freezone_text_generate" and isinstance(result, dict):
                     result = dict(result)
                     result_reservation_id = str(

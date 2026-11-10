@@ -180,8 +180,13 @@ def plan_refined(
     beats: Sequence[dict],
     episode: int | None = None,
     book: PriceBook | None = None,
+    video_model: str | None = None,
 ) -> list[ActionRequest]:
-    """由已有分镜推出「还要花钱」的动作清单（不含已发生的文本类大头）。"""
+    """由已有分镜推出「还要花钱」的动作清单（不含已发生的文本类大头）。
+
+    ``video_model`` 是**本集生效**的视频模型（目录 id，如 ``seedance-2.0-mini``）；
+    不传则回落到实例默认 ``DEFAULT_VIDEO_MODEL``。
+    """
 
     book = book or load_prices()
     from novelvideo.config import (
@@ -190,6 +195,8 @@ def plan_refined(
         NEWAPI_IMAGE_MODEL,
         NEWAPI_VIDEO_RESOLUTION,
     )
+
+    video_model = str(video_model or "").strip() or DEFAULT_VIDEO_MODEL
 
     shots = _shot_beats(beats)
     grids = _grid_count(beats)
@@ -251,7 +258,7 @@ def plan_refined(
         actions.append(
             ActionRequest(
                 kind="video",
-                model=DEFAULT_VIDEO_MODEL,
+                model=video_model,
                 feature_key="mainline.single_video",
                 params={"resolution": NEWAPI_VIDEO_RESOLUTION, "video_input": "none"},
                 quantity=len(shots),
@@ -322,11 +329,14 @@ def plan_coarse(
     episodes: int = 0,
     chapters: int = 0,
     book: PriceBook | None = None,
+    video_model: str | None = None,
 ) -> list[ActionRequest]:
     """由剧本字数推整部（或若干集）的动作清单。
 
     集数未知时按 ``beats_per_episode`` 与 ``chars_per_beat`` 反推：相机选一个集数，
     让「总镜头数」落在合理区间。这里给的是**区间中点**，UI 上会标 ±。
+
+    ``video_model`` 是项目级默认视频模型（目录 id）；不传则回落实例默认。
     """
 
     book = book or load_prices()
@@ -336,6 +346,8 @@ def plan_coarse(
         NEWAPI_IMAGE_MODEL,
         NEWAPI_VIDEO_RESOLUTION,
     )
+
+    video_model = str(video_model or "").strip() or DEFAULT_VIDEO_MODEL
 
     total_chars = max(int(chars or 0), 0)
     chars_per_beat = _assumption(book, "chars_per_beat") or 60.0
@@ -383,7 +395,7 @@ def plan_coarse(
         actions.append(
             ActionRequest(
                 kind="video",
-                model=DEFAULT_VIDEO_MODEL,
+                model=video_model,
                 feature_key="mainline.single_video",
                 params={"resolution": NEWAPI_VIDEO_RESOLUTION, "video_input": "none"},
                 quantity=beats,

@@ -27,6 +27,45 @@ logger = logging.getLogger(__name__)
 #: 相对项目输出目录的落盘位置。
 TIMING_RELATIVE_PATH = Path("runtime") / "pipeline_timing.jsonl"
 
+#: 轮转上限（字节）。超过后只保留最新的一半，避免跨多次重跑无界增长。
+TIMING_MAX_BYTES_ENV = "PIPELINE_TIMING_MAX_BYTES"
+DEFAULT_TIMING_MAX_BYTES = 2_000_000
+
+
+def _max_bytes() -> int:
+    raw = os.environ.get(TIMING_MAX_BYTES_ENV, str(DEFAULT_TIMING_MAX_BYTES)).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TIMING_MAX_BYTES
+    return max(0, value)
+
+
+def _maybe_rotate(path: Path) -> None:
+    """文件超过上限时只保留最新的一半事件（绝不抛错）。"""
+
+    limit = _max_bytes()
+    if limit <= 0:
+        return
+    try:
+        if path.stat().st_size <= limit:
+            return
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        budget = limit // 2
+        kept: list[str] = []
+        size = 0
+        for line in reversed(lines):
+            line_bytes = len(line.encode("utf-8")) + 1
+            if kept and size + line_bytes > budget:
+                break
+            kept.append(line)
+            size += line_bytes
+        path.write_text(
+            ("\n".join(reversed(kept)) + "\n") if kept else "", encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001 - 轮转失败不影响产线
+        logger.debug("pipeline timing rotate failed", exc_info=True)
+
 
 def timing_path(output_dir: str | os.PathLike[str]) -> Path:
     """Return the timing log path for a project output directory."""
@@ -61,8 +100,34 @@ def record_event(
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(line, ensure_ascii=False) + "\n")
+        _maybe_rotate(path)
     except Exception:  # noqa: BLE001 - 观测失败不能影响产线
         logger.debug("pipeline timing write failed", exc_info=True)
+
+
+def record_span(
+    output_dir: str | os.PathLike[str] | None,
+    stage: str,
+    *,
+    started: float,
+    ended: float | None = None,
+    event: str = "task_span",
+    **fields: Any,
+) -> None:
+    """记录一段墙钟（默认 ``task_span``）：起止都要，便于算重叠。
+
+    ``started`` 是 epoch 秒。与 :func:`record_event` 一样绝不抛错。
+    """
+
+    finish = time.time() if ended is None else float(ended)
+    record_event(
+        output_dir,
+        event,
+        stage=stage,
+        started=round(float(started), 3),
+        duration_seconds=round(max(0.0, finish - float(started)), 3),
+        **fields,
+    )
 
 
 def load_events(output_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
@@ -154,10 +219,123 @@ def summarize(output_dir: str | os.PathLike[str]) -> dict[str, Any]:
     }
 
 
+def summarize_spans(
+    output_dir: str | os.PathLike[str],
+    *,
+    since: float | None = None,
+    event: str = "task_span",
+) -> dict[str, Any]:
+    """按阶段汇总 ``task_span`` 事件：调用数 / 总耗时 / 墙钟跨度 / 失败数。
+
+    阶段之间天然串行的链路里，某阶段的 ``span_seconds`` 就是它把整条流水线堵住
+    的时长；把它按大小排出来，就知道下一刀该切哪。``since`` 只看某一跑。
+    """
+
+    events = [
+        entry
+        for entry in load_events(output_dir)
+        if str(entry.get("event") or "") == event
+    ]
+    if since is not None:
+        events = [
+            entry
+            for entry in events
+            if float(entry.get("started") or entry.get("ts") or 0) >= float(since)
+        ]
+
+    stages: dict[str, dict[str, Any]] = {}
+    for entry in events:
+        stage = str(entry.get("stage") or entry.get("task_type") or "unknown")
+        bucket = stages.setdefault(
+            stage,
+            {
+                "calls": 0,
+                "failures": 0,
+                "duration_sum_seconds": 0.0,
+                "first": None,
+                "last": None,
+            },
+        )
+        duration = float(entry.get("duration_seconds") or 0.0)
+        start = float(entry.get("started") or entry.get("ts") or 0.0)
+        bucket["calls"] += 1
+        bucket["duration_sum_seconds"] += duration
+        if entry.get("ok") is False:
+            bucket["failures"] += 1
+        bucket["first"] = start if bucket["first"] is None else min(bucket["first"], start)
+        bucket["last"] = (
+            start + duration if bucket["last"] is None else max(bucket["last"], start + duration)
+        )
+
+    for bucket in stages.values():
+        bucket["duration_sum_seconds"] = round(bucket["duration_sum_seconds"], 1)
+        first = bucket.pop("first")
+        last = bucket.pop("last")
+        bucket["span_seconds"] = round(last - first, 1) if first is not None else 0.0
+
+    return {"count": len(events), "stages": stages}
+
+
+def summarize_stage(
+    output_dir: str | os.PathLike[str],
+    stage: str,
+    *,
+    since: float | None = None,
+) -> dict[str, Any]:
+    """汇总某个阶段 ``<stage>_call`` 事件的调用数/耗时/span。
+
+    ``since`` 可用于只看某一跑（epoch 秒）；不传则统计文件里该阶段的所有事件。
+    """
+
+    events = [
+        event
+        for event in load_events(output_dir)
+        if str(event.get("event") or "") == f"{stage}_call"
+    ]
+    if since is not None:
+        events = [
+            event for event in events if float(event.get("ts") or 0) >= float(since)
+        ]
+    if not events:
+        return {"stage": stage, "calls": 0}
+
+    timestamps = [
+        float(event["ts"]) for event in events if isinstance(event.get("ts"), (int, float))
+    ]
+    durations = [
+        float(event["duration_seconds"])
+        for event in events
+        if isinstance(event.get("duration_seconds"), (int, float))
+    ]
+    phases: dict[str, int] = {}
+    failures = 0
+    for event in events:
+        phases[str(event.get("phase"))] = phases.get(str(event.get("phase")), 0) + 1
+        if event.get("ok") is False:
+            failures += 1
+    durations.sort()
+    span = (max(timestamps) - min(timestamps)) if len(timestamps) >= 2 else 0.0
+    return {
+        "stage": stage,
+        "calls": len(events),
+        "failures": failures,
+        "phases": phases,
+        "span_seconds": round(span, 1),
+        "duration_sum_seconds": round(sum(durations), 1),
+        "duration_median_seconds": (
+            round(durations[len(durations) // 2], 2) if durations else None
+        ),
+    }
+
+
 __all__ = [
     "TIMING_RELATIVE_PATH",
+    "TIMING_MAX_BYTES_ENV",
     "load_events",
     "record_event",
+    "record_span",
     "summarize",
+    "summarize_spans",
+    "summarize_stage",
     "timing_path",
 ]

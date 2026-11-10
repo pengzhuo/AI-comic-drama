@@ -17,10 +17,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from novelvideo.i18n_message import MessageLike, lmsg
 from novelvideo.shared.env_guard import preserve_st_env
 from novelvideo.config import get_newapi_structured_output_litellm_kwargs
-from novelvideo.utils.bounded_concurrency import (
-    default_llm_concurrency,
-    map_bounded,
-)
+from novelvideo.utils.bounded_concurrency import map_bounded
 from novelvideo.utils.source_language import (
     AssetLanguage,
     asset_language_instruction,
@@ -1257,7 +1254,9 @@ async def enrich_scene_environments_batched(
         pending[start : start + _ENRICHMENT_BATCH_SIZE]
         for start in range(0, len(pending), _ENRICHMENT_BATCH_SIZE)
     ]
-    results = await map_bounded(batches, run_batch, limit=default_llm_concurrency())
+    results = await map_bounded(
+        batches, run_batch, limit=None, stage="cognee"
+    )
     fresh = {scene.name: scene for batch in results if batch for scene in batch}
 
     # Rebuilt in the caller's original order, so a resumed build publishes the

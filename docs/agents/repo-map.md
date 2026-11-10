@@ -51,7 +51,7 @@ with iterative `tsc -b` rather than a blind cut.
 | `agents/*.py` | LLM agents: `episode_planner`, `identity_planner`, `content_rewriter`, `asset_compiler`, `global_video_optimizer` |
 | `novel_source.py` | Imported-script read funnel (`load_imported_novel_content` prefers the normalized text) |
 | `screenplay_preprocess.py` | 剧本预处理 artifacts (`screenplay/preprocess.json`, `novel.normalized.txt`, `novel.original.txt`) |
-| `workflows/*.py` | Script-writing workflows (`script_writing`, `literal_script_writing`, `script_processing`) |
+| `workflows/*.py` | Script-writing workflows (`script_writing`, `literal_script_writing`, `script_processing`) —— 处理剧本调参见 [`script-process-tuning.md`](script-process-tuning.md) |
 | `structured_ingest.py`, `structured_extraction.py`, `structured_builders.py` | Structured (`structured_v1`) ingest + extraction |
 | `pacing.py` | 剧集节奏：每集≈60s + 镜头最少（分集规则、镜头合并、`resolve_pacing_settings`）——见 [`episode-pacing.md`](episode-pacing.md) |
 | `sqlite_store.py` | `build_episodes_from_chapters`（一章一集）/ `build_episodes_by_duration`（按目标时长分集，默认模式） |
@@ -68,8 +68,11 @@ with iterative `tsc -b` rather than a blind cut.
 | `export/` | Episode export (SRT/video/zip) |
 | `verification/` | Quality gates |
 | `styles/`, `prompts/`, `skills/`, `assets/` | Bundled content; `skills/ai_film_process/` = 制作流程包 — injection rules in [`skill-pack-injection.md`](skill-pack-injection.md) |
-| `utils/` | `model_context_budget`, `document_parsers`, `path_resolver`, `screenplay_normalize`, `screenplay_scene_parser`, `upload_safety` |
+| `utils/` | `model_context_budget`, `document_parsers`, `path_resolver`, `screenplay_normalize`, `screenplay_scene_parser`, `upload_safety`, `bounded_concurrency`（`map_bounded`，默认过全局闸门） |
 | `shared/runtime_env.py` | Runtime/edition flags (`is_ce_effective`) |
+| `shared/stage_runtime.py` | 阶段共享运行库：热调参文件/值收正/`StageLimiter`/`run_bounded`/`record_call`——见 [`stage-runtime.md`](stage-runtime.md) |
+| `shared/global_llm_gate.py` | 进程级 LLM 在飞闸门（`LLM_GLOBAL_CONCURRENCY`，默认 12）——见 [`stage-runtime.md`](stage-runtime.md) |
+| `pipeline_timing.py` | `pipeline_timing.jsonl` 追加记录 + 上限轮转 + `summarize_stage` |
 
 ## Frontend (`frontend/src/`)
 

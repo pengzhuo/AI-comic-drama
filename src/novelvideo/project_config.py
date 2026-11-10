@@ -417,6 +417,122 @@ def effective_video_backend(username: str, project: str) -> str:
     return configured or str(VIDEO_BACKEND or "").strip()
 
 
+#: 客户在「上传剧本 / 每集报价」里可选的视频模型（目录 id）。默认 seedance-2.5。
+SELECTABLE_VIDEO_MODELS: tuple[str, ...] = (
+    "seedance-2.5",
+    "seedance-2.0",
+    "seedance-2.0-fast",
+    "seedance-2.0-mini",
+)
+DEFAULT_SELECTABLE_VIDEO_MODEL = "seedance-2.5"
+
+#: 项目配置里「每集视频模型覆盖」的键：``{"1": "newapi_seedance-2.0-mini", ...}``。
+EPISODE_VIDEO_BACKENDS_KEY = "episode_video_backends"
+
+_NEWAPI_VIDEO_PREFIX = "newapi_"
+
+
+def video_backend_value(model: str | None) -> str:
+    """目录 id → 渲染后端值（``seedance-2.5`` → ``newapi_seedance-2.5``）。
+
+    已经是后端值（带 ``newapi_`` 前缀）时原样返回，方便调用方两种形态都能传。
+    """
+
+    value = str(model or "").strip()
+    if not value:
+        return ""
+    if value.startswith(_NEWAPI_VIDEO_PREFIX):
+        return value
+    return f"{_NEWAPI_VIDEO_PREFIX}{value}"
+
+
+def video_catalog_id(backend: str | None) -> str:
+    """渲染后端值 → 目录 id（``newapi_seedance-2.5`` → ``seedance-2.5``）。
+
+    估价按目录 id 匹配价格表，所以出片用的后端值得先转回目录 id。
+    """
+
+    value = str(backend or "").strip()
+    if not value:
+        return ""
+    if value.lower() == "newapi":
+        from novelvideo.config import NEWAPI_VIDEO_MODEL
+
+        return str(NEWAPI_VIDEO_MODEL or "").strip()
+    if value.startswith(_NEWAPI_VIDEO_PREFIX):
+        return value[len(_NEWAPI_VIDEO_PREFIX) :].strip()
+    return value
+
+
+def episode_video_backends(config: dict | None) -> dict[str, str]:
+    """读出「每集视频模型覆盖」映射，过滤空值。"""
+
+    value = (config or {}).get(EPISODE_VIDEO_BACKENDS_KEY)
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): str(v) for k, v in value.items() if str(v).strip()}
+
+
+def episode_video_backend(config: dict | None, episode: int | None) -> str:
+    """该集覆盖的后端值；没配返回空串。"""
+
+    if episode is None:
+        return ""
+    try:
+        key = str(int(episode))
+    except (TypeError, ValueError):
+        return ""
+    return episode_video_backends(config).get(key, "")
+
+
+def effective_video_backend_for_episode(
+    username: str, project: str, episode: int | None
+) -> str:
+    """某集实际出片用的后端：该集覆盖 > 项目配置 > 实例默认。"""
+
+    config = load_project_config(username, project)
+    override = episode_video_backend(config, episode)
+    if override:
+        return override
+    return effective_video_backend(username, project)
+
+
+def effective_video_model_for_episode(
+    username: str, project: str, episode: int | None
+) -> str:
+    """某集实际出片用的**目录 id**（估价按它匹配价格表）。"""
+
+    return video_catalog_id(effective_video_backend_for_episode(username, project, episode))
+
+
+def set_episode_video_backend(
+    username: str,
+    project: str,
+    episode: int,
+    backend: str | None,
+) -> dict:
+    """写入 / 清除某集的视频模型覆盖（``backend`` 为空则删除该集）。"""
+
+    try:
+        key = str(int(episode))
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid episode: {episode!r}") from None
+    value = str(backend or "").strip()
+
+    def _apply(config: dict) -> None:
+        mapping = dict(episode_video_backends(config))
+        if value:
+            mapping[key] = value
+        else:
+            mapping.pop(key, None)
+        if mapping:
+            config[EPISODE_VIDEO_BACKENDS_KEY] = mapping
+        else:
+            config.pop(EPISODE_VIDEO_BACKENDS_KEY, None)
+
+    return update_project_config_file(username, project, _apply)
+
+
 def ensure_project_uuid_in_state_dir(state_dir: str | Path) -> str:
     """Ensure a stable UUID without resolving legacy username/project paths."""
 

@@ -10,6 +10,7 @@ import {
   deriveProjectName,
   saveStudioProjectChoices,
   startStudioIngest,
+  STUDIO_VIDEO_MODELS,
   uploadStudioScript,
   type CreatedProject,
   type StudioChoices,
@@ -204,6 +205,7 @@ export function StudioUploadCard({
         visual_style: choices.visual_style,
         narration_style: choices.narration_style,
         ethnicity: choices.ethnicity,
+        video_model: choices.video_model,
       });
       const started = await startStudioIngest(
         project.id,
@@ -289,8 +291,8 @@ export function StudioUploadCard({
               </span>
             </button>
 
-            {/* 导入剧本下方的三个选择：项目类型 / 视觉风格 / 默认未指定人群。 */}
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            {/* 导入剧本下方的四个选择：项目类型 / 视觉风格 / 默认未指定人群 / 视频模型。 */}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <StudioSelect
                 label={t("ingest.projectType")}
                 value={choices.spine_template}
@@ -328,6 +330,18 @@ export function StudioUploadCard({
                 options={ETHNICITY_OPTIONS.map((option) => ({
                   value: option.value,
                   label: t(option.labelKey),
+                }))}
+              />
+              <StudioSelect
+                label="视频模型"
+                value={choices.video_model}
+                disabled={busy}
+                onChange={(value) =>
+                  setChoices((prev) => ({ ...prev, video_model: value }))
+                }
+                options={STUDIO_VIDEO_MODELS.map((option) => ({
+                  value: option.id,
+                  label: option.label,
                 }))}
               />
             </div>

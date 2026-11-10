@@ -623,9 +623,9 @@ Output the {output_label} motion prompt directly. No JSON, explanation, or markd
         color_map_text = self._build_color_map_text(character_color_map)
         beats_by_num = {b.get("beat_number"): b for b in beats}
         sketches_path = Path(sketches_dir)
-        fixed_count = 0
+        fixed = {"count": 0}
 
-        for result in results:
+        async def _review_one(result: dict) -> None:
             beat_num = result["beat_number"]
             video_mode = result["video_mode"]
             prompt = result["prompt"]
@@ -634,7 +634,7 @@ Output the {output_label} motion prompt directly. No JSON, explanation, or markd
             sketch_file = sketches_path / f"beat_{beat_num:02d}.png"
             if not sketch_file.exists():
                 _log(f"Beat {beat_num}: 草图帧不存在，跳过审核")
-                continue
+                return
 
             beat = beats_by_num.get(beat_num, {})
             visual_desc = beat.get("visual_description", "")
@@ -677,7 +677,7 @@ Output the {output_label} motion prompt directly. No JSON, explanation, or markd
                     review: ReviewResult = response.output
                     if review.needs_fix:
                         result["prompt"] = review.prompt or prompt
-                        fixed_count += 1
+                        fixed["count"] += 1
                         _log(f"Beat {beat_num}: ✏️ 已修正 — {review.reason}")
                     else:
                         _log(f"Beat {beat_num}: ✅ 通过审核")
@@ -687,7 +687,12 @@ Output the {output_label} motion prompt directly. No JSON, explanation, or markd
             except Exception as e:
                 _log(f"Beat {beat_num}: 审核异常 ({e})，保留原 prompt")
 
-        _log(f"审核完成：{fixed_count}/{len(results)} 个 Beat 已修正")
+        # 各 beat 之间无依赖（只改各自的 prompt），按阶段并发跑，默认 2。
+        from novelvideo.utils.bounded_concurrency import map_bounded
+
+        await map_bounded(results, _review_one, stage="video_optimizer")
+
+        _log(f"审核完成：{fixed['count']}/{len(results)} 个 Beat 已修正")
         return results
 
     def _build_color_map_text(self, character_color_map: dict) -> str:

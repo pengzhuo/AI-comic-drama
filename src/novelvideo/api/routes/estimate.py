@@ -185,7 +185,12 @@ async def _build_estimate(
                 if not beats:
                     continue
                 actions.extend(
-                    estimate.plan_refined(beats=beats, episode=number, book=book)
+                    estimate.plan_refined(
+                        beats=beats,
+                        episode=number,
+                        book=book,
+                        video_model=_resolve_video_model(resolution, number),
+                    )
                 )
                 refined_episodes += 1
         finally:
@@ -205,6 +210,7 @@ async def _build_estimate(
             episodes=int(episodes or 0),
             chapters=int(chapters or 0),
             book=book,
+            video_model=_resolve_video_model(resolution, episode),
         )
 
     actual_cny = (
@@ -221,6 +227,7 @@ async def _build_estimate(
         episode_count=episode_count,
     )
     payload["project"] = project
+    payload["video_model"] = _resolve_video_model(resolution, episode)
     if not estimate.display_safety_check(payload):  # pragma: no cover - 防线
         logger.error("客户视角载荷出现金额，已强制脱敏 project=%s", project)
         payload = estimate._mask_for_client(payload)  # noqa: SLF001
@@ -243,6 +250,30 @@ def _with_points(payload: dict[str, Any]) -> dict[str, Any]:
     )
     payload["price"] = price
     return payload
+
+
+def _resolve_video_model(resolution: Any, episode: int | None) -> str:
+    """本集/本项目实际出片用的视频模型（目录 id）。
+
+    优先级：该集覆盖（``episode_video_backends``）> 项目配置 ``video_backend`` >
+    实例默认。估价与预扣都用它匹配价格表，所以与出片口径一致。
+    """
+
+    from novelvideo.project_config import (
+        DEFAULT_SELECTABLE_VIDEO_MODEL,
+        effective_video_model_for_episode,
+    )
+
+    try:
+        model = effective_video_model_for_episode(
+            getattr(resolution, "username", ""),
+            getattr(resolution, "project_name", ""),
+            episode,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("解析视频模型失败", exc_info=True)
+        model = ""
+    return model or DEFAULT_SELECTABLE_VIDEO_MODEL
 
 
 async def client_price_cny(
@@ -345,6 +376,114 @@ async def get_production_quote(
             "view": payload.get("view"),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# 每集视频模型（选择 / 覆盖）
+# ---------------------------------------------------------------------------
+
+
+def _video_model_label(model: str) -> str:
+    try:
+        from novelvideo.model_gateway_settings import (
+            get_official_media_model_mappings,
+        )
+
+        item = get_official_media_model_mappings().get(model) or {}
+        label = str(item.get("label") or "").strip()
+        if label:
+            return label
+    except Exception:  # noqa: BLE001
+        logger.debug("读取视频模型 label 失败", exc_info=True)
+    from novelvideo.generators.video_generator import NEWAPI_VIDEO_DISPLAY_LABELS
+
+    return NEWAPI_VIDEO_DISPLAY_LABELS.get(model, model)
+
+
+def _video_model_options() -> list[dict[str, str]]:
+    from novelvideo.project_config import SELECTABLE_VIDEO_MODELS, video_backend_value
+
+    return [
+        {
+            "id": model,
+            "backend": video_backend_value(model),
+            "label": _video_model_label(model),
+        }
+        for model in SELECTABLE_VIDEO_MODELS
+    ]
+
+
+def _episode_video_model_payload(resolution: Any, episode: int) -> dict[str, Any]:
+    from novelvideo.project_config import (
+        DEFAULT_SELECTABLE_VIDEO_MODEL,
+        effective_video_model_for_episode,
+        episode_video_backend,
+        load_project_config,
+        video_catalog_id,
+    )
+
+    config = load_project_config(resolution.username, resolution.project_name)
+    override = video_catalog_id(episode_video_backend(config, episode))
+    default_model = (
+        video_catalog_id(str(config.get("video_backend") or "").strip())
+        or DEFAULT_SELECTABLE_VIDEO_MODEL
+    )
+    return {
+        "episode": int(episode),
+        "video_model": effective_video_model_for_episode(
+            resolution.username, resolution.project_name, episode
+        )
+        or DEFAULT_SELECTABLE_VIDEO_MODEL,
+        "override_model": override,
+        "default_model": default_model,
+        "options": _video_model_options(),
+    }
+
+
+@router.get("/projects/{project}/episodes/{episode_num}/video-model")
+async def get_episode_video_model(
+    project: str,
+    episode_num: int,
+    user: dict = Depends(get_api_user),
+):
+    """某一集当前的视频模型（含可用选项与项目默认）。"""
+
+    resolution = await resolve_project_scope(project, user, required_role="viewer")
+    return {"ok": True, "data": _episode_video_model_payload(resolution, episode_num)}
+
+
+@router.put("/projects/{project}/episodes/{episode_num}/video-model")
+async def update_episode_video_model(
+    project: str,
+    episode_num: int,
+    body: dict[str, Any] = Body(default_factory=dict),
+    user: dict = Depends(get_api_user),
+):
+    """设置（或清除）某一集的视频模型覆盖；空值 = 回落到项目默认。"""
+
+    from novelvideo.project_config import (
+        SELECTABLE_VIDEO_MODELS,
+        set_episode_video_backend,
+        video_backend_value,
+        video_catalog_id,
+    )
+
+    resolution = await resolve_project_scope(project, user, required_role="editor")
+    raw = body.get("video_model", body.get("video_backend"))
+    model = str(raw or "").strip()
+    backend = ""
+    if model:
+        catalog = video_catalog_id(model)
+        if catalog not in SELECTABLE_VIDEO_MODELS:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": f"不支持的视频模型: {model}"},
+            )
+        backend = video_backend_value(catalog)
+    set_episode_video_backend(
+        resolution.username, resolution.project_name, episode_num, backend
+    )
+    return {"ok": True, "data": _episode_video_model_payload(resolution, episode_num)}
 
 
 # ---------------------------------------------------------------------------

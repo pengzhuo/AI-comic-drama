@@ -128,6 +128,8 @@ export const queryKeys = {
   directorAutoRun: (p: string) => ["projects", p, "director-auto"] as const,
   productionEstimate: (p: string, episode?: number | null, stage?: string) =>
     ["projects", p, "production-estimate", episode ?? null, stage ?? "auto"] as const,
+  episodeVideoModel: (p: string, episode: number) =>
+    ["projects", p, "episodes", episode, "video-model"] as const,
   productionPriceBook: () => ["settings", "production-prices"] as const,
   freezoneCanvases: (p: string) =>
     ["projects", p, "freezone", "canvases"] as const,

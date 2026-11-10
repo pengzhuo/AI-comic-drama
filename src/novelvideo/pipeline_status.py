@@ -147,18 +147,31 @@ def beat_seedance2_prompt_ready(beat: dict) -> bool:
     return bool(str(config.final_prompt or "").strip())
 
 
-def seedance2_prompt_required(username: str, project: str) -> bool:
+def seedance2_prompt_required(
+    username: str, project: str, episode: int | None = None
+) -> bool:
     """Whether this project renders with a Seedance 2.0-family backend.
 
     Only those backends refuse to render a beat whose 2.0 final prompt is empty
     (``beat_seedance2_final_prompt_missing``), so every other backend treats the
     step as vacuously complete and its ordering is unchanged.
+
+    ``episode`` 传入时按该集的视频模型判定（客户可在每集报价处覆盖模型），否则
+    按项目默认。
     """
 
-    from novelvideo.project_config import effective_video_backend
+    from novelvideo.project_config import (
+        effective_video_backend,
+        effective_video_backend_for_episode,
+    )
     from novelvideo.seedance2_i2v.pipeline import is_huimeng_seedance2_backend
 
-    return is_huimeng_seedance2_backend(effective_video_backend(username, project))
+    backend = (
+        effective_video_backend(username, project)
+        if episode is None
+        else effective_video_backend_for_episode(username, project, episode)
+    )
+    return is_huimeng_seedance2_backend(backend)
 
 
 async def _collect_voice_prereq_errors(
@@ -418,7 +431,7 @@ async def compute_pipeline_status(
     )
 
     has_seedance2_prompt = (
-        not seedance2_prompt_required(username, project_name)
+        not seedance2_prompt_required(username, project_name, target_ep)
         or _all_or_empty([beat_seedance2_prompt_ready(b) for b in beats])
     )
 

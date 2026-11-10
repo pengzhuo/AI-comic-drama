@@ -54,8 +54,31 @@ def _fit_identity_content(text: str) -> str:
     budget = TextContextBudget.from_env("IDENTITY_PLANNER_ANALYSIS_MODEL")
     if budget is None:
         return text
-    reserve = budget.framing_tokens + budget.default_output_tokens + 8192
+    # The episodes' planning passes embed far more than the raw text: the
+    # identity-planner skill pack alone is ~29 KB, plus the system prompt,
+    # structured-output schema, cast/identity listing and graph context. Reserve
+    # for that whole prompt (not just framing + output) so the fitted text keeps
+    # the final request inside the budget.
+    reserve = budget.framing_tokens + budget.default_output_tokens + 57344
     return fit_text(text, budget, reserve_tokens=reserve)
+
+
+def _stage_failure(prefix: str, exc: Exception) -> Exception:
+    """Wrap a planning-stage failure while preserving its structured error code.
+
+    The task runtime classifies failures by exception *type* (see
+    ``task_backend.run_core._project_task_failure_for_exception``), so wrapping a
+    ``ModelContextBudgetExceeded`` in a bare ``RuntimeError`` hides the code and
+    turns a deterministic failure into pointless auto-retries. Re-raise the typed
+    exception so ``error_code=MODEL_CONTEXT_BUDGET_EXCEEDED`` survives.
+    """
+
+    from novelvideo.utils.model_context_budget import ModelContextBudgetExceeded
+
+    message = f"{prefix}: {exc}"
+    if isinstance(exc, ModelContextBudgetExceeded):
+        return ModelContextBudgetExceeded(message)
+    return RuntimeError(message)
 
 
 # =============================================================================
@@ -758,7 +781,7 @@ class IdentityPlanner:
         except Exception as e:
             if on_log:
                 on_log(f"[EP{episode.number:03d}] AI 筛选出场角色失败: {e}")
-            raise RuntimeError(f"Pass 0 出场角色筛选失败: {e}") from e
+            raise _stage_failure("Pass 0 出场角色筛选失败", e) from e
 
     def _build_character_info(self, characters: list[str]) -> str:
         """构建角色基础信息 + 已有身份信息文本。"""
@@ -1011,7 +1034,7 @@ class IdentityPlanner:
         except Exception as e:
             if on_log:
                 on_log(f"[EP{episode.number:03d}] Pass A 默认身份分析失败: {e}")
-            raise RuntimeError(f"Pass A 默认身份分析失败: {e}") from e
+            raise _stage_failure("Pass A 默认身份分析失败", e) from e
 
     async def _analyze_special_identities(
         self,

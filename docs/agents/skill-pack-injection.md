@@ -31,6 +31,15 @@ Whole parts are 29–52 KB. Image templates must never receive them.
 Layering written into the mapping: **01 总控 is only injected at merge/总控
 scope** (`script_process` `digest`), never into per-shot or per-asset calls.
 
+`script_process` is the one stage whose per-call form is **hot-switchable**: its
+`segment` scope defaults to the whole 02 part (as in the table) but can be
+flipped to the condensed `directives/02_script_and_blocking.md` block at runtime
+with `SCRIPT_PROCESS_SKILL_INJECTION=condensed` or
+`{"skill_injection": "condensed"}` in the runtime tuning file (see
+[`script-process-tuning.md`](script-process-tuning.md)). Its `digest` scope has
+no condensed block (there is none for part 01), so it always falls back to the
+whole part.
+
 ## Safety rules (do not break these)
 
 1. **Never raise, never truncate the user's text.** Every helper returns `""`
@@ -52,6 +61,7 @@ scope** (`script_process` `digest`), never into per-shot or per-asset calls.
 | `DIRECTOR_PACK_INJECTION` | on | `0`/`false`/`no`/`off` disables **all** pack injection |
 | `DIRECTOR_PACK_SECTION_WINDOW_RATIO` | `0.25` | max share of the text window one whole part may take (0–1) |
 | `NEWAPI_TEXT_CONTEXT_TOKENS` / `MODEL_CONTEXT_WINDOWS_JSON` | `131072` | window used by the budget check |
+| `SCRIPT_PROCESS_SKILL_INJECTION` | `full` | `script_process` `segment` form: `full` (whole 02) or `condensed` (block). Overridden by the runtime tuning file when unset |
 
 ## Wiring sites
 

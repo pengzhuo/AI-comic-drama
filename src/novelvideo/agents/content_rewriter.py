@@ -227,4 +227,5 @@ async def rewrite_episode_content(
         budget=budget,
         reserve_tokens=reserve,
         require_all=True,
+        stage="rewriter",
     )

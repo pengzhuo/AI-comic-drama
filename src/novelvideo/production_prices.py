@@ -602,9 +602,37 @@ class PriceBook:
             if key.split(":", 1)[-1] == model:
                 return key, entry
         normalized = _normalize_name(model)
+        if not normalized:
+            return None
+        # 中转站常有多个镜像 + 连字符/点号两种写法（``doubao-seedance-2-0`` 与
+        # ``doubao-seedance-2.0``），后缀会命中多个。先看有没有归一化后完全同名的；
+        # 都不同名时，优先「价目表已在用的中转站」（已被别的 ``aliases`` 指定过的
+        # label），仍不唯一就不计价——不同站单价可能不同，宁可不猜。
+        preferred_labels = {
+            str(value).split(":", 1)[0]
+            for value in self.aliases.values()
+            if ":" in str(value)
+        }
+        suffix_hits: list[tuple[str, dict[str, Any]]] = []
         for key, entry in models.items():
-            if _normalize_name(key.split(":", 1)[-1]) == normalized:
+            upstream = _normalize_name(key.split(":", 1)[-1])
+            if not upstream:
+                continue
+            if upstream == normalized:
                 return key, entry
+            if upstream.endswith(normalized):
+                suffix_hits.append((key, entry))
+        if not suffix_hits:
+            return None
+        if len(suffix_hits) == 1:
+            return suffix_hits[0]
+        preferred_hits = [
+            (key, entry)
+            for key, entry in suffix_hits
+            if key.split(":", 1)[0] in preferred_labels
+        ]
+        if len(preferred_hits) == 1:
+            return preferred_hits[0]
         return None
 
     def _price_synced(self, action: ActionRequest) -> PricedAction | None:

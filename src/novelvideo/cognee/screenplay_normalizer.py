@@ -6,10 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from novelvideo.time_of_day import LlmTimeOfDay, normalize_time_of_day
-from novelvideo.utils.bounded_concurrency import (
-    default_llm_concurrency,
-    map_bounded,
-)
+from novelvideo.utils.bounded_concurrency import map_bounded
 from novelvideo.utils.screenplay_scene_parser import TIME_TOKEN_RE, parse_scene_blocks
 from novelvideo.utils.source_language import (
     asset_language_instruction,
@@ -461,7 +458,7 @@ async def normalize_screenplay_scenes(
             return produced
 
         for outcome in await map_bounded(
-            batches, run_batch, limit=default_llm_concurrency()
+            batches, run_batch, limit=None, stage="cognee"
         ):
             for original_index, normalized in outcome or []:
                 resolved[original_index] = normalized

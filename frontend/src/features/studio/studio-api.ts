@@ -169,14 +169,38 @@ export interface StudioChoices {
   visual_style: string;
   narration_style: string;
   ethnicity: string;
+  video_model: string;
 }
 
-/** 默认预设：用户不改也能直接开跑（项目类型默认精品剧）。 */
+/** 客户可选的视频模型（目录 id）；显示名与后端目录 label 对齐。 */
+export interface StudioVideoModelOption {
+  id: string;
+  label: string;
+}
+
+export const STUDIO_VIDEO_MODELS: StudioVideoModelOption[] = [
+  { id: "seedance-2.5", label: "Seedance 2.5" },
+  { id: "seedance-2.0", label: "Seedance 2.0" },
+  { id: "seedance-2.0-fast", label: "Seedance2.0 Fast" },
+  { id: "seedance-2.0-mini", label: "Seedance 2.0 mini" },
+];
+
+export const DEFAULT_STUDIO_VIDEO_MODEL = "seedance-2.5";
+
+/** 目录 id → 项目配置/渲染用的后端值（`seedance-2.5` → `newapi_seedance-2.5`）。 */
+export function videoBackendValue(model: string): string {
+  const value = (model || "").trim();
+  if (!value) return "";
+  return value.startsWith("newapi_") ? value : `newapi_${value}`;
+}
+
+/** 默认预设：用户不改也能直接开跑（项目类型默认精品剧，视频模型默认 2.5）。 */
 export const DEFAULT_STUDIO_CHOICES: StudioChoices = {
   spine_template: "drama",
   visual_style: "chinese_period_drama",
   narration_style: "first_person",
   ethnicity: "Chinese",
+  video_model: DEFAULT_STUDIO_VIDEO_MODEL,
 };
 
 /**
@@ -211,6 +235,9 @@ export async function saveStudioProjectChoices(
     body.narration_style = choices.narration_style;
   }
   if (choices.ethnicity !== undefined) body.ethnicity = choices.ethnicity;
+  if (choices.video_model !== undefined) {
+    body.video_backend = videoBackendValue(choices.video_model);
+  }
   if (Object.keys(body).length === 0) return;
   await jsonWithBackendError<OkResponse<unknown>>(
     api.patch(p`api/v1/projects/${project}`, {
