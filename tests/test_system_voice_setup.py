@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -581,3 +582,194 @@ async def test_prepare_missing_system_voices_avoids_duplicate_presets(
     assert set(by_target) == {"刘奶奶"}
     assert by_target["刘奶奶"]["voice"] == system_voice_setup.GATEWAY_FEMALE_VOICES[1]
     assert by_target["刘奶奶"]["voice"] != claimed_voice
+
+
+def _multi_character_store(project_dir: Path) -> "_FakeStore":
+    """6 女 2 男：女声池只有 4 条，池耗尽后必然出现「多个角色共用一条预置音色」。"""
+
+    store = _FakeStore(project_dir)
+    store.characters = [
+        NovelCharacter(name="林夏", gender="女", age_group="youth", is_main=True),
+        NovelCharacter(name="苏晴", gender="女", age_group="youth", is_main=False),
+        NovelCharacter(name="许知意", gender="女", age_group="youth", is_main=False),
+        NovelCharacter(name="白薇", gender="女", age_group="youth", is_main=False),
+        NovelCharacter(name="柳月", gender="女", age_group="youth", is_main=False),
+        NovelCharacter(name="沈清", gender="女", age_group="youth", is_main=False),
+        NovelCharacter(name="陈默", gender="男", age_group="youth", is_main=False),
+        NovelCharacter(name="赵岩", gender="男", age_group="youth", is_main=False),
+    ]
+    store.beats = [
+        {
+            "beat_number": index,
+            "audio_type": "dialogue",
+            "speaker": character.name,
+            "narration_segment": f"“{character.name}开口了。”",
+        }
+        for index, character in enumerate(store.characters, start=1)
+    ]
+    return store
+
+
+def test_system_voice_concurrency_precedence(monkeypatch, tmp_path):
+    """并发旋钮优先级 env > ``runtime/system_voice_setup.json`` > 默认；非法值回落。"""
+
+    from novelvideo.audio import system_voice_setup
+
+    monkeypatch.delenv(system_voice_setup.SYSTEM_VOICE_CONCURRENCY_ENV, raising=False)
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / "system_voice_setup.json").write_text(
+        '{"concurrency": 6}', encoding="utf-8"
+    )
+
+    assert system_voice_setup.system_voice_concurrency() == 6
+
+    monkeypatch.setenv(system_voice_setup.SYSTEM_VOICE_CONCURRENCY_ENV, "2")
+    assert system_voice_setup.system_voice_concurrency() == 2
+
+    # 非法 / 非正值一律回落（热调参文件仍生效）。
+    monkeypatch.setenv(system_voice_setup.SYSTEM_VOICE_CONCURRENCY_ENV, "0")
+    assert system_voice_setup.system_voice_concurrency() == 6
+
+    monkeypatch.delenv(system_voice_setup.SYSTEM_VOICE_CONCURRENCY_ENV)
+    (tmp_path / "system_voice_setup.json").unlink()
+    assert (
+        system_voice_setup.system_voice_concurrency()
+        == system_voice_setup.SYSTEM_VOICE_CONCURRENCY_DEFAULT
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepare_missing_system_voices_generates_character_voices_concurrently(
+    monkeypatch,
+    tmp_path,
+):
+    """角色声线合成有界并发；同一条预置音色只打一次网关。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.freezone import audio_node
+
+    narrator_updates: list[dict] = []
+    writer_calls: list[dict] = []
+    in_flight = 0
+    max_in_flight = 0
+
+    async def fake_write_newapi_audio_speech(**kwargs):
+        nonlocal in_flight, max_in_flight
+        writer_calls.append(kwargs)
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.02)
+            path = Path(kwargs["output_path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"gateway:{kwargs['voice']}".encode())
+        finally:
+            in_flight -= 1
+        return {"ok": True}
+
+    _patch_voice_setup_io(monkeypatch, system_voice_setup, narrator_updates)
+    monkeypatch.setenv("SYSTEM_VOICE_TTS_MODEL", "doubao-seed-audio-1-0")
+    monkeypatch.setenv(system_voice_setup.SYSTEM_VOICE_CONCURRENCY_ENV, "3")
+    monkeypatch.setattr(
+        audio_node, "_write_newapi_audio_speech", fake_write_newapi_audio_speech
+    )
+
+    store = _multi_character_store(tmp_path)
+    result = await system_voice_setup.prepare_missing_system_voices(
+        store=store,
+        username="alice",
+        project="demo",
+        project_dir=tmp_path,
+        episode=1,
+    )
+
+    assert result["ready"] is True
+    assert result["prepared_count"] == len(store.characters)
+    # 并发真的发生了（串行只会有 1），且不超过配置的在飞上限。
+    assert 2 <= max_in_flight <= 3
+    # 池耗尽后多个角色共用同一条音色时，仍然只打一次网关（否则并发会放大成 N 次）。
+    requested = [call["voice"] for call in writer_calls]
+    assert len(requested) == len(set(requested)) == 6
+
+
+@pytest.mark.asyncio
+async def test_character_voice_assignment_identical_at_any_concurrency(
+    monkeypatch,
+    tmp_path,
+):
+    """并发只改吞吐：concurrency=1 与并发跑出的声线分配与顺序逐字一致。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.freezone import audio_node
+
+    async def fake_write_newapi_audio_speech(**kwargs):
+        path = Path(kwargs["output_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"gateway:{kwargs['voice']}".encode())
+        return {"ok": True}
+
+    monkeypatch.setenv("SYSTEM_VOICE_TTS_MODEL", "doubao-seed-audio-1-0")
+    monkeypatch.setattr(
+        audio_node, "_write_newapi_audio_speech", fake_write_newapi_audio_speech
+    )
+
+    async def run_once(limit: str, directory: Path) -> dict:
+        narrator_updates: list[dict] = []
+        _patch_voice_setup_io(monkeypatch, system_voice_setup, narrator_updates)
+        monkeypatch.setenv(system_voice_setup.SYSTEM_VOICE_CONCURRENCY_ENV, limit)
+        store = _multi_character_store(directory)
+        return await system_voice_setup.prepare_missing_system_voices(
+            store=store,
+            username="alice",
+            project="demo",
+            project_dir=directory,
+            episode=1,
+        )
+
+    serial = await run_once("1", tmp_path / "serial")
+    parallel = await run_once("4", tmp_path / "parallel")
+
+    assert serial["ready"] is True
+    assert serial["prepared"] == parallel["prepared"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_missing_system_voices_raises_when_character_voice_fails(
+    monkeypatch,
+    tmp_path,
+):
+    """任一角色声线彻底合成失败就整集失败，不静默退化成「少几个角色声线」。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.freezone import audio_node
+    from novelvideo.generators.tts_generator import TTSResult
+
+    class FailingEdgeTTSGenerator:
+        def __init__(self, voice: str, egress_context=None) -> None:  # noqa: ARG002
+            self.voice = voice
+
+        async def generate(self, *, text, output_path, generate_subtitle):  # noqa: ARG002
+            return TTSResult(success=False, error="edge unavailable")
+
+    async def failing_write_newapi_audio_speech(**kwargs):  # noqa: ARG001
+        raise RuntimeError("gateway down")
+
+    _patch_voice_setup_io(monkeypatch, system_voice_setup, [])
+    monkeypatch.setenv("SYSTEM_VOICE_TTS_MODEL", "doubao-seed-audio-1-0")
+    monkeypatch.setattr(
+        system_voice_setup, "EdgeTTSGenerator", FailingEdgeTTSGenerator
+    )
+    monkeypatch.setattr(
+        audio_node, "_write_newapi_audio_speech", failing_write_newapi_audio_speech
+    )
+
+    store = _multi_character_store(tmp_path)
+    with pytest.raises(RuntimeError):
+        await system_voice_setup.prepare_missing_system_voices(
+            store=store,
+            username="alice",
+            project="demo",
+            project_dir=tmp_path,
+            episode=1,
+        )
+

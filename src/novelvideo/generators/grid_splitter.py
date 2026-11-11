@@ -526,9 +526,13 @@ def combine_to_grid(
     Returns:
         输出路径
     """
-    # 加载所有图片
+    # 加载图片。只有前 rows*cols 张会参与拼接，提前停止可避免整集上千张
+    # 分镜时一次性打开全部文件而耗尽文件描述符（EMFILE）。
+    capacity = max(1, rows * cols)
     loaded_images = []
     for img_data in images:
+        if len(loaded_images) >= capacity:
+            break
         if isinstance(img_data, bytes):
             img = Image.open(io.BytesIO(img_data))
         else:
@@ -570,6 +574,8 @@ def combine_to_grid(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     grid_img.save(output_path)
+    for img in loaded_images:
+        img.close()
 
     print(f"[GridSplitter] 合并完成: {output_path}")
     return output_path

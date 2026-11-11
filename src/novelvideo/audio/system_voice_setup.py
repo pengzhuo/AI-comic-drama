@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -61,11 +62,35 @@ GATEWAY_MALE_VOICES = (
     "zh_male_ruyayichen_uranus_bigtts",
 )
 
+#: 角色声线合成的有界并发。长剧一集 27+ 个角色，每角色一次网关往返 10~70s（偶发
+#: 单次 5 分钟以上），串行实测 ``system_voice_setup`` span 549s。热调参
+#: ``runtime/system_voice_setup.json`` 的 ``concurrency``，env
+#: ``SYSTEM_VOICE_TTS_CONCURRENCY`` 优先级更高；设 1 = 逐角色串行（旧行为）。
+SYSTEM_VOICE_STAGE = "system_voice_setup"
+SYSTEM_VOICE_CONCURRENCY_ENV = "SYSTEM_VOICE_TTS_CONCURRENCY"
+SYSTEM_VOICE_CONCURRENCY_DEFAULT = 4
+
 
 def gateway_voice_model() -> str:
     """网关 TTS 模型名；为空表示系统声线只走 EdgeTTS。"""
 
     return str(os.environ.get("SYSTEM_VOICE_TTS_MODEL", "") or "").strip()
+
+
+def system_voice_concurrency() -> int:
+    """角色声线合成的在飞上限：env > ``runtime/system_voice_setup.json`` > 常量。"""
+
+    from novelvideo.shared.stage_runtime import stage_int
+
+    return max(
+        1,
+        stage_int(
+            SYSTEM_VOICE_STAGE,
+            SYSTEM_VOICE_CONCURRENCY_ENV,
+            "concurrency",
+            SYSTEM_VOICE_CONCURRENCY_DEFAULT,
+        ),
+    )
 
 
 def _env_voice(name: str, default: str) -> str:
@@ -404,17 +429,66 @@ async def prepare_missing_system_voices(
                 }
             )
 
+    # 角色声线合成是这一阶段最长的串行热点（实测 10 次网关调用串行 535s，其中一次
+    # 单请求 5m26s）。声线选择必须按角色顺序串行——同项目内去重靠 ``claimed`` 逐个
+    # 递进；但合成本身互不依赖，于是先串行定好每个角色要生成什么，再按有界并发合成，
+    # 最后按原顺序落库，``prepared`` 与去重结果都与逐角色串行一致。
+    generation_jobs: list[tuple[str, list[tuple[str, str]]]] = []
     for character_name, character in character_targets.items():
         gender_error = gender_missing_error(character)
         if gender_error:
             gender_missing.append(gender_error)
             continue
-        content, provider, voice = await _system_voice_content(
-            project_dir=root,
-            candidates=_character_voice_candidates(character, claimed=claimed_voices),
-            cache=content_cache,
-        )
-        claimed_voices.add(voice)
+        candidates = _character_voice_candidates(character, claimed=claimed_voices)
+        # 串行版本里 ``claimed`` 收的是本次实际生效的声线；预设通道成功时正是这里的
+        # 主候选。先按主候选预约，保证同性别角色不撞预置音色。
+        if candidates:
+            claimed_voices.add(candidates[0][1])
+        generation_jobs.append((character_name, candidates))
+
+    # 声线池只有个位数，池耗尽后多个角色会落到同一条预置音色。同一主声线加锁，让
+    # 后到的角色直接命中 ``assets/system_voices`` 缓存，不重复打网关（串行版靠文件
+    # 缓存天然去重，并发下不加锁会变成 N 次重复请求）。
+    voice_locks: dict[str, asyncio.Lock] = {}
+
+    async def _generate_character_voice(
+        job: tuple[str, list[tuple[str, str]]],
+    ) -> tuple[bytes, str, str]:
+        _character_name, candidates = job
+        lock = voice_locks.setdefault(candidates[0][1], asyncio.Lock())
+        async with lock:
+            return await _system_voice_content(
+                project_dir=root,
+                candidates=candidates,
+                cache=content_cache,
+            )
+
+    failures: list[BaseException] = []
+
+    def _note_generation_failure(
+        _job: tuple[str, list[tuple[str, str]]], exc: BaseException
+    ) -> None:
+        failures.append(exc)
+
+    from novelvideo.utils.bounded_concurrency import map_bounded
+
+    generated = await map_bounded(
+        generation_jobs,
+        _generate_character_voice,
+        limit=system_voice_concurrency(),
+        # 音频不是 LLM 调用，不占进程级 LLM 在飞闸门。
+        gate=False,
+        on_error=_note_generation_failure,
+    )
+    if failures:
+        # 与逐角色串行同口径：任一角色声线合成失败就整集失败（让阶段重试），
+        # 不静默退化成「少几个角色声线」。
+        raise failures[0]
+
+    for (character_name, _candidates), outcome in zip(generation_jobs, generated):
+        if outcome is None:  # pragma: no cover - 失败已在上面上抛
+            raise RuntimeError(f"角色「{character_name}」系统声线合成为空结果")
+        content, provider, voice = outcome
         rel_path, sha256, updated_at = persist_character_voice_file(
             project_dir=root,
             character_name=character_name,

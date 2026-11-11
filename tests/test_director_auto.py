@@ -553,6 +553,74 @@ async def test_taskless_pause_reports_the_gate_reason(
 
 
 @pytest.mark.asyncio
+async def test_taskless_turn_checks_the_gate_before_asking_the_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """闸门（例如缺声线策略）在空转的第一轮就拦住，不再先问捏导。
+
+    现场（2026-11）：run 停在 ``voice_setup``，捏导每轮都「补一个写任务」——反复
+    重出早就齐备的草图网格。它既不推进阶段，又把空转预算不断清零，run 永远落不到
+    该停的闸门上，白烧钱还占住阶段。
+    """
+
+    from novelvideo import pipeline_status
+
+    agent_turns: list[str] = []
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return []
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(
+            self, run, *, final_delivery=False, instruction=None
+        ):
+            agent_turns.append(run.run_id)
+            self._remember_continuation(run.run_id, wrote=True, note="sketch_grid")
+            return True
+
+    async def status(**_kwargs):
+        return {"next_step": "voice_setup", "current_episode": 1, "episode_status": {}}
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(pipeline_status, "_user_has_configured", lambda *_: True)
+    monkeypatch.setattr(pipeline_status, "compute_pipeline_status", status)
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path, scope="project"))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        for _ in range(600):
+            saved = store.get("alice", "project-1")
+            if saved is not None and saved.status == "paused":
+                break
+            await asyncio.sleep(0.01)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "paused"
+        assert saved.pause_kind == director_auto.PAUSE_KIND_VOICE
+        assert saved.last_error == director_auto.VOICE_POLICY_REQUIRED_ERROR
+        # 关键：闸门在问捏导之前就拦住了。
+        assert agent_turns == []
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("store_read_delay", [0, 0.1])
 async def test_failure_retries_before_pausing_without_agent_turn(
     monkeypatch: pytest.MonkeyPatch,
@@ -1829,7 +1897,9 @@ async def test_moderation_failure_on_batch_stage_suspends_without_guessing(
 
     try:
         coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
-        await asyncio.wait_for(notified.wait(), timeout=5)
+        # 30s：这条路径第一次会导入 api.deps（cognee）——测试环境要 8s 上下，
+        # 5s 的老上限会因导入而不是逻辑超时。
+        await asyncio.wait_for(notified.wait(), timeout=30)
 
         saved = store.get("alice", "project-1")
         assert saved is not None and saved.status == "awaiting_confirmation"
@@ -1837,6 +1907,172 @@ async def test_moderation_failure_on_batch_stage_suspends_without_guessing(
         assert "无法定位到具体镜头" in coordinator.notifications[0]
         # 也没有偷偷走通用重试。
         assert saved.stage_attempts == 0
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_moderation_failure_on_complete_batch_stage_does_not_suspend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """产物已齐备的批量 stage 被上游拒（重复生成）不该把整条 run 停死。
+
+    现场：工作台上手动重出某一格草图，5x5 里有一个 beat 触了上游内容策略，
+    整个网格请求被拒。草图其实早就齐了，这次失败纯属多余的重渲——而批量 stage
+    的失败报文没有镜号，旧逻辑会因此把 run 停成 ``awaiting_confirmation``
+    （「无法定位到具体镜头」），整条自动流程就此卡住。
+    """
+
+    from novelvideo import pipeline_status
+
+    failed = _moderation_task(task_type="sketch_grid_generation", beat_num=None)
+    notified = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [failed]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            notified.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            return True
+
+    async def status_says_sketches_are_done(**_kwargs):
+        return {"episode_status": {"sketches": True}}
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        pipeline_status, "compute_pipeline_status", status_says_sketches_are_done
+    )
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        await asyncio.wait_for(notified.wait(), timeout=30)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None and saved.status == "running"
+        assert "已忽略这次重复生成" in coordinator.notifications[0]
+        assert saved.blocked_shots == ()
+    finally:
+        await coordinator.shutdown()
+
+
+def test_stage_status_key_maps_runtime_task_types_to_status_keys() -> None:
+    assert director_auto._stage_status_key("sketch_grid_generation") == "sketches"
+    assert director_auto._stage_status_key("sketch_generation") == "sketches"
+    assert director_auto._stage_status_key("selected_regen") == "first_frames"
+    assert director_auto._stage_status_key("single_video") == "video"
+    assert director_auto._stage_status_key("global_optimize_video") == "global_optimize"
+    # 认不出来的类型不兜底。
+    assert director_auto._stage_status_key("mystery_stage") is None
+    assert director_auto._stage_status_key("") is None
+
+
+@pytest.mark.asyncio
+async def test_stage_artifacts_complete_reads_the_stage_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """兜底判断只认自己阶段的产物标志，取不到状态一律不兜底。"""
+
+    from novelvideo import pipeline_status
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    coordinator = DirectorAutoCoordinator(store)
+    run = run_record(tmp_path)
+
+    async def status(**_kwargs):
+        return {"episode_status": {"sketches": True, "first_frames": False}}
+
+    monkeypatch.setattr(pipeline_status, "compute_pipeline_status", status)
+
+    batch = _moderation_task(task_type="sketch_grid_generation", beat_num=None)
+    assert await coordinator._stage_artifacts_complete(batch, run) is True
+    # 同一份状态里 first_frames 还是 false：首帧阶段的失败照旧交回用户。
+    frame_failed = _moderation_task(task_type="selected_regen")
+    assert await coordinator._stage_artifacts_complete(frame_failed, run) is False
+    # 状态里根本没有这一阶段（项目还没走到）也不兜底。
+    video_failed = _moderation_task(task_type="single_video")
+    assert await coordinator._stage_artifacts_complete(video_failed, run) is False
+
+
+@pytest.mark.asyncio
+async def test_every_failure_of_a_terminal_batch_is_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """一批终态里同时躺着好几个失败时，每一个都要落地处理。
+
+    旧实现把整批终态一次性标成 handled，却只处理 ``failures[0]``：同一批里的
+    其它失败既不重试也不降级，而它们的派发签名已经记过一次，确定性派发再也不会
+    重投——留下永远补不上的缺口（现场 1528/1533 就是这样丢的）。
+    """
+
+    second = _moderation_task(beat_num=13)
+    second.task_id = "failed-13"
+    first = _moderation_task(beat_num=12)
+    first.task_id = "failed-12"
+    handled_both = asyncio.Event()
+
+    class Manager:
+        def list_tasks_for_project(self, _ctx):
+            return [second, first]
+
+    class RecordingCoordinator(DirectorAutoCoordinator):
+        def __init__(self, store):
+            super().__init__(store)
+            self.notifications: list[str] = []
+
+        async def _notify(self, run, text):
+            self.notifications.append(text)
+            if len(self.notifications) >= 2:
+                handled_both.set()
+            return {"content": text}
+
+        async def _broadcast_status(self, run, **_kwargs):
+            return None
+
+        async def _agent_continue(self, run, *, final_delivery=False):
+            return True
+
+    monkeypatch.setattr(director_auto, "get_task_manager", lambda: Manager())
+    monkeypatch.setattr(director_auto, "POLL_SECONDS", 0.01)
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            recovery_keys=(
+                "moderation-prompt-repair:1:12",
+                "moderation-prompt-repair:1:13",
+            ),
+        )
+    )
+    coordinator = RecordingCoordinator(store)
+
+    try:
+        coordinator._ensure_worker(store.get("alice", "project-1"))  # type: ignore[arg-type]
+        await asyncio.wait_for(handled_both.wait(), timeout=30)
+
+        saved = store.get("alice", "project-1")
+        assert saved is not None
+        # 两个失败都降级落地了，不是只有第一个。
+        assert sorted(shot["beat"] for shot in saved.blocked_shots) == [12, 13]
     finally:
         await coordinator.shutdown()
 

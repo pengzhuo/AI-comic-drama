@@ -59,6 +59,14 @@ MAX_SINGLE_VIDEO_BATCH = 9
 #: and the signature carries the chunk, so the next call after this chunk
 #: completes reads as progress rather than a retry.
 AUTO_FIRST_FRAME_CHUNK = 9
+#: 同时在飞的**首帧块数**（块内的图片并发另由 ``NANOBANANA_REGEN_CONCURRENCY``
+#: 决定，默认 3），所以真实并发是「块数 × 块内并发」。实测这一段是全流水线最大
+#: 的热点：1656 beats 逐块串行铺了 12.7h 墙钟，而每块 9 张图里只有 3 路真的在飞。
+#: 上限留在 3 是因为 CE 的 default lane 全局只有 6 个执行槽位（见
+#: ``task_backend/limits.py``），块数再往上抬会被 lane-full 挡回。
+AUTO_FIRST_FRAME_STAGE = "first_frames"
+AUTO_FIRST_FRAME_CONCURRENCY_ENV = "FIRST_FRAMES_CONCURRENCY"
+AUTO_FIRST_FRAME_CONCURRENCY_DEFAULT = 3
 #: 2.0 提示词一条 beat 一个任务（任务是协调器记账的抓手）。每条提示词只吃这条
 #: beat 自己的数据 + 下一条 beat 的首尾帧信息，彼此没有先后依赖——真正需要按顺序
 #: 传下去的是 ``global_optimize_video`` 的上一镜提示词链，那一步在这之前已经按 beat
@@ -66,6 +74,18 @@ AUTO_FIRST_FRAME_CHUNK = 9
 #: (task_type, episode, beat_num) 幂等，窗口重叠不会重复生成；一次只发一条会把
 #: 39 条提示词排成 39 个前后相接的 LLM 往返（实测 ~32s/条 ≈ 21min）。
 AUTO_SEEDANCE2_PROMPT_BATCH = 4
+#: 剧本写作「任务级按集并发」的上限：同项目同时在飞的**按集预取**任务数（每集身份
+#: 规划 + 本集剧本）。两者都按集彼此独立（每集只吃本集的身份/场景/道具菜单），过去
+#: 调度器一轮只派 ``current_episode`` 一集、等它写完才轮下一集，而单集剧本是一次
+#: 「若干分钟~数小时」的 LLM 往返（护花铃_2 单集 1656 行实测 ~5.5h，含失败重派），
+#: 多集项目串起来就是十小时级。默认 3；设 1 即回到逐集串行的老行为（逃生舱）。
+AUTO_SCRIPT_WRITER_STAGE = "script_writer"
+AUTO_SCRIPT_WRITER_CONCURRENCY_ENV = "SCRIPT_WRITER_CONCURRENCY"
+AUTO_SCRIPT_WRITER_CONCURRENCY_DEFAULT = 3
+#: 每集身份规划。它同样只按 ``current_episode`` 派发，而「本集身份还没规划」正是
+#: 剧本的前置闸门（``pipeline_status`` 的 ``has_identity_plan`` 与
+#: ``enqueue_script_writer_task`` 都看本集 ``identity_ids``），所以要和剧本一起预取。
+AUTO_IDENTITY_PLANNER_STAGE = "identity_planner"
 
 
 async def dispatch_next_stage(
@@ -76,6 +96,7 @@ async def dispatch_next_stage(
     episode: int,
     target_episodes: int = 0,
     attempted: set[str] | None = None,
+    voice_policy: str = "",
 ) -> tuple[str | None, str | None]:
     """Enqueue the next deterministically-dispatchable stage.
 
@@ -84,6 +105,9 @@ async def dispatch_next_stage(
     in this run — the caller should then fall back to the agent for that step.
     The signature lets the caller persist "already tried" across restarts so a
     stage whose artifact never materialises cannot loop forever.
+
+    ``voice_policy`` 是该 run 的声线选择（``system``／``custom``／空）。空档由闸门
+    先停在 ``voice_setup`` 让用户拍板；只有 ``system`` 才在这里确定性入队。
     """
 
     attempted = attempted or set()
@@ -98,6 +122,20 @@ async def dispatch_next_stage(
     )
     next_step = str(data.get("next_step") or "")
     current_episode = int(data.get("current_episode") or episode or 1)
+
+    # 按集预取：本集剧本已经轮到过之后，趁每一轮调度把后面几集的**按集前置链**
+    # （每集身份规划 → 本集剧本）也发出去（见 :func:`_prefetch_episode_chain`）。
+    # 探到可预取的一集就先返回它，否则照旧走下面的逐阶段阶梯——主路径永远先照顾本集。
+    prefetched = await _prefetch_episode_chain(
+        ctx=ctx,
+        store=store,
+        project_dir=project_dir,
+        attempted=attempted,
+        current_episode=current_episode,
+        current_script_done=bool((data.get("episode_status") or {}).get("script")),
+    )
+    if prefetched[0] is not None:
+        return prefetched
 
     if next_step == "screenplay_preprocess":
         return await _enqueue_once(
@@ -171,10 +209,10 @@ async def dispatch_next_stage(
         return await _enqueue_once(
             ctx,
             attempted,
-            task_type="identity_planner",
+            task_type=AUTO_IDENTITY_PLANNER_STAGE,
             queue_kind="default",
             episode=current_episode,
-            signature=f"dispatch:identity_planner:{current_episode}",
+            signature=f"dispatch:{AUTO_IDENTITY_PLANNER_STAGE}:{current_episode}",
             payload={"episode": current_episode},
         )
     if next_step == "identity_images":
@@ -189,6 +227,10 @@ async def dispatch_next_stage(
         return await _dispatch_global_optimize(ctx, store, current_episode, project_dir, attempted)
     if next_step == "selected_regen":
         return await _dispatch_first_frames(ctx, store, current_episode, project_dir, attempted)
+    if next_step == "voice_setup":
+        return await _dispatch_voice_setup(
+            ctx, current_episode, project_dir, attempted, voice_policy
+        )
     if next_step == "tts":
         return await _dispatch_tts(ctx, store, current_episode, project_dir, attempted)
     if next_step == "seedance2_prompt":
@@ -381,11 +423,15 @@ async def _dispatch_script_writer(
     project_dir: Path,
     attempted: set[str],
 ) -> tuple[str | None, str | None]:
-    """Enqueue the episode's script through the REST payload builder."""
+    """Enqueue the episode's script through the REST payload builder.
+
+    本集之外还允许同时在飞几集（``SCRIPT_WRITER_CONCURRENCY``，见
+    :func:`_prefetch_episode_chain`）；这一函数只负责「本集」这一份，签名按集去重。
+    """
 
     from novelvideo.api.routes.scripts import enqueue_script_writer_task
 
-    signature = f"dispatch:script_writer:{episode}"
+    signature = f"dispatch:{AUTO_SCRIPT_WRITER_STAGE}:{episode}"
     if signature in attempted:
         return None, signature
     result = await enqueue_script_writer_task(
@@ -396,7 +442,159 @@ async def _dispatch_script_writer(
     )
     if not result.get("ok"):
         return None, None
-    return "script_writer", signature
+    return AUTO_SCRIPT_WRITER_STAGE, signature
+
+
+def _script_writer_concurrency() -> int:
+    """``SCRIPT_WRITER_CONCURRENCY``（热调参）——按集预取同时在飞的任务数上限。"""
+
+    from novelvideo.shared.stage_runtime import stage_int
+
+    return max(
+        1,
+        stage_int(
+            AUTO_SCRIPT_WRITER_STAGE,
+            AUTO_SCRIPT_WRITER_CONCURRENCY_ENV,
+            "concurrency",
+            AUTO_SCRIPT_WRITER_CONCURRENCY_DEFAULT,
+        ),
+    )
+
+
+async def _in_flight_task_episodes(
+    ctx: Any, task_types: tuple[str, ...]
+) -> dict[str, set[int]]:
+    """本项目里还在飞的那几种任务，各自派给了哪几集。"""
+
+    from novelvideo.task_state import ACTIVE_PROJECT_TASK_STATUSES
+
+    wanted = set(task_types)
+
+    def _collect() -> dict[str, set[int]]:
+        found: dict[str, set[int]] = {task_type: set() for task_type in wanted}
+        try:
+            tasks = get_task_manager().list_tasks_for_project(ctx)
+        except Exception:  # noqa: BLE001 - 查不到就不拦：同集还有签名去重兜底
+            return found
+        for task in tasks:
+            task_type = str(getattr(task, "task_type", "") or "")
+            if task_type not in wanted:
+                continue
+            if str(getattr(task, "status", "") or "") not in ACTIVE_PROJECT_TASK_STATUSES:
+                continue
+            try:
+                number = int(getattr(task, "episode", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                found[task_type].add(number)
+        return found
+
+    return await asyncio.to_thread(_collect)
+
+
+def _last_dispatched_episode(attempted: set[str], stage: str) -> int:
+    """``recovery_keys`` 里这个阶段派过的最大集号 —— 按集预取的游标。"""
+
+    numbers: list[int] = []
+    for key in attempted:
+        text = str(key)
+        if not text.startswith(f"dispatch:{stage}:"):
+            continue
+        try:
+            numbers.append(int(text.rsplit(":", 1)[1]))
+        except (TypeError, ValueError):
+            continue
+    return max(numbers) if numbers else 0
+
+
+async def _prefetch_episode_chain(
+    ctx: Any,
+    store: Any,
+    project_dir: Path,
+    attempted: set[str],
+    current_episode: int,
+    current_script_done: bool,
+) -> tuple[str | None, str | None]:
+    """把后面几集的**按集前置链**也发出去：先是每集身份规划，再是本集剧本。
+
+    剧本写作过去是逐集串行：调度器一轮只派 ``current_episode`` 一集，等它写完才轮到
+    下一集。单集剧本是一次「若干分钟~数小时」的 LLM 往返（护花铃_2 单集 1656 行实测
+    ≈5.5h 墙钟），多集项目串起来就是十小时级；而各集剧本彼此独立（只吃本集的身份 /
+    场景 / 道具菜单），没有先后依赖。
+
+    但「本集身份还没规划」正是剧本的前置闸门：``pipeline_status`` 的
+    ``has_identity_plan`` 看的是本集 ``identity_ids``，``enqueue_script_writer_task``
+    缺它时直接返回 ``identity_plan_required``，而身份规划本身也只按 ``current_episode``
+    派发。所以这里把两者一起预取：候选集的剧本派不动就先把它的身份规划派出去，等规划
+    回来再由下一轮调度接力派它的剧本。身份规划只做规划、不生成图片（图片仍按集在成片
+    流程里生成），所以不会抢图片 lane。
+
+    只有本集剧本**已经轮到过**（已派发过一次或已经写好）才预取，所以调度主路径永远
+    先照顾本集；老行为（逐集串行）只是并发=1 的特例。游标取**剧本**已派签名里的最大
+    集号：一集剧本只派一次、按集号往前推，身份规划也不发散到窗口之外。并发上限同时数
+    身份规划与剧本两种在飞任务，因此扇出天然有界。
+
+    「还没剧本」与 ``pipeline_status`` 同口径（``_all_or_empty``）：**没有分镜也算没
+    剧本**——剧本阶段本身会把原文切成行、建成 beats（护花铃_2 的 1656 条就是它建的），
+    所以不能把「beats 还空着」当成「无事可做」而跳过。
+    """
+
+    limit = _script_writer_concurrency()
+    if limit <= 1:
+        return None, None
+    current_signature = f"dispatch:{AUTO_SCRIPT_WRITER_STAGE}:{current_episode}"
+    if not (current_script_done or current_signature in attempted):
+        return None, None
+
+    in_flight = await _in_flight_task_episodes(
+        ctx, (AUTO_SCRIPT_WRITER_STAGE, AUTO_IDENTITY_PLANNER_STAGE)
+    )
+    in_flight_scripts = in_flight[AUTO_SCRIPT_WRITER_STAGE]
+    in_flight_identities = in_flight[AUTO_IDENTITY_PLANNER_STAGE]
+    if len(in_flight_scripts) + len(in_flight_identities) >= limit:
+        return None, None
+
+    from novelvideo.api.routes.scripts import enqueue_script_writer_task
+    from novelvideo.pipeline_status import _beat_has_script_content
+
+    cursor = max(
+        _last_dispatched_episode(attempted, AUTO_SCRIPT_WRITER_STAGE), current_episode
+    )
+    for candidate in range(cursor + 1, cursor + limit + 1):
+        script_signature = f"dispatch:{AUTO_SCRIPT_WRITER_STAGE}:{candidate}"
+        if script_signature in attempted or candidate in in_flight_scripts:
+            continue
+        if store.get_episode(candidate) is None:
+            continue
+        beats = await store.get_beats_as_dicts(candidate)
+        if beats and all(_beat_has_script_content(beat) for beat in beats):
+            # 剧本已经写好的集不能因为签名被阶段重试清掉就整集重写（那是数小时的
+            # LLM 往返）。
+            continue
+        result = await enqueue_script_writer_task(
+            ctx=ctx,
+            store=store,
+            episode_num=candidate,
+            output_dir=str(project_dir),
+        )
+        if result.get("ok"):
+            return AUTO_SCRIPT_WRITER_STAGE, script_signature
+        if result.get("code") != "identity_plan_required":
+            continue
+        identity_signature = f"dispatch:{AUTO_IDENTITY_PLANNER_STAGE}:{candidate}"
+        if identity_signature in attempted or candidate in in_flight_identities:
+            continue
+        return await _enqueue_once(
+            ctx,
+            attempted,
+            task_type=AUTO_IDENTITY_PLANNER_STAGE,
+            queue_kind="default",
+            episode=candidate,
+            signature=identity_signature,
+            payload={"episode": candidate},
+        )
+    return None, None
 
 
 async def _dispatch_asset_references(
@@ -627,6 +825,50 @@ async def _dispatch_global_optimize(
     return "global_optimize_video", signature
 
 
+def _first_frame_chunks(beat_numbers: Any) -> list[list[int]]:
+    """按 beat 号把整集切成固定块——与「谁已经就绪」无关。
+
+    固定块是「多块并发」的前提：块的签名只由它在集里的位置决定，所以一块在飞时
+    另一块的计算结果不会跟着变，两块永远不会覆盖同一批 beat（旧版按「缺帧的
+    beat 取前 N 个」切，窗口会随帧落盘整体右移，重叠派发必然重复渲染）。
+    """
+
+    ordered = sorted({int(number) for number in beat_numbers if int(number) > 0})
+    size = max(1, int(AUTO_FIRST_FRAME_CHUNK))
+    return [ordered[index : index + size] for index in range(0, len(ordered), size)]
+
+
+def _first_frame_signature(
+    episode: int, chunk: list[int], missing: list[int]
+) -> str:
+    """块的派发签名：``dispatch:selected_regen:{ep}:{首}-{尾}:{缺哪几个}``。
+
+    光有区间不够：块跑完通常会留下极少数被上游挑掉的 beat，缺集变了必须能再派
+    一次（签名里带上缺集就自洽了——同一缺集只派一次，成功补上后缺集消失，仍失败
+    则由协调器的失败重试/降级兜底）。也刻意与 ``_block_shot_and_continue`` 登记的
+    单镜跳过键 ``dispatch:selected_regen:{ep}:{beat}`` 区分开（后者没有区间）。
+    """
+
+    span = f"{chunk[0]}-{chunk[-1]}"
+    detail = "all" if list(missing) == list(chunk) else ",".join(str(n) for n in missing)
+    return f"dispatch:selected_regen:{episode}:{span}:{detail}"
+
+
+def _blocked_first_frame_beats(attempted: Any, episode: int) -> set[int]:
+    """``_block_shot_and_continue`` 登记过「这一镜已降级、别再派」的 beat 号。"""
+
+    prefix = f"dispatch:selected_regen:{episode}:"
+    blocked: set[int] = set()
+    for key in attempted:
+        text = str(key)
+        if not text.startswith(prefix):
+            continue
+        tail = text[len(prefix) :]
+        if tail.isdigit():
+            blocked.add(int(tail))
+    return blocked
+
+
 async def _dispatch_first_frames(
     ctx: Any,
     store: Any,
@@ -637,61 +879,119 @@ async def _dispatch_first_frames(
     """Enqueue the ready beats' first frames (Render) via the REST payload.
 
     "Ready" means the beat has a sketch and still no first frame — mirroring
-    ``_dispatch_single_videos``. The chunk is capped at
-    ``AUTO_FIRST_FRAME_CHUNK`` (well below the runtime's ``batch_size <= 9``
-    limit) so a beat rejected by upstream moderation only costs the retry of a
-    few renders, and the signature carries the chunk, so the next call after
-    this chunk completes reads as progress rather than a retry.
+    ``_dispatch_single_videos``. Chunks are **fixed beat ranges** of
+    ``AUTO_FIRST_FRAME_CHUNK`` beats, and several chunks may be in flight at once
+    (``FIRST_FRAMES_CONCURRENCY``, default 3): first frames are independent of one
+    another, so nothing but upstream throughput forced the old strict
+    single-flight, and that single-flight was the pipeline's biggest piece of
+    wall clock (9 renders per ~190s chunk = 12.7h for 1656 beats, while only
+    ``NANOBANANA_REGEN_CONCURRENCY`` = 3 of them were ever in flight).
 
-    **一轮一块（单飞）**：就绪窗口是「缺首帧的 beat 取前 9 个」，而帧是在块跑完
-    时才落盘的，所以窗口会随帧落盘整体右移——[18..26] 里 18 号补上后，下一次算
-    出来的是 [19..27]，区间变了签名就不是「同一块」，重叠派发会把 19-26 再渲染
-    一遍（同一批 beat 两份任务重复生成，后落盘的那份覆盖先前那份）。块内并发由
-    ``NANOBANANA_REGEN_CONCURRENCY`` 提供，所以这里要求同时只有一块在飞：这一块
-    终止后（含失败），下一轮按最新的就绪集合继续派发，失败 beat 的重试语义不变。
+    Only the beats of the chunk that are *still* missing are shipped, so a chunk
+    that already produced most of its frames is re-dispatched as the few beat
+    left over (a chunk-level retry, not a re-render of the whole chunk). That is
+    also what lets a beat rejected by upstream moderation fall back to the
+    coordinator's per-shot handling: a lone leftover beat becomes a one-beat
+    task, which carries ``beat_num``, so the failure can be localised and either
+    repaired or degraded to its sketch instead of stalling the run.
     """
 
     from novelvideo.api.routes.generation import (
         _single_render_mode_from_sketch,
         enqueue_selected_regen_task,
     )
+    from novelvideo.shared.stage_runtime import stage_int
     from novelvideo.utils.path_resolver import PathResolver
 
-    if await _has_in_flight_task(ctx, "selected_regen"):
+    concurrency = max(
+        1,
+        stage_int(
+            AUTO_FIRST_FRAME_STAGE,
+            AUTO_FIRST_FRAME_CONCURRENCY_ENV,
+            "concurrency",
+            AUTO_FIRST_FRAME_CONCURRENCY_DEFAULT,
+        ),
+    )
+    if await _count_in_flight_tasks(ctx, "selected_regen") >= concurrency:
         return None, None
 
     beats = await store.get_beats_as_dicts(episode)
     if not beats:
         return None, None
     paths = PathResolver(str(project_dir), episode)
-    ready = sorted(
-        beat_num
-        for beat_num in (int(beat.get("beat_number") or 0) for beat in beats)
-        if beat_num > 0
-        and paths.sketch(beat_num).is_file()
-        and not paths.first_frame_for_video(beat_num).exists()
-    )
-    if not ready:
+    blocked = _blocked_first_frame_beats(attempted, episode)
+
+    def _ready(beat_num: int) -> bool:
+        return (
+            beat_num not in blocked
+            and paths.sketch(beat_num).is_file()
+            and not paths.first_frame_for_video(beat_num).exists()
+        )
+
+    for chunk in _first_frame_chunks(
+        int(beat.get("beat_number") or 0) for beat in beats
+    ):
+        missing = [beat_num for beat_num in chunk if _ready(beat_num)]
+        if not missing:
+            continue
+        signature = _first_frame_signature(episode, chunk, missing)
+        if signature in attempted:
+            continue
+        result = await enqueue_selected_regen_task(
+            ctx=ctx,
+            store=store,
+            username=ctx.requester_username,
+            project_name=ctx.project_name,
+            output_dir=str(project_dir),
+            episode_num=episode,
+            beat_indices=missing,
+            # The batch's own sketch aspect decides the render mode; the client
+            # default would silently letterbox a 16:9 sketch as 2:3.
+            mode_key=_single_render_mode_from_sketch(str(project_dir), episode, [missing[0]]),
+            # 单镜块带上 beat_num：失败报文才定位得到「是哪一镜」，协调器才能
+            # 改写提示词重试或把该镜降级成草图顶替（否则只能把整条 run 停下来）。
+            beat_num=missing[0] if len(missing) == 1 else None,
+        )
+        if not result.get("ok"):
+            return None, None
+        return "selected_regen", signature
+    return None, None
+
+
+async def _dispatch_voice_setup(
+    ctx: Any,
+    episode: int,
+    project_dir: Path,
+    attempted: set[str],
+    voice_policy: str,
+) -> tuple[str | None, str | None]:
+    """系统声线准备：纯确定性任务，不必让捏导来写。
+
+    ``voice_setup`` 早先没有确定性处理器，只能回退到 agent；LLM 在这一步常选错写
+    任务（2026-11 现场：停在 ``voice_setup`` 时反复重出早已齐备的草图网格，每格 ~4
+    分钟、每格都有 1 个 beat 触上游内容策略，白烧钱还占住阶段）。声线策略选
+    ``system`` 时，「准备缺失的系统声线」本身就是一个确定性任务
+    （``system_voice_setup``，与 agent 工具走同一条 runner，完成后回钩续跑），这里
+    直接入队。
+
+    ``custom`` 档不走这里：自定义音色要用户上传/录制，仍交给 agent 与工作台。
+    """
+
+    if str(voice_policy or "") != "system":
         return None, None
-    batch = ready[:AUTO_FIRST_FRAME_CHUNK]
-    signature = f"dispatch:selected_regen:{episode}:{batch[0]}-{batch[-1]}"
-    if signature in attempted:
-        return None, signature
-    result = await enqueue_selected_regen_task(
-        ctx=ctx,
-        store=store,
-        username=ctx.requester_username,
-        project_name=ctx.project_name,
-        output_dir=str(project_dir),
-        episode_num=episode,
-        beat_indices=batch,
-        # The batch's own sketch aspect decides the render mode; the client
-        # default would silently letterbox a 16:9 sketch as 2:3.
-        mode_key=_single_render_mode_from_sketch(str(project_dir), episode, [batch[0]]),
+    return await _enqueue_once(
+        ctx,
+        attempted,
+        task_type="system_voice_setup",
+        queue_kind="default",
+        episode=episode,
+        signature=f"dispatch:system_voice_setup:{episode}",
+        payload={
+            "episode": episode,
+            "output_dir": str(project_dir),
+            "state_dir": str(getattr(ctx, "state_dir", "") or ""),
+        },
     )
-    if not result.get("ok"):
-        return None, None
-    return "selected_regen", signature
 
 
 async def _dispatch_tts(
@@ -755,6 +1055,30 @@ async def _in_flight_beat_numbers(ctx: Any, task_type: str) -> set[int]:
     return await asyncio.to_thread(_collect)
 
 
+async def _count_in_flight_tasks(ctx: Any, task_type: str) -> int:
+    """本项目里 ``task_type`` 尚在飞的任务数（「同阶段最多几路」的闸门）。
+
+    查不到任务列表时返回 0（不拦）：宁可多派一次——同一块按签名幂等，重复入队
+    不会重复生成——也不要因为一次查询抖动把整条流水线停住。
+    """
+
+    from novelvideo.task_state import ACTIVE_PROJECT_TASK_STATUSES
+
+    def _collect() -> int:
+        try:
+            tasks = get_task_manager().list_tasks_for_project(ctx)
+        except Exception:  # noqa: BLE001
+            return 0
+        return sum(
+            1
+            for task in tasks
+            if str(getattr(task, "task_type", "") or "") == task_type
+            and str(getattr(task, "status", "") or "") in ACTIVE_PROJECT_TASK_STATUSES
+        )
+
+    return await asyncio.to_thread(_collect)
+
+
 async def _has_in_flight_task(ctx: Any, task_type: str) -> bool:
     """该项目是否已有 ``task_type`` 的任务在飞（「同一阶段单飞」的闸门）。
 
@@ -762,20 +1086,7 @@ async def _has_in_flight_task(ctx: Any, task_type: str) -> bool:
     不会重复生成），比起因为一次查询抖动把整条流水线停住更安全。
     """
 
-    from novelvideo.task_state import ACTIVE_PROJECT_TASK_STATUSES
-
-    def _collect() -> bool:
-        try:
-            tasks = get_task_manager().list_tasks_for_project(ctx)
-        except Exception:  # noqa: BLE001
-            return False
-        return any(
-            str(getattr(task, "task_type", "") or "") == task_type
-            and str(getattr(task, "status", "") or "") in ACTIVE_PROJECT_TASK_STATUSES
-            for task in tasks
-        )
-
-    return await asyncio.to_thread(_collect)
+    return await _count_in_flight_tasks(ctx, task_type) > 0
 
 
 #: 同一条 beat 在准备阶段（提示词/声线校验）被挡下多少次后暂时停止重试。

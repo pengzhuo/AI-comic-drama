@@ -150,7 +150,7 @@ def test_generate_sketches_grid_index_minus_one_dispatches_one_queued_batch(
 def test_generate_sketches_forwards_sketch_model_and_aspect_ratio(
     monkeypatch, tmp_path
 ):
-    client, _clean_calls, start_calls, scene_split_calls = _client(monkeypatch, tmp_path)
+    client, clean_calls, start_calls, scene_split_calls = _client(monkeypatch, tmp_path)
 
     response = client.post(
         "/api/v1/projects/demo/episodes/2/sketches/generate",
@@ -174,3 +174,27 @@ def test_generate_sketches_forwards_sketch_model_and_aspect_ratio(
     billing = start_calls[0]["payload"]["billing"]
     assert billing["image_selection"] == "newapi_nanobanana2"
     assert billing["pricing_kind"] == "image"
+    assert clean_calls == []
+
+
+def test_generate_sketches_single_grid_keeps_confirmed_sketches(monkeypatch, tmp_path):
+    """单格重生成不得清空已确认的规范化草图。
+
+    ``clean_sketches()`` 会 ``rmtree(sketches/epXXX)``；若单格派发也清空，其它
+    beat 的 ``beat_NN.png`` 会一起消失，``_beat_sketch_series_complete`` 因此
+    永远为假，草图阶段被反复重派（线上实测卡住数小时）。只有 ``grid_index=-1``
+    的全量重生成才应清理。
+    """
+
+    client, clean_calls, start_calls, _scene_split_calls = _client(monkeypatch, tmp_path)
+
+    response = client.post(
+        "/api/v1/projects/demo/episodes/2/sketches/generate",
+        json={"grid_index": 1, "sketch_scene_grouping": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert len(start_calls) == 1
+    assert start_calls[0]["scope"] == "grid_1"
+    assert clean_calls == []

@@ -927,7 +927,11 @@ async def enqueue_sketch_grid_tasks(
 
     from novelvideo.utils.path_resolver import PathResolver
 
-    PathResolver(output_dir, episode_num).clean_sketches()
+    # 只有“全量重生成”才清理已确认的规范化草图。单格重生成若也清空，
+    # 会把其它 beat 的 sketches/epXXX/beat_NN.png 一起删掉，于是
+    # _beat_sketch_series_complete 永远为假，草图阶段会被反复重派。
+    if generate_all_grids:
+        PathResolver(output_dir, episode_num).clean_sketches()
 
     episode_obj = _episode_from_store_or_none(store, episode_num)
     prop_menu = await _runtime_prop_menu_with_global_props(store, episode_obj, beats)
@@ -2037,11 +2041,15 @@ async def enqueue_selected_regen_task(
     sketch_aspect_padding: bool | None = None,
     batch_id: str | None = None,
     batch_size: int | None = None,
+    beat_num: int | None = None,
 ) -> dict[str, Any]:
     """Enqueue first-frame (Render) generation for selected beats.
 
     Extracted so the deterministic auto pipeline can render first frames without
-    an agent turn.
+    an agent turn. ``beat_num`` is only set when the whole batch is one beat: a
+    batch failure cannot say *which* shot was rejected, so shipping the beat
+    number for a single-shot batch is what lets the coordinator repair or degrade
+    that shot instead of stopping the run.
     """
 
     proj_config = load_project_config(username, project_name)
@@ -2130,6 +2138,7 @@ async def enqueue_selected_regen_task(
         task_type="selected_regen",
         queue_kind="default",
         episode=episode_num,
+        beat_num=beat_num,
         scope=scope,
         payload={
             "episode": episode_num,

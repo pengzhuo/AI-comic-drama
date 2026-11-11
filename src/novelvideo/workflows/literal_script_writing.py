@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass, field
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
@@ -40,6 +43,19 @@ from novelvideo.utils.source_language import (
 )
 
 DIALOGUE_RE = re.compile(r"^(?P<speaker>[^：:]{1,24})[：:](?P<speech>.+)$")
+
+#: 逐行剧本的断点落点间隔（行）：每这么多行把已生成进度原子写到
+#: ``<output_dir>/runtime/script_writer/ep{N}.json``（断点只覆盖逐行循环的产物，
+#: 不含落库；成功 ``persist_narration_script`` 后删除）。任务失败、进程重启或任务被
+#: 取消后，只要原文与影响 prompt 的输入没变，就能从最近断点续跑，最坏只重算这么多行。
+#: 设 1 即每行都落点（写入量最大）。
+SCRIPT_CHECKPOINT_EVERY = 5
+
+#: 断点文件格式版本。凡影响逐行 prompt 或循环语义的改动都要 +1，使旧断点自然失效。
+SCRIPT_CHECKPOINT_VERSION = 1
+
+#: 断点文件相对 ``output_dir`` 的位置。
+SCRIPT_CHECKPOINT_RELATIVE_DIR = Path("runtime") / "script_writer"
 
 CONTENT_FILTER_HINT_TERMS: dict[str, tuple[str, ...]] = {
     "暴力/武器": (
@@ -581,39 +597,62 @@ class LiteralScriptWritingWorkflow:
         beats: list[VisualBeat] = []
         total = max(1, len(line_contexts))
         current_block: SceneBlock | None = None
+        current_block_index = 0
+        block_positions = {id(block): index for index, block in enumerate(scene_blocks)}
         episode_sticky_identities: dict[str, str] = dict(episode_identity_default_map)
         block_sticky_identities: dict[str, str] = {}
         safe_prompt_history: list[str] = []
 
-        for content_index, line_ctx in enumerate(line_contexts, start=1):
+        # 断点续跑：指纹一致（原文 + 影响 prompt 的配置 + 菜单/场次块）且上次没跑完时才
+        # 复用；成功落库后断点即被删除，所以用户主动重生成天然从零开始。
+        checkpoint_fingerprint = self._script_checkpoint_fingerprint(
+            episode_num=episode_num,
+            episode=episode,
+            source_text_sha256=source_text_sha256,
+            line_count=len(line_contexts),
+            scene_blocks=scene_blocks,
+            episode_identity_default_map=episode_identity_default_map,
+            visual_style=visual_style,
+        )
+        checkpoint = self._load_script_checkpoint(
+            episode_num=episode_num,
+            fingerprint=checkpoint_fingerprint,
+            total=total,
+            log=log,
+        )
+        start_index = 1
+        if checkpoint is not None:
+            beats = list(checkpoint["beats"])
+            start_index = int(checkpoint["next_index"])
+            restored_block_index = int(checkpoint["current_block_index"])
+            if 0 <= restored_block_index < len(scene_blocks):
+                current_block = scene_blocks[restored_block_index]
+                current_block_index = restored_block_index
+                self._enter_scene_block_candidates(
+                    current_block, episode_identity_ids, episode_prop_ids, log
+                )
+            episode_sticky_identities = dict(checkpoint["episode_sticky_identities"])
+            block_sticky_identities = dict(checkpoint["block_sticky_identities"])
+            safe_prompt_history = list(checkpoint["safe_prompt_history"])
+            self.last_degraded_lines = list(checkpoint["degraded_lines"])
+            log(
+                f"[Literal] 复用未完成的断点：已完成 {len(beats)}/{total} 行，"
+                f"从第 {start_index} 行继续"
+            )
+
+        for content_index in range(start_index, total + 1):
+            line_ctx = line_contexts[content_index - 1]
             raw_line = line_ctx.raw_line
             content_filtered = False
             block = line_ctx.scene_block
             if block is not current_block:
                 current_block = block
+                current_block_index = block_positions.get(id(block), current_block_index)
                 block_sticky_identities = dict(episode_sticky_identities)
                 safe_prompt_history = []
-                block_ctx = block.context
-                narrowed_identity_ids = (
-                    set(block_ctx.candidate_identity_ids)
-                    if block_ctx and block_ctx.candidate_identity_ids
-                    else set(episode_identity_ids)
+                self._enter_scene_block_candidates(
+                    block, episode_identity_ids, episode_prop_ids, log
                 )
-                if (
-                    block_ctx
-                    and not block_ctx.candidate_identity_ids
-                    and block_ctx.identity_fallback_reason
-                ):
-                    log(f"[Literal Block] {block_ctx.identity_fallback_reason}")
-                narrowed_prop_ids = (
-                    set(block_ctx.candidate_prop_ids)
-                    if block_ctx and block_ctx.candidate_prop_ids
-                    else set(episode_prop_ids)
-                )
-                self._valid_identity_ids.clear()
-                self._valid_identity_ids.update(narrowed_identity_ids)
-                self._valid_prop_ids.clear()
-                self._valid_prop_ids.update(narrowed_prop_ids)
 
             current_scene_label = block.location
             current_scene_id = self._resolve_scene_id(block.location, episode)
@@ -830,6 +869,20 @@ class LiteralScriptWritingWorkflow:
             safe_prompt_history = safe_prompt_history[-2:]
             log(f"[Literal] 行 {content_index}/{total} -> {audio_type}")
 
+            if content_index % SCRIPT_CHECKPOINT_EVERY == 0 or content_index == total:
+                self._write_script_checkpoint(
+                    episode_num=episode_num,
+                    fingerprint=checkpoint_fingerprint,
+                    total=total,
+                    next_index=content_index + 1,
+                    beats=beats,
+                    current_block_index=current_block_index,
+                    episode_sticky_identities=episode_sticky_identities,
+                    block_sticky_identities=block_sticky_identities,
+                    safe_prompt_history=safe_prompt_history,
+                    degraded_lines=self.last_degraded_lines,
+                )
+
         if self.last_degraded_lines:
             self.last_review_passed = False
             degraded_text = ", ".join(str(index) for index in self.last_degraded_lines)
@@ -883,8 +936,205 @@ class LiteralScriptWritingWorkflow:
         )
         report_progress(0.93, "保存脚本...")
         await self.cognee_store.persist_narration_script(script)
+        # 落库成功才删断点：下次同指纹重跑从零开始（用户主动重生成即此路径）。
+        self._clear_script_checkpoint(episode_num)
         report_progress(1.0, "完成")
         return script
+
+    # ------------------------------------------------------------------
+    # 断点续跑（逐行剧本）
+    # ------------------------------------------------------------------
+    def _script_checkpoint_root(self) -> Path | None:
+        """断点根目录：优先构造参数，其次 store 的项目输出目录。
+
+        注意：生产 runner 走 ``create_script_writing_workflow``，那里
+        ``workflow.output_dir`` 拿的是 ``store.output_dir``（``CogneeStore`` 没有这个
+        属性，所以是空串）；真正可用的项目输出目录在 ``store.project_dir``。
+        """
+
+        candidates = (
+            getattr(self, "output_dir", ""),
+            getattr(self.cognee_store, "output_dir", ""),
+            getattr(self.cognee_store, "project_dir", ""),
+        )
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text:
+                return Path(text)
+        return None
+
+    def _script_checkpoint_path(self, episode_num: int) -> Path | None:
+        """断点文件路径；没有项目输出目录时返回 None（库调用/测试不落盘）。"""
+
+        root = self._script_checkpoint_root()
+        if root is None:
+            return None
+        return root / SCRIPT_CHECKPOINT_RELATIVE_DIR / f"ep{int(episode_num)}.json"
+
+    def _script_checkpoint_fingerprint(
+        self,
+        *,
+        episode_num: int,
+        episode: Any,
+        source_text_sha256: str,
+        line_count: int,
+        scene_blocks: list[SceneBlock],
+        episode_identity_default_map: dict[str, str],
+        visual_style: str,
+    ) -> str:
+        """指纹覆盖所有会改变逐行输出的输入；不一致就丢掉旧断点重算。"""
+
+        blocks: list[dict[str, Any]] = []
+        for block in scene_blocks:
+            context = block.context
+            blocks.append(
+                {
+                    "header": block.header_line,
+                    "location": block.location,
+                    "time_of_day": block.time_of_day,
+                    "characters": list(block.characters),
+                    "line_count": len(block.lines),
+                    "identity_section": context.identity_section if context else "",
+                    "prop_section": context.prop_section if context else "",
+                    "candidate_identity_ids": sorted(
+                        context.candidate_identity_ids if context else ()
+                    ),
+                    "candidate_prop_ids": sorted(
+                        context.candidate_prop_ids if context else ()
+                    ),
+                }
+            )
+        payload = {
+            "version": SCRIPT_CHECKPOINT_VERSION,
+            "episode_num": int(episode_num),
+            "episode_title": str(getattr(episode, "title", "") or ""),
+            "source_text_sha256": source_text_sha256,
+            "line_count": int(line_count),
+            "output_language": self._output_language,
+            "audio_type_mode": self.audio_type_mode,
+            "visual_style": str(visual_style or ""),
+            "identity_default_map": sorted(episode_identity_default_map.items()),
+            "valid_scene_ids": sorted(self._valid_scene_ids),
+            "blocks": blocks,
+        }
+        blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return sha256(blob.encode("utf-8")).hexdigest()
+
+    def _write_script_checkpoint(
+        self,
+        *,
+        episode_num: int,
+        fingerprint: str,
+        total: int,
+        next_index: int,
+        beats: list[VisualBeat],
+        current_block_index: int,
+        episode_sticky_identities: dict[str, str],
+        block_sticky_identities: dict[str, str],
+        safe_prompt_history: list[str],
+        degraded_lines: list[int],
+    ) -> None:
+        """原子写断点。断点只是提速手段，写失败只记日志，绝不打断主流程。"""
+
+        path = self._script_checkpoint_path(episode_num)
+        if path is None:
+            return
+        payload = {
+            "version": SCRIPT_CHECKPOINT_VERSION,
+            "fingerprint": fingerprint,
+            "episode_num": int(episode_num),
+            "total": int(total),
+            "next_index": int(next_index),
+            "current_block_index": int(current_block_index),
+            "beats": [beat.model_dump(mode="json") for beat in beats],
+            "episode_sticky_identities": dict(episode_sticky_identities),
+            "block_sticky_identities": dict(block_sticky_identities),
+            "safe_prompt_history": list(safe_prompt_history),
+            "degraded_lines": [int(index) for index in degraded_lines],
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _load_script_checkpoint(
+        self,
+        *,
+        episode_num: int,
+        fingerprint: str,
+        total: int,
+        log: Callable[[str], None],
+    ) -> dict[str, Any] | None:
+        """读取并校验断点。文件存在即代表「上次没跑完」；任何不自洽都当没有。"""
+
+        path = self._script_checkpoint_path(episode_num)
+        if path is None or not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            log("[Literal] 断点文件不可读，已忽略并重新逐行生成")
+            return None
+        if not isinstance(payload, dict) or payload.get("version") != (
+            SCRIPT_CHECKPOINT_VERSION
+        ):
+            return None
+        if payload.get("fingerprint") != fingerprint:
+            log("[Literal] 断点指纹与本次输入不一致，已忽略并重新逐行生成")
+            return None
+        if int(payload.get("total") or 0) != int(total):
+            return None
+        next_index = int(payload.get("next_index") or 0)
+        if next_index < 1 or next_index > total + 1:
+            return None
+        try:
+            beats = [
+                VisualBeat.model_validate(item) for item in payload.get("beats") or []
+            ]
+        except Exception:  # noqa: BLE001 - 坏断点等同没有断点
+            log("[Literal] 断点内容损坏，已忽略并重新逐行生成")
+            return None
+        if len(beats) != next_index - 1:
+            log("[Literal] 断点进度与已生成镜头不一致，已忽略并重新逐行生成")
+            return None
+        return {
+            "next_index": next_index,
+            "current_block_index": int(payload.get("current_block_index") or 0),
+            "beats": beats,
+            "episode_sticky_identities": {
+                str(key): str(value)
+                for key, value in (
+                    payload.get("episode_sticky_identities") or {}
+                ).items()
+            },
+            "block_sticky_identities": {
+                str(key): str(value)
+                for key, value in (payload.get("block_sticky_identities") or {}).items()
+            },
+            "safe_prompt_history": [
+                str(item) for item in payload.get("safe_prompt_history") or []
+            ],
+            "degraded_lines": [
+                int(item) for item in payload.get("degraded_lines") or []
+            ],
+        }
+
+    def _clear_script_checkpoint(self, episode_num: int) -> None:
+        """成功后删档；删除失败不影响主流程。"""
+
+        path = self._script_checkpoint_path(episode_num)
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     async def _run_line_metadata_with_resilience(
         self,
@@ -1086,6 +1336,41 @@ class LiteralScriptWritingWorkflow:
             if item_base == base_id
         )
         return allowed
+
+    def _enter_scene_block_candidates(
+        self,
+        block: SceneBlock,
+        episode_identity_ids: set[str],
+        episode_prop_ids: set[str],
+        log: Callable[[str], None],
+    ) -> None:
+        """按当前场次块收窄候选身份/道具集（写 ``self._valid_*``）。
+
+        逐行循环进入新块时调用；断点续跑从块中间恢复时也要重放一次，才能拿到
+        与中断前一致的候选集。
+        """
+
+        block_ctx = block.context
+        narrowed_identity_ids = (
+            set(block_ctx.candidate_identity_ids)
+            if block_ctx and block_ctx.candidate_identity_ids
+            else set(episode_identity_ids)
+        )
+        if (
+            block_ctx
+            and not block_ctx.candidate_identity_ids
+            and block_ctx.identity_fallback_reason
+        ):
+            log(f"[Literal Block] {block_ctx.identity_fallback_reason}")
+        narrowed_prop_ids = (
+            set(block_ctx.candidate_prop_ids)
+            if block_ctx and block_ctx.candidate_prop_ids
+            else set(episode_prop_ids)
+        )
+        self._valid_identity_ids.clear()
+        self._valid_identity_ids.update(narrowed_identity_ids)
+        self._valid_prop_ids.clear()
+        self._valid_prop_ids.update(narrowed_prop_ids)
 
     def _canonical_scene_ref_for_menu_choice(self, scene_id: str) -> SceneRef | None:
         scene_id = str(scene_id or "").strip()

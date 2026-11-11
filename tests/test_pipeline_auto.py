@@ -17,9 +17,18 @@ def ctx(tmp_path: Path) -> SimpleNamespace:
     )
 
 
-def patch_status(monkeypatch: pytest.MonkeyPatch, next_step: str, episode: int = 1) -> None:
+def patch_status(
+    monkeypatch: pytest.MonkeyPatch,
+    next_step: str,
+    episode: int = 1,
+    script: bool | None = None,
+) -> None:
+    payload: dict = {"next_step": next_step, "current_episode": episode}
+    if script is not None:
+        payload["episode_status"] = {"script": script}
+
     async def fake_status(**_kwargs):
-        return {"next_step": next_step, "current_episode": episode}
+        return payload
 
     monkeypatch.setattr(pipeline_auto, "compute_pipeline_status", fake_status)
 
@@ -83,6 +92,82 @@ async def test_dispatch_build_episodes_uses_target(
     assert task_type == "build_episodes"
     assert calls[0]["payload"]["config"]["target_episodes"] == 7
     assert calls[0]["payload"]["config"]["planning_mode"] == "duration"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_voice_setup_enqueues_system_voices_when_policy_is_system(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """声线策略选系统声线时，系统声线准备是确定性任务，不该回退到捏导。
+
+    现场（2026-11）：``voice_setup`` 没有确定性处理器，只能走捏导，而 LLM 在这里
+    反复选错写任务（重出早已齐备的草图网格），run 永远走不到 tts。
+    """
+
+    patch_status(monkeypatch, "voice_setup")
+    calls = capture_enqueue(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=object(),
+        episode=1,
+        voice_policy="system",
+    )
+
+    assert task_type == "system_voice_setup"
+    assert signature == "dispatch:system_voice_setup:1"
+    assert calls[0]["task_type"] == "system_voice_setup"
+    assert calls[0]["episode"] == 1
+    assert calls[0]["payload"] == {
+        "episode": 1,
+        "output_dir": str(tmp_path),
+        "state_dir": str(tmp_path / "state"),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["", "custom"])
+async def test_dispatch_voice_setup_leaves_unset_or_custom_to_the_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy: str
+) -> None:
+    """空档由闸门停下让用户拍板；自定义音色要用户上传，仍交给捏导。"""
+
+    patch_status(monkeypatch, "voice_setup")
+    calls = capture_enqueue(monkeypatch)
+
+    result = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=object(),
+        episode=1,
+        voice_policy=policy,
+    )
+
+    assert result == (None, None)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_voice_setup_respects_an_attempted_signature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """签名试过就不再重复入队：阶段签名是「同一阶段别无限重投」的闸。"""
+
+    patch_status(monkeypatch, "voice_setup")
+    calls = capture_enqueue(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=object(),
+        episode=1,
+        voice_policy="system",
+        attempted={"dispatch:system_voice_setup:1"},
+    )
+
+    assert (task_type, signature) == (None, "dispatch:system_voice_setup:1")
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -545,6 +630,317 @@ async def test_dispatch_script_writer_prerequisite_failure_falls_back(
     assert result == (None, None)
 
 
+def _script_store(scripted: dict[int, bool | None]) -> SimpleNamespace:
+    """只回答剧本预取会问的两件事：有哪几集、各集是「还没剧本」还是已写好。
+
+    值为 ``None`` 表示这一集**还没有 beats**（剧本阶段会自己建），``False`` 表示有
+    beats 但还没有剧本内容，``True`` 表示剧本已写好。
+    """
+
+    async def get_beats_as_dicts(episode: int) -> list[dict]:
+        state = scripted.get(episode)
+        if state is None:
+            return []
+        return [{"narration": "已写好的台词" if state else ""}]
+
+    def get_episode(episode: int):
+        return SimpleNamespace(number=episode) if episode in scripted else None
+
+    return SimpleNamespace(
+        get_beats_as_dicts=get_beats_as_dicts,
+        get_episode=get_episode,
+    )
+
+
+def _patch_in_flight_episode_tasks(
+    monkeypatch: pytest.MonkeyPatch, *tasks: tuple[str, int]
+) -> None:
+    """把「同时在飞的按集任务」摆成给定 ``(task_type, 集号)`` 的一组任务。"""
+
+    monkeypatch.setattr(
+        pipeline_auto,
+        "get_task_manager",
+        lambda: SimpleNamespace(
+            list_tasks_for_project=lambda _ctx: [
+                SimpleNamespace(task_type=task_type, status="running", episode=episode)
+                for task_type, episode in tasks
+            ]
+        ),
+    )
+
+
+def _capture_script_writer_enqueues(
+    monkeypatch: pytest.MonkeyPatch, result: dict | None = None
+) -> list[dict]:
+    from novelvideo.api.routes import scripts as scripts_module
+
+    calls: list[dict] = []
+
+    async def fake_enqueue_script_writer_task(**kwargs):
+        calls.append(kwargs)
+        return result or {"ok": True, "task_type": "script_writer"}
+
+    monkeypatch.setattr(
+        scripts_module, "enqueue_script_writer_task", fake_enqueue_script_writer_task
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_dispatch_script_writer_prefetches_the_next_ready_episode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """本集剧本已在写时，顺手把后面就绪的那一集也派出去（任务级按集并发）。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "3")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(monkeypatch)
+    calls = _capture_script_writer_enqueues(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: False}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert task_type == "script_writer"
+    assert signature == "dispatch:script_writer:2"
+    assert [call["episode_num"] for call in calls] == [2]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_script_writer_prefetch_walks_past_written_scripts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """预取只派「还没剧本」的集：已经写好的集绝不因为签名被清而整集重写。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "3")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(monkeypatch)
+    calls = _capture_script_writer_enqueues(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: True, 3: False}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert task_type == "script_writer"
+    assert signature == "dispatch:script_writer:3"
+    assert [call["episode_num"] for call in calls] == [3]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_script_writer_prefetches_an_episode_without_beats(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """没有分镜也算「还没剧本」：beats 是剧本阶段自己建的（同 pipeline_status 口径）。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "3")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(monkeypatch)
+    calls = _capture_script_writer_enqueues(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: None}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert task_type == "script_writer"
+    assert signature == "dispatch:script_writer:2"
+    assert [call["episode_num"] for call in calls] == [2]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_script_writer_prefetch_stops_at_the_concurrency_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "2")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(
+        monkeypatch, ("script_writer", 2), ("script_writer", 3)
+    )
+    calls = _capture_script_writer_enqueues(monkeypatch)
+
+    result = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: False, 3: False, 4: False}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert result == (None, None)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_episode_chain_counts_identity_plans_against_the_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """身份规划与剧本共用同一个并发上限：扇出不会因为多了身份规划而翻倍。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "2")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(
+        monkeypatch, ("identity_planner", 2), ("script_writer", 3)
+    )
+    enqueued = capture_enqueue(monkeypatch)
+    calls = _capture_script_writer_enqueues(
+        monkeypatch, {"ok": False, "code": "identity_plan_required"}
+    )
+
+    result = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: False, 3: False}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert result == (None, None)
+    assert calls == []
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_episode_chain_prefetches_the_identity_plan_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """剧本卡在「本集身份还没规划」时，先把这一集的身份规划派出去。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "3")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(monkeypatch)
+    enqueued = capture_enqueue(monkeypatch)
+    calls = _capture_script_writer_enqueues(
+        monkeypatch, {"ok": False, "code": "identity_plan_required"}
+    )
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: False}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert task_type == "identity_planner"
+    assert signature == "dispatch:identity_planner:2"
+    assert [call["episode_num"] for call in calls] == [2]
+    assert enqueued[0]["task_type"] == "identity_planner"
+    assert enqueued[0]["episode"] == 2
+    assert enqueued[0]["payload"] == {"episode": 2}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_episode_chain_moves_on_when_that_identity_is_in_flight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """这一集的身份规划已经在飞时，窗口继续往前推，派下一集的。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "3")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(monkeypatch, ("identity_planner", 2))
+    enqueued = capture_enqueue(monkeypatch)
+    _capture_script_writer_enqueues(
+        monkeypatch, {"ok": False, "code": "identity_plan_required"}
+    )
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: False, 3: False}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert task_type == "identity_planner"
+    assert signature == "dispatch:identity_planner:3"
+    assert [call["task_type"] for call in enqueued] == ["identity_planner"]
+    assert enqueued[0]["episode"] == 3
+
+
+@pytest.mark.asyncio
+async def test_dispatch_episode_chain_hands_over_to_the_script_once_planned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """身份规划回来了（本集剧本可以写了）：下一轮调度接力派它的剧本。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "3")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(monkeypatch)
+    calls = _capture_script_writer_enqueues(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: False}),
+        episode=1,
+        attempted={"dispatch:identity_planner:2"},
+    )
+
+    assert task_type == "script_writer"
+    assert signature == "dispatch:script_writer:2"
+    assert [call["episode_num"] for call in calls] == [2]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_script_writer_prefetch_is_off_at_concurrency_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """并发=1 退回逐集串行的老行为（逃生舱，便于按部署回退）。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "1")
+    patch_status(monkeypatch, "done", episode=1, script=True)
+    _patch_in_flight_episode_tasks(monkeypatch)
+    calls = _capture_script_writer_enqueues(monkeypatch)
+
+    result = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: False}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert result == (None, None)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_script_writer_prefetch_waits_for_the_current_episode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """还没轮到本集剧本时不预取，调度主路径照旧先走本集的阶段。"""
+
+    monkeypatch.setenv("SCRIPT_WRITER_CONCURRENCY", "3")
+    patch_status(monkeypatch, "identity_plan", episode=1, script=False)
+    _patch_in_flight_episode_tasks(monkeypatch)
+    enqueued = capture_enqueue(monkeypatch)
+    calls = _capture_script_writer_enqueues(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_script_store({2: False}),
+        episode=1,
+        attempted=set(),
+    )
+
+    assert task_type == "identity_planner"
+    assert signature == "dispatch:identity_planner:1"
+    assert enqueued[0]["task_type"] == "identity_planner"
+    assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_dispatch_sketches_requests_every_grid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -655,9 +1051,12 @@ async def test_dispatch_first_frames_only_sends_sketched_beats_without_a_frame(
     )
 
     assert task_type == "selected_regen"
-    assert signature == "dispatch:selected_regen:1:1-3"
+    # 签名带上「这一块还缺哪几镜」：缺集变了才允许再派一次。
+    assert signature == "dispatch:selected_regen:1:1-3:1,3"
     assert calls[0]["beat_indices"] == [1, 3]
     assert calls[0]["episode_num"] == 1
+    # 多镜块定位不到具体镜头，只有单镜块才带 beat_num。
+    assert calls[0]["beat_num"] is None
 
 
 @pytest.mark.asyncio
@@ -702,12 +1101,84 @@ async def test_dispatch_first_frames_chunk_matches_the_runtime_limit(
     assert pipeline_auto.AUTO_FIRST_FRAME_CHUNK == pipeline_auto.MAX_SINGLE_VIDEO_BATCH
     chunk = list(range(1, pipeline_auto.AUTO_FIRST_FRAME_CHUNK + 1))
     assert task_type == "selected_regen"
-    assert signature == f"dispatch:selected_regen:1:{chunk[0]}-{chunk[-1]}"
+    assert signature == f"dispatch:selected_regen:1:{chunk[0]}-{chunk[-1]}:all"
     assert calls[0]["beat_indices"] == chunk
 
 
 @pytest.mark.asyncio
-async def test_dispatch_first_frames_does_not_repeat_a_chunk(
+async def test_dispatch_first_frames_walks_fixed_chunks_without_overlap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """块按 beat 号固定切开，所以「哪一块还缺哪几镜」与块边界无关。
+
+    旧版按「缺首帧的 beat 取前 9 个」切窗口：帧一落盘窗口就整体右移，同一批 beat
+    会在下一个窗口里再被渲染一遍，因此只能单飞。固定块之后，补块 1 的缺口和推进
+    块 2 是两个互不重叠的任务，可以同时在飞。
+    """
+
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    beat_numbers = tuple(range(1, 19))
+    _write_sketches(tmp_path, beat_numbers)
+    # 块 1（1-9）只剩 1 号缺帧，块 2（10-18）只剩 10 号缺帧。
+    _write_video_inputs(tmp_path, tuple(range(2, 10)) + tuple(range(11, 19)))
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store(beat_numbers),
+        episode=1,
+    )
+
+    assert task_type == "selected_regen"
+    assert signature == "dispatch:selected_regen:1:1-9:1"
+    assert calls[0]["beat_indices"] == [1]
+    # 单镜块带 beat_num：失败报文才定位得到「是哪一镜」，协调器才能改写提示词
+    # 重试或把该镜降级成草图兜底，而不是把整条 run 停下来等人。
+    assert calls[0]["beat_num"] == 1
+
+    # 块 1 的缺口派发过之后，轮到块 2（不是把块 1 再整块渲染一遍）。
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store(beat_numbers),
+        episode=1,
+        attempted={"dispatch:selected_regen:1:1-9:1"},
+    )
+
+    assert task_type == "selected_regen"
+    assert signature == "dispatch:selected_regen:1:10-18:10"
+    assert calls[1]["beat_indices"] == [10]
+    assert calls[1]["beat_num"] == 10
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_retries_a_chunk_whose_missing_set_shrank(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """整块缺帧派过一次后，留下缺口仍要能再派（缺集变了就是新签名）。"""
+
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    _write_sketches(tmp_path, (1, 2))
+    _write_video_inputs(tmp_path, (1,))
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+        attempted={"dispatch:selected_regen:1:1-2:all"},
+    )
+
+    assert task_type == "selected_regen"
+    assert signature == "dispatch:selected_regen:1:1-2:2"
+    assert calls[0]["beat_indices"] == [2]
+    assert calls[0]["beat_num"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_does_not_repeat_the_same_missing_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     patch_status(monkeypatch, "selected_regen", episode=1)
@@ -719,37 +1190,65 @@ async def test_dispatch_first_frames_does_not_repeat_a_chunk(
         username="alice",
         store=_video_store((1, 2)),
         episode=1,
-        attempted={"dispatch:selected_regen:1:1-2"},
+        attempted={"dispatch:selected_regen:1:1-2:all"},
     )
 
     assert task_type is None
-    assert signature == "dispatch:selected_regen:1:1-2"
+    assert signature is None
     assert calls == []
 
 
-@pytest.mark.asyncio
-async def test_dispatch_first_frames_waits_for_the_in_flight_chunk(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def _patch_in_flight_tasks(
+    monkeypatch: pytest.MonkeyPatch, *statuses: str
 ) -> None:
-    """首帧一律单飞：就绪窗口会随帧落盘右移，重叠派发必然重复渲染同一批 beat。
-
-    这里把「上一块还在跑」摆出来（同一个 beat 集也可以不在窗口里），断言这一轮
-    一个任务都不发；块内的并发由 ``NANOBANANA_REGEN_CONCURRENCY`` 负责。
-    """
-
-    patch_status(monkeypatch, "selected_regen", episode=1)
-    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
-    _write_sketches(tmp_path, (1, 2, 3))
+    """把「本项目有多少 selected_regen 任务在飞」摆成给定状态的一组任务。"""
 
     monkeypatch.setattr(
         pipeline_auto,
         "get_task_manager",
         lambda: SimpleNamespace(
             list_tasks_for_project=lambda _ctx: [
-                SimpleNamespace(task_type="selected_regen", status="running", beat_num=None),
+                SimpleNamespace(task_type="selected_regen", status=status, beat_num=None)
+                for status in statuses
             ]
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_allows_parallel_chunks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """默认 3 块并行：单飞是这一段墙钟的根因（实测 1656 beats 铺了 12.7h）。"""
+
+    monkeypatch.setenv("FIRST_FRAMES_CONCURRENCY", "3")
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    beat_numbers = tuple(range(1, 19))
+    _write_sketches(tmp_path, beat_numbers)
+    _patch_in_flight_tasks(monkeypatch, "running", "running")
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store(beat_numbers),
+        episode=1,
+    )
+
+    assert task_type == "selected_regen"
+    assert signature == "dispatch:selected_regen:1:1-9:all"
+    assert calls[0]["beat_indices"] == list(range(1, 10))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_stops_at_the_concurrency_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("FIRST_FRAMES_CONCURRENCY", "2")
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    _write_sketches(tmp_path, (1, 2, 3))
+    _patch_in_flight_tasks(monkeypatch, "running", "running")
 
     task_type, signature = await pipeline_auto.dispatch_next_stage(
         ctx=ctx(tmp_path),
@@ -762,16 +1261,8 @@ async def test_dispatch_first_frames_waits_for_the_in_flight_chunk(
     assert signature is None
     assert calls == []
 
-    # 上一块结束后（已终态）立刻按最新就绪集合继续派发。
-    monkeypatch.setattr(
-        pipeline_auto,
-        "get_task_manager",
-        lambda: SimpleNamespace(
-            list_tasks_for_project=lambda _ctx: [
-                SimpleNamespace(task_type="selected_regen", status="completed", beat_num=None),
-            ]
-        ),
-    )
+    # 已终态的任务不占名额，下一轮立刻按最新就绪集合继续派发。
+    _patch_in_flight_tasks(monkeypatch, "running", "completed")
 
     task_type, signature = await pipeline_auto.dispatch_next_stage(
         ctx=ctx(tmp_path),
@@ -781,8 +1272,56 @@ async def test_dispatch_first_frames_waits_for_the_in_flight_chunk(
     )
 
     assert task_type == "selected_regen"
-    assert signature == "dispatch:selected_regen:1:1-3"
+    assert signature == "dispatch:selected_regen:1:1-3:all"
     assert calls[0]["beat_indices"] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_single_flight_when_concurrency_is_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """并发=1 退回旧的单飞语义（逃生舱，便于按部署回退）。"""
+
+    monkeypatch.setenv("FIRST_FRAMES_CONCURRENCY", "1")
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    _write_sketches(tmp_path, (1, 2, 3))
+    _patch_in_flight_tasks(monkeypatch, "running")
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2, 3)),
+        episode=1,
+    )
+
+    assert task_type is None
+    assert signature is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_first_frames_skips_a_shot_the_run_already_degraded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_block_shot_and_continue`` 登记过的镜头不再派（它已有草图兜底产物）。"""
+
+    patch_status(monkeypatch, "selected_regen", episode=1)
+    calls, _ = _capture_selected_regen_enqueues(monkeypatch)
+    _write_sketches(tmp_path, (1, 2))
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+        attempted={"dispatch:selected_regen:1:1"},
+    )
+
+    assert task_type == "selected_regen"
+    assert signature == "dispatch:selected_regen:1:1-2:2"
+    assert calls[0]["beat_indices"] == [2]
+    assert calls[0]["beat_num"] == 2
 
 
 @pytest.mark.asyncio

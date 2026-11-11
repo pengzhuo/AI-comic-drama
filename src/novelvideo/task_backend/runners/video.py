@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1269,6 +1270,14 @@ def run_compose_episode(
 register_project_task_runner("compose_episode", run_compose_episode)
 
 
+# 逐 beat 首帧提示词优化（`global_optimize_video`）的阶段级热调参键。
+# 并发默认 1 = 旧行为（严格串行、逐字节一致）；调大开波前并发见函数内注释。
+GLOBAL_OPTIMIZE_STAGE = "global_optimize_video"
+GLOBAL_OPTIMIZE_CONCURRENCY_ENV = "GLOBAL_OPTIMIZE_CONCURRENCY"
+GLOBAL_OPTIMIZE_WAVE_SIZE_ENV = "GLOBAL_OPTIMIZE_WAVE_SIZE"
+GLOBAL_OPTIMIZE_PREV_PROMPT_ENV = "GLOBAL_OPTIMIZE_PREV_PROMPT"
+
+
 async def _run_global_optimize_video_async(
     envelope: dict[str, Any],
     ctx: ProjectContext,
@@ -1280,6 +1289,8 @@ async def _run_global_optimize_video_async(
         prepare_global_optimizer_input,
     )
     from novelvideo.cognee import CogneeStore
+    from novelvideo.shared.stage_runtime import record_call, stage_choice, stage_int
+    from novelvideo.utils.bounded_concurrency import map_bounded
     from novelvideo.utils.path_resolver import PathResolver
 
     payload = envelope.get("payload") or {}
@@ -1328,7 +1339,48 @@ async def _run_global_optimize_video_async(
         failure_messages: list[str] = []
         prev_prompt = None
 
-        for index, beat in enumerate(sorted_beats):
+        # 逐 beat 调视觉 LLM 生成本 beat 的首帧运动提示词，是全流水线最大的串行
+        # 热点（1656 beats × 13.9s = 22,981.9s ≈ 6h23m）。并发按「波」切：波内互不
+        # 依赖地并行，波与波之间串行推进——于是 concurrency=1 时与旧的严格串行
+        # 逐字节一致。默认 8 是实测拐点（12 路无额外收益、单次时延还略升）。
+        concurrency = max(
+            1,
+            stage_int(
+                GLOBAL_OPTIMIZE_STAGE,
+                GLOBAL_OPTIMIZE_CONCURRENCY_ENV,
+                "concurrency",
+                8,
+            ),
+        )
+        # 唯一的跨 beat 依赖是 prev_prompt（上一 beat 已优化提示词的前 150 字，
+        # 作为连贯性锚点）。波内拿不到「上一 beat 的优化结果」，因此波内每个 beat
+        # 都以「上一波最后一个 beat」的提示词为锚点；"none" 则整段不发该字段。
+        # 相邻 beat 的画面描述本来就随 prev_beat / next_beat 一起进上下文。
+        prev_prompt_mode = stage_choice(
+            GLOBAL_OPTIMIZE_STAGE,
+            GLOBAL_OPTIMIZE_PREV_PROMPT_ENV,
+            "prev_prompt",
+            {"wave", "none"},
+            "wave",
+        )
+        # 「波宽」与「在飞上限」是两件事：波宽决定锚点粒度与栅栏次数，在飞上限决定
+        # 吞吐。两者相等时就是「一波恰好装满一轮调用」；把波宽调大，「每波都等最慢
+        # 那一路」的栅栏成本被摊到更少的波上（实测：8 路/波宽 8 只有 4.9x，
+        # 波宽 40 提到 8.27x ≈ 在飞上限本身）。0/非法值表示「等于在飞上限」。
+        wave_size = max(
+            concurrency,
+            stage_int(
+                GLOBAL_OPTIMIZE_STAGE,
+                GLOBAL_OPTIMIZE_WAVE_SIZE_ENV,
+                "wave_size",
+                40,
+            ),
+        )
+
+        async def _optimize_one(
+            item: tuple[int, dict[str, Any], str | None],
+        ) -> tuple[int, dict[str, Any], str | None]:
+            index, beat, anchor = item
             beat_num = int(beat.get("beat_number") or 0)
             log(
                 f"Beat {beat_num}/{len(sorted_beats)}: 生成视频提示词...",
@@ -1342,12 +1394,13 @@ async def _run_global_optimize_video_async(
                     break
             if not sketch_path:
                 log(f"Beat {beat_num}: 无草图帧，跳过")
-                continue
+                return index, beat, None
 
             prev_beat = sorted_beats[index - 1] if index > 0 else None
             next_beat = (
                 sorted_beats[index + 1] if index < len(sorted_beats) - 1 else None
             )
+            started = time.monotonic()
             try:
                 result = await optimizer.optimize_single_beat(
                     beat=beat,
@@ -1356,25 +1409,69 @@ async def _run_global_optimize_video_async(
                     language=language,
                     prev_beat=prev_beat,
                     next_beat=next_beat,
-                    prev_prompt=prev_prompt,
+                    prev_prompt=anchor,
                     total_beats=len(sorted_beats),
                 )
-                prompt = result["prompt"]
+            except BaseException:
+                record_call(
+                    output_dir,
+                    GLOBAL_OPTIMIZE_STAGE,
+                    "beat",
+                    started=started,
+                    ok=False,
+                    beat=beat_num,
+                )
+                raise
+            record_call(
+                output_dir,
+                GLOBAL_OPTIMIZE_STAGE,
+                "beat",
+                started=started,
+                ok=True,
+                beat=beat_num,
+            )
+            return index, beat, str(result["prompt"])
+
+        def _note_failure(
+            item: tuple[int, dict[str, Any], str | None], exc: BaseException
+        ) -> None:
+            beat_num = int(item[1].get("beat_number") or 0)
+            failure_messages.append(f"Beat {beat_num}: {exc}")
+            log(f"Beat {beat_num}: 生成失败 ({exc})")
+
+        for wave_start in range(0, len(sorted_beats), wave_size):
+            anchor = prev_prompt if prev_prompt_mode == "wave" else None
+            wave = [
+                (index, sorted_beats[index], anchor)
+                for index in range(
+                    wave_start, min(wave_start + wave_size, len(sorted_beats))
+                )
+            ]
+            outcomes = await map_bounded(
+                wave,
+                _optimize_one,
+                limit=concurrency,
+                on_error=_note_failure,
+            )
+            # 模型调用可以并发，写状态不行：落库按 beat 顺序串行执行。
+            for outcome in outcomes:
+                if outcome is None:
+                    continue
+                _index, beat, prompt = outcome
+                if not prompt:
+                    continue
                 beat["video_mode"] = "first_frame"
                 beat["video_prompt"] = prompt
                 beat["keyframe_prompt"] = None
                 await store.update_beat_asset(
                     episode_number=episode,
-                    beat_number=beat_num,
+                    beat_number=int(beat.get("beat_number") or 0),
                     video_mode="first_frame",
                     video_prompt=prompt,
                     keyframe_prompt=None,
                 )
                 updated_count += 1
                 prev_prompt = prompt
-            except Exception as exc:  # noqa: BLE001
-                failure_messages.append(f"Beat {beat_num}: {exc}")
-                log(f"Beat {beat_num}: 生成失败 ({exc})")
 
         if updated_count == 0:
             error = f"全局优化失败：0/{len(sorted_beats)} 个 Beat 生成成功"

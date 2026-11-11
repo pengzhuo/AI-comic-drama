@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -832,3 +834,230 @@ async def test_menu_writes_go_through_the_column_patch(tmp_path):
 
     assert store.sqlite_store.patched == [(1, {"scene_menu": []})]
     assert store.updated == []
+
+
+def _scene(name: str, *, environment_prompt: str = "") -> NovelScene:
+    return NovelScene(
+        name=name, scene_type="interior", environment_prompt=environment_prompt
+    )
+
+
+def _patch_block_llm(
+    monkeypatch,
+    *,
+    enrich=None,
+    derived,
+) -> None:
+    """把块级模型调用换掉：enrich 省略时表示「本集不该补齐」."""
+
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    async def fail_enrich(**_kwargs):
+        raise AssertionError("不应补齐环境描述已存在的场景")
+
+    monkeypatch.setattr(
+        asset_compiler,
+        "enrich_scene_environment_from_context",
+        enrich or fail_enrich,
+    )
+    monkeypatch.setattr(asset_compiler.AssetCompiler, "_analyze_derived_scenes", derived)
+
+
+@pytest.mark.asyncio
+async def test_compile_scenes_runs_block_llm_work_concurrently(monkeypatch):
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    monkeypatch.setenv("ASSET_SCENE_BLOCK_CONCURRENCY", "4")
+    in_flight = 0
+    peak = 0
+
+    async def fake_enrich(**kwargs):
+        return NovelScene(
+            name=kwargs["scene_name"],
+            aliases=[],
+            scene_type=kwargs["scene_type"],
+            environment_prompt=ENRICHED_ENVIRONMENT_PROMPT,
+            description="补齐",
+        )
+
+    async def fake_derived(self, scene_name, block):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        return []
+
+    _patch_block_llm(monkeypatch, enrich=fake_enrich, derived=fake_derived)
+
+    locations = ["甲", "乙", "丙", "丁"]
+    store = _FakeCogneeStore([_scene(name) for name in locations])
+    compiler = asset_compiler.AssetCompiler(store)
+
+    await compiler._compile_scenes(
+        [_block(location=name) for name in locations],
+        SimpleNamespace(number=1),
+        lambda _message: None,
+    )
+
+    # 四块的模型工作同时在飞（受 ASSET_SCENE_BLOCK_CONCURRENCY 限制）。
+    assert peak == 4
+    assert in_flight == 0
+    assert sorted(name for name, _updates in store.sqlite_store.updated) == sorted(
+        locations
+    )
+
+
+@pytest.mark.asyncio
+async def test_compile_scenes_block_concurrency_one_falls_back_to_serial(monkeypatch):
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    monkeypatch.setenv("ASSET_SCENE_BLOCK_CONCURRENCY", "1")
+    in_flight = 0
+    peak = 0
+
+    async def fake_derived(self, scene_name, block):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return []
+
+    _patch_block_llm(monkeypatch, derived=fake_derived)
+
+    locations = ["甲", "乙", "丙"]
+    store = _FakeCogneeStore(
+        [_scene(name, environment_prompt=ENRICHED_ENVIRONMENT_PROMPT) for name in locations]
+    )
+    compiler = asset_compiler.AssetCompiler(store)
+
+    await compiler._compile_scenes(
+        [_block(location=name) for name in locations],
+        SimpleNamespace(number=1),
+        lambda _message: None,
+    )
+
+    # 逃生舱：并发 1 = 与逐块串行等价。
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_compile_scenes_keeps_block_order_when_completions_race(monkeypatch):
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    async def fake_derived(self, scene_name, block):
+        if scene_name == "甲":
+            # 第一块最慢：完成顺序与块顺序相反，菜单仍须按块顺序。
+            await asyncio.sleep(0.05)
+        return [
+            asset_compiler.DerivedSceneRequirement(
+                label=f"{scene_name}变体", description="变体描述"
+            )
+        ]
+
+    _patch_block_llm(monkeypatch, derived=fake_derived)
+
+    store = _FakeCogneeStore(
+        [
+            _scene("甲", environment_prompt=ENRICHED_ENVIRONMENT_PROMPT),
+            _scene("乙", environment_prompt=ENRICHED_ENVIRONMENT_PROMPT),
+        ]
+    )
+    compiler = asset_compiler.AssetCompiler(store)
+
+    scene_menu, pending_scenes = await compiler._compile_scenes(
+        [_block(location="甲"), _block(location="乙")],
+        SimpleNamespace(number=1),
+        lambda _message: None,
+    )
+
+    assert [item.scene_id for item in scene_menu] == ["甲", "甲_甲变体", "乙", "乙_乙变体"]
+    assert [scene.name for scene in pending_scenes] == ["甲_甲变体", "乙_乙变体"]
+
+
+@pytest.mark.asyncio
+async def test_compile_scenes_propagates_block_llm_failure(monkeypatch):
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    async def fake_derived(self, scene_name, block):
+        if scene_name == "乙":
+            raise RuntimeError("派生场景分析炸了")
+        return []
+
+    _patch_block_llm(monkeypatch, derived=fake_derived)
+
+    store = _FakeCogneeStore(
+        [
+            _scene("甲", environment_prompt=ENRICHED_ENVIRONMENT_PROMPT),
+            _scene("乙", environment_prompt=ENRICHED_ENVIRONMENT_PROMPT),
+        ]
+    )
+    compiler = asset_compiler.AssetCompiler(store)
+
+    # 任一块失败就整集失败（让阶段重试），不静默退化成「少几个派生场景」。
+    with pytest.raises(RuntimeError, match="派生场景分析炸了"):
+        await compiler._compile_scenes(
+            [_block(location="甲"), _block(location="乙")],
+            SimpleNamespace(number=1),
+            lambda _message: None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_compile_scenes_enriches_shared_scene_once(monkeypatch):
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    calls: list[str] = []
+
+    async def fake_enrich(**kwargs):
+        calls.append(str(kwargs["scene_name"]))
+        return NovelScene(
+            name=kwargs["scene_name"],
+            aliases=[],
+            scene_type=kwargs["scene_type"],
+            environment_prompt=ENRICHED_ENVIRONMENT_PROMPT,
+            description="补齐",
+        )
+
+    async def fake_derived(self, scene_name, block):
+        return []
+
+    _patch_block_llm(monkeypatch, enrich=fake_enrich, derived=fake_derived)
+
+    store = _FakeCogneeStore([_scene("咖啡馆")])
+    compiler = asset_compiler.AssetCompiler(store)
+
+    await compiler._compile_scenes(
+        [
+            _block(location="咖啡馆"),
+            _block(location="咖啡馆"),
+            _block(location="咖啡馆"),
+        ],
+        SimpleNamespace(number=1),
+        lambda _message: None,
+    )
+
+    assert calls == ["咖啡馆"]
+    assert len(store.sqlite_store.updated) == 1
+
+
+def test_scene_block_concurrency_prefers_env_then_runtime_file(monkeypatch, tmp_path):
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    monkeypatch.delenv("NOVELVIDEO_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("ASSET_SCENE_BLOCK_CONCURRENCY", raising=False)
+    assert (
+        asset_compiler.AssetCompiler._scene_block_concurrency()
+        == asset_compiler.ASSET_SCENE_BLOCK_CONCURRENCY_DEFAULT
+    )
+
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / "asset.json").write_text(
+        json.dumps({"scene_block_concurrency": 5}), encoding="utf-8"
+    )
+    assert asset_compiler.AssetCompiler._scene_block_concurrency() == 5
+
+    monkeypatch.setenv("ASSET_SCENE_BLOCK_CONCURRENCY", "7")
+    assert asset_compiler.AssetCompiler._scene_block_concurrency() == 7
+

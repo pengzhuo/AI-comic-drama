@@ -62,7 +62,52 @@ ${NOVELVIDEO_RUNTIME_DIR:-<DATA_ROOT>/runtime}/<stage>.json
 | `cognee`（场景归一化/富化、逐章事件提取） | `map_bounded(stage="cognee")` | `map_bounded` 默认 | `cognee.json` | — |
 | `rewriter`（解说改写 map_reduce） | `map_bounded(stage="rewriter")` | `map_bounded` 默认 | `rewriter.json` | — |
 | `asset`（素材/道具对账 map_reduce） | `map_bounded(stage="asset")` | `map_bounded` 默认 | `asset.json` | — |
+| `asset`（`_compile_scenes` 块级：补齐环境描述 + 派生场景分析） | `stage_int("asset", "ASSET_SCENE_BLOCK_CONCURRENCY", "scene_block_concurrency", 4)` = 在飞的**场景块数** | `map_bounded` 默认 | `asset.json` → `scene_block_concurrency` | — |
 | `video_optimizer`（逐 beat 视频提示词审核） | `map_bounded(stage="video_optimizer")` | `map_bounded` 默认 | `video_optimizer.json` | — |
+| `global_optimize_video`（逐 beat 首帧提示词优化） | `stage_int("global_optimize_video", "GLOBAL_OPTIMIZE_CONCURRENCY", …, 8)` + `wave_size`（默认 40） | `map_bounded` 默认 | `global_optimize_video.json` | `global_optimize_video_call` |
+| `first_frames`（`selected_regen` 首帧渲染） | `stage_int("first_frames", "FIRST_FRAMES_CONCURRENCY", "concurrency", 3)` = 在飞的**块数** | —（图片请求不经 LLM 闸门） | `first_frames.json` | `selected_regen`（任务级 `task_span`） |
+| `system_voice_setup`（角色参考声线合成） | `stage_int("system_voice_setup", "SYSTEM_VOICE_TTS_CONCURRENCY", "concurrency", 4)` = 在飞的**角色数** | —（音频请求不经 LLM 闸门） | `system_voice_setup.json` | `system_voice_setup`（任务级 `task_span`） |
+
+`system_voice_setup` 只把**合成**并发：声线的选择（含同项目内 `claimed` 去重）
+仍按角色顺序串行，`prepared` / 声线分配与逐角色串行逐字一致（`concurrency=1` 即回退旧行为）。
+合成池只有个位数条预置音色，池耗尽后多个角色会共用同一条音色 → 按**主声线加锁**，
+后到的角色直接命中 `assets/system_voices/<provider>__<voice>.mp3` 缓存，
+不重复打网关（串行版靠文件缓存天然去重，并发下不加锁会放大成 N 次重复请求）。
+任一角色彻底合成失败仍整集失败（与串行同口径，不静默降级）。
+实测（`护花铃_2` episode 1）：基线 **549s / 10 次网关调用串行**，
+其中一次单请求 **5m26s**、一次 71s——瓶颈是单次网关时延而不是派发。
+
+`first_frames` 这一层是**任务级（块级）并发**，与阶段内并发叠加：每块 9 个 beat、
+块内 `NANOBANANA_REGEN_CONCURRENCY`（默认 3）路图片请求，块数由本表这一行控制，
+所以真实在飞图片请求 ≈ `块数 × 块内并发`（默认 3 × 3 = 9）。块按 beat 号
+**固定切开**（`AUTO_FIRST_FRAME_CHUNK=9`）而不是「缺帧的前 9 个」滑动窗口——固定块
+才允许块间并行（滑动窗口一旦并发就会把同一批 beat 渲染两遍）。签名带缺集
+（`dispatch:selected_regen:{ep}:{首}-{尾}:{缺哪几个}`），所以「整块缺帧」只派一次，
+跑完留下缺口才允许再派一次补缺。单镜块会带 `beat_num`，让被上游审核挑掉的 beat
+能走「改写提示词 → 降级成草图顶替」的既有闭环，而不是把整条 run 停成等人确认。
+整段基线实测 **25,321s / 136 块 ≈ 12.7h（≈191s/块、≈20.7s/beat，1656 beats）**；
+`concurrency=1` 即退回旧单飞语义。
+
+实测（`护花铃_2`，生产 run 中途热补）：
+- 基线单飞 **2.95 帧/分**（≈20.7s/beat）；
+- 块并发 3 → 稳定 3 块在飞、**≈6 帧/分（2.0x）**；
+- 块并发 5 → 稳定 5 块在飞、**≈13.5 帧/分（4.6x）**，单块耗时仍 ≈140s（未被上游拉长，
+  说明瓶颈一直是我们自己的串行派发），内存 764MiB → 1.16GiB，无 429/5xx
+  （唯一的 Grid 失败是被审核挑掉的 beat 与重启中断）。
+- 生产热调参文件取 `{"concurrency": 5}`：CE 的 default lane 全局 6 槽，留 1 个给别的阶段。
+
+已知折中：块内的图是**逐张落盘**的，所以一块还在跑时它的缺口会缩小，若此时签名被
+清（失败重试会清全部 `dispatch:*`）就会对那几个 beat 再派一次——实测浪费 ≈0.5%
+的图片调用，换来 4.6x，暂不值得为它加「在飞块覆盖区间」的簿记。
+
+`global_optimize_video` 是**波前（wave）并发**：唯一的跨 beat 依赖是
+`prev_prompt`（上一 beat 已优化提示词的前 150 字），所以按波切分，波内并行、
+波间串行，波内每个 beat 以「上一波最后一个成功提示词」为锚点。两个独立旋钮：
+`concurrency` = 在飞上限（吞吐），`wave_size` = 波宽（锚点粒度 + 栅栏次数），
+`wave_size` 取 `max(concurrency, 配置值)`；`prev_prompt=none` 可整段不发锚点。
+实测（80 beats，`护花铃_2`）：1 路 1065.7s → 8 路/波宽 8 217.7s（4.9x）→
+**8 路/波宽 40 128.8s（8.27x）**，盲评质量与串行持平；12 路无额外收益。
+`concurrency=1` 时逐字节等于旧串行。
 
 `map_bounded(..., stage="x")` 仅在 `limit is None` 时读 `runtime/x.json` 的
 `concurrency` 键；显式传 `limit` 一律优先。env 复用 `STRUCTURED_LLM_CONCURRENCY`。

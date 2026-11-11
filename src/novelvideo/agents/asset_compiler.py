@@ -43,6 +43,15 @@ from novelvideo.workflows.literal_script_writing import (
 # containment (``走廊``、``大堂``、``台阶``); exact name/alias matches never use it.
 MIN_SPECIFIC_SCENE_TOKEN_LEN = 3
 
+#: 场景块级模型工作的并发上限（``_compile_scenes`` 每块最多两次调用：补齐环境描述 +
+#: 派生场景分析）。这类调用很短，真正的总量上限是全局 LLM 闸门
+#: （``LLM_GLOBAL_CONCURRENCY``，默认 12）；设 1 即回退逐块串行（逃生舱）。
+#: 热调参：``runtime/asset.json`` 的 ``scene_block_concurrency``，
+#: env ``ASSET_SCENE_BLOCK_CONCURRENCY`` 优先级更高。
+ASSET_STAGE = "asset"
+ASSET_SCENE_BLOCK_CONCURRENCY_ENV = "ASSET_SCENE_BLOCK_CONCURRENCY"
+ASSET_SCENE_BLOCK_CONCURRENCY_DEFAULT = 4
+
 
 class DerivedSceneRequirement(BaseModel):
     label: str = Field(description="派生场景后缀，如 '雪景'、'战后版'、'蒸汽弥漫'")
@@ -1037,29 +1046,67 @@ class AssetCompiler:
         pending_scene_map: dict[str, NovelScene] = {}
         time_plate_counts = self._time_plate_counts(scene_blocks)
 
+        from novelvideo.utils.bounded_concurrency import map_bounded
+
+        # 第一遍：块 → 基础场景解析。只读 store、不花 LLM；解析失败的块留到第三遍
+        # 按原顺序记「跳过」日志。
+        resolved: list[tuple[SceneBlock, NovelScene | None, str]] = []
         for block in scene_blocks:
             location = str(block.location or "").strip()
             if not location:
                 continue
-
             existing = pending_scene_map.get(
                 location
             ) or await self._find_matching_scene(location)
+            resolved.append((block, existing, location))
+
+        # 第二遍：块级模型工作（补齐环境描述 + 派生场景分析）互不依赖，有界并发跑完。
+        # 结果按块号归位，第三遍仍严格按块顺序合并，菜单与派生场景的先后顺序不变。
+        jobs: list[tuple[int, SceneBlock, NovelScene, bool]] = []
+        enrich_planned: set[str] = set()
+        for index, (block, scene, _location) in enumerate(resolved):
+            if scene is None:
+                continue
+            needs_enrich = not str(scene.environment_prompt or "").strip()
+            if needs_enrich and scene.name in enrich_planned:
+                # 同一基础场景在本集重复出现时只补齐一次：逐块串行时第二次会命中
+                # 第一次写回的 environment_prompt，效果相同。
+                needs_enrich = False
+            if needs_enrich:
+                enrich_planned.add(scene.name)
+            jobs.append((index, block, scene, needs_enrich))
+
+        failures: list[BaseException] = []
+
+        async def _prepare(job: tuple[int, SceneBlock, NovelScene, bool]):
+            return await self._prepare_scene_block(
+                job[1], job[2], episode, enrich=job[3]
+            )
+
+        prepared = await map_bounded(
+            jobs,
+            _prepare,
+            limit=self._scene_block_concurrency(),
+            on_error=lambda _job, exc: failures.append(exc),
+        )
+        if failures:
+            # 与逐块串行同口径：任一块的模型调用失败就整集失败（让阶段重试），
+            # 不静默退化成「少几个派生场景」。
+            raise failures[0]
+        outcomes = {
+            job[0]: (outcome or (None, [])) for job, outcome in zip(jobs, prepared)
+        }
+
+        # 第三遍：按块顺序合并（写库、建菜单、派生/时间盘场景）。
+        for index, (block, existing, location) in enumerate(resolved):
             if not existing:
                 log(f"  跳过缺失基础场景: {location}（AI校对未创建或未复用）")
                 continue
-            else:
-                existing = await self._enrich_scene_prompt_from_block(
-                    existing,
-                    block,
-                    episode,
-                    persist=True,
-                    log=log,
-                )
 
-            derived_requirements = await self._analyze_derived_scenes(
-                existing.name, block
-            )
+            enriched, derived_requirements = outcomes.get(index, (None, []))
+            if enriched is not None:
+                await self._apply_scene_enrichment(existing, enriched, log=log)
+
             normalized_derived = self._build_derived_scene_specs(derived_requirements)
             self._add_to_scene_menu(existing.name, scene_menu, seen_scene_ids)
             for scene_time, count in sorted(
@@ -1247,43 +1294,67 @@ class AssetCompiler:
             log(f"  解说场景分析失败，改用文本规则兜底: {exc}")
             return None
 
-    async def _enrich_scene_prompt_from_block(
+    async def _prepare_scene_block(
         self,
-        scene: NovelScene,
         block: SceneBlock,
+        scene: NovelScene,
         episode: Any,
         *,
-        persist: bool,
-        log: Callable[[str], None],
-    ) -> NovelScene:
-        if str(scene.environment_prompt or "").strip():
-            return scene
+        enrich: bool,
+    ) -> tuple[NovelScene | None, list[DerivedSceneRequirement]]:
+        """单个场景块的模型工作：补齐环境描述 + 派生场景分析（两者互不依赖）。
 
-        enriched = await enrich_scene_environment_from_context(
-            scene_name=scene.name,
-            aliases=scene.aliases,
-            scene_type=scene.scene_type,
-            time_of_day=str(getattr(block, "time_of_day", "") or ""),
-            interior=str(getattr(block, "interior_exterior", "") or "内") != "外",
-            episodes=[int(getattr(episode, "number", 1) or 1)],
-            characters=list(getattr(block, "characters", []) or []),
-            context_lines=list(getattr(block, "lines", []) or []),
-        )
+        这里只做 LLM 调用，不落库、不改共享状态；调用方在按块顺序的合并阶段
+        （``_compile_scenes`` 第三遍）再写回，块级并发因此不会打乱菜单顺序。
+        """
+
+        enriched: NovelScene | None = None
+        if enrich:
+            enriched = await enrich_scene_environment_from_context(
+                scene_name=scene.name,
+                aliases=scene.aliases,
+                scene_type=scene.scene_type,
+                time_of_day=str(getattr(block, "time_of_day", "") or ""),
+                interior=str(getattr(block, "interior_exterior", "") or "内") != "外",
+                episodes=[int(getattr(episode, "number", 1) or 1)],
+                characters=list(getattr(block, "characters", []) or []),
+                context_lines=list(getattr(block, "lines", []) or []),
+            )
+        derived_requirements = await self._analyze_derived_scenes(scene.name, block)
+        return enriched, derived_requirements
+
+    async def _apply_scene_enrichment(
+        self,
+        scene: NovelScene,
+        enriched: NovelScene,
+        log: Callable[[str], None],
+    ) -> None:
+        """把补齐结果写回场景：就地改字段 + 落库 + 记日志。"""
+
         scene.scene_type = enriched.scene_type or scene.scene_type
         scene.environment_prompt = enriched.environment_prompt
         if str(enriched.description or "").strip():
             scene.description = enriched.description
+        await self.store.update_scene(
+            scene.name,
+            scene_type=scene.scene_type,
+            environment_prompt=scene.environment_prompt,
+            description=scene.description,
+        )
+        log(f"  补齐场景环境描述: {scene.name}")
 
-        if persist:
-            await self.store.update_scene(
-                scene.name,
-                scene_type=scene.scene_type,
-                environment_prompt=scene.environment_prompt,
-                description=scene.description,
-            )
-            log(f"  补齐场景环境描述: {scene.name}")
+    @staticmethod
+    def _scene_block_concurrency() -> int:
+        """块级 LLM 并发：env > ``runtime/asset.json`` > 常量；设 1 = 逐块串行。"""
 
-        return scene
+        from novelvideo.shared.stage_runtime import stage_int
+
+        return stage_int(
+            ASSET_STAGE,
+            ASSET_SCENE_BLOCK_CONCURRENCY_ENV,
+            "scene_block_concurrency",
+            ASSET_SCENE_BLOCK_CONCURRENCY_DEFAULT,
+        )
 
     async def _analyze_derived_scenes(
         self,

@@ -398,6 +398,33 @@ def _stage_key_for(task: TaskState | None, run: DirectorAutoRun) -> str:
     return run.stage_key or "unknown"
 
 
+#: 任务类型 → 流水线状态键的别名。阶段签名/状态键与真正跑的任务类型不总同名：
+#: 草图阶段的任务叫 ``sketch_grid_generation``，状态键叫 ``sketch_generation``
+#: （见 ``_clear_stage_signatures`` 的同一条说明）。
+_TASK_STAGE_ALIASES = {
+    "sketch_grid_generation": "sketch_generation",
+}
+
+
+def _stage_status_key(task_type: str) -> str | None:
+    """该任务类型对应 ``episode_status`` 里的哪个阶段键（认不出来返回 None）。
+
+    以 ``pipeline_status.STEP_MAP`` 为唯一事实来源做逆映射，避免各处再抄一份
+    「任务类型 ↔ 阶段」的对应表。
+    """
+
+    from novelvideo.pipeline_status import STEP_MAP
+
+    text = str(task_type or "")
+    wanted = _TASK_STAGE_ALIASES.get(text, text)
+    if not wanted:
+        return None
+    for status_key, (step_task_type, _label) in STEP_MAP.items():
+        if step_task_type and step_task_type == wanted:
+            return status_key
+    return None
+
+
 def _fallback_kind(stage_key: str) -> str:
     """该 stage 失败时的本地降级方式。
 
@@ -2501,6 +2528,46 @@ class DirectorAutoCoordinator:
             if close:
                 await close()
 
+    async def _stage_artifacts_complete(
+        self, task: TaskState, run: DirectorAutoRun
+    ) -> bool:
+        """该任务所属阶段的产物在本地是否已经齐备。
+
+        「审核失败但定位不到镜号」时用它兜底：产物齐备就说明这次失败只是对已完成
+        阶段的一次**重复生成**（典型现场：工作台上手动重出某一格草图被上游拒），
+        整条自动流程不该为此停在「需要人工处理」。判断不出来的（取不到状态、任务
+        类型认不出来）一律返回 False，维持原来的「交回用户」行为。
+        """
+
+        status_key = _stage_status_key(str(getattr(task, "task_type", "") or ""))
+        if not status_key:
+            return False
+        ctx = run.context
+        try:
+            from novelvideo.pipeline_status import compute_pipeline_status
+
+            store = await self._open_ctx_store(ctx)
+            try:
+                data = await compute_pipeline_status(
+                    store=store,
+                    username=run.username,
+                    project_name=ctx.project_name,
+                    project_dir=ctx.output_dir,
+                    ctx=ctx,
+                    episode=run.episode if run.episode > 0 else None,
+                )
+            finally:
+                close = getattr(store, "close", None)
+                if close:
+                    await close()
+        except Exception:  # noqa: BLE001 - 只是兜底判断，取不到就不兜底
+            logger.debug("stage artifact probe failed", exc_info=True)
+            return False
+        episode_status = data.get("episode_status")
+        if not isinstance(episode_status, dict):
+            return False
+        return bool(episode_status.get(status_key))
+
     async def _pause_gate(self, run: DirectorAutoRun) -> str | None:
         """Return a human-facing reason to stop, or None to keep automating.
 
@@ -2568,6 +2635,38 @@ class DirectorAutoCoordinator:
                 return COST_ESTIMATE_REQUIRED_ERROR
         return None
 
+    async def _pause_on_gate(self, run: DirectorAutoRun, run_id: str) -> bool:
+        """空转时先问一次闸门，命中就暂停并返回 True。
+
+        「没有确定性处理器」不等于「只能靠捏导」：有些下一步本来就必须由用户拍板
+        （缺声线策略、缺项目配置、缺角色/身份图确认、成本预估未确认）。捏导在这些
+        闸门上一件事也推进不了，反而容易乱起写任务——2026-11 现场就是停在
+        ``voice_setup`` 时捏导反复重出草图网格：白烧钱、占住阶段，run 还永远走不到
+        该停的闸门上。所以先问闸门，再问捏导。
+        """
+
+        if not run.is_project_scope:
+            return False
+        try:
+            gate_reason = await self._pause_gate(run)
+        except Exception:  # noqa: BLE001 - 闸门识别失败不能拖垮续跑
+            logger.exception("pause gate check failed (run %s)", run.run_id)
+            return False
+        if not gate_reason:
+            return False
+        if not await self._owns_run(run_id):
+            return True
+        await self._pause_owned(
+            run_id=run_id,
+            username=run.username,
+            project_id=run.project_id,
+            reason=gate_reason,
+        )
+        await self._notify(
+            run, f"自动成片已暂停：{_pause_reason_display(gate_reason)}。"
+        )
+        return True
+
     async def _dispatch_stage(
         self, run: DirectorAutoRun, *, overlapped: bool = False
     ) -> tuple[bool, str | None]:
@@ -2592,6 +2691,7 @@ class DirectorAutoCoordinator:
                 episode=run.episode,
                 target_episodes=run.target_episodes,
                 attempted=set(run.recovery_keys),
+                voice_policy=run.voice_policy,
             )
         finally:
             close = getattr(store, "close", None)
@@ -2806,9 +2906,18 @@ class DirectorAutoCoordinator:
             if terminal:
                 if not await self._owns_run(run_id):
                     return
-                handled.update(task.task_id for task in terminal)
                 failures = [task for task in terminal if task.status != "completed"]
                 completed = [task for task in terminal if task.status == "completed"]
+                # 一轮里同时躺着好几个失败是常态（多块并发时尤其明显）：这一轮只处理
+                # 第一个，**其余的必须先留在 handled 之外**——否则它们会被永久标成
+                # 「已处理」，既不重试也不降级，留下永远补不上的缺口，而派发签名又
+                # 已经记过一次，确定性派发再也不会重投它（2026-11 现场：一批里的
+                # 1528/1533 就是这样被静默丢掉，首帧卡在 1653/1656 上不去）。
+                deferred_failures = {task.task_id for task in failures[1:]}
+                handled.update(
+                    task.task_id for task in terminal if task.task_id not in deferred_failures
+                )
+                failed = failures[0] if failures else None
                 # The retry budget belongs to the stage the run is driving and is
                 # cleared only when the run actually moves on to another stage.
                 # A completion *inside* the same stage must not clear it: for a
@@ -2838,8 +2947,7 @@ class DirectorAutoCoordinator:
                 )
                 if not await self._update_owned(updated):
                     return
-                if failures:
-                    failed = failures[0]
+                if failed is not None:
                     reason = failed.error or failed.current_task or failed.status
                     reason = _failure_reason_with_detail(failed, reason)
                     if _task_is_stalled(failed):
@@ -2943,6 +3051,19 @@ class DirectorAutoCoordinator:
                         )
                         if not target:
                             # 连「是哪一镜」都定位不到（批量 stage 的失败报文没有镜号）：
+                            # 无法本地降级。但如果这一步的产物在本地已经齐备，这次失败
+                            # 只可能是对已完成阶段的一次重复生成（工作台上手动重出某格
+                            # 草图被上游拒就是这样），不能为它把整条自动流程停死。
+                            if await self._stage_artifacts_complete(failed, updated):
+                                await self._notify(
+                                    updated,
+                                    f"{_task_instruction(failed)} 未通过内容审核，"
+                                    "但该步骤产物已齐备，已忽略这次重复生成，"
+                                    "继续本集制作。",
+                                )
+                                taskless_continuations = 0
+                                await asyncio.sleep(POLL_SECONDS)
+                                continue
                             # 无法本地降级，只能把决定权交回用户。用 awaiting_confirmation
                             # 而不是 paused，避免客户端把这类暂停当硬暂停无限续跑。
                             await self._suspend_owned(
@@ -3204,38 +3325,15 @@ class DirectorAutoCoordinator:
                 if chat_service.chat_run_lock_is_active(username, project_id):
                     await asyncio.sleep(POLL_SECONDS)
                     continue
+                # 没有确定性处理器时才轮到这里。先问闸门：命中说明这一步只能由用户
+                # 拍板，捏导来了也推进不了（还会乱起写任务，见 ``_pause_on_gate``）。
+                if await self._pause_on_gate(run, run_id):
+                    return
                 # A taskless continuation is often transient: the agent may have
                 # spent the turn on reads (or on a route that 404s) before it
                 # could start the step. Retry within a bounded budget and only
                 # then pause the durable run for the user's decision.
                 if taskless_continuations >= MAX_TASKLESS_CONTINUATIONS:
-                    # 空转也会停在必须由用户拍板的闸门上：缺声线策略、肖像/身份图
-                    # 时确定性派发不会产生写任务。若这里只报「未产生写任务」，前端
-                    # 认不出闸门类型、弹不出对应卡片，客户点「继续制作」只会再空转
-                    # 一轮（2026-11 现场：nn_1103_3 停在 voice_setup 反复空转）。
-                    # 所以耗尽空转预算时先问一次闸门，命中就按闸门原因暂停。
-                    if run.is_project_scope:
-                        try:
-                            gate_reason = await self._pause_gate(run)
-                        except Exception:  # noqa: BLE001 - 闸门识别失败不能拖垮续跑
-                            logger.exception(
-                                "taskless pause gate check failed (run %s)", run.run_id
-                            )
-                            gate_reason = None
-                        if gate_reason:
-                            if not await self._owns_run(run_id):
-                                return
-                            await self._pause_owned(
-                                run_id=run_id,
-                                username=username,
-                                project_id=project_id,
-                                reason=gate_reason,
-                            )
-                            await self._notify(
-                                run,
-                                f"自动成片已暂停：{_pause_reason_display(gate_reason)}。",
-                            )
-                            return
                     wrote, note = self._last_continuation(run_id)
                     reason = (
                         "自动续跑未产生新的任务"
