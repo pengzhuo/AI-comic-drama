@@ -174,3 +174,75 @@ def test_stale_inline_task_no_longer_blocks_active_count(tmp_path: Path) -> None
     manager = _restarted()
 
     assert manager.count_active_tasks_for_project(ctx) == 0
+
+
+def test_claim_inline_task_worker_flips_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from novelvideo import task_state
+
+    monkeypatch.setattr(task_state, "_INLINE_TASK_WORKER_CLAIMED", False)
+    assert task_state.inline_task_worker_claimed() is False
+    task_state.claim_inline_task_worker()
+    assert task_state.inline_task_worker_claimed() is True
+
+
+def test_unclaimed_process_does_not_sweep_live_inline_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """非 inline worker 进程（CLI/脚本/诊断工具）不得按自己的启动时刻回收在途行。
+
+    2026-11-12 线上事故：一次诊断脚本构造了项目 store，就把 API 进程里在飞的 68 条
+    ``single_video`` 行整批落成 failed；下游 lane 里对应的 job 随即在鉴权时被判无效、
+    瞬间静默失败，整段视频阶段停工，协调器还把那些误判当真实失败逐镜降级。
+    "早于本进程启动 = 已中断"只对**持有 inline 后端的进程**成立。
+    """
+
+    from novelvideo import task_state
+
+    manager = TaskStateManager()
+    ctx = _ctx(tmp_path)
+    created = manager.create_task_for_project(
+        ctx, "ingest_fast", 0, scope="job_live", metadata={"backend": "inline"}
+    )
+    manager.update_progress_for_project(ctx, "ingest_fast", 0, progress=0.1, scope="job_live")
+    _backdate(manager, ctx, created.task_id)
+    # conftest 默认让测试进程认领 worker 身份；这里退回「普通脚本进程」。
+    monkeypatch.setattr(task_state, "_INLINE_TASK_WORKER_CLAIMED", False)
+    manager = _restarted()
+
+    listed = manager.list_tasks_for_project(ctx)
+    fetched = manager.get_task_for_project(ctx, "ingest_fast", 0, scope="job_live")
+
+    assert len(listed) == 1
+    assert listed[0].status == "running"
+    assert fetched is not None
+    assert fetched.status == "running"
+
+
+def test_unclaimed_process_still_sweeps_celery_axis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """celery 轴按 TTL 判、与进程身份无关：非 worker 进程也该照常收超时行。"""
+
+    from novelvideo import task_state
+
+    manager = TaskStateManager()
+    ctx = _ctx(tmp_path)
+    created = manager.create_task_for_project(
+        ctx, "ingest_fast", 0, scope="job_celery_old", metadata={"backend": "celery"}
+    )
+    manager.update_progress_for_project(
+        ctx, "ingest_fast", 0, progress=0.1, scope="job_celery_old"
+    )
+    stale = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=TaskStateManager.CELERY_STALE_TTL + 60)
+    ).isoformat().replace("+00:00", "Z")
+    _backdate(manager, ctx, created.task_id, when=stale)
+    monkeypatch.setattr(task_state, "_INLINE_TASK_WORKER_CLAIMED", False)
+    manager = _restarted()
+
+    listed = manager.list_tasks_for_project(ctx)
+
+    assert listed[0].status == "failed"

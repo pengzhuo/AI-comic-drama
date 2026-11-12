@@ -52,10 +52,18 @@ DIALOGUE_RE = re.compile(r"^(?P<speaker>[^：:]{1,24})[：:](?P<speech>.+)$")
 SCRIPT_CHECKPOINT_EVERY = 5
 
 #: 断点文件格式版本。凡影响逐行 prompt 或循环语义的改动都要 +1，使旧断点自然失效。
-SCRIPT_CHECKPOINT_VERSION = 1
+SCRIPT_CHECKPOINT_VERSION = 2
 
 #: 断点文件相对 ``output_dir`` 的位置。
 SCRIPT_CHECKPOINT_RELATIVE_DIR = Path("runtime") / "script_writer"
+
+#: 「剧本处理理解账」注入逐行 prompt 的开关。部署级口径：env
+#: ``SCRIPT_PROCESS_DIGEST`` > ``runtime/script_writer.json`` 的 ``process_digest``
+#: > 默认开；项目级口径：``project_config.json`` 的 ``script_process_digest``
+#: （布尔）单独覆盖，方便只对某个项目开/关。
+SCRIPT_WRITER_STAGE = "script_writer"
+SCRIPT_PROCESS_DIGEST_ENV = "SCRIPT_PROCESS_DIGEST"
+SCRIPT_PROCESS_DIGEST_DEFAULT = True
 
 CONTENT_FILTER_HINT_TERMS: dict[str, tuple[str, ...]] = {
     "暴力/武器": (
@@ -467,13 +475,15 @@ class LiteralScriptWritingWorkflow:
         character/reveal boundary without changing what a line may contain.
         """
 
-        output_dir = str(getattr(self, "output_dir", "") or "")
-        if not output_dir:
+        if not self._script_process_digest_enabled():
+            return ""
+        root = self._project_output_dir()
+        if root is None:
             return ""
         try:
             from novelvideo.script_process import build_downstream_digest
 
-            digest = build_downstream_digest(output_dir)
+            digest = build_downstream_digest(root)
         except Exception:  # noqa: BLE001 - enrichment must never block script generation
             return ""
         if not digest:
@@ -484,6 +494,30 @@ class LiteralScriptWritingWorkflow:
             "你仍然只标注当前这一行，不得据此补出原文没有的人、事、物。\n"
             f"{digest}\n"
         )
+
+    def _script_process_digest_enabled(self) -> bool:
+        """理解账注入是否生效：项目级 > 部署级（env > 热调参 > 默认开）。"""
+
+        from novelvideo.shared.stage_runtime import stage_bool
+
+        enabled = stage_bool(
+            SCRIPT_WRITER_STAGE,
+            SCRIPT_PROCESS_DIGEST_ENV,
+            "process_digest",
+            SCRIPT_PROCESS_DIGEST_DEFAULT,
+        )
+        state_dir = str(getattr(self.sqlite_store, "state_dir", "") or "").strip()
+        if not state_dir:
+            return enabled
+        try:
+            from novelvideo.project_config import (
+                script_process_digest_override_from_state_dir,
+            )
+
+            override = script_process_digest_override_from_state_dir(state_dir)
+        except Exception:  # noqa: BLE001 - 配置读不到就按部署级口径
+            return enabled
+        return enabled if override is None else override
 
     async def run(
         self,
@@ -944,12 +978,13 @@ class LiteralScriptWritingWorkflow:
     # ------------------------------------------------------------------
     # 断点续跑（逐行剧本）
     # ------------------------------------------------------------------
-    def _script_checkpoint_root(self) -> Path | None:
-        """断点根目录：优先构造参数，其次 store 的项目输出目录。
+    def _project_output_dir(self) -> Path | None:
+        """项目输出目录：优先构造参数，其次 store 的项目输出目录。
 
         注意：生产 runner 走 ``create_script_writing_workflow``，那里
         ``workflow.output_dir`` 拿的是 ``store.output_dir``（``CogneeStore`` 没有这个
         属性，所以是空串）；真正可用的项目输出目录在 ``store.project_dir``。
+        断点文件与「剧本处理理解账」都从这里取根目录，否则生产里会变成空操作。
         """
 
         candidates = (
@@ -962,6 +997,11 @@ class LiteralScriptWritingWorkflow:
             if text:
                 return Path(text)
         return None
+
+    def _script_checkpoint_root(self) -> Path | None:
+        """断点根目录：与「理解账」注入同源的 :meth:`_project_output_dir`。"""
+
+        return self._project_output_dir()
 
     def _script_checkpoint_path(self, episode_num: int) -> Path | None:
         """断点文件路径；没有项目输出目录时返回 None（库调用/测试不落盘）。"""

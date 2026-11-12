@@ -24,8 +24,16 @@
 | 文件 | 键 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `/data/runtime/script_writer.json` | `concurrency` | 3 | 同时在飞的身份规划 + 剧本任务数（共用同一上限，扇出因此有界） |
+| `/data/runtime/script_writer.json` | `process_digest` | `true` | 是否把 `script_process` 的「理解账」注入逐行 prompt（env `SCRIPT_PROCESS_DIGEST` 优先；项目级 `project_config.json` 的 `script_process_digest` 覆盖） |
 
 环境变量 `SCRIPT_WRITER_CONCURRENCY` 优先于热调参文件（`stage_int` 语义）。
+
+「理解账注入」是把 `script_process` 阶段产出的 `script_process/result.json` 摘要
+（`script_process.build_downstream_digest`：理解账 + 人物表 + 未决项）追加到逐行标注的
+系统提示里，让每行标注不越过流程包锁定的角色/揭示边界；提示里同时明确「仍只标注当前
+这一行、不得据此脑补」。这是一次**逐行 prompt 变更**，所以
+`SCRIPT_CHECKPOINT_VERSION` 已随之 +1（旧断点失效、最坏整集重算一次）；不想要就置
+`false`。
 
 ## 断点续跑（逐行主循环）
 

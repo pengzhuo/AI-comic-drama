@@ -1203,7 +1203,7 @@ async def _dispatch_single_videos(
         if beat_num > 0
         and beat_num not in in_flight
         and paths.first_frame_for_video(beat_num).exists()
-        and not paths.video(beat_num).exists()
+        and not _single_video_has_trusted_clip(paths.video(beat_num))
     )
     if not ready:
         return None, None
@@ -1263,6 +1263,24 @@ async def _dispatch_single_videos(
         _clear_prep_rejection(rejection_key)
         return "single_video", signature
     return None, None
+
+
+def _single_video_has_trusted_clip(video_path: Path) -> bool:
+    """该镜是否已有**可信**成片（工作台可据此跳过重渲）。
+
+    降级兜底产物（本地静帧短片）与真成片同目录同文件名，光看文件存在会把兜底
+    当成做完了、那一镜再也不会重生成。降级时会在产物旁挂 ``.degraded.json``
+    标记（见 ``chat.director_auto._block_shot_and_continue``）：带标记的镜头
+    此处判为「还得重渲」。被阻塞的镜头另有 dispatch 跳过签名挡着，所以这不会
+    变成无限重渲；用户重做（``clear_blocked_shot``）摘掉标记和签名后才回到队列。
+    """
+
+    path = Path(video_path)
+    if not path.exists():
+        return False
+    from novelvideo.generators.fallback_clip import has_degraded_marker
+
+    return not has_degraded_marker(path)
 
 
 def _single_video_enqueued(result: Any) -> bool:

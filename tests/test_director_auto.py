@@ -330,6 +330,61 @@ async def test_agent_continuation_is_pinned_to_the_auto_run_episode(
 
 
 @pytest.mark.asyncio
+async def test_final_delivery_permission_failure_keeps_the_finished_run_completable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """收口回合撞上身份校验失败时，已经出片的 run 必须还能被收成 completed。
+
+    复现 t3 的收尾事故：run 的 ctx 里 ``requester_user_id`` 是映射不出主体
+    （没有 ``client:`` 前缀）的裸号，收口回合重新校验身份拿到 403。此前会走
+    ``_pause_owned`` → 释放租约 → 调用方 ``_owns_run`` 失败并直接 return → run
+    永久停在 ``paused/fatal``，还给用户弹「当前用户已无权继续修改该项目」。
+    """
+
+    from fastapi import HTTPException
+
+    async def denied(**_kwargs):
+        raise HTTPException(status_code=403, detail="project role required: editor")
+
+    async def noop_broadcast(**_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(director_auto, "resolve_project_context", denied)
+    monkeypatch.setattr(director_auto, "broadcast_project_chat_event", noop_broadcast)
+
+    coordinator = DirectorAutoCoordinator(DirectorAutoStore(tmp_path / "director-auto.db"))
+    store = coordinator.store
+    run = run_record(tmp_path, episode=2)
+    store.upsert(run)
+    assert store.claim_lease(run.run_id, coordinator.owner_token, lease_seconds=120)
+
+    notified: list[str] = []
+
+    async def fake_notify(_run, text, *_args, **_kwargs):
+        notified.append(text)
+        return {}
+
+    monkeypatch.setattr(coordinator, "_notify", fake_notify)
+
+    assert await coordinator._agent_continue(run, final_delivery=True) is False
+    saved = store.get(run.username, run.project_id)
+    assert saved is not None
+    assert (saved.status, saved.pause_kind, saved.last_error) == ("running", "", "")
+    assert store.owns_lease(run.run_id, coordinator.owner_token) is True
+    assert notified == []
+
+    # 普通推进回合保持原语义：用户真的没权限了就停下并说明。
+    assert await coordinator._agent_continue(run) is False
+    saved = store.get(run.username, run.project_id)
+    assert saved is not None
+    assert saved.status == "paused"
+    assert saved.pause_kind == "fatal"
+    assert saved.last_error.startswith("项目权限校验失败")
+    assert notified and "无权" in notified[0]
+
+
+@pytest.mark.asyncio
 async def test_resume_only_restarts_persisted_running_sessions(tmp_path: Path) -> None:
     class RecordingCoordinator(DirectorAutoCoordinator):
         def __init__(self, store):
@@ -2528,6 +2583,181 @@ async def test_reap_unprogressing_run_rearms_live_worker(tmp_path: Path) -> None
     assert loaded is not None
     assert loaded.recovery_attempts == 1
     assert coordinator.started == ["run-1"]
+
+
+@pytest.mark.asyncio
+async def test_alternating_stage_failures_cannot_refill_the_retry_budget(
+    tmp_path: Path,
+) -> None:
+    """A/B 两个 stage 交替失败时，预算按 (集, stage) 累计。
+
+    旧口径 ``stage_attempts + 1 if stage_key == key else 1`` 把每次交替都当「新
+    stage」→ 永远 1/3、无限重试、既不浮出人工也不烧完预算（護花鈴_2 上实测到的
+    死循环）。
+    """
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(run_record(tmp_path))
+    coordinator = DirectorAutoCoordinator(store)
+    try:
+        assert store.claim_lease("run-1", coordinator.owner_token) is True
+        seen: list[tuple[str, bool, int]] = []
+        for index in range(director_auto.MAX_STAGE_ATTEMPTS * 2):
+            stage = "single_video" if index % 2 == 0 else "selected_regen"
+            failed = task(f"failed-{index}", "failed", task_type=stage)
+            failed.beat_num = 12
+            run = store.get("alice", "project-1")
+            assert run is not None
+            granted, attempt = await coordinator._grant_stage_retry(
+                run=run,
+                task=failed,
+                reason="upstream rejected",
+            )
+            seen.append((stage, granted, attempt))
+
+        assert [(stage, ok) for stage, ok, _ in seen] == [
+            ("single_video", True),
+            ("selected_regen", True),
+            ("single_video", True),
+            ("selected_regen", True),
+            ("single_video", True),
+            ("selected_regen", True),
+        ], seen
+
+        run = store.get("alice", "project-1")
+        assert run is not None
+        assert (
+            run.stage_attempts_by_key["1:single_video"]
+            == director_auto.MAX_STAGE_ATTEMPTS
+        )
+        extra = task("failed-extra", "failed", task_type="single_video")
+        extra.beat_num = 12
+        granted, attempt = await coordinator._grant_stage_retry(
+            run=run,
+            task=extra,
+            reason="upstream rejected",
+        )
+        # 旧口径这里仍是 (True, 1)：预算被交替"回满"了。
+        assert granted is False
+        assert attempt == director_auto.MAX_STAGE_ATTEMPTS + 1
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_blocked_shot_marks_degraded_product_and_keeps_skip_signature(
+    tmp_path: Path,
+) -> None:
+    """降级产物要能被认出（旁挂标记），重试清签名时不能把它重新拉回队列。"""
+
+    from novelvideo.generators import fallback_clip
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    store.upsert(
+        run_record(
+            tmp_path,
+            stage_key="selected_regen",
+            stage_attempts=director_auto.MAX_STAGE_ATTEMPTS,
+            stage_attempts_by_key={
+                "1:selected_regen": director_auto.MAX_STAGE_ATTEMPTS
+            },
+        )
+    )
+    coordinator = DirectorAutoCoordinator(store)
+    try:
+        assert store.claim_lease("run-1", coordinator.owner_token) is True
+        ctx = context(tmp_path)
+        sketch = ctx.output_dir / "sketches" / "ep001" / "beat_12.png"
+        sketch.parent.mkdir(parents=True, exist_ok=True)
+        sketch.write_bytes(b"sketch-bytes")
+
+        run = store.get("alice", "project-1")
+        assert run is not None
+        blocked = await coordinator._block_shot_and_continue(
+            run=run,
+            episode=1,
+            beat_num=12,
+            stage="selected_regen",
+            code="retries_exhausted",
+            reason="内容审核未通过",
+            kind="frame",
+        )
+
+        assert blocked is not None
+        assert blocked.blocked_shots[0]["degraded"] is True
+        frame = ctx.output_dir / "frames" / "ep001" / "beat_12.png"
+        assert frame.read_bytes() == b"sketch-bytes"
+        assert fallback_clip.has_degraded_marker(frame) is True
+        # 阻塞一镜 = 放弃这一镜（不是放弃整个 stage）：它的预算要放掉。
+        assert "1:selected_regen" not in blocked.stage_attempts_by_key
+
+        with_extra = replace(
+            blocked,
+            recovery_keys=(*blocked.recovery_keys, "dispatch:single_video:1:99"),
+        )
+        cleared = coordinator._clear_stage_signatures(with_extra)
+        assert "dispatch:selected_regen:1:12" in cleared
+        assert "dispatch:single_video:1:99" not in cleared
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_clear_blocked_shot_drops_marker_and_skip_signature(
+    tmp_path: Path,
+) -> None:
+    """工作台重做该镜（清阻塞）后，降级标记和跳过签名都要摘掉，派发才会重新认它。"""
+
+    from novelvideo.generators import fallback_clip
+
+    store = DirectorAutoStore(tmp_path / "director-auto.db")
+    ctx = context(tmp_path)
+    video = ctx.output_dir / "videos" / "beats" / "ep001" / "beat_12.mp4"
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"degraded-clip")
+    assert (
+        fallback_clip.write_degraded_marker(
+            video, stage="single_video", code="retries_exhausted"
+        )
+        is True
+    )
+    store.upsert(
+        run_record(
+            tmp_path,
+            blocked_shots=(
+                {
+                    "episode": 1,
+                    "beat": 12,
+                    "stage": "single_video",
+                    "degraded": True,
+                },
+            ),
+            recovery_keys=(
+                "dispatch:single_video:1:12",
+                "missing-character-portrait:1",
+            ),
+        )
+    )
+    coordinator = DirectorAutoCoordinator(store)
+    try:
+        updated = await coordinator.clear_blocked_shot(
+            username="alice",
+            project_id="project-1",
+            episode=1,
+            beat_num=12,
+        )
+
+        assert updated is not None
+        assert updated.blocked_shots == ()
+        assert "dispatch:single_video:1:12" not in updated.recovery_keys
+        assert "missing-character-portrait:1" in updated.recovery_keys
+        assert fallback_clip.has_degraded_marker(video) is False
+        persisted = store.get("alice", "project-1")
+        assert persisted is not None
+        assert persisted.blocked_shots == ()
+        assert "dispatch:single_video:1:12" not in persisted.recovery_keys
+    finally:
+        await coordinator.shutdown()
 
 
 

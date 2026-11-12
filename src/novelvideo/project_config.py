@@ -1034,3 +1034,69 @@ def record_points_settlement_in_state_dir(
 
     update_project_config_file_in_state_dir(state_dir, _apply)
     return entry
+
+
+# ── 运行期行为开关（项目级覆盖部署级默认） ─────────────────────────────────
+#
+# 两个开关都从「部署级一套」改成「项目级可覆盖」：部署级（env / ``/data/runtime``
+# 热调参）仍是缺省值，项目没写键就照旧跟随；写死键就只影响那个项目。
+
+
+#: 群杂兜底音色（``project_config.json``）：缺失 = 跟随部署级默认；
+#: 显式 ``""`` / ``false`` / ``null`` = 该项目关闭兜底（回到「对不上角色就硬失败」）；
+#: 非空字符串 = 该项目的群杂音色 id。语义见 ``audio/system_voice_setup.py``。
+UNMATCHED_SPEAKER_VOICE_KEY = "unmatched_speaker_voice"
+
+
+def project_unmatched_speaker_voice(config: dict | None) -> str | None:
+    """读项目级群杂音色：``None`` = 没配（跟随部署级），``""`` = 显式关闭。"""
+
+    if not isinstance(config, dict) or UNMATCHED_SPEAKER_VOICE_KEY not in config:
+        return None
+    value = config.get(UNMATCHED_SPEAKER_VOICE_KEY)
+    if value is None or value is False:
+        return ""
+    return str(value).strip()
+
+
+def unmatched_speaker_voice_override_from_state_dir(
+    state_dir: str | Path,
+) -> str | None:
+    """按项目目录读群杂音色的项目级覆盖；没配返回 ``None``。"""
+
+    return project_unmatched_speaker_voice(
+        load_project_config_file_from_state_dir(state_dir)
+    )
+
+
+#: 「剧本处理理解账」注入逐行剧本 prompt 的开关（``project_config.json``）：
+#: 缺失 = 跟随部署级默认（``SCRIPT_PROCESS_DIGEST`` / ``runtime/script_writer.json``），
+#: 显式布尔 = 该项目单独开/关。语义见 ``workflows/literal_script_writing.py``。
+SCRIPT_PROCESS_DIGEST_KEY = "script_process_digest"
+
+
+def project_script_process_digest(config: dict | None) -> bool | None:
+    """读项目级「理解账注入」开关：``None`` = 没配（跟随部署级）。"""
+
+    if not isinstance(config, dict) or SCRIPT_PROCESS_DIGEST_KEY not in config:
+        return None
+    value = config.get(SCRIPT_PROCESS_DIGEST_KEY)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+    return None
+
+
+def script_process_digest_override_from_state_dir(state_dir: str | Path) -> bool | None:
+    """按项目目录读「理解账注入」的项目级覆盖；没配返回 ``None``。"""
+
+    return project_script_process_digest(
+        load_project_config_file_from_state_dir(state_dir)
+    )

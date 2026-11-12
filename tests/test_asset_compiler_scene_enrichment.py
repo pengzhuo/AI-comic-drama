@@ -1061,3 +1061,273 @@ def test_scene_block_concurrency_prefers_env_then_runtime_file(monkeypatch, tmp_
     monkeypatch.setenv("ASSET_SCENE_BLOCK_CONCURRENCY", "7")
     assert asset_compiler.AssetCompiler._scene_block_concurrency() == 7
 
+
+def test_shares_scene_token_filters_unrelated_reuse_targets():
+    """校对乱指的复用目标（听雪楼叛乱现场 → 书斋）不能通过片段校验。"""
+
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    tingxue = NovelScene(name="听雪楼临时驻地", aliases=["听雪楼临时驻地_夜雨版"])
+    assert asset_compiler.shares_scene_token("听雪楼叛乱现场", tingxue)
+    assert asset_compiler.shares_scene_token("听雪楼驻地", tingxue)
+    assert not asset_compiler.shares_scene_token("听雪楼叛乱现场", NovelScene(name="书斋"))
+    assert not asset_compiler.shares_scene_token("木楼檐下·夜雨", tingxue)
+
+
+@pytest.mark.asyncio
+async def test_base_scene_reconcile_reuse_decision_resolves_episode_location(monkeypatch):
+    """护花铃 ep10/ep14：校对答 reuse 的映射必须落地，块定位串才解析得到场景。"""
+
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    async def fake_derived(self, scene_name, block):
+        return []
+
+    _patch_block_llm(monkeypatch, derived=fake_derived)
+    logs: list[str] = []
+
+    store = _FakeCogneeStore(
+        [_scene("听雪楼临时驻地", environment_prompt=ENRICHED_ENVIRONMENT_PROMPT)]
+    )
+    compiler = asset_compiler.AssetCompiler(store)
+
+    created = await compiler._apply_base_scene_reconcile_output(
+        asset_compiler.EpisodeBaseSceneReconcileOutput(
+            scenes=[
+                asset_compiler.BaseSceneReconcileDecision(
+                    action="reuse",
+                    scene_name="听雪楼叛乱现场",
+                    matched_existing_name="听雪楼临时驻地",
+                    aliases=["听雪楼叛乱现场"],
+                    evidence_lines=["场景：听雪楼叛乱现场·夜（闪回）"],
+                )
+            ]
+        ),
+        "场景：听雪楼叛乱现场·夜（闪回）",
+        SimpleNamespace(number=10),
+        logs.append,
+    )
+
+    assert created == []
+    assert any("校对决策 reuse: 听雪楼临时驻地" in line for line in logs)
+
+    scene_menu, pending_scenes = await compiler._compile_scenes(
+        [_block(location="听雪楼叛乱现场·夜", time_of_day="夜晚")],
+        SimpleNamespace(number=10),
+        logs.append,
+    )
+
+    assert [item.scene_id for item in scene_menu] == ["听雪楼临时驻地"]
+    assert pending_scenes == []
+    assert store.sqlite_store.added == []
+    assert not any("跳过缺失基础场景" in line for line in logs)
+
+
+@pytest.mark.asyncio
+async def test_base_scene_reconcile_rejects_unrelated_reuse_target(monkeypatch):
+    """复用目标与本集定位毫无共同片段时不留映射：宁可另按定位建档。"""
+
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    async def fake_derived(self, scene_name, block):
+        return []
+
+    _patch_block_llm(monkeypatch, derived=fake_derived)
+    logs: list[str] = []
+
+    store = _FakeCogneeStore([_scene("书斋", environment_prompt=ENRICHED_ENVIRONMENT_PROMPT)])
+    compiler = asset_compiler.AssetCompiler(store)
+
+    await compiler._apply_base_scene_reconcile_output(
+        asset_compiler.EpisodeBaseSceneReconcileOutput(
+            scenes=[
+                asset_compiler.BaseSceneReconcileDecision(
+                    action="reuse",
+                    scene_name="听雪楼叛乱现场",
+                    matched_existing_name="书斋",
+                    aliases=["听雪楼叛乱现场"],
+                    evidence_lines=["场景：听雪楼叛乱现场·夜"],
+                )
+            ]
+        ),
+        "场景：听雪楼叛乱现场·夜",
+        SimpleNamespace(number=10),
+        logs.append,
+    )
+
+    assert any("校对决策 reuse 未落实" in line for line in logs)
+    assert compiler._base_scene_reuse_hints == {}
+
+    scene_menu, _pending = await compiler._compile_scenes(
+        [_block(location="听雪楼叛乱现场·夜", time_of_day="夜晚")],
+        SimpleNamespace(number=10),
+        logs.append,
+    )
+
+    assert scene_menu == []
+    assert any("跳过缺失基础场景: 听雪楼叛乱现场·夜" in line for line in logs)
+
+
+@pytest.mark.asyncio
+async def test_compile_episode_scenes_backfills_scene_from_block_location(monkeypatch):
+    """护花铃 ep9：校对什么都没落地时按场次定位补建，不再整集硬失败。"""
+
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    enrich_calls: list[dict] = []
+
+    async def fake_enrich(**kwargs):
+        enrich_calls.append(kwargs)
+        return NovelScene(
+            name=kwargs["scene_name"],
+            scene_type=kwargs["scene_type"],
+            environment_prompt=ENRICHED_ENVIRONMENT_PROMPT,
+        )
+
+    async def fake_derived(self, scene_name, block):
+        return []
+
+    async def no_reconcile(self, source_text, episode, log):
+        log("  校对决策 ignore: 木楼檐下")
+        return []
+
+    async def fake_load_scene_blocks(self, episode):
+        return [_block(location="木楼檐下·夜雨", time_of_day="夜晚")]
+
+    monkeypatch.setattr(asset_compiler, "enrich_scene_environment_from_context", fake_enrich)
+    monkeypatch.setattr(asset_compiler.AssetCompiler, "_analyze_derived_scenes", fake_derived)
+    monkeypatch.setattr(
+        asset_compiler.AssetCompiler, "_load_scene_blocks", fake_load_scene_blocks
+    )
+    monkeypatch.setattr(
+        asset_compiler.AssetCompiler,
+        "_normalize_scene_block_headers",
+        lambda self, blocks, log: _return_async(blocks),
+    )
+    monkeypatch.setattr(
+        asset_compiler.AssetCompiler, "_reconcile_base_scenes_from_text", no_reconcile
+    )
+
+    store = _FakeCogneeStore()
+    compiler = asset_compiler.AssetCompiler(store)
+    logs: list[str] = []
+
+    scene_menu, new_count = await compiler.compile_episode_scenes(
+        SimpleNamespace(number=9, title="第九集", beat_source_text="场景：木楼檐下·夜雨"),
+        logs.append,
+    )
+
+    assert [item.scene_id for item in scene_menu] == ["木楼檐下·夜雨"]
+    assert new_count == 1
+    assert [scene.name for scene in store.sqlite_store.added] == ["木楼檐下·夜雨"]
+    assert store.sqlite_store.scenes["木楼檐下·夜雨"].notes.endswith("(ep9)")
+    assert any("按定位行补建基础场景: 木楼檐下·夜雨" in line for line in logs)
+    assert enrich_calls and enrich_calls[0]["scene_name"] == "木楼檐下·夜雨"
+    assert enrich_calls[0]["context_lines"][0].startswith("场次（1）地点：木楼檐下·夜雨")
+
+
+@pytest.mark.asyncio
+async def test_compile_episode_scenes_resolves_location_with_trailing_separator(
+    monkeypatch,
+):
+    """护花铃 ep22/ep27：定位串带残留尾分隔符（``月神殿·``）时三遍匹配都落空。
+
+    校对又什么都没落地，旧实现直接跳过整块 → 空菜单硬失败。兜底先把分隔符
+    clean 掉再匹配，就能解析到已有的基础场景（``月神殿外``），不重复建档。
+    """
+
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    async def fail_enrich(**_kwargs):
+        raise AssertionError("解析到已有基础场景时不该再建档、不该调 enrich")
+
+    async def fake_derived(self, scene_name, block):
+        return []
+
+    async def no_reconcile(self, source_text, episode, log):
+        log("  校对决策 ignore: 月神殿")
+        return []
+
+    async def fake_load_scene_blocks(self, episode):
+        return [_block(location="月神殿·", time_of_day="夜")]
+
+    monkeypatch.setattr(
+        asset_compiler, "enrich_scene_environment_from_context", fail_enrich
+    )
+    monkeypatch.setattr(asset_compiler.AssetCompiler, "_analyze_derived_scenes", fake_derived)
+    monkeypatch.setattr(
+        asset_compiler.AssetCompiler, "_load_scene_blocks", fake_load_scene_blocks
+    )
+    monkeypatch.setattr(
+        asset_compiler.AssetCompiler,
+        "_normalize_scene_block_headers",
+        lambda self, blocks, log: _return_async(blocks),
+    )
+    monkeypatch.setattr(
+        asset_compiler.AssetCompiler, "_reconcile_base_scenes_from_text", no_reconcile
+    )
+
+    store = _FakeCogneeStore(
+        [
+            NovelScene(
+                name="月神殿外",
+                scene_type="exterior",
+                environment_prompt="月色下的殿外石阶",
+            )
+        ]
+    )
+    compiler = asset_compiler.AssetCompiler(store)
+    logs: list[str] = []
+
+    scene_menu, new_count = await compiler.compile_episode_scenes(
+        SimpleNamespace(number=22, title="第二十二集", beat_source_text="场景：月神殿·"),
+        logs.append,
+    )
+
+    assert [item.scene_id for item in scene_menu] == ["月神殿外"]
+    assert new_count == 0
+    assert store.sqlite_store.added == []
+    assert any("按定位行解析到已有基础场景: 月神殿外（月神殿·）" in line for line in logs)
+
+
+@pytest.mark.asyncio
+async def test_base_scene_reconcile_logs_why_create_decisions_did_not_land(monkeypatch):
+    """校对决策的全过程必须进任务日志——否则这种事故事后无从复盘。"""
+
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    async def fail_enrich(**_kwargs):
+        raise AssertionError("没落地的 create 不该调 enrich")
+
+    monkeypatch.setattr(
+        asset_compiler, "enrich_scene_environment_from_context", fail_enrich
+    )
+    logs: list[str] = []
+    compiler = asset_compiler.AssetCompiler(_FakeCogneeStore())
+
+    created = await compiler._apply_base_scene_reconcile_output(
+        asset_compiler.EpisodeBaseSceneReconcileOutput(
+            scenes=[
+                asset_compiler.BaseSceneReconcileDecision(
+                    action="create",
+                    scene_name="木楼檐下",
+                    evidence_lines=["这句原文里没有"],
+                ),
+                asset_compiler.BaseSceneReconcileDecision(
+                    action="create", scene_name="室内", evidence_lines=["室内一片昏暗"]
+                ),
+                asset_compiler.BaseSceneReconcileDecision(
+                    action="ignore", scene_name="背景板"
+                ),
+            ]
+        ),
+        "场景：木楼檐下·夜雨\n\n室内一片昏暗。",
+        SimpleNamespace(number=9),
+        logs.append,
+    )
+
+    assert created == []
+    assert any("校对决策 ignore: 背景板" in line for line in logs)
+    assert any("create 未落地: 室内（泛称或缺名）" in line for line in logs)
+    assert any("证据句不在本集原文里" in line for line in logs)
+

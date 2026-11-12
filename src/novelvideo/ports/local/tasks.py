@@ -34,7 +34,11 @@ from novelvideo.task_backend.limits import (
 from novelvideo.task_backend.queues import QUEUE_KINDS, normalize_queue_kind
 from novelvideo.task_backend.run_core import run_project_task_core_sync
 from novelvideo.task_backend.subprocesses import kill_task_processes
-from novelvideo.task_state import ACTIVE_PROJECT_TASK_STATUSES, get_task_manager
+from novelvideo.task_state import (
+    ACTIVE_PROJECT_TASK_STATUSES,
+    claim_inline_task_worker,
+    get_task_manager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +292,9 @@ class InlineTaskBackend:
         那条临时循环上,runner 一返回循环即被回收、job 被静默取消——任务行却永远
         停在 ``queued``。派单必须跨线程回到这里绑定的主循环。
         """
+        # 绑定本循环 = 本进程就是 inline worker:只有它才有资格按自己的启动时刻
+        # 回收「早于本进程启动」的在途行(见 task_state._INLINE_TASK_WORKER_CLAIMED)。
+        claim_inline_task_worker()
         self._owner_loop = loop
 
     def _owner_loop_or_current(self) -> asyncio.AbstractEventLoop:

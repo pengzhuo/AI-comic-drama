@@ -52,6 +52,71 @@ ASSET_STAGE = "asset"
 ASSET_SCENE_BLOCK_CONCURRENCY_ENV = "ASSET_SCENE_BLOCK_CONCURRENCY"
 ASSET_SCENE_BLOCK_CONCURRENCY_DEFAULT = 4
 
+#: 泛称——这些名字当基础场景没有意义，校对给出来也不落地。
+GENERIC_BASE_SCENE_NAMES = frozenset(
+    {"室内", "外景", "内景", "路边", "街边", "本集主场景", "主场景"}
+)
+
+#: 场次定位串尾部的分隔残留（``破庙·``、``听雪楼驻地·``、``木楼檐下·``）。
+LOCATION_TRAILING_SEPARATOR_RE = re.compile(r"[·・\-–—‒~～,，、;；:：]+$")
+
+
+def clean_block_location_name(location: str, time_of_day: str = "") -> tuple[str, str]:
+    """把场次块的定位串清成可当基础场景名的串。
+
+    ``clean_scene_name_and_time`` 会去掉时段/内外，但留着 ``破庙·`` 这种尾部分隔符；
+    按定位行补建基础场景前先去掉它，否则会建出 ``破庙·`` 这种名字。
+    """
+
+    name, tod = clean_scene_name_and_time(str(location or ""), time_of_day)
+    stripped = LOCATION_TRAILING_SEPARATOR_RE.sub("", name).strip()
+    if stripped and stripped != name:
+        name, tod = clean_scene_name_and_time(stripped, tod)
+    return name, tod
+
+
+def _short_log_label(value: Any, limit: int = 60) -> str:
+    """把模型输出压成一行短标签，任务日志里能安全落盘。"""
+
+    text = " ".join(str(value or "").split())
+    return text[:limit] if len(text) > limit else text
+
+
+def shares_scene_token(
+    label: str,
+    scene: NovelScene,
+    min_overlap_len: int = 3,
+) -> bool:
+    """``label`` 与场景名/别名是否共享一段足够长的字（防模型把地点指错）。
+
+    校对的 prompt 要求「优先复用已有基础场景，不要因为时段/天气建新场景」，模型因此
+    倾向答 reuse，偶尔会把明显不同的地点（``听雪楼叛乱现场`` → ``书斋``）并进某个已有
+    场景。同一地点同址改状态的写法（``听雪楼驻地`` / ``听雪楼叛乱现场`` 之于
+    ``听雪楼临时驻地``）至少共享 ``听雪楼`` 这种片段，据此可以把明显乱指的挡掉。
+
+    两字的短名（``书斋``）只有整串命中才算——否则 ``夜雨`` 这种天气词会把不相干的地点
+    也认成同一处。
+    """
+
+    haystack = str(label or "").lower()
+    if not haystack:
+        return False
+    raw_tokens = [str(getattr(scene, "name", "") or "")] + [
+        str(alias or "") for alias in (getattr(scene, "aliases", []) or [])
+    ]
+    for raw_token in raw_tokens:
+        token = raw_token.strip().lower()
+        if len(token) < 2:
+            continue
+        if token in haystack:
+            return True
+        if len(token) < min_overlap_len:
+            continue
+        for start in range(0, len(token) - min_overlap_len + 1):
+            if token[start : start + min_overlap_len] in haystack:
+                return True
+    return False
+
 
 class DerivedSceneRequirement(BaseModel):
     label: str = Field(description="派生场景后缀，如 '雪景'、'战后版'、'蒸汽弥漫'")
@@ -480,6 +545,10 @@ class AssetCompiler:
         # structured callers pass SQLiteStore directly.
         self.store = getattr(cognee_store, "sqlite_store", cognee_store)
         self.spine_template = "drama"
+        # 本集校对给出的「复用」映射：归一化后的原文写法 → 已有基础场景名。
+        # 见 :meth:`_apply_base_scene_reconcile_output` 与
+        # :meth:`_resolve_scene_from_reuse_hints`。
+        self._base_scene_reuse_hints: dict[str, str] = {}
 
     async def _write_menus(
         self, episode_number: int, *, only_if_empty: bool = False, **menus: Any
@@ -658,7 +727,17 @@ class AssetCompiler:
                 source_text, episode, log
             )
         if not scene_menu:
-            raise ValueError("未识别到任何场景，请先生成逐行解说工作稿或补充场次地点")
+            # 与 compile_episode_scenes 同口径的最后一道兜底：按场次定位行补建。
+            fallback_menu, fallback_scenes = await self._build_scenes_from_block_locations(
+                scene_blocks, episode, log
+            )
+            scene_menu.extend(fallback_menu)
+            pending_scenes.extend(fallback_scenes)
+        if not scene_menu:
+            raise ValueError(
+                "未识别到任何场景，请先生成逐行解说工作稿或补充场次地点"
+                + self._unresolved_location_note(scene_blocks)
+            )
 
         report(0.55, "编译道具资产...")
         prop_menu = await self._compile_props(scene_blocks, episode, log)
@@ -697,6 +776,7 @@ class AssetCompiler:
                 on_progress(progress, task)
 
         source_text = await self._load_source_text(episode)
+        scene_blocks: list[SceneBlock] = []
         if str(self.spine_template or "drama").strip() == "narrated":
             report(0.2, "从解说稿规划场景资产...")
             scene_menu, pending_scenes = await self._compile_narrated_scenes(
@@ -733,8 +813,19 @@ class AssetCompiler:
                     episode,
                     log,
                 )
+        if not scene_menu and not allow_empty_scene_menu and scene_blocks:
+            # 最后一道兜底：块里写着 `场景：X`，校对却没落地成基础场景（reuse 被丢、
+            # 证据句对不上原文、答了 ignore…）——按定位行补建，别让整集硬失败。
+            fallback_menu, fallback_scenes = await self._build_scenes_from_block_locations(
+                scene_blocks, episode, log
+            )
+            scene_menu.extend(fallback_menu)
+            pending_scenes.extend(fallback_scenes)
         if not scene_menu and not allow_empty_scene_menu:
-            raise ValueError("未识别到任何场景，请先生成逐行解说工作稿或补充场次地点")
+            raise ValueError(
+                "未识别到任何场景，请先生成逐行解说工作稿或补充场次地点"
+                + self._unresolved_location_note(scene_blocks)
+            )
 
         report(0.85, "写入本集场景规划...")
         for scene in pending_scenes:
@@ -833,6 +924,8 @@ class AssetCompiler:
         log: Callable[[str], None],
     ) -> list[str]:
         source_text = str(source_text or "").strip()
+        # 每次校对都从零收集本集的复用映射（编译器实例按集复用时的残留）。
+        self._base_scene_reuse_hints = {}
         if not source_text:
             return []
         existing_scenes = await self.store.list_scenes()
@@ -945,16 +1038,24 @@ class AssetCompiler:
         log: Callable[[str], None],
     ) -> list[str]:
         created: list[str] = []
-        generic_names = {"室内", "外景", "内景", "路边", "街边", "本集主场景", "主场景"}
         for decision in output.scenes:
+            if decision.action == "reuse":
+                await self._record_base_scene_reuse(decision, episode, log)
+                continue
             if decision.action != "create":
+                log(
+                    "  校对决策 ignore: "
+                    f"{_short_log_label(decision.scene_name) or '(无名)'}"
+                )
                 continue
             scene_name, _ = clean_scene_name_and_time(decision.scene_name)
-            if not scene_name or scene_name in generic_names:
+            if not scene_name or scene_name in GENERIC_BASE_SCENE_NAMES:
+                log(f"  校对决策 create 未落地: {decision.scene_name}（泛称或缺名）")
                 continue
             if await self._find_existing_base_scene_by_name_or_alias(
                 [scene_name, decision.matched_existing_name, *(decision.aliases or [])]
             ):
+                log(f"  校对决策 create 未落地: {scene_name}（已是已有场景或别名）")
                 continue
             evidence_lines = [
                 str(line or "").strip()
@@ -962,8 +1063,13 @@ class AssetCompiler:
                 if str(line or "").strip()
             ]
             if not evidence_lines:
+                log(f"  校对决策 create 未落地: {scene_name}（没给原文证据）")
                 continue
             if source_text and not any(line in source_text for line in evidence_lines):
+                log(
+                    f"  校对决策 create 未落地: {scene_name}"
+                    f"（证据句不在本集原文里：{_short_log_label(evidence_lines[0])}）"
+                )
                 continue
             scene = await enrich_scene_environment_from_context(
                 scene_name=scene_name,
@@ -985,6 +1091,80 @@ class AssetCompiler:
             created.append(scene.name)
             log(f"  AI补全基础场景: {scene.name}")
         return created
+
+    async def _record_base_scene_reuse(
+        self,
+        decision: BaseSceneReconcileDecision,
+        episode: Any,
+        log: Callable[[str], None],
+    ) -> None:
+        """把校对的 ``reuse`` 决策登记成本集的定位串 → 已有基础场景映射。
+
+        校对模型答 ``reuse`` 时已经判定「本集这个地点就是已有的某个基础场景」，并把
+        原文写法放进 ``aliases``。旧实现把 ``action != "create"`` 一律丢掉，于是
+        ``_compile_scenes`` 解析不到基础场景、整集 scene_menu 为空并以「未识别到任何
+        场景」硬失败（护花铃 ep10/ep14 就是这么死的）。
+
+        这里只登记**逐字相等**的映射（块的定位串与模型给的别名/场景名归一化后相同），
+        且只作用于本集：不写回项目的场景别名——写回去等于让一次模型判断永久改变项目
+        资产，而且 ``_find_matching_scene`` 的包含匹配会拿新别名去认别的集的定位串。
+        """
+
+        existing = await self._find_existing_base_scene_by_name_or_alias(
+            [decision.matched_existing_name, decision.scene_name, *(decision.aliases or [])]
+        )
+        if existing is None:
+            log(
+                "  校对决策 reuse 未落地: "
+                f"{_short_log_label(decision.scene_name) or '(无名)'}"
+                "（没有可复用的基础场景）"
+            )
+            return
+        keys = list(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in (decision.scene_name, *(decision.aliases or []))
+                if str(value or "").strip() and str(value or "").strip() != existing.name
+            )
+        )
+        if not any(shares_scene_token(key, existing) for key in keys):
+            log(
+                f"  校对决策 reuse 未落实: {existing.name} ← "
+                f"{'、'.join(_short_log_label(key) for key in keys) or '(无名)'}"
+                "（与已有场景名没有共同片段，按本集定位另行建档）"
+            )
+            return
+        for key in keys:
+            normalized = self._normalize_alias_lookup(key)
+            if normalized:
+                self._base_scene_reuse_hints[normalized] = existing.name
+        log(
+            f"  校对决策 reuse: {existing.name}"
+            f"（登记别名映射: {'、'.join(keys) or '无'}）"
+        )
+
+    async def _resolve_scene_from_reuse_hints(
+        self,
+        location: str,
+        block: SceneBlock,
+    ) -> Optional[NovelScene]:
+        """用本集 ``reuse`` 映射解析块的定位串；只认归一化后逐字相等。"""
+
+        if not self._base_scene_reuse_hints:
+            return None
+        clean_name, _ = clean_block_location_name(
+            location, str(getattr(block, "time_of_day", "") or "")
+        )
+        for candidate in (location, clean_name):
+            target = self._base_scene_reuse_hints.get(
+                self._normalize_alias_lookup(candidate)
+            )
+            if not target:
+                continue
+            scene = await self.store.get_scene(target)
+            if scene:
+                return scene
+        return None
 
     async def _find_existing_base_scene_by_name_or_alias(
         self,
@@ -1058,6 +1238,9 @@ class AssetCompiler:
             existing = pending_scene_map.get(
                 location
             ) or await self._find_matching_scene(location)
+            if existing is None:
+                # 校对答 reuse 时给的映射（逐字相等才认）优先于「跳过」。
+                existing = await self._resolve_scene_from_reuse_hints(location, block)
             resolved.append((block, existing, location))
 
         # 第二遍：块级模型工作（补齐环境描述 + 派生场景分析）互不依赖，有界并发跑完。
@@ -1149,6 +1332,93 @@ class AssetCompiler:
             log(f"  场景: {existing.name}{extra}")
 
         return scene_menu, pending_scenes
+
+    async def _build_scenes_from_block_locations(
+        self,
+        scene_blocks: list[SceneBlock],
+        episode: Any,
+        log: Callable[[str], None],
+    ) -> tuple[list[SceneMenuItem], list[NovelScene]]:
+        """最后一道兜底：按块的场次定位行补建基础场景。
+
+        精品剧的块必然带 ``场景：X``／场次头，定位串就是本集声明的物理地点。校对没给出
+        可落地的 create/reuse（模型答了 ignore、证据句对不上原文、或答了别的场景）时，
+        旧实现把唯一的块跳过、整集抛「未识别到任何场景，请先生成逐行解说工作稿或补充
+        场次地点」——对一份已经写好的分集稿是误导，还白丢一整集的剧本。宁可按定位行
+        补一个基础场景（环境描述走同一套 enrich 合同），也不让整集硬失败。
+        """
+
+        scene_menu: list[SceneMenuItem] = []
+        seen_scene_ids: set[str] = set()
+        pending_scenes: list[NovelScene] = []
+        for block in scene_blocks or []:
+            location = str(getattr(block, "location", "") or "").strip()
+            if not location:
+                continue
+            scene_name, time_of_day = clean_block_location_name(
+                location, str(getattr(block, "time_of_day", "") or "")
+            )
+            if not scene_name or scene_name in GENERIC_BASE_SCENE_NAMES:
+                continue
+            existing = await self._find_matching_scene(scene_name)
+            if existing is None and scene_name != location:
+                existing = await self._find_matching_scene(location)
+            if existing is not None:
+                self._add_to_scene_menu(existing.name, scene_menu, seen_scene_ids)
+                log(f"  按定位行解析到已有基础场景: {existing.name}（{location}）")
+                continue
+            scene = await enrich_scene_environment_from_context(
+                scene_name=scene_name,
+                scene_type=self._block_scene_type(block),
+                time_of_day=time_of_day,
+                context_lines=self._block_context_lines(block),
+            )
+            scene.notes = f"由 AssetCompiler 按本集场次定位补建 (ep{episode.number})"
+            pending_scenes.append(scene)
+            self._add_to_scene_menu(scene.name, scene_menu, seen_scene_ids)
+            log(f"  按定位行补建基础场景: {scene.name}（{location}）")
+        if scene_menu:
+            log(f"[AssetCompiler] 按场次定位兜底补建 {len(scene_menu)} 个基础场景")
+        return scene_menu, pending_scenes
+
+    @staticmethod
+    def _block_context_lines(block: SceneBlock, limit: int = 8) -> list[str]:
+        """块内原文（场次头 + 前几行正文）——交给 enrich 当环境描述的证据。"""
+
+        raw_lines = [str(getattr(block, "header_line", "") or "").strip()]
+        raw_lines.extend(
+            str(line or "").strip() for line in (getattr(block, "lines", []) or [])
+        )
+        context: list[str] = []
+        for line in raw_lines:
+            if not line:
+                continue
+            context.append(line[:200])
+            if len(context) >= limit:
+                break
+        return context
+
+    @staticmethod
+    def _block_scene_type(block: SceneBlock) -> str:
+        interior_exterior = (
+            str(getattr(block, "interior_exterior", "") or "").strip().upper()
+        )
+        if interior_exterior.startswith("外") or interior_exterior.startswith("EXT"):
+            return "exterior"
+        return "interior"
+
+    @staticmethod
+    def _unresolved_location_note(scene_blocks: list[SceneBlock]) -> str:
+        """给硬失败的错误文案补上本集声明的场次定位，便于人工判断。"""
+
+        locations = [
+            str(getattr(block, "location", "") or "").strip()
+            for block in (scene_blocks or [])
+        ]
+        unique = [location for location in dict.fromkeys(locations) if location]
+        if not unique:
+            return ""
+        return f"（本集场次定位：{'、'.join(unique[:5])}）"
 
     async def _compile_narrated_scenes(
         self,

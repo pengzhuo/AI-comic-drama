@@ -160,6 +160,24 @@ if "." not in _PROCESS_STARTED_AT:
     # 会把启动后同秒更新的活任务误判为过期,补齐小数位消除该反转。
     _PROCESS_STARTED_AT = _PROCESS_STARTED_AT.replace("Z", ".000000Z")
 
+#: 本进程是否真的持有 inline 任务后端。上面那条「早于本进程启动 = 已中断」的推断
+#: **只对 inline worker 自己成立**:它的作业句柄就在本进程内存里。CLI、脚本、诊断
+#: 工具同样会打开项目任务库,它们不是 worker,若也按自己的启动时刻清扫,就会把 API
+#: 进程里正在跑的行整批误判成「服务重启」并杀掉下游(2026-11-12 线上事故的根因)。
+#: 所以懒清扫要先由 worker 认领,非 worker 进程一个在途行都不许碰。
+_INLINE_TASK_WORKER_CLAIMED = False
+
+
+def claim_inline_task_worker() -> None:
+    """认领 inline worker 身份(API 进程 startup 绑定事件循环时调用)。"""
+
+    global _INLINE_TASK_WORKER_CLAIMED
+    _INLINE_TASK_WORKER_CLAIMED = True
+
+
+def inline_task_worker_claimed() -> bool:
+    return _INLINE_TASK_WORKER_CLAIMED
+
 
 def parse_task_timestamp(value: str | None) -> datetime | None:
     text = str(value or "").strip()
@@ -1447,13 +1465,18 @@ class TaskStateManager:
     # + 5min 余量。超过它仍未更新的在途行,worker 已被硬超时杀掉。
     CELERY_STALE_TTL = 40 * 60
 
-    def _sweep_stale_tasks_on_connection(self, conn) -> int | None:
+    def _sweep_stale_tasks_on_connection(
+        self, conn, *, include_inline: bool = True
+    ) -> int | None:
         """把不可能仍在执行的 ACTIVE 任务落为 failed(僵尸回收),两条轴:
 
         - inline:worker 随 API 进程消亡,早于本进程启动的必然已中断;
         - celery/EE:worker 独立于本进程,按 CELERY_STALE_TTL 判(见其注释)。
 
-        两条轴按 backend 标记互斥,彼此不外溢。
+        两条轴按 backend 标记互斥,彼此不外溢。``include_inline=False`` 时只收
+        celery 轴——非 inline worker 的进程(CLI/脚本)不能按自己的启动时刻判别人
+        在飞的行(见 :data:`_INLINE_TASK_WORKER_CLAIMED`);celery 轴按 TTL 判,与
+        进程身份无关,任何进程都可以收。
         时间戳按字符串比较:两侧均为 utc_now_iso 产物且保证含小数位。
         """
         now = utc_now_iso()
@@ -1465,22 +1488,25 @@ class TaskStateManager:
             # "...:56Z" 字典序大于 "...:56.4Z",会多扫掉同秒内的活任务。
             celery_stale_before = celery_stale_before.replace("Z", ".000000Z")
         try:
-            inline_result = conn.execute(
-                "UPDATE task_states SET status = 'failed', "
-                "error = COALESCE(NULLIF(error, ''), ?), "
-                "completed_at = ?, updated_at = ?, expires_at = ? "
-                "WHERE status IN ('submitting', 'queued', 'running') "
-                "AND updated_at < ? "
-                "AND json_valid(result_json) "
-                "AND json_extract(result_json, '$.task_metadata.backend') = 'inline'",
-                (
-                    "服务重启,任务已中断,请重新发起",
-                    now,
-                    now,
-                    compute_expiry(self.COMPLETED_TTL),
-                    _PROCESS_STARTED_AT,
-                ),
-            )
+            inline_count = 0
+            if include_inline:
+                inline_result = conn.execute(
+                    "UPDATE task_states SET status = 'failed', "
+                    "error = COALESCE(NULLIF(error, ''), ?), "
+                    "completed_at = ?, updated_at = ?, expires_at = ? "
+                    "WHERE status IN ('submitting', 'queued', 'running') "
+                    "AND updated_at < ? "
+                    "AND json_valid(result_json) "
+                    "AND json_extract(result_json, '$.task_metadata.backend') = 'inline'",
+                    (
+                        "服务重启,任务已中断,请重新发起",
+                        now,
+                        now,
+                        compute_expiry(self.COMPLETED_TTL),
+                        _PROCESS_STARTED_AT,
+                    ),
+                )
+                inline_count = inline_result.rowcount
             celery_result = conn.execute(
                 "UPDATE task_states SET status = 'failed', "
                 "error = COALESCE(NULLIF(error, ''), ?), "
@@ -1502,10 +1528,11 @@ class TaskStateManager:
             conn.rollback()
             logger.warning("stale task sweep skipped: %s", exc)
             return None
-        return inline_result.rowcount + celery_result.rowcount
+        return inline_count + celery_result.rowcount
 
     def _sweep_interrupted_inline_tasks_once(self, conn, db_path: Path) -> None:
         """普通连接首次打开每个 DB 时运行清扫，失败则留给下次连接重试。"""
+
         key = str(db_path.resolve())
         with self._sweep_lock:
             if key in self._swept_dbs:
@@ -1515,10 +1542,19 @@ class TaskStateManager:
             with self._sweep_lock:
                 if key in self._swept_dbs:
                     return
-            changed = self._sweep_stale_tasks_on_connection(conn)
-            if changed is not None:
-                with self._sweep_lock:
-                    self._swept_dbs.add(key)
+            include_inline = _INLINE_TASK_WORKER_CLAIMED
+            changed = self._sweep_stale_tasks_on_connection(
+                conn, include_inline=include_inline
+            )
+            if changed is None:
+                return
+            if not include_inline:
+                # 非 worker 进程（CLI/脚本/诊断）只收得到 celery 轴，不记忆化：等本
+                # 进程（或下一次 API 启动）认领 worker 身份后，第一次连库仍要把
+                # inline 僵尸收干净。不缓存 = 多跑几次 TTL 判定，代价可忽略。
+                return
+            with self._sweep_lock:
+                self._swept_dbs.add(key)
 
     def sweep_stale_tasks_for_project(self, ctx: ProjectContext) -> int | None:
         """显式、可重复地清扫项目 DB 中已失联的在途任务。"""

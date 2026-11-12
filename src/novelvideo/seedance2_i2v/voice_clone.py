@@ -592,6 +592,28 @@ def resolve_character_voice(
     return CharacterVoiceResolution(audio_path=None, sha256="", tier=None)
 
 
+def _resolve_unmatched_speaker_voice(
+    project_dir: Path, store: object | None = None
+) -> tuple[Path, str] | None:
+    """群杂兜底：未匹配到角色时，用该项目的「群杂音色」参考声线。
+
+    配置在 ``system_voice_setup``（项目配置 ``unmatched_speaker_voice`` >
+    ``SYSTEM_VOICE_UNMATCHED_VOICE`` > ``runtime/system_voice_setup.json``）；
+    懒导入是为了避免 ``system_voice_setup`` → ``voice_clone`` 的循环依赖。
+    """
+
+    from novelvideo.audio.system_voice_setup import (
+        unmatched_speaker_voice_cache_path,
+        unmatched_speaker_voice_for_store,
+    )
+
+    voice = unmatched_speaker_voice_for_store(store)
+    candidate = unmatched_speaker_voice_cache_path(project_dir, voice=voice)
+    if candidate is None:
+        return None
+    return (candidate, file_sha256(candidate))
+
+
 async def resolve_dialogue_reference_audio(beat: dict, store) -> tuple[Path, str] | None:
     """Resolve the speaker's voice path and hash via the 3-tier fallback."""
     speaker = str(beat.get("speaker") or "").strip()
@@ -601,7 +623,10 @@ async def resolve_dialogue_reference_audio(beat: dict, store) -> tuple[Path, str
     project_dir = Path(store.project_dir)
     character = select_character_for_speaker(speaker, await store.list_characters())
     if character is None:
-        return None
+        # 说话人对不上任何角色（「路人」「伙计」「众弟子」这类脚本里的临时说话人）。
+        # 默认返回 None（调用方据此硬失败并提示补角色）；项目配了「群杂音色」时，
+        # 统一用那条系统声线兜底，避免整集卡在几个龙套身上。
+        return _resolve_unmatched_speaker_voice(project_dir, store)
 
     identity = next(
         (item for item in character.identities if item.identity_id == speaker),

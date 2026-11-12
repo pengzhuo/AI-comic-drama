@@ -180,9 +180,13 @@ def test_ordinary_connections_still_auto_sweep_only_once(tmp_path: Path) -> None
             super().__init__()
             self.sweep_calls = 0
 
-        def _sweep_stale_tasks_on_connection(self, conn) -> int | None:
+        def _sweep_stale_tasks_on_connection(
+            self, conn, *, include_inline: bool = True
+        ) -> int | None:
             self.sweep_calls += 1
-            return super()._sweep_stale_tasks_on_connection(conn)
+            return super()._sweep_stale_tasks_on_connection(
+                conn, include_inline=include_inline
+            )
 
     manager = TrackingManager()
     ctx = _ctx(tmp_path)

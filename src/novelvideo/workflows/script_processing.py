@@ -1784,10 +1784,10 @@ class ScriptProcessWorkflow:
                 aliases = trimmed.get("aliases")
                 if isinstance(aliases, list) and len(aliases) > 3:
                     trimmed["aliases"] = aliases[:3]
-                for field in text_fields:
-                    value = trimmed.get(field)
+                for text_field in text_fields:
+                    value = trimmed.get(text_field)
                     if isinstance(value, str) and len(value) > 120:
-                        trimmed[field] = value[:120] + "…"
+                        trimmed[text_field] = value[:120] + "…"
                 out.append(trimmed)
             return out
 

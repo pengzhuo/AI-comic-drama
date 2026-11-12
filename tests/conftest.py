@@ -27,6 +27,22 @@ def restore_ports_registry_globals():
 
 
 @pytest.fixture(autouse=True)
+def inline_task_worker_identity(monkeypatch):
+    """让测试进程扮演 inline worker（= API 进程，startup 时绑定事件循环）。
+
+    ``task_state._sweep_interrupted_inline_tasks_once`` 只在「本进程就是 inline
+    worker」时才按自己的启动时刻回收在途行——只有它的作业句柄真的在内存里，这条
+    推断才成立。测试里造 store/读任务行的正是"worker"，所以默认认领；
+    ``test_task_state_restart_reconcile.py`` 另有用例验证非 worker 进程不许扫。
+    """
+
+    from novelvideo import task_state
+
+    monkeypatch.setattr(task_state, "_INLINE_TASK_WORKER_CLAIMED", True)
+    yield
+
+
+@pytest.fixture(autouse=True)
 async def close_sqlite_stores_created_by_test(monkeypatch):
     from novelvideo.sqlite_store import SQLiteStore
 

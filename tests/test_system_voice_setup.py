@@ -773,3 +773,299 @@ async def test_prepare_missing_system_voices_raises_when_character_voice_fails(
             episode=1,
         )
 
+
+def test_unmatched_speaker_voice_precedence(monkeypatch, tmp_path):
+    """群杂音色优先级 env > ``runtime/system_voice_setup.json`` > 空（硬失败）。"""
+
+    from novelvideo.audio import system_voice_setup
+
+    monkeypatch.delenv(system_voice_setup.UNMATCHED_SPEAKER_VOICE_ENV, raising=False)
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(tmp_path))
+    assert system_voice_setup.unmatched_speaker_voice() == ""
+
+    (tmp_path / "system_voice_setup.json").write_text(
+        '{"unmatched_speaker_voice": "zh_male_taocheng_uranus_bigtts"}',
+        encoding="utf-8",
+    )
+    assert (
+        system_voice_setup.unmatched_speaker_voice() == "zh_male_taocheng_uranus_bigtts"
+    )
+
+    monkeypatch.setenv(
+        system_voice_setup.UNMATCHED_SPEAKER_VOICE_ENV, "zh_female_vv_uranus_bigtts"
+    )
+    assert system_voice_setup.unmatched_speaker_voice() == "zh_female_vv_uranus_bigtts"
+
+
+def _crowd_store(project_dir: Path) -> "_FakeStore":
+    """林夏 + 一个对不上任何角色的临时说话人「伙计」。"""
+
+    store = _FakeStore(project_dir)
+    store.beats = [
+        {
+            "beat_number": 1,
+            "audio_type": "dialogue",
+            "speaker": "林夏",
+            "narration_segment": "“我们出发吧。”",
+        },
+        {
+            "beat_number": 2,
+            "audio_type": "dialogue",
+            "speaker": "伙计",
+            "narration_segment": "“客官里面请。”",
+        },
+    ]
+    return store
+
+
+@pytest.mark.asyncio
+async def test_unmatched_speaker_voice_unblocks_episode_and_caches(
+    monkeypatch,
+    tmp_path,
+):
+    """配了群杂音色后，对不上角色的说话人不再阻塞整集，只用一条缓存声线兜底。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.freezone import audio_node
+    from novelvideo.seedance2_i2v.voice_clone import resolve_dialogue_reference_audio
+
+    writer_calls: list[dict] = []
+
+    async def fake_write_newapi_audio_speech(**kwargs):
+        writer_calls.append(kwargs)
+        path = Path(kwargs["output_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"gateway:{kwargs['voice']}".encode())
+        return {"ok": True}
+
+    _patch_voice_setup_io(monkeypatch, system_voice_setup, [])
+    monkeypatch.setenv("SYSTEM_VOICE_TTS_MODEL", "doubao-seed-audio-1-0")
+    monkeypatch.setenv(
+        system_voice_setup.UNMATCHED_SPEAKER_VOICE_ENV,
+        "zh_male_taocheng_uranus_bigtts",
+    )
+    monkeypatch.setattr(
+        audio_node, "_write_newapi_audio_speech", fake_write_newapi_audio_speech
+    )
+
+    store = _crowd_store(tmp_path)
+    result = await system_voice_setup.prepare_missing_system_voices(
+        store=store,
+        username="alice",
+        project="demo",
+        project_dir=tmp_path,
+        episode=1,
+    )
+
+    assert result["ready"] is True
+    # 群杂不是一个角色：只准备林夏的声线，群杂不写进 prepared。
+    assert [item["target"] for item in result["prepared"]] == ["林夏"]
+    crowd_voice = "zh_male_taocheng_uranus_bigtts"
+    crowd_path = system_voice_setup._system_voice_cache_path(
+        tmp_path, crowd_voice, provider="gateway-doubao-seed-audio-1-0"
+    )
+    assert crowd_path.exists() and crowd_path.stat().st_size > 0
+    assert {call["voice"] for call in writer_calls} == {
+        result["prepared"][0]["voice"],
+        crowd_voice,
+    }
+
+    # 下游解析器（音频计划与配音生成共用）拿到的是同一条群杂声线。
+    resolved = await resolve_dialogue_reference_audio(store.beats[1], store)
+    assert resolved is not None
+    assert resolved[0] == crowd_path
+
+
+@pytest.mark.asyncio
+async def test_unmatched_speaker_blocks_when_crowd_voice_unset(monkeypatch, tmp_path):
+    """没配群杂音色时保持旧口径：对不上角色的说话人让前置硬失败，且不白打网关。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.freezone import audio_node
+
+    writer_calls: list[dict] = []
+
+    async def fake_write_newapi_audio_speech(**kwargs):
+        writer_calls.append(kwargs)
+        path = Path(kwargs["output_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"gateway")
+        return {"ok": True}
+
+    _patch_voice_setup_io(monkeypatch, system_voice_setup, [])
+    monkeypatch.setenv("SYSTEM_VOICE_TTS_MODEL", "doubao-seed-audio-1-0")
+    monkeypatch.delenv(system_voice_setup.UNMATCHED_SPEAKER_VOICE_ENV, raising=False)
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setattr(
+        audio_node, "_write_newapi_audio_speech", fake_write_newapi_audio_speech
+    )
+
+    store = _crowd_store(tmp_path)
+    store.beats = [store.beats[1]]
+
+    result = await system_voice_setup.prepare_missing_system_voices(
+        store=store,
+        username="alice",
+        project="demo",
+        project_dir=tmp_path,
+        episode=1,
+    )
+
+    assert result["ready"] is False
+    assert result["remaining_errors"] == ["未找到说话身份对应角色：伙计"]
+    assert writer_calls == []
+
+
+def test_unmatched_speaker_voice_project_override_precedence(monkeypatch, tmp_path):
+    """项目级显式值 > env > 热调参；``""`` = 该项目显式关闭兜底。"""
+
+    from novelvideo.audio import system_voice_setup
+
+    monkeypatch.setenv(
+        system_voice_setup.UNMATCHED_SPEAKER_VOICE_ENV,
+        "zh_female_vv_uranus_bigtts",
+    )
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(tmp_path))
+
+    # 没配（None）= 跟随部署级。
+    assert (
+        system_voice_setup.unmatched_speaker_voice(None)
+        == "zh_female_vv_uranus_bigtts"
+    )
+    # 项目级写了音色 = 该项目用它，压过部署级。
+    assert (
+        system_voice_setup.unmatched_speaker_voice("zh_male_taocheng_uranus_bigtts")
+        == "zh_male_taocheng_uranus_bigtts"
+    )
+    # 项目级显式空串 = 该项目关闭兜底（回到硬失败）。
+    assert system_voice_setup.unmatched_speaker_voice("") == ""
+
+
+def test_project_config_unmatched_speaker_voice_semantics():
+    """``project_config.json`` 里三种写法：缺键 / 显式关 / 显式音色。"""
+
+    from novelvideo.project_config import project_unmatched_speaker_voice
+
+    assert project_unmatched_speaker_voice({}) is None
+    assert project_unmatched_speaker_voice({"unmatched_speaker_voice": ""}) == ""
+    assert project_unmatched_speaker_voice({"unmatched_speaker_voice": False}) == ""
+    assert project_unmatched_speaker_voice({"unmatched_speaker_voice": None}) == ""
+    assert (
+        project_unmatched_speaker_voice(
+            {"unmatched_speaker_voice": "zh_male_taocheng_uranus_bigtts"}
+        )
+        == "zh_male_taocheng_uranus_bigtts"
+    )
+
+
+def _write_project_unmatched_voice(state_dir: Path, value) -> None:
+    import json
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "project_config.json").write_text(
+        json.dumps({"unmatched_speaker_voice": value}), encoding="utf-8"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_crowd_switch_only_affects_that_project(monkeypatch, tmp_path):
+    """群杂兜底的项目级开关：写了键的项目放行，没写的项目维持硬失败。"""
+
+    from novelvideo.audio import system_voice_setup
+    from novelvideo.freezone import audio_node
+    from novelvideo.seedance2_i2v.voice_clone import resolve_dialogue_reference_audio
+
+    crowd_voice = "zh_male_taocheng_uranus_bigtts"
+    writer_calls: list[dict] = []
+
+    async def fake_write_newapi_audio_speech(**kwargs):
+        writer_calls.append(kwargs)
+        path = Path(kwargs["output_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"gateway:{kwargs['voice']}".encode())
+        return {"ok": True}
+
+    _patch_voice_setup_io(monkeypatch, system_voice_setup, [])
+    monkeypatch.setenv("SYSTEM_VOICE_TTS_MODEL", "doubao-seed-audio-1-0")
+    # 部署级默认关：只有项目级写了音色的项目才会兜底。
+    monkeypatch.delenv(system_voice_setup.UNMATCHED_SPEAKER_VOICE_ENV, raising=False)
+    monkeypatch.setenv("NOVELVIDEO_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setattr(
+        audio_node, "_write_newapi_audio_speech", fake_write_newapi_audio_speech
+    )
+
+    on_dir = tmp_path / "on"
+    on_store = _crowd_store(on_dir)
+    on_store.state_dir = str(on_dir / "state")
+    _write_project_unmatched_voice(on_dir / "state", crowd_voice)
+
+    result = await system_voice_setup.prepare_missing_system_voices(
+        store=on_store,
+        username="alice",
+        project="demo",
+        project_dir=on_dir,
+        episode=1,
+    )
+
+    assert result["ready"] is True
+    assert [item["target"] for item in result["prepared"]] == ["林夏"]
+    crowd_path = system_voice_setup._system_voice_cache_path(
+        on_dir, crowd_voice, provider="gateway-doubao-seed-audio-1-0"
+    )
+    assert crowd_path.exists() and crowd_path.stat().st_size > 0
+    resolved = await resolve_dialogue_reference_audio(on_store.beats[1], on_store)
+    assert resolved is not None and resolved[0] == crowd_path
+
+    # 另一个项目没写这个键：同一份部署配置下仍然硬失败，不会白打网关。
+    off_dir = tmp_path / "off"
+    off_store = _crowd_store(off_dir)
+    off_store.state_dir = str(off_dir / "state")
+    off_store.beats = [off_store.beats[1]]
+
+    before = len(writer_calls)
+    blocked = await system_voice_setup.prepare_missing_system_voices(
+        store=off_store,
+        username="alice",
+        project="other",
+        project_dir=off_dir,
+        episode=1,
+    )
+
+    assert blocked["ready"] is False
+    assert blocked["remaining_errors"] == ["未找到说话身份对应角色：伙计"]
+    assert len(writer_calls) == before
+
+
+@pytest.mark.asyncio
+async def test_project_switch_can_disable_crowd_voice_while_deployment_default_on(
+    monkeypatch, tmp_path
+):
+    """部署级默认开着时，项目级显式关仍然有效（互不影响）。"""
+
+    from novelvideo.audio import system_voice_setup
+
+    _patch_voice_setup_io(monkeypatch, system_voice_setup, [])
+    monkeypatch.setenv("SYSTEM_VOICE_TTS_MODEL", "doubao-seed-audio-1-0")
+    monkeypatch.setenv(
+        system_voice_setup.UNMATCHED_SPEAKER_VOICE_ENV,
+        "zh_male_taocheng_uranus_bigtts",
+    )
+
+    store = _crowd_store(tmp_path)
+    store.state_dir = str(tmp_path / "state")
+    _write_project_unmatched_voice(tmp_path / "state", "")
+    # 只看「对不上角色」的那条 beat：这个用例要验的是项目级关掉兜底，
+    # 不给林夏合成声线，避免走到真实 TTS 通道。
+    store.beats = [store.beats[1]]
+
+    result = await system_voice_setup.prepare_missing_system_voices(
+        store=store,
+        username="alice",
+        project="demo",
+        project_dir=tmp_path,
+        episode=1,
+    )
+
+    assert result["ready"] is False
+    assert result["remaining_errors"] == ["未找到说话身份对应角色：伙计"]
+

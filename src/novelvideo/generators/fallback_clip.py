@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from novelvideo.config import FFMPEG_PATH
@@ -27,6 +29,72 @@ DEFAULT_WIDTH = 720
 DEFAULT_HEIGHT = 1280
 DEFAULT_FPS = 24
 DEFAULT_DURATION = 5.0
+
+#: 降级产物的旁挂标记后缀。降级短片与真成片同规格、同目录、同文件名，光看文件
+#: 分不出「上游真渲染」和「本地静帧兜底」——「文件存在即算完成」的下游会把兜底
+#: 当成完成，那个镜头再也不会重生成。标记让运维/重做流程能机械识别（同目录已有
+#: ``review_flags.json`` 的先例，不新增目录、不干扰 ``beat_*.mp4`` 的 glob）。
+DEGRADED_MARKER_SUFFIX = ".degraded.json"
+
+
+def degraded_marker_path(product: str | Path) -> Path:
+    """降级标记路径：产物旁挂 ``<product>.degraded.json``。"""
+
+    path = Path(product)
+    return path.with_name(f"{path.name}{DEGRADED_MARKER_SUFFIX}")
+
+
+def has_degraded_marker(product: str | Path) -> bool:
+    return degraded_marker_path(product).is_file()
+
+
+def write_degraded_marker(
+    product: str | Path,
+    *,
+    stage: str = "",
+    code: str = "",
+    reason: str = "",
+) -> bool:
+    """给降级产物落一个标记；失败只记日志，绝不向上抛（兜底不能反过来搞挂流程）。"""
+
+    marker = degraded_marker_path(product)
+    payload = {
+        "product": Path(product).name,
+        "stage": str(stage or ""),
+        "code": str(code or ""),
+        "reason": str(reason or ""),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:  # noqa: BLE001 - 兜底路径不抛
+        logger.warning("degraded marker not written %s: %s", marker, exc)
+        return False
+    logger.warning(
+        "shot degraded to local fallback: product=%s stage=%s code=%s reason=%s",
+        product,
+        payload["stage"],
+        payload["code"],
+        payload["reason"],
+    )
+    return True
+
+
+def clear_degraded_marker(product: str | Path) -> bool:
+    """重做该镜成功后清掉标记；不存在也算成功。"""
+
+    marker = degraded_marker_path(product)
+    try:
+        marker.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as exc:  # noqa: BLE001
+        logger.warning("degraded marker not cleared %s: %s", marker, exc)
+        return False
 
 
 def _filters(

@@ -374,6 +374,39 @@ async def test_dispatch_single_videos_only_sends_ready_beats(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_single_videos_rerenders_degraded_placeholder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """降级兜底产物（旁挂 ``.degraded.json``）不算完成：仍要派发真渲染。
+
+    兜底短片与真成片同目录同文件名，光看「文件存在」会把某一镜永久当成做完了。
+    """
+
+    from novelvideo.generators.fallback_clip import write_degraded_marker
+
+    patch_status(monkeypatch, "single_video", episode=1)
+    calls = _capture_single_video_enqueues(monkeypatch)
+    _write_video_inputs(tmp_path, (1, 2))
+    videos = tmp_path / "videos" / "beats" / "ep001"
+    videos.mkdir(parents=True)
+    # beat 1 是真成片（跳过）；beat 2 是降级短片（带标记，重渲）。
+    (videos / "beat_01.mp4").write_bytes(b"real-clip")
+    (videos / "beat_02.mp4").write_bytes(b"degraded-clip")
+    assert write_degraded_marker(videos / "beat_02.mp4", stage="single_video") is True
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+    )
+
+    assert task_type == "single_video"
+    assert signature == "dispatch:single_video:1:2"
+    assert [call["beat_num"] for call in calls] == [2]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_single_videos_is_paced_one_beat_per_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -40,6 +40,16 @@ with `SCRIPT_PROCESS_SKILL_INJECTION=condensed` or
 no condensed block (there is none for part 01), so it always falls back to the
 whole part.
 
+The pack's *result* is then fed one step back into per-line labelling: the
+`script_process` stage writes `script_process/result.json`, and
+`LiteralScriptWritingWorkflow._script_process_digest_section()` injects a
+compact digest (`script_process.build_downstream_digest()`) into the 逐行剧本
+system prompt so per-line labelling stays inside the locked character/reveal
+boundary. Switch it off with `SCRIPT_PROCESS_DIGEST=0`,
+`runtime/script_writer.json` → `{"process_digest": false}`, or per project with
+`project_config.json` → `{"script_process_digest": false}` (see
+[`stage-runtime.md`](stage-runtime.md)).
+
 ## Safety rules (do not break these)
 
 1. **Never raise, never truncate the user's text.** Every helper returns `""`

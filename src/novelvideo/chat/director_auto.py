@@ -10,7 +10,7 @@ import re
 import sqlite3
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -609,6 +609,26 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _load_stage_attempts(raw: Any) -> dict[str, int]:
+    """读 ``stage_attempts_json``：任何脏数据都退化成空表，不让 run 读不出来。"""
+
+    try:
+        loaded = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    attempts: dict[str, int] = {}
+    for key, value in loaded.items():
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            attempts[str(key)] = count
+    return attempts
+
+
 def _timestamp(value: str | None) -> float:
     try:
         return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).timestamp()
@@ -663,6 +683,11 @@ class DirectorAutoRun:
     #: keeps a retry from hammering a provider that just failed.
     stage_key: str = ""
     stage_attempts: int = 0
+    #: 每个 ``{episode}:{stage_key}`` 已花掉的重试次数。``stage_attempts`` 只描述
+    #: "当前 stage"，stage 一变就复位；两个 stage 交替失败时（派发在 A/B 之间来回）
+    #: 旧口径每次都判成"新 stage"从而回满预算，表现为无限重试、永不浮出人工。
+    #: 这张表按 (集, stage) 记账，只有**换集**或**人工介入**才清空。
+    stage_attempts_by_key: dict[str, int] = field(default_factory=dict)
     next_attempt_at: float = 0.0
     #: Shots the coordinator gave up on for this run (upstream moderation, or
     #: retries exhausted). Each entry is ``{episode, beat, stage, code, reason,
@@ -721,6 +746,7 @@ class DirectorAutoStore:
               driver TEXT NOT NULL DEFAULT 'agent',
               stage_key TEXT NOT NULL DEFAULT '',
               stage_attempts INTEGER NOT NULL DEFAULT 0,
+              stage_attempts_json TEXT NOT NULL DEFAULT '{}',
               next_attempt_at REAL NOT NULL DEFAULT 0,
               blocked_shots_json TEXT NOT NULL DEFAULT '[]',
               pause_kind TEXT NOT NULL DEFAULT '',
@@ -785,6 +811,11 @@ class DirectorAutoStore:
                 "ALTER TABLE director_auto_runs "
                 "ADD COLUMN stage_attempts INTEGER NOT NULL DEFAULT 0"
             )
+        if "stage_attempts_json" not in columns:
+            conn.execute(
+                "ALTER TABLE director_auto_runs "
+                "ADD COLUMN stage_attempts_json TEXT NOT NULL DEFAULT '{}'"
+            )
         if "next_attempt_at" not in columns:
             conn.execute(
                 "ALTER TABLE director_auto_runs "
@@ -832,6 +863,7 @@ class DirectorAutoStore:
             driver=str(row["driver"] or "agent"),
             stage_key=str(row["stage_key"] or ""),
             stage_attempts=int(row["stage_attempts"] or 0),
+            stage_attempts_by_key=_load_stage_attempts(row["stage_attempts_json"]),
             next_attempt_at=float(row["next_attempt_at"] or 0.0),
             blocked_shots=tuple(json.loads(row["blocked_shots_json"] or "[]")),
             pause_kind=str(row["pause_kind"] or ""),
@@ -847,9 +879,9 @@ class DirectorAutoStore:
                   updated_at, context_json, baseline_task_ids_json,
                   handled_task_ids_json, recovery_keys_json, voice_policy, last_error,
                   scope, target_episodes, config_json, driver,
-                  stage_key, stage_attempts, next_attempt_at, blocked_shots_json,
-                  pause_kind, recovery_attempts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  stage_key, stage_attempts, stage_attempts_json, next_attempt_at,
+                  blocked_shots_json, pause_kind, recovery_attempts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username, project_id) DO UPDATE SET
                   run_id=excluded.run_id,
                   episode=excluded.episode,
@@ -868,6 +900,7 @@ class DirectorAutoStore:
                   driver=excluded.driver,
                   stage_key=excluded.stage_key,
                   stage_attempts=excluded.stage_attempts,
+                  stage_attempts_json=excluded.stage_attempts_json,
                   next_attempt_at=excluded.next_attempt_at,
                   blocked_shots_json=excluded.blocked_shots_json,
                   pause_kind=excluded.pause_kind,
@@ -901,6 +934,7 @@ class DirectorAutoStore:
                     run.driver,
                     run.stage_key,
                     int(run.stage_attempts or 0),
+                    json.dumps(run.stage_attempts_by_key or {}),
                     float(run.next_attempt_at or 0.0),
                     json.dumps(list(run.blocked_shots)),
                     run.pause_kind or "",
@@ -1082,7 +1116,7 @@ class DirectorAutoStore:
                     baseline_task_ids_json=?, handled_task_ids_json=?,
                     recovery_keys_json=?, voice_policy=?, last_error=?,
                     scope=?, target_episodes=?, config_json=?, driver=?,
-                    stage_key=?, stage_attempts=?, next_attempt_at=?,
+                    stage_key=?, stage_attempts=?, stage_attempts_json=?, next_attempt_at=?,
                     blocked_shots_json=?, pause_kind=?, recovery_attempts=?
                 WHERE run_id=? AND status='running' AND owner_token=?
                   AND lease_expires_at>?
@@ -1104,6 +1138,7 @@ class DirectorAutoStore:
                     run.driver,
                     run.stage_key,
                     int(run.stage_attempts or 0),
+                    json.dumps(run.stage_attempts_by_key or {}),
                     float(run.next_attempt_at or 0.0),
                     json.dumps(list(run.blocked_shots)),
                     run.pause_kind or "",
@@ -1408,6 +1443,7 @@ class DirectorAutoCoordinator:
                 # spent before the pause against the next failure.
                 "stage_key": "",
                 "stage_attempts": 0,
+                "stage_attempts_by_key": {},
                 "next_attempt_at": 0.0,
             }
         )
@@ -1503,6 +1539,7 @@ class DirectorAutoCoordinator:
                 # like progress and defeat MAX_RECOVERY_ATTEMPTS.
                 "recovery_keys": self._clear_stage_signatures(run),
                 "stage_attempts": 0,
+                "stage_attempts_by_key": {},
                 "next_attempt_at": 0.0,
             }
         )
@@ -2134,6 +2171,26 @@ class DirectorAutoCoordinator:
         stage_key = str(entry["stage"])
         # 让确定性派发跳过这一镜（签名与 ``_dispatch_single_videos`` 一致）。
         skip_signature = f"dispatch:{stage_key}:{episode}:{beat_num}"
+        # 降级产物与真成片同目录、同文件名，光看文件分不出「上游真渲染」和「本地
+        # 静帧兜底」——下游「文件存在即完成」就会把这个镜头当成做完了，再也不会
+        # 重生成。落一个旁挂标记 + 一条 WARNING：运维能机械找出所有兜底产物，
+        # 工作台重做该镜时也能据此清标记。
+        if degraded:
+            from novelvideo.generators.fallback_clip import write_degraded_marker
+
+            await asyncio.to_thread(
+                write_degraded_marker,
+                video if kind == "video" else frame,
+                stage=stage_key,
+                code=str(entry["code"]),
+                reason=str(reason or ""),
+            )
+        # 阻塞一镜 = 放弃**这一镜**，不是放弃整个 stage：把它的重试预算清掉，让
+        # 其余镜头仍各用自己的次数（同时 ``stage_attempts`` 归零，保持旧口径）。
+        # 真正交还人工的判定靠预算表本身：同一 stage 连续用尽、又没降级可走时才停。
+        stage_budget = f"{int(episode)}:{stage_key}"
+        attempts = dict(run.stage_attempts_by_key or {})
+        attempts.pop(stage_budget, None)
         updated = DirectorAutoRun(
             **{
                 **asdict(run),
@@ -2145,6 +2202,7 @@ class DirectorAutoCoordinator:
                 ),
                 "stage_key": stage_key,
                 "stage_attempts": 0,
+                "stage_attempts_by_key": attempts,
                 "next_attempt_at": datetime.now(timezone.utc).timestamp(),
                 "last_error": reason,
             }
@@ -2180,29 +2238,77 @@ class DirectorAutoCoordinator:
 
         只清标记，不删产物、不重新派发：重做本身由调用方（工作台的「重做该镜」）
         显式入队单镜生成，这里只是让错误条不再继续挂着一面已重做的红牌。
+
+        同时把该镜的 dispatch 跳过签名和降级标记摘掉：签名留着会让确定性派发永远
+        绕开这一镜，标记留着会让「这是兜底产物」的判定一直生效。
         """
 
         run = await asyncio.to_thread(self.store.get, username, project_id)
         if run is None:
             return None
+        target = (int(episode), int(beat_num))
+        removed = [
+            item
+            for item in run.blocked_shots
+            if (
+                int(item.get("episode", 0) or 0),
+                int(item.get("beat", 0) or 0),
+            )
+            == target
+        ]
         remaining = tuple(
             item
             for item in run.blocked_shots
-            if (int(item.get("episode", 0) or 0), int(item.get("beat", 0) or 0))
-            != (int(episode), int(beat_num))
+            if (
+                int(item.get("episode", 0) or 0),
+                int(item.get("beat", 0) or 0),
+            )
+            != target
         )
-        if len(remaining) == len(run.blocked_shots):
+        if not removed:
             return run
+        dropped = {
+            f"dispatch:{str(item.get('stage') or '').strip()}:{target[0]}:{target[1]}"
+            for item in removed
+        }
+        from novelvideo.generators.fallback_clip import clear_degraded_marker
+
+        for item in removed:
+            for product in self._blocked_shot_products(run, item):
+                await asyncio.to_thread(clear_degraded_marker, product)
         updated = DirectorAutoRun(
             **{
                 **asdict(run),
                 "updated_at": _utc_now(),
                 "blocked_shots": remaining,
+                "recovery_keys": tuple(
+                    key for key in run.recovery_keys if key not in dropped
+                ),
             }
         )
         await asyncio.to_thread(self.store.upsert, updated)
         await self._broadcast_status(updated)
         return updated
+
+    @staticmethod
+    def _blocked_shot_products(
+        run: DirectorAutoRun, item: dict[str, Any]
+    ) -> tuple[Path, ...]:
+        """被阻塞镜头可能的降级产物路径（首帧/视频都试一遍，清标记时不怕多）。"""
+
+        try:
+            episode = int(item.get("episode", 0) or 0)
+            beat = int(item.get("beat", 0) or 0)
+            output_dir = Path(run.context.output_dir)
+        except Exception:  # noqa: BLE001 - 取不到路径就不清标记，不能拖垮重做
+            return ()
+        if episode <= 0 or beat <= 0:
+            return ()
+        ep_str = f"ep{episode:03d}"
+        return (
+            output_dir / "frames" / ep_str / f"beat_{beat:02d}.png",
+            output_dir / "videos" / "beats" / ep_str / f"beat_{beat:02d}.mp4",
+        )
 
     def _clear_stage_signatures(self, run: DirectorAutoRun) -> tuple[str, ...]:
         """Drop the dispatcher's per-stage dedupe keys so a retry can re-enqueue.
@@ -2214,9 +2320,28 @@ class DirectorAutoCoordinator:
         only the failing stage's prefix, because the task type a stage executes
         as does not always match its signature segment (sketches run as
         ``sketch_grid_generation`` but sign as ``sketch_generation``).
+
+        例外：``blocked_shots`` 里已降级/跳过的镜头的签名必须留着。清掉它，重试
+        一轮就会把刚降级的那一镜重新派发一遍（降级产物还在，白白再烧一次上游），
+        而且「已放弃」的语义会被悄悄抹掉。这些镜头只在用户重做（
+        :meth:`clear_blocked_shot`）时才重新回到派发队列。
         """
 
-        return tuple(key for key in run.recovery_keys if not key.startswith("dispatch:"))
+        keep: set[str] = set()
+        for item in run.blocked_shots:
+            try:
+                beat = int(item.get("beat", 0) or 0)
+                episode = int(item.get("episode", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            stage = str(item.get("stage") or "").strip()
+            if beat > 0 and stage:
+                keep.add(f"dispatch:{stage}:{episode}:{beat}")
+        return tuple(
+            key
+            for key in run.recovery_keys
+            if not key.startswith("dispatch:") or key in keep
+        )
 
     async def _grant_stage_retry(
         self,
@@ -2235,9 +2360,19 @@ class DirectorAutoCoordinator:
         if not _stage_retry_enabled():
             return False, 0
         key = _stage_key_for(task, run)
-        attempt = run.stage_attempts + 1 if run.stage_key == key else 1
+        # 预算按 (集, stage) 记账：stage 一变就回满的老口径会让「A 失败→B 失败→A 失败」
+        # 这类交替失败无限重试，永远浮不出人工（见 stage_attempts_by_key 的注释）。
+        budget_key = f"{int(run.episode)}:{key}"
+        attempts = dict(run.stage_attempts_by_key or {})
+        previous = int(attempts.get(budget_key, 0))
+        if run.stage_key == key:
+            # 兼容升级前的行（那时只有 ``stage_attempts`` 一列）与并发路径写下的旧
+            # 计数：同一 stage 的两次记账取大。
+            previous = max(previous, int(run.stage_attempts or 0))
+        attempt = previous + 1
         if attempt > MAX_STAGE_ATTEMPTS:
             return False, attempt
+        attempts[budget_key] = attempt
         now = datetime.now(timezone.utc).timestamp()
         granted = DirectorAutoRun(
             **{
@@ -2246,6 +2381,7 @@ class DirectorAutoCoordinator:
                 "recovery_keys": self._clear_stage_signatures(run),
                 "stage_key": key,
                 "stage_attempts": attempt,
+                "stage_attempts_by_key": attempts,
                 "next_attempt_at": now + _stage_retry_delay(attempt),
                 "last_error": f"{RETRY_REASON_PREFIX}{attempt}/{MAX_STAGE_ATTEMPTS}] {reason}",
             }
@@ -2317,6 +2453,17 @@ class DirectorAutoCoordinator:
                 required_role="editor",
             )
         except Exception as exc:  # noqa: BLE001
+            if final_delivery:
+                # 收口回合只负责展示与收尾：这时成片已经在盘上，一次身份校验失败
+                # 不该把一部做完的片降级成 ``paused/fatal``，更不该弹「当前用户已
+                # 无权继续修改该项目」这种误导终态。而且 ``_pause_owned`` 会释放
+                # 租约，调用方随后的 ``_owns_run`` 会失败并直接 return，连
+                # ``completed`` 都写不进去。跳过收口，让调用方正常收官。
+                logger.warning(
+                    "director-auto final delivery skipped: project role check failed: %s",
+                    exc,
+                )
+                return False
             await self._pause_owned(
                 run_id=run.run_id,
                 username=run.username,
@@ -3263,6 +3410,9 @@ class DirectorAutoCoordinator:
                                     **asdict(updated),
                                     "episode": next_episode,
                                     "updated_at": _utc_now(),
+                                    # 换集 = 全新预算：上一集用尽的 stage 次数
+                                    # 不该压到下一集的第一次失败上。
+                                    "stage_attempts_by_key": {},
                                 }
                             )
                             if not await self._update_owned(advanced):

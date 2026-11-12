@@ -77,6 +77,34 @@ ${NOVELVIDEO_RUNTIME_DIR:-<DATA_ROOT>/runtime}/<stage>.json
 实测（`护花铃_2` episode 1）：基线 **549s / 10 次网关调用串行**，
 其中一次单请求 **5m26s**、一次 71s——瓶颈是单次网关时延而不是派发。
 
+**群杂兜底**（同一份热调参文件）：dialogue beat 的 `speaker` 对不上任何角色时
+（「路人」「伙计」「众弟子」这类脚本里的临时说话人），默认**硬失败**并列出
+「未找到说话身份对应角色：X」让用户补角色；把 `unmatched_speaker_voice`
+（env `SYSTEM_VOICE_UNMATCHED_VOICE`）设成一条网关 preset 音色 id 后，
+这些说话人统一用那条「群杂音色」配音，不再阻塞整集。群杂音色交给同一条合成通道
+（同一并发池、同一 `assets/system_voices` 缓存、同主声线加锁），但它不是一个角色，
+不会写进 `prepared`；解析口径落在 `resolve_dialogue_reference_audio`，
+所以音频计划、配音生成、`system_voice_setup` 前置检查三处一致。
+实测（`护花铃_2` episode 1）：1123 条对白 beat 里 51 条（35 个说话身份）对不上角色。
+
+**这个开关有项目级口径**：`project_config.json` 的同名键
+`unmatched_speaker_voice` 优先于部署级（env / 热调参文件），三态语义是
+「缺键 = 跟随部署级」「显式 `""`/`false`/`null` = 该项目关掉兜底（回到硬失败）」
+「非空字符串 = 该项目的群杂音色」。因此想「只让某个项目用群杂」的做法是：
+部署级留空（缺省），只在该项目的 `project_config.json` 里写音色 id；
+反向（全局开、个别项目关）就直接在该项目里写 `""`。读取路径统一走
+`store.state_dir/project_config.json`（`unmatched_speaker_voice_for_store`），
+下游解析同样按项目口径取同一个音色 id，避免「准备阶段用项目音色、配音阶段用部署音色」
+这种半生效。
+
+另有一个**项目级开关**：`script_process_digest`（布尔）
+控制「剧本处理理解账」是否注入逐行剧本 prompt，部署级口径是
+`SCRIPT_PROCESS_DIGEST`（env）> `runtime/script_writer.json` 的 `process_digest`
+> 默认**开**。理解账来自 `script_process` 阶段的 `script_process/result.json`，
+注入时会在系统提示里追加理解账 / 人物 / 未决项，并明确「仍只标注当前这一行」。
+注入改变了逐行 prompt，因此 `SCRIPT_CHECKPOINT_VERSION` 随之上调
+（旧断点自然失效）。
+
 `first_frames` 这一层是**任务级（块级）并发**，与阶段内并发叠加：每块 9 个 beat、
 块内 `NANOBANANA_REGEN_CONCURRENCY`（默认 3）路图片请求，块数由本表这一行控制，
 所以真实在飞图片请求 ≈ `块数 × 块内并发`（默认 3 × 3 = 9）。块按 beat 号

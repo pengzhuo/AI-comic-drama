@@ -58,7 +58,7 @@ with iterative `tsc -b` rather than a blind cut.
 | `cognee/` | Legacy knowledge-graph pipeline (`store`, `pipeline`, `event_extractor`, `screenplay_normalizer`) |
 | `generators/` | Media generation (`video_composer`, `prompt_builder`, `nanobanana_grid`, image/video generators) |
 | `generators/anchor_moderation.py` | 首帧真人隐私审核的降质阶梯（`plan_anchor_variants`）——素材库不可用时的兜底 |
-| `audio/system_voice_setup.py` | 系统参考声线（旁白/角色）：网关 preset TTS；角色声线有界并发（`SYSTEM_VOICE_TTS_CONCURRENCY` / `system_voice_setup.json`，默认 4）——见 [`stage-runtime.md`](stage-runtime.md) |
+| `audio/system_voice_setup.py` | 系统参考声线（旁白/角色）：网关 preset TTS；角色声线有界并发（`SYSTEM_VOICE_TTS_CONCURRENCY` / `system_voice_setup.json`，默认 4）；对不上角色的说话人有「群杂音色」兜底（部署级 `unmatched_speaker_voice`，可用 `project_config.json` 同名键按项目覆盖）——见 [`stage-runtime.md`](stage-runtime.md) |
 | `storage/asset_library.py` | AICF 素材库：真人首帧登记成 `asset://` 引用（免输入档隐私拒绝）+ 台账 — 见 [`asset-library.md`](asset-library.md) |
 | `storage/media_relay.py` | 本地媒体 → 公网 URL（`upload_image_file` / `upload_media_bytes`） |
 | `points_client.py` | 漫剧伴点预扣（`dopoints.php`）+ `/data/dopoints.json` 配置 — 见 [`points-prepay.md`](points-prepay.md) |

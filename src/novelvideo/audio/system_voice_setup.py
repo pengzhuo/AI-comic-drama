@@ -70,6 +70,16 @@ SYSTEM_VOICE_STAGE = "system_voice_setup"
 SYSTEM_VOICE_CONCURRENCY_ENV = "SYSTEM_VOICE_TTS_CONCURRENCY"
 SYSTEM_VOICE_CONCURRENCY_DEFAULT = 4
 
+#: 群杂兜底。dialogue beat 的 ``speaker`` 对不上任何角色时（「路人」「伙计」
+#: 「众弟子」这类脚本里的临时说话人），默认硬失败、提示用户去补角色；把它设成一条
+#: 预设音色后，这些说话人统一用这条「群杂音色」配音，不再阻塞整集。
+#: 取值为网关 preset 音色 id，空字符串 = 保持旧口径（硬失败）。
+UNMATCHED_SPEAKER_VOICE_ENV = "SYSTEM_VOICE_UNMATCHED_VOICE"
+
+#: 群杂音色在合成批次里的占位目标名；它只落 ``assets/system_voices`` 缓存，
+#: 不会出现在 ``prepared`` 里（群杂不是一个角色）。
+UNMATCHED_SPEAKER_TARGET = "__unmatched_speaker__"
+
 
 def gateway_voice_model() -> str:
     """网关 TTS 模型名；为空表示系统声线只走 EdgeTTS。"""
@@ -91,6 +101,92 @@ def system_voice_concurrency() -> int:
             SYSTEM_VOICE_CONCURRENCY_DEFAULT,
         ),
     )
+
+
+def unmatched_speaker_voice(project_override: str | None = None) -> str:
+    """群杂音色 id：项目级显式值 > env > ``runtime/system_voice_setup.json`` > 空。
+
+    ``project_override`` 非 ``None`` 时它就是最终决定（``""`` = 该项目显式关闭兜底，
+    回到「对不上角色就硬失败」的旧口径）；``None`` 表示该项目没写这个键，
+    跟随部署级默认。
+    """
+
+    if project_override is not None:
+        return str(project_override).strip()
+    env = str(os.environ.get(UNMATCHED_SPEAKER_VOICE_ENV, "") or "").strip()
+    if env:
+        return env
+    from novelvideo.shared.stage_runtime import load_runtime_tuning
+
+    tuned = load_runtime_tuning(SYSTEM_VOICE_STAGE).get("unmatched_speaker_voice")
+    return str(tuned or "").strip()
+
+
+def unmatched_speaker_voice_for_store(store: object | None = None) -> str:
+    """按项目解析群杂音色：项目配置 > 部署级（env / 热调参）。
+
+    读取路径统一走 ``store.state_dir/project_config.json``（v2.0 项目配置就在
+    state 目录下）；store 没有 ``state_dir``（测试桩、旧对象）时退回部署级默认。
+    """
+
+    state_dir = str(getattr(store, "state_dir", "") or "").strip()
+    override: str | None = None
+    if state_dir:
+        from novelvideo.project_config import unmatched_speaker_voice_override_from_state_dir
+
+        try:
+            override = unmatched_speaker_voice_override_from_state_dir(state_dir)
+        except Exception:  # noqa: BLE001 - 配置读不到就按「没配」处理
+            override = None
+    return unmatched_speaker_voice(override)
+
+
+def _unmatched_speaker_voice_candidates(voice: str) -> list[tuple[str, str]]:
+    """群杂音色的合成候选；未配置群杂音色时返回空列表。"""
+
+    voice = str(voice or "").strip()
+    if not voice:
+        return []
+    if gateway_voice_model():
+        return [("gateway", voice)]
+    return [("edge", voice)]
+
+
+def unmatched_speaker_voice_cache_path(
+    project_dir: str | Path, *, voice: str | None = None
+) -> Path | None:
+    """已合成好的群杂音色文件；未配置或还没合成时返回 ``None``。
+
+    下游 :func:`resolve_dialogue_reference_audio` 用它给「对不上角色」的说话人
+    兜底，因此这里只认已经存在且非空的缓存文件，不触发任何合成。
+
+    ``voice`` 省略时按部署级口径解析；调用方已经按项目解析过就把它传进来，
+    避免同一处两套口径（项目级开关与文件解析必须一致）。
+    """
+
+    voice = str(voice if voice is not None else unmatched_speaker_voice()).strip()
+    if not voice:
+        return None
+    root = Path(project_dir)
+    candidates: list[Path] = []
+    model = gateway_voice_model()
+    if model:
+        candidates.append(
+            _system_voice_cache_path(root, voice, provider=f"gateway-{model}")
+        )
+    candidates.append(_system_voice_cache_path(root, voice, provider="edge"))
+    safe = _safe_voice_filename(voice)
+    cache_dir = root / "assets" / "system_voices"
+    candidates.extend(
+        path for path in sorted(cache_dir.glob(f"*__{safe}.mp3")) if path not in candidates
+    )
+    for path in candidates:
+        try:
+            if path.exists() and path.stat().st_size > 0:
+                return path
+        except OSError:  # pragma: no cover - 读不到按未命中处理
+            continue
+    return None
 
 
 def _env_voice(name: str, default: str) -> str:
@@ -363,6 +459,9 @@ async def prepare_missing_system_voices(
     character_targets: dict[str, object] = {}
     needs_narrator = False
     unresolved_speakers: set[str] = set()
+    needs_unmatched_voice = False
+    # 项目级开关只影响本项目：没写键就跟随部署级（env / 热调参）。
+    crowd_voice = unmatched_speaker_voice_for_store(store)
 
     for beat in beats:
         audio_type = normalize_seedance2_audio_type(beat)
@@ -374,7 +473,12 @@ async def prepare_missing_system_voices(
             speaker = str(beat.get("speaker") or "").strip()
             character = _matching_character(speaker, characters)
             if character is None:
-                unresolved_speakers.add(speaker or "未指定说话身份")
+                # 配了群杂音色就统一兜底（不再把「路人」「伙计」这类临时说话人
+                # 当成必须补角色的阻塞项）；没配就维持硬失败口径。
+                if crowd_voice:
+                    needs_unmatched_voice = True
+                else:
+                    unresolved_speakers.add(speaker or "未指定说话身份")
             else:
                 character_targets[character.name] = character
 
@@ -472,8 +576,16 @@ async def prepare_missing_system_voices(
 
     from novelvideo.utils.bounded_concurrency import map_bounded
 
+    # 群杂音色和角色声线走同一条合成通道、同一个并发池；它只占批次末尾一位，
+    # 后面按 `generation_jobs`（批次前缀）合并，所以不会写进 ``prepared``。
+    batch_jobs: list[tuple[str, list[tuple[str, str]]]] = list(generation_jobs)
+    if needs_unmatched_voice:
+        batch_jobs.append(
+            (UNMATCHED_SPEAKER_TARGET, _unmatched_speaker_voice_candidates(crowd_voice))
+        )
+
     generated = await map_bounded(
-        generation_jobs,
+        batch_jobs,
         _generate_character_voice,
         limit=system_voice_concurrency(),
         # 音频不是 LLM 调用，不占进程级 LLM 在飞闸门。
@@ -485,6 +597,7 @@ async def prepare_missing_system_voices(
         # 不静默退化成「少几个角色声线」。
         raise failures[0]
 
+    # 只落库角色（``generation_jobs`` 是批次前缀，群杂占位目标不会进来）。
     for (character_name, _candidates), outcome in zip(generation_jobs, generated):
         if outcome is None:  # pragma: no cover - 失败已在上面上抛
             raise RuntimeError(f"角色「{character_name}」系统声线合成为空结果")
