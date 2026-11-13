@@ -761,13 +761,22 @@ def _try_combine_frames_to_grid(resolver, beats, output_dir, episode) -> list[st
                     frame_paths.append(str(candidate))
                     break
 
-        if len(frame_paths) >= 4:  # 至少 4 帧才拼
-            rows = 5
-            cols = 5
-            if len(frame_paths) <= 9:
+        # 帧数不足 4 也要拼：分集可能只有 1-3 个 beat（护花铃 39 个有 beats 的集里
+        # 有 32 个 <4），旧实现「至少 4 帧才拼」会让这些集的 global_optimize_video
+        # 永远拿不到网格、卡在「找不到草图网格」重试到硬暂停。档位按帧数选，
+        # 空出来的格子留黑（combine_to_grid 本来就只贴前 rows*cols 张）。
+        if frame_paths:
+            count = len(frame_paths)
+            if count <= 1:
+                rows, cols = 1, 1
+            elif count <= 4:
+                rows, cols = 2, 2
+            elif count <= 9:
                 rows, cols = 3, 3
-            elif len(frame_paths) <= 16:
+            elif count <= 16:
                 rows, cols = 4, 4
+            else:
+                rows, cols = 5, 5
 
             grid_path = sketch_pool_dir / f"_global_opt_grid_{rows}x{cols}.png"
             sketch_pool_dir.mkdir(parents=True, exist_ok=True)

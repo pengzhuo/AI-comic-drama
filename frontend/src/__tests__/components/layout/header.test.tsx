@@ -51,6 +51,9 @@ const brandingState = vi.hoisted(() => ({
     branding: { logo_url: string; updated_at: string };
   },
 }));
+const accessState = vi.hoisted(() => ({
+  data: undefined as undefined | { enabled: boolean; kind: string; phone: string },
+}));
 
 vi.mock("@/lib/reset-region-state", () => ({
   resetUserSessionState: resetUserSessionStateMock,
@@ -81,6 +84,14 @@ vi.mock("@/lib/queries/org-branding", () => ({
     return { data: brandingState.data };
   },
 }));
+
+vi.mock("@/lib/access-session", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/access-session")>();
+  return {
+    ...actual,
+    useAccessSession: () => accessState.data,
+  };
+});
 
 vi.mock("@tanstack/react-router", () => ({
   Link: ({
@@ -233,6 +244,7 @@ describe("Header runtime gating", () => {
     brandingState.enabled = null;
     brandingState.data = undefined;
     securityState.data = undefined;
+    accessState.data = undefined;
   });
 
   it("reads branding only for an authenticated EE session and renders it in the home link", () => {
@@ -279,6 +291,31 @@ describe("Header runtime gating", () => {
 
       // Only the 设置 bolt is gone; the rest of the header actions still render.
       expect(screen.queryByRole("button", { name: "Settings" })).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Open account")).toBeInTheDocument();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("shows the access-settings and production-price entries for the internal identity", () => {
+    accessState.data = { enabled: true, kind: "internal", phone: "" };
+
+    renderHeader();
+
+    expect(screen.getByLabelText("header.accessSettings")).toBeInTheDocument();
+    expect(screen.getByLabelText("header.productionPrices")).toBeInTheDocument();
+  });
+
+  it("drops the access-settings and production-price entries when the instance flags are set", () => {
+    accessState.data = { enabled: true, kind: "internal", phone: "" };
+    vi.stubEnv("VITE_HIDE_HEADER_ACCESS_SETTINGS", "1");
+    vi.stubEnv("VITE_HIDE_HEADER_PRODUCTION_PRICES", "1");
+    try {
+      renderHeader();
+
+      // Both links are gone; the rest of the header actions still render.
+      expect(screen.queryByLabelText("header.accessSettings")).not.toBeInTheDocument();
+      expect(screen.queryByLabelText("header.productionPrices")).not.toBeInTheDocument();
       expect(screen.getByLabelText("Open account")).toBeInTheDocument();
     } finally {
       vi.unstubAllEnvs();

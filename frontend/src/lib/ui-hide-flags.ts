@@ -71,3 +71,23 @@ export function githubStarsHidden(): boolean {
 export function headerSettingsHidden(): boolean {
   return envFlag(import.meta.env.VITE_HIDE_HEADER_SETTINGS);
 }
+
+/**
+ * Hide the top-right 「访问设置」 entry in the internal app header — the page that
+ * rotates the internal console key and the customer-link secret. Instances that
+ * manage those credentials elsewhere can drop the entry. The client `/studio`
+ * shell never had this button.
+ */
+export function headerAccessSettingsHidden(): boolean {
+  return envFlag(import.meta.env.VITE_HIDE_HEADER_ACCESS_SETTINGS);
+}
+
+/**
+ * Hide the top-right 「制作单价表」 entry in the internal app header. It is an
+ * operator-only view of internal unit prices and customer multipliers; instances
+ * that keep pricing off the header can drop it. The client `/studio` shell never
+ * had this button.
+ */
+export function headerProductionPricesHidden(): boolean {
+  return envFlag(import.meta.env.VITE_HIDE_HEADER_PRODUCTION_PRICES);
+}

@@ -23,6 +23,10 @@ interface ImportMetaEnv {
   readonly VITE_HIDE_MODEL_GUIDE?: string;
   /** Set to "1" on instance builds to stop calling the GitHub API for star counts. */
   readonly VITE_HIDE_GITHUB_STARS?: string;
+  /** Set to "1" on instance builds to drop the header "访问设置" entry. */
+  readonly VITE_HIDE_HEADER_ACCESS_SETTINGS?: string;
+  /** Set to "1" on instance builds to drop the header "制作单价表" entry. */
+  readonly VITE_HIDE_HEADER_PRODUCTION_PRICES?: string;
 }
 
 interface ImportMeta {

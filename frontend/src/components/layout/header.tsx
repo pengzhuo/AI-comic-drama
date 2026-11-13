@@ -53,7 +53,7 @@ import {
   markUpgradeSeen,
   shouldShowUpgradeNudge,
 } from "@/lib/release-notification-state";
-import { headerSettingsHidden, notificationCenterHidden } from "@/lib/ui-hide-flags";
+import { headerAccessSettingsHidden, headerProductionPricesHidden, headerSettingsHidden, notificationCenterHidden } from "@/lib/ui-hide-flags";
 import { FREEZONE_DOCK_OFFSET_ANIMATED_STYLE } from "@/features/freezone/dockOffset";
 import {
   ProjectHeaderNavigation,
@@ -130,6 +130,8 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
     (shouldShowUpgradeNudge(releaseFeed) || announcementUnreadCount(announcementIds) > 0);
   const gatewayConfig = modelGatewayConfig.data?.data;
   const settingsHidden = headerSettingsHidden();
+  const accessSettingsHidden = headerAccessSettingsHidden();
+  const productionPricesHidden = headerProductionPricesHidden();
   const hasSettingsWarning = Boolean(
     !settingsHidden &&
       ceRuntime &&
@@ -352,7 +354,7 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
 
         {/* Actions */}
         <div data-header-slot="right" className="flex min-w-0 flex-1 shrink-0 items-center justify-end gap-1">
-          {access?.enabled && access.kind === "internal" ? (
+          {access?.enabled && access.kind === "internal" && !accessSettingsHidden ? (
             <TooltipProvider delay={80}>
               <Tooltip>
                 <TooltipTrigger
@@ -377,7 +379,7 @@ export function Header({ ambientBackground = false }: { ambientBackground?: bool
               </Tooltip>
             </TooltipProvider>
           ) : null}
-          {access?.enabled && access.kind === "internal" ? (
+          {access?.enabled && access.kind === "internal" && !productionPricesHidden ? (
             <TooltipProvider delay={80}>
               <Tooltip>
                 <TooltipTrigger
