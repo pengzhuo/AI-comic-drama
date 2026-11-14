@@ -27,6 +27,7 @@ from novelvideo.seedance2_i2v.models import (
 from novelvideo.seedance2_i2v.spoken_dialogue import (
     dialogue_text_key,
     ensure_dialogue_text_mention,
+    ensure_narration_voice_clause,
     required_seedance2_dialogue_texts,
 )
 from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
@@ -236,6 +237,7 @@ def collect_seedance2_video_prereq_errors(
             assets=assets,
             seedance2_config=config,
         )
+        final_prompt = ensure_narration_voice_clause(final_prompt, beat=beat)
         assets = apply_prompt_audio_selection(assets, final_prompt)
         beat_number = int(beat.get("beat_number") or index + 1)
         selected_audio_assets = _selected_audio_assets(assets)
@@ -333,6 +335,9 @@ async def prepare_seedance2_generation_inputs(
         assets=assets,
         seedance2_config=config,
     )
+    # 旁白镜的解说必须是画外音、画内人物开口必须标性别嗓音：否则上游会把解说挂到
+    # 画内人物的嘴唇上、或让没写性别的配角开口，模型于是自编音色（女角出男声）。
+    final_prompt = ensure_narration_voice_clause(final_prompt, beat=beat)
     # 声线编号补齐后，再把漏写的台词逐字补进提示词：闸门要求提示词必须含台词，
     # 上游 composer 偶尔只写镜头/资产约束，整条 beat 会被拦在发请求之前。
     final_prompt = ensure_dialogue_text_mention(final_prompt, beat=beat)

@@ -1157,3 +1157,37 @@ def test_large_first_frame_is_sent_as_is(tmp_path, monkeypatch):
 
     assert selected_reference_paths(assets, "image_url") == [str(frame)]
     assert not (project_dir / "video_input_frames").exists()
+
+
+def test_identity_prompt_fallback_carries_character_gender():
+    """身份描述必须带上性别：提示词 LLM 看不到角色表，缺了性别就会把女主写成「他」。"""
+
+    from novelvideo.seedance2_i2v.assets import _identity_prompt_fallback
+
+    identity = CharacterIdentity(
+        identity_id="乡亲主播_青年时期",
+        character_name="乡亲主播",
+        identity_name="青年时期",
+        appearance_details="短发自然蓬松无定型",
+        body_type="乡村青年身形",
+    )
+    character = NovelCharacter(
+        name="乡亲主播",
+        gender="female",
+        face_prompt="年轻乡亲，黑色头发",
+        body_type="乡村青年身形",
+    )
+    character.identities = [identity]
+
+    text = _identity_prompt_fallback("乡亲主播_青年时期", [character])
+
+    assert text.startswith("女性，")
+    assert "短发自然蓬松无定型" in text
+
+    character.gender = "male"
+    male_text = _identity_prompt_fallback("乡亲主播_青年时期", [character])
+    assert male_text.startswith("男性，")
+
+    character.gender = ""
+    unknown_text = _identity_prompt_fallback("乡亲主播_青年时期", [character])
+    assert unknown_text == "年轻乡亲，黑色头发，短发自然蓬松无定型，乡村青年身形"

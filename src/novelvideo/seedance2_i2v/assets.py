@@ -668,7 +668,30 @@ def _identity_prompt_fallback(identity_id: str, characters: list[Any]) -> str:
     if not body_type:
         body_type = _text(getattr(character, "body_type", ""))
     parts = [part for part in (face_prompt, appearance, body_type) if part]
-    return "，".join(parts) or _identity_display_label(identity_id)
+    descriptor = "，".join(parts) or _identity_display_label(identity_id)
+    return _with_gender_prefix(character, descriptor)
+
+
+def _gender_prompt_label(character: Any) -> str:
+    """角色性别的中文标签（``女性`` / ``男性`` / 空）。"""
+    raw = _text(getattr(character, "gender", "")).lower().replace(" ", "")
+    if raw in ("female", "f", "女", "女性"):
+        return "女性"
+    if raw in ("male", "m", "男", "男性"):
+        return "男性"
+    return ""
+
+
+def _with_gender_prefix(character: Any, descriptor: str) -> str:
+    """把性别写进身份描述。
+
+    提示词 LLM 只看得到这段身份描述、看不到角色表：性别缺了它就自己猜，
+    女性角色会被写成「他 / 男主播」，成片音色也跟着变成男声。
+    """
+    label = _gender_prompt_label(character)
+    if not label or label in descriptor:
+        return descriptor
+    return f"{label}，{descriptor}"
 
 
 def _speaker_matches_character(speaker: str, character: Any) -> bool:

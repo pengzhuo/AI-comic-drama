@@ -1396,3 +1396,45 @@ def test_ensure_dialogue_text_mention_keeps_non_dialogue_and_existing_lines():
 
     # 空提示词不凭空补台词，交给调用方报「提示词为空」。
     assert ensure_dialogue_text_mention("", beat=beat) == ""
+
+
+def test_ensure_narration_voice_clause_pins_offscreen_voice_and_is_idempotent():
+    """旁白镜必须写明「解说＝画外音、画内人物开口要标性别嗓音」。
+
+    现场问题（凤凰村 ep1 beat 24，成片 2:06）：旁白镜的提示词让画内男主的嘴唇
+    「随解说快速开合」，又让只写成「年轻主播」的女配角「接力开口」，模型于是
+    给画面里的女主播配了男声。``ensure_narration_voice_clause`` 在发请求前把
+    口径补上，避免上游再自配音色。
+    """
+
+    from novelvideo.seedance2_i2v.spoken_dialogue import ensure_narration_voice_clause
+
+    beat = {
+        "audio_type": "narration",
+        "speaker": "",
+        "narration": "他建产业、带就业，也帮助困难农户。",
+    }
+    original = "以@图片1作为视频第 0 帧……参考@音频1作为项目解说声线。"
+
+    repaired = ensure_narration_voice_clause(original, beat=beat)
+    assert repaired.startswith(original)
+    assert "画外音" in repaired
+    assert "女性角色用清亮的年轻女性嗓音" in repaired
+    # 幂等：再补一次不再追加。
+    assert ensure_narration_voice_clause(repaired, beat=beat) == repaired
+
+
+def test_ensure_narration_voice_clause_keeps_other_beats_untouched():
+    from novelvideo.seedance2_i2v.spoken_dialogue import ensure_narration_voice_clause
+
+    # 台词 beat 由 ensure_dialogue_text_mention / 声线口径负责，这里不动。
+    dialogue = {"audio_type": "dialogue", "speaker": "方宁_青年时期", "narration": "他说电话不接。"}
+    assert ensure_narration_voice_clause("画面描述。", beat=dialogue) == "画面描述。"
+
+    # 旁白 beat 但没有解说文本：没有可念的解说，不追加。
+    silent = {"audio_type": "narration", "speaker": "", "narration": "   "}
+    assert ensure_narration_voice_clause("画面描述。", beat=silent) == "画面描述。"
+
+    # 空提示词不凭空追加，交给调用方报「提示词为空」。
+    narration = {"audio_type": "narration", "speaker": "", "narration": "他从零创立周生堂。"}
+    assert ensure_narration_voice_clause("", beat=narration) == ""

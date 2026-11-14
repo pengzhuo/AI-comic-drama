@@ -329,3 +329,39 @@ def ensure_dialogue_text_mention(prompt: str, *, beat: dict[str, Any]) -> str:
     ]
     block = _DIALOGUE_MENTION_HEADER + "\n" + "\n".join(rendered)
     return f"{text}\n\n{block}"
+
+
+#: 旁白 beat 的声线口径分节标题（也是幂等标记）。模型只认提示词里写死的字。
+_NARRATION_VOICE_HEADER = "【旁白口径】"
+
+#: 旁白 beat 的声线口径正文：解说＝画外音，画内人物开口必须标性别嗓音。
+_NARRATION_VOICE_CLAUSE = (
+    "本镜解说为画外音，画面内人物不要与解说对口型；画面内人物若开口说话，"
+    "必须写清性别对应的嗓音（女性角色用清亮的年轻女性嗓音、男性角色用男声），"
+    "不能让女性角色发出男声。"
+)
+
+
+def ensure_narration_voice_clause(prompt: str, *, beat: dict[str, Any]) -> str:
+    """旁白 beat 的提示词必须写死「谁在出声、什么嗓音」，漏写时补一段（幂等）。
+
+    narration beat 的解说由项目声线（``@音频1``）在**画外**念出，画内人物并不替旁白
+    开口。上游 composer 有时却把解说挂到画内人物的嘴唇上（「嘴唇随解说快速开合」），
+    或者让一个没写性别的配角「接力开口」——模型于是自编音色：凤凰村 ep1 beat 24
+    的现场问题就是画面里的女主播被配了男声（成片 2:06）。
+
+    这里在发请求前把口径补上：解说＝画外音 + 参考声线，画内人物开口必须按性别写清
+    嗓音。不改写任何既有内容（已带该分节时原样返回），非旁白 beat、无解说文本的
+    beat 与空提示词一律不动（空提示词交给调用方报「提示词为空」）。
+    """
+
+    text = str(prompt or "")
+    if not text.strip():
+        return text
+    if normalize_seedance2_audio_type(beat) != "narration":
+        return text
+    if not beat_spoken_text(beat):
+        return text
+    if _NARRATION_VOICE_HEADER in text:
+        return text
+    return f"{text}\n\n{_NARRATION_VOICE_HEADER}{_NARRATION_VOICE_CLAUSE}"
