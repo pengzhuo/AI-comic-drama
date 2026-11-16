@@ -877,7 +877,7 @@ async def _prepare_happyhorse_api_beat(
             next_beat=next_beat,
             prop_menu=prop_menu,
         )
-        append_seedance2_user_reference_assets(
+        assets = append_seedance2_user_reference_assets(
             assets,
             reference_image_paths=list(config.reference_image_paths),
             reference_audio_paths=[],
@@ -958,7 +958,7 @@ async def _prepare_grok_video_api_beat(
             next_beat=next_beat,
             prop_menu=prop_menu,
         )
-        append_seedance2_user_reference_assets(
+        assets = append_seedance2_user_reference_assets(
             assets,
             reference_image_paths=list(config.reference_image_paths),
             reference_audio_paths=[],

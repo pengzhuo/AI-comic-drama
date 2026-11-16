@@ -930,37 +930,72 @@ class LiteralScriptWritingWorkflow:
         self._valid_prop_ids.clear()
         self._valid_prop_ids.update(episode_prop_ids)
 
-        # 镜头越少越好：把“一行一镜”合并成更少、更长的镜头（同音色才合并）。
-        # 仅在显式传入节奏参数时启用——生产 runner 总会传（默认全局 60s/单镜 15s），
-        # 这样直接构造 workflow 的库调用/单测维持旧的“一行一镜”行为。
+        # 短剧镜头语言：把「一行一镜」归并成 ~6s 一镜的**切点**（同音色才合并），
+        # 单镜硬上限 8s。旧口径是「合并成长镜、镜头越少越好」，会让成片像会动的
+        # PPT；新口径让镜头数由内容（台词/动作的切点）决定，靠正打/反打/特写来回切。
+        # 仅在显式传入节奏参数时启用——生产 runner 总会传，这样直接构造 workflow 的
+        # 库调用/单测维持旧的“一行一镜”行为。
         if self.pacing_settings is not None:
             from novelvideo.pacing import (
                 compact_beats_for_shots,
+                default_dialogue_chars_per_second,
                 split_long_beats_for_shots,
             )
 
             pacing = self.pacing_settings
+            # 合并/拆分统一用**保守的对白语速**：对白实测比旁白慢，且一镜多声线要逐行
+            # 合成再拼接（每行有头尾静音开销）。用旁白语速会把 beat 合得太满，实际音频
+            # 溢出模型单镜上限，成片被截断。
+            shot_rate = default_dialogue_chars_per_second()
             compacted = compact_beats_for_shots(
                 beats,
                 shot_target_seconds=pacing.shot_target_seconds,
-                max_shots=pacing.max_shots,
+                shot_max_seconds=pacing.shot_max_seconds,
+                chars_per_second=shot_rate,
             )
             if len(compacted) != len(beats):
                 log(
-                    f"[Literal] 镜头合并: {len(beats)} -> {len(compacted)} 镜 "
-                    f"(单镜上限 {pacing.shot_target_seconds:.0f}s)"
+                    f"[Literal] 镜头归并: {len(beats)} -> {len(compacted)} 镜 "
+                    f"(单镜目标 {pacing.shot_target_seconds:.0f}s/"
+                    f"上限 {pacing.shot_max_seconds:.0f}s)"
                 )
-            # 合并只把镜头变长，单条超长台词仍可能超过视频模型单镜上限（Seedance2.5=30s），
-            # 成片会被截断，需再拆一刀。
+            # 归并只把镜头变长，单条超长台词仍会超过单镜上限（成片会被截断），需再拆一刀。
             split = split_long_beats_for_shots(
-                compacted, max_seconds=pacing.shot_target_seconds
+                compacted,
+                max_seconds=pacing.shot_target_seconds,
+                chars_per_second=shot_rate,
             )
             if len(split) != len(compacted):
                 log(
                     f"[Literal] 长台词拆分: {len(compacted)} -> {len(split)} 镜 "
-                    f"(单条上限 {pacing.shot_target_seconds:.0f}s)"
+                    f"(单条目标 {pacing.shot_target_seconds:.0f}s)"
                 )
             beats = split
+            log(
+                f"[Literal] 分镜共 {len(beats)} 镜"
+                f"（{len(beats) / max(1, int(pacing.min_shots)):.1f}× 下限"
+                f" {pacing.min_shots}，上限 {pacing.max_shots}）"
+            )
+
+            # 分镜规划（镜头语言）：在**草图之前**就定好每镜的景别/机位/运镜，并随剧本
+            # 一起落库。草图是画面的构图源头（渲染色块时以草图构图为准，不允许改机位），
+            # 所以镜头语言必须在画草图之前定下来——否则规划出的「特写/反打」只会出现在
+            # 视频提示词里，与草图实际画出来的景别互相打架。
+            from novelvideo.shot_language import plan_shot_language
+
+            planned_shots = plan_shot_language(beats)
+            for beat, planned in zip(beats, planned_shots):
+                beat.shot_size = planned.shot_size
+                beat.shot_angle = planned.shot_angle
+                beat.shot_move = planned.shot_move
+            if planned_shots:
+                log(
+                    "[Literal] 分镜规划: "
+                    + "；".join(
+                        f"{index}.{item.shot_size}/{item.shot_angle}"
+                        for index, item in enumerate(planned_shots, 1)
+                    )[:400]
+                )
 
         script = NarrationScript(
             episode_number=episode_num,

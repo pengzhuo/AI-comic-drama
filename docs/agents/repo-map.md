@@ -53,7 +53,8 @@ with iterative `tsc -b` rather than a blind cut.
 | `screenplay_preprocess.py` | 剧本预处理 artifacts (`screenplay/preprocess.json`, `novel.normalized.txt`, `novel.original.txt`) |
 | `workflows/*.py` | Script-writing workflows (`script_writing`, `literal_script_writing`, `script_processing`) —— 处理剧本调参见 [`script-process-tuning.md`](script-process-tuning.md)，按集前置链（身份规划→剧本）预取与逐行断点续跑见 [`script-writer-tuning.md`](script-writer-tuning.md) |
 | `structured_ingest.py`, `structured_extraction.py`, `structured_builders.py` | Structured (`structured_v1`) ingest + extraction |
-| `pacing.py` | 剧集节奏：每集≈60s + 镜头最少（分集规则、镜头合并、`resolve_pacing_settings`）——见 [`episode-pacing.md`](episode-pacing.md) |
+| `pacing.py` | 剧集节奏：每集≈目标时长 + 单镜 3–8s（分集规则、镜头切分、`resolve_pacing_settings`）——见 [`episode-pacing.md`](episode-pacing.md) |
+| `shot_language.py` | 分镜规划：每镜「景别/机位/运镜」纯规则决策，保证相邻两镜有差（正打↔反打）——见 [`episode-pacing.md`](episode-pacing.md) |
 | `sqlite_store.py` | `build_episodes_from_chapters`（一章一集）/ `build_episodes_by_duration`（按目标时长分集，默认模式） |
 | `cognee/` | Legacy knowledge-graph pipeline (`store`, `pipeline`, `event_extractor`, `screenplay_normalizer`) |
 | `generators/` | Media generation (`video_composer`, `prompt_builder`, `nanobanana_grid`, image/video generators) |

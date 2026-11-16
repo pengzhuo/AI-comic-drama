@@ -877,6 +877,13 @@ async def enqueue_sketch_grid_tasks(
     if not beats:
         return {"ok": False, "error": f"No beats found for episode {episode_num}"}
 
+    # 分镜规划（镜头语言）必须在画草图之前定下来：草图是画面的构图源头，渲染阶段被明确
+    # 禁止改机位，所以景别/机位只能靠草图落地。全局优化阶段虽然也会规划一次，但它排在
+    # 草图**之后**；这里按整集确定性规划一遍盖到 beats 上，随任务下发给草图提示词。
+    from novelvideo.shot_language import apply_shot_language_plan
+
+    beats = apply_shot_language_plan(beats)
+
     # 提前验证 grid_index，避免异步任务内才报错
     from novelvideo.generators.nanobanana_grid import (
         get_sketch_nxn_modes,

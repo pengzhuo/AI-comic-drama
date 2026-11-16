@@ -39,6 +39,65 @@ MAX_SEEDANCE2_REFERENCE_AUDIOS = 3
 MAX_SEEDANCE2_REFERENCE_AUDIO_TOTAL_SECONDS = 15.0
 
 
+def _first_last_frame_chaining_enabled(state_dir: str | Path) -> bool:
+    """相邻 beat 首尾帧逐帧咬合是否开启（部署级 env > 项目级配置 > **默认关**）。
+
+    默认关的理由：逐帧咬合让每个镜头的首帧都等于上一镜的尾帧，也就是**不允许有切点**——
+    那正是「长镜头 PPT」的观感来源。短剧靠正打/反打/特写来回切，每镜换机位、换景别，
+    所以默认改成关；需要长镜头连贯运动的特殊镜头仍可用 env
+    ``FIRST_LAST_FRAME_CHAINING=1`` 或项目配置 ``first_last_frame_chaining`` 单独打开。
+    """
+
+    import os
+
+    raw = os.environ.get("FIRST_LAST_FRAME_CHAINING")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+    try:
+        from novelvideo.project_config import (
+            first_last_frame_chaining_override_from_state_dir,
+        )
+
+        override = first_last_frame_chaining_override_from_state_dir(state_dir)
+    except Exception:  # noqa: BLE001 - 读配置失败按默认（关）处理
+        override = None
+    return False if override is None else bool(override)
+
+
+def _rolling_first_frame_path(
+    project_output: str | Path,
+    episode: int,
+    beat_number: int,
+) -> Path | None:
+    """上一 beat 成片的尾帧，用作本 beat 的首帧（滚动咬合）。
+
+    上游禁止把 ``last_frame_image`` 和参考媒体（参考声线也算）放进同一次请求，所以不
+    能用厂商的首尾帧参数来实现「Beat N 尾帧 = Beat N+1 首帧」。这里改走滚动：把上一
+    beat 已经出片的尾帧当成下一 beat 的首帧输入，模式仍是严格首帧，于是同一镜里既逐帧
+    咬合又能带原生多声线。尾帧由 ``return_last_frame`` 落盘，扩展名来自返回 URL。
+    """
+
+    if beat_number <= 1:
+        return None
+    try:
+        from novelvideo.utils.path_resolver import PathResolver
+
+        base = PathResolver(Path(project_output), episode).returned_last_frame(
+            beat_number - 1
+        )
+        for candidate in sorted(base.parent.glob(f"{base.name}.*")):
+            if candidate.is_file() and candidate.suffix.lower() in {
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+            }:
+                return candidate
+    except Exception:  # noqa: BLE001 - 解析失败就不咬合，退回渲染首帧
+        return None
+    return None
+
+
 @dataclass(frozen=True)
 class Seedance2PreparedGeneration:
     prompt: str
@@ -224,7 +283,7 @@ def collect_seedance2_video_prereq_errors(
             prop_menu=prop_menu,
         )
         final_prompt = str(config.final_prompt or "").strip()
-        append_seedance2_user_reference_assets(
+        assets = append_seedance2_user_reference_assets(
             assets,
             reference_image_paths=list(config.reference_image_paths),
             reference_audio_paths=list(config.reference_audio_paths),
@@ -290,9 +349,28 @@ async def prepare_seedance2_generation_inputs(
 
     project_output = Path(project_output)
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
+    beat_number = int(beat.get("beat_number") or 0)
+    rolling_first_frame: Path | None = None
 
     if video_mode == "keyframe" and config.mode != Seedance2I2VMode.FIRST_LAST_FRAME:
         config.mode = Seedance2I2VMode.FIRST_LAST_FRAME
+    elif (
+        config.mode == Seedance2I2VMode.FIRST_FRAME
+        and video_mode in {"", "first_frame"}
+        and _first_last_frame_chaining_enabled(state_dir)
+    ):
+        # 全局默认：相邻 beat 首尾帧逐帧咬合（滚动咬合）。
+        #
+        # 上游明确禁止把 ``last_frame_image`` 和参考媒体（参考声线也算）放进同一次请求
+        # （``conflicting_media_inputs``），所以不能用厂商的首尾帧参数。这里改成：让每个
+        # beat 都申请厂商返回尾帧（``return_last_frame``），下一 beat 直接拿上一 beat 的
+        # 成片尾帧当首帧输入，模式仍是严格首帧——于是同一镜既逐帧接住画面，又能带原生
+        # 多声线。上一镜尾帧还没出来（首镜 / 上一镜失败 / 上一镜没开尾帧）时自然退回本
+        # 项目渲染的首帧，不会阻塞出片。
+        config.return_last_frame = True
+        rolling_first_frame = _rolling_first_frame_path(
+            project_output, episode, beat_number
+        )
 
     assets = build_seedance2_project_assets(
         project_output=project_output,
@@ -303,8 +381,9 @@ async def prepare_seedance2_generation_inputs(
         next_beat=next_beat,
         characters=characters,
         prop_menu=prop_menu,
+        first_frame_override=rolling_first_frame,
     )
-    append_seedance2_user_reference_assets(
+    assets = append_seedance2_user_reference_assets(
         assets,
         reference_image_paths=list(config.reference_image_paths),
         reference_audio_paths=list(config.reference_audio_paths),
@@ -373,6 +452,13 @@ async def prepare_seedance2_generation_inputs(
         last_frames = selected_reference_paths(assets, "last_frame_image")
         image_path = first_frames[0] if first_frames else None
         last_frame_path = last_frames[0] if last_frames else None
+        # 首尾帧链路同样要带参考声线：请求里的 ``reference_audios`` 只从 ``references``
+        # 组装（``_relay_seedance2_references``），不放进这里就会静默丢声线——上游自编
+        # 音色、跨镜音色/口型失去依据，且声线预检会把有台词的镜头判成「缺参考音频」。
+        references = _references_from_paths(
+            image_paths=[],
+            audio_paths=config.reference_audio_paths,
+        )
     else:
         references = _references_from_paths(
             image_paths=config.reference_image_paths,

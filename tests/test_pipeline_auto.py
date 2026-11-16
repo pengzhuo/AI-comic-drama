@@ -430,6 +430,64 @@ async def test_dispatch_single_videos_is_paced_one_beat_per_call(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_single_videos_waits_for_previous_beat_when_rolling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """滚动咬合：上一 beat 还在跑时本 beat 不能抢跑，否则首帧接不上。"""
+
+    patch_status(monkeypatch, "single_video", episode=1)
+    monkeypatch.setenv("FIRST_LAST_FRAME_CHAINING", "1")
+    calls = _capture_single_video_enqueues(monkeypatch)
+    _write_video_inputs(tmp_path, (1, 2))
+    monkeypatch.setattr(
+        pipeline_auto,
+        "get_task_manager",
+        lambda: SimpleNamespace(
+            list_tasks_for_project=lambda _ctx: [
+                SimpleNamespace(task_type="single_video", status="running", beat_num=1),
+            ]
+        ),
+    )
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+    )
+
+    assert task_type is None
+    assert signature is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_single_videos_advances_after_previous_clip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """滚动咬合：上一 beat 成片到位后才派发本 beat（拿它尾帧当首帧）。"""
+
+    patch_status(monkeypatch, "single_video", episode=1)
+    monkeypatch.setenv("FIRST_LAST_FRAME_CHAINING", "1")
+    calls = _capture_single_video_enqueues(monkeypatch)
+    _write_video_inputs(tmp_path, (1, 2))
+    videos = tmp_path / "videos" / "beats" / "ep001"
+    videos.mkdir(parents=True)
+    (videos / "beat_01.mp4").write_bytes(b"real-clip")
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path),
+        username="alice",
+        store=_video_store((1, 2)),
+        episode=1,
+    )
+
+    assert task_type == "single_video"
+    assert signature == "dispatch:single_video:1:2"
+    assert [call["beat_num"] for call in calls] == [2]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_single_videos_skips_beats_already_generating(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -440,6 +498,8 @@ async def test_dispatch_single_videos_skips_beats_already_generating(
     """
 
     patch_status(monkeypatch, "single_video", episode=1)
+    # 滚动咬合下同集 video 串行，本用例测的是「在飞剔除」这套正交逻辑，关掉咬合保持原场景。
+    monkeypatch.setenv("FIRST_LAST_FRAME_CHAINING", "0")
     calls = _capture_single_video_enqueues(monkeypatch)
     _write_video_inputs(tmp_path, (1, 2, 3, 4))
     monkeypatch.setattr(
@@ -1477,3 +1537,49 @@ async def test_dispatch_portrait_covers_non_main_characters_with_identities(
     assert task_type == "character_portrait"
     assert signature == "dispatch:character_portrait:Villager"
     assert calls[0]["payload"]["character_name"] == "Villager"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_audio_design_matches_task_type_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``compute_pipeline_status`` 返回的 ``next_step`` 是 **task_type**
+    （``episode_audio_design``），不是步骤键名 ``audio_design``。
+
+    现场（2026-11，第 1 集首次跑整集声音层）：派发分支只比对 ``"audio_design"``，
+    永远不命中 → 回退捏导 → 该阶段没有 REST 路由（404）→ run 空转、合成永不启动。
+    这里用真实的 ``next_step`` 值（task_type）锁住回归。
+    """
+
+    patch_status(monkeypatch, "episode_audio_design")
+    calls = capture_enqueue(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=object(), episode=1
+    )
+
+    assert task_type == "episode_audio_design"
+    assert signature == "dispatch:episode_audio_design:1"
+    assert calls[0]["task_type"] == "episode_audio_design"
+    # "tts" 不是已知队列 lane（只有 default/ffmpeg/video/world），必须走 default。
+    assert calls[0]["queue_kind"] == "default"
+    assert calls[0]["episode"] == 1
+    assert calls[0]["payload"]["episode"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_audio_design_tolerates_step_key_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """步骤键名 ``audio_design`` 也接受，避免再因命名口径不一致而漏派发。"""
+
+    patch_status(monkeypatch, "audio_design")
+    calls = capture_enqueue(monkeypatch)
+
+    task_type, signature = await pipeline_auto.dispatch_next_stage(
+        ctx=ctx(tmp_path), username="alice", store=object(), episode=1
+    )
+
+    assert task_type == "episode_audio_design"
+    assert signature == "dispatch:episode_audio_design:1"
+    assert calls[0]["queue_kind"] == "default"

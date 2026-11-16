@@ -76,6 +76,8 @@ SCRIPT_SPEAKER_PREFIX_RE = re.compile(
 SCRIPT_LEADING_NOTE_RE = re.compile(
     r"^\s*(?:（(?P<zh_note>[^）]{1,120})）|\((?P<ascii_note>[^)]{1,120})\))\s*"
 )
+#: 系统 UI / 特效标记（``【特效】：`` / ``【新增效果】：``）：是画面标注，不该念出来。
+SCRIPT_BRACKET_LABEL_RE = re.compile(r"^\s*【[^】]{1,24}】\s*[：:]\s*")
 SCRIPT_LABEL_MAX_CHARS = 12
 SCRIPT_LABEL_VERBS = ("说", "道", "问", "答", "喊", "叫", "念", "读", "写")
 #: 单字动词在名字里很常见（``苏念`` 含 ``念``）。只有达到这个长度的前缀才用动词
@@ -210,7 +212,10 @@ def dialogue_text(beat: dict) -> str:
         return " ".join(quoted_parts)
     # No quotes: drop the scripted ``角色（os）：`` label and the leading
     # ``（表演提示）`` note so the actor does not read stage directions aloud.
-    return strip_leading_script_marks(raw_text) or raw_text
+    # 一镜多声线的文本是逐行标了说话人的（``说话人：台词``），逐行清洗后再相接。
+    lines = [strip_leading_script_marks(line) for line in raw_text.splitlines()]
+    cleaned = " ".join(line.strip() for line in lines if line.strip())
+    return cleaned or raw_text
 
 
 def dialogue_emotion_prompt(beat: dict) -> str:
@@ -256,9 +261,27 @@ def same_voice_dialogue_beats(beats: list[dict], speaker: str) -> list[tuple[int
 
 
 def narration_beat_text(beat: dict) -> str:
-    return str(
+    """Text the narrator TTS must speak: the line only, never script/UI labels.
+
+    旁白行常被脚本或模型带上标注前缀（``系统VO：`` / ``秦岚VO：`` / ``秦岚OS：`` /
+    ``字幕：``）或系统 UI 标记（``【特效】：``）。这些是给后期看的标注，不是要念出来
+    的台词；直接读出来会让配音里冒出「系统VO」「特效」这种旁白不该有的字。这里复用
+    对白的清洗口径（:func:`strip_leading_script_marks`）去掉它们；万一清洗后为空，
+    退回原文，绝不吐空文本。
+    """
+
+    raw_text = str(
         beat.get("narration_segment") or beat.get("narration") or beat.get("dialogue") or ""
     ).strip()
+    if not raw_text:
+        return ""
+    cleaned = strip_leading_script_marks(raw_text)
+    while True:
+        stripped = SCRIPT_BRACKET_LABEL_RE.sub("", cleaned, count=1)
+        if stripped == cleaned:
+            break
+        cleaned = stripped.lstrip()
+    return cleaned or raw_text
 
 
 def normalize_seedance2_audio_type(beat: dict) -> str:
@@ -652,6 +675,174 @@ async def resolve_dialogue_reference_audio(beat: dict, store) -> tuple[Path, str
     return None
 
 
+def dialogue_lines(beat: dict) -> list[tuple[str, str]]:
+    """Return ``(speaker, text)`` lines for a dialogue beat.
+
+    一镜多声线：beat 文本按行标了说话人（``说话人：台词``）时返回多条；否则退回
+    单条 ``(beat["speaker"], dialogue_text(beat))``。空文本的行会被丢掉。
+    """
+
+    from novelvideo.seedance2_i2v.spoken_dialogue import parse_seedance2_spoken_lines
+
+    parsed = [
+        (str(line.speaker or "").strip(), str(line.text or "").strip())
+        for line in parse_seedance2_spoken_lines(beat)
+    ]
+    parsed = [(speaker, text) for speaker, text in parsed if text]
+    if parsed:
+        return parsed
+    speaker = str(beat.get("speaker") or "").strip()
+    text = dialogue_text(beat).strip()
+    return [(speaker, text)] if text else []
+
+
+def dialogue_voice_keys(beat: dict) -> list[str]:
+    """All distinct speakers needing a voice in a (possibly multi-voice) beat."""
+
+    speakers: list[str] = []
+    for speaker, text in dialogue_lines(beat):
+        if speaker and text and speaker not in speakers:
+            speakers.append(speaker)
+    if speakers:
+        return speakers
+    single = str(beat.get("speaker") or "").strip()
+    return [single] if single else []
+
+
+def _concat_audio_files(part_paths: list[Path], output_path: Path) -> bool:
+    """把逐行合成的小音频按顺序拼成一条 mp3（多声线）。
+
+    ``ffmpeg`` 不在 PATH 时返回 ``False``（调用方据此报错）。单段直接拷贝，省一次
+    ffmpeg 调用。段间的编码参数由同一 generator 产出，``-c copy`` 即可无缝相接。
+    """
+
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    paths = [Path(p) for p in part_paths]
+    if not paths:
+        return False
+    if len(paths) == 1:
+        try:
+            shutil.copyfile(paths[0], output_path)
+            return True
+        except OSError:
+            return False
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+
+    list_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as handle:
+            list_path = Path(handle.name)
+            for path in paths:
+                escaped = str(path.as_posix()).replace("'", "'\\''")
+                handle.write(f"file '{escaped}'\n")
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-c",
+                "copy",
+                str(output_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    finally:
+        if list_path is not None:
+            try:
+                os.unlink(list_path)
+            except OSError:
+                pass
+    return (
+        proc.returncode == 0
+        and output_path.exists()
+        and output_path.stat().st_size > 0
+    )
+
+
+async def _generate_multi_voice_dialogue_audio(
+    *,
+    beat: dict,
+    lines: list[tuple[str, str]],
+    generator,
+    store,
+    builder: AudioUrlBuilder,
+    output_path: Path,
+) -> TTSResult:
+    """逐行合成不同声线，再拼成该 beat 的单条 ``beat_NN.mp3``。"""
+
+    part_paths: list[Path] = []
+    try:
+        for index, (speaker, text) in enumerate(lines, start=1):
+            line_beat = {
+                **beat,
+                "speaker": speaker,
+                "narration_segment": text,
+            }
+            resolved = await resolve_dialogue_reference_audio(line_beat, store)
+            if resolved is None:
+                return TTSResult(
+                    success=False,
+                    error=f"角色声线缺失（speaker={speaker or '<空>'}）",
+                )
+            reference_path, _scope = resolved
+            if not reference_path.exists():
+                return TTSResult(
+                    success=False, error=f"Reference audio not found: {reference_path}"
+                )
+            part_path = output_path.with_name(
+                f"{output_path.stem}.part{index:02d}{output_path.suffix or '.mp3'}"
+            )
+            emotion = _with_film_pack_emotion(
+                "dialogue_audio", dialogue_emotion_prompt(line_beat)
+            )
+            maybe_result = generator.generate(
+                prompt=text,
+                audio_url=builder(reference_path),
+                output_path=part_path,
+                emotion_prompt=emotion,
+            )
+            item_result = (
+                await maybe_result if inspect.isawaitable(maybe_result) else maybe_result
+            )
+            if item_result is None:
+                return TTSResult(
+                    success=False, error=f"角色声线缺失（speaker={speaker or '<空>'}）"
+                )
+            if not getattr(item_result, "success", False):
+                return item_result
+            part_paths.append(part_path)
+        if not _concat_audio_files(part_paths, output_path):
+            return TTSResult(success=False, error="多声线音频拼接失败")
+        return TTSResult(success=True)
+    finally:
+        for part_path in part_paths:
+            try:
+                part_path.unlink()
+            except OSError:
+                pass
+
+
 async def generate_seedance2_dialogue_audio(
     *,
     beat: dict,
@@ -675,13 +866,6 @@ async def generate_seedance2_dialogue_audio(
     if not narration:
         return TTSResult(success=False, error="Beat dialogue text is empty")
 
-    resolved = await resolve_dialogue_reference_audio(beat, store)
-    if resolved is None:
-        return None
-    reference_path, _scope = resolved
-    if not reference_path.exists():
-        return TTSResult(success=False, error=f"Reference audio not found: {reference_path}")
-
     if generator is None:
         from novelvideo.generators.indextts2_fal import IndexTTS2FalClient
 
@@ -689,6 +873,31 @@ async def generate_seedance2_dialogue_audio(
 
     builder = audio_url_builder or build_reference_audio_url
     output_path = beat_audio_path(store.project_dir, episode, beat_num)
+
+    # 一镜多声线：beat 文本按行标了多个说话人时，逐行用各自声线合成，再按顺序
+    # 拼成该 beat 的单条 ``beat_NN.mp3``（视频侧参考音频/字幕本来就按行认人）。
+    lines = dialogue_lines(beat)
+    speakers: list[str] = []
+    for speaker, _text in lines:
+        if speaker and speaker not in speakers:
+            speakers.append(speaker)
+    if len(speakers) > 1:
+        return await _generate_multi_voice_dialogue_audio(
+            beat=beat,
+            lines=lines,
+            generator=generator,
+            store=store,
+            builder=builder,
+            output_path=output_path,
+        )
+
+    resolved = await resolve_dialogue_reference_audio(beat, store)
+    if resolved is None:
+        return None
+    reference_path, _scope = resolved
+    if not reference_path.exists():
+        return TTSResult(success=False, error=f"Reference audio not found: {reference_path}")
+
     resolved_emotion_prompt = str(emotion_prompt or "").strip() or dialogue_emotion_prompt(beat)
     resolved_emotion_prompt = _with_film_pack_emotion("dialogue_audio", resolved_emotion_prompt)
     maybe_result = generator.generate(

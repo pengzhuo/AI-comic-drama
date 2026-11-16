@@ -696,6 +696,27 @@ def build_text_overlay_prompt_fragment(
     )
 
 
+def _beat_shot_language_fragment(beat: dict[str, Any], language: AssetLanguage) -> str:
+    """把 beat 上已规划好的镜头语言渲染成提示词里的一句。
+
+    分镜规划步把景别/机位/运镜写进 beat 字段；这里把它们显式放进提示词，避免模型
+    把每一镜都退回「中景平视」。三个字段都为空（未规划）时返回空串，不打扰旧流程。
+    """
+
+    size = str(beat.get("shot_size") or "").strip()
+    angle = str(beat.get("shot_angle") or "").strip()
+    move = str(beat.get("shot_move") or "").strip()
+    if not (size or angle or move):
+        return ""
+    parts = [part for part in (size, angle) if part]
+    if move:
+        parts.append(f"{move}机位" if move != "固定" else "固定机位")
+    body = "、".join(parts)
+    if language == "en":
+        return f"Shot language: {body}"
+    return f"镜头语言：{body}"
+
+
 def build_seedance2_prompt_draft(
     *,
     mode: Seedance2I2VMode | str,
@@ -735,8 +756,11 @@ def build_seedance2_prompt_draft(
         prompt_guidance, prompt_guidance_template_keys, language
     )
     manual = normalize_seedance2_editor_prompt(manual_prompt_reference)
+    shot_language = _beat_shot_language_fragment(beat, language)
 
     lines = [_clean_sentence(reference, language)]
+    if shot_language:
+        lines.append(_clean_sentence(shot_language, language))
     if language == "en":
         if visual:
             lines.append(_clean_sentence(f"The scene shows {_sentence_text(visual)}", language))
@@ -869,6 +893,9 @@ def build_seedance2_prompt_composer_task(
             "props_description": beat.get("props_description") or "",
             "video_prompt": beat.get("video_prompt") or "",
             "keyframe_prompt": beat.get("keyframe_prompt") or "",
+            "shot_size": beat.get("shot_size") or "",
+            "shot_angle": beat.get("shot_angle") or "",
+            "shot_move": beat.get("shot_move") or "",
             "dialogue": beat.get("dialogue") or "",
             "narration_segment": beat.get("narration_segment") or "",
             "detected_identities": real_detected_identities(

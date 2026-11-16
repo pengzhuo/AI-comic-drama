@@ -84,11 +84,10 @@ describe("hard-paused runs resume automatically", () => {
 });
 
 /**
- * 身份图闸门自动放行。
+ * 图片闸门停在客户身上。
  *
- * 现场 `系统标准格式版`：run 停在 `identity_images`（3/7 身份图），没人点卡片就一直
- * 挂着——「不指定就由 AI 生成」本来没有必须人做主的决定。工作台开着时给一段宽限期，
- * 到点替客户把「跳过」答了；真正需要客户点头的角色肖像 / 报价闸门仍然停下等人。
+ * 角色形象图与每集身份图都等客户：可以上传自己的图，或点卡片上的「跳过，由 AI
+ * 生成」。两档都不再有自动放行——身份图不再有 90 秒倒计时，客户端绝不替客户答。
  */
 
 const server = setupServer();
@@ -121,7 +120,7 @@ function pausedRun(gate: string): Record<string, unknown> {
   };
 }
 
-function usePausedGate(gate: string, confirmed: unknown[], graceMs = 20) {
+function usePausedGate(gate: string, confirmed: unknown[]) {
   server.use(
     http.get("http://localhost:3000/api/v1/projects/demo/chat/director-auto", () =>
       HttpResponse.json({ ok: true, data: pausedRun(gate) }),
@@ -134,30 +133,30 @@ function usePausedGate(gate: string, confirmed: unknown[], graceMs = 20) {
       },
     ),
   );
-  return renderHook(() => useStudioRun("demo", { auto: true, identityGraceMs: graceMs }), {
+  return renderHook(() => useStudioRun("demo", { auto: true }), {
     wrapper,
   });
 }
 
-describe("identity gate auto-advances after a grace window", () => {
-  it("倒计时结束替客户点「跳过，由 AI 生成」", async () => {
+describe("image gates wait for the client", () => {
+  it("身份图闸门不自动确认，等客户上传或跳过", async () => {
     const confirmed: unknown[] = [];
     const { result } = usePausedGate("identity_images", confirmed);
 
     await waitFor(() => expect(result.current.gateKind).toBe("identity_images"));
-    // 宽限期内先把「稍后会自动跳过」摆在顶部，客户仍来得及上传自己的图。
-    expect(result.current.needsHuman ?? "").toContain("自动跳过");
+    // 不再有 90 秒倒计时，只把「可以上传或跳过」摆出来。
+    expect(result.current.needsHuman ?? "").not.toContain("自动跳过");
+    expect(result.current.needsHuman ?? "").toContain("上传自己的图");
 
-    await waitFor(() => expect(confirmed).toHaveLength(1), { timeout: 2000 });
-    expect(confirmed[0]).toEqual({ episode: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(confirmed).toHaveLength(0);
   });
 
-  it("角色肖像闸门仍交给客户，不自动确认", async () => {
+  it("角色肖像闸门同样交给客户，不自动确认", async () => {
     const confirmed: unknown[] = [];
     const { result } = usePausedGate("character_images", confirmed);
 
     await waitFor(() => expect(result.current.gateKind).toBe("character_images"));
-    // 宽限期是给身份图的；肖像闸门连「会自动跳过」都不该说。
     expect(result.current.needsHuman ?? "").not.toContain("自动跳过");
 
     await new Promise((resolve) => setTimeout(resolve, 80));

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from novelvideo.egress_context import (
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 INDEXTTS2_AUDIO_TASK_TYPE = "audio_generation_indextts2"
 SYSTEM_VOICE_SETUP_TASK_TYPE = "system_voice_setup"
+EPISODE_AUDIO_DESIGN_TASK_TYPE = "episode_audio_design"
 
 
 def run_system_voice_setup(envelope: dict[str, Any], ctx: ProjectContext) -> dict[str, Any]:
@@ -86,6 +88,156 @@ async def _run_system_voice_setup(
         return result
     finally:
         await store.close()
+
+
+def run_episode_audio_design(
+    envelope: dict[str, Any], ctx: ProjectContext
+) -> dict[str, Any]:
+    """整集「声音层」：设计并生成配乐 / 环境音 / 音效（见
+    :mod:`novelvideo.audio.episode_audio_design`）。
+
+    输入是**已经生成好的整集视频**（这一阶段跑在视频之后、合成导出之前），
+    因此时间轴用每镜视频的真实时长累计，混音时才能对上画面。
+    """
+
+    return asyncio.run(
+        await_envelope_with_cancel_watch(
+            _run_episode_audio_design(envelope, ctx),
+            envelope,
+            task_type=EPISODE_AUDIO_DESIGN_TASK_TYPE,
+        )
+    )
+
+
+def _probe_media_duration(path: Path) -> float:
+    import subprocess
+
+    if not path.exists():
+        return 0.0
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return max(0.0, float(str(result.stdout).strip() or 0.0))
+    except Exception:  # noqa: BLE001 - 探测失败按未知时长处理
+        return 0.0
+
+
+async def _run_episode_audio_design(
+    envelope: dict[str, Any],
+    ctx: ProjectContext,
+) -> dict[str, Any]:
+    from novelvideo.audio.episode_audio_design import (
+        STAGE,
+        audio_design_caps,
+        generate_episode_audio_design,
+    )
+    from novelvideo.project_config import load_project_config
+    from novelvideo.sqlite_store import SQLiteStore
+
+    payload = envelope.get("payload") or {}
+    episode = int(envelope.get("episode") or payload.get("episode") or 0)
+    manager = get_task_manager()
+    store = SQLiteStore(
+        ctx.owner_project_label,
+        output_dir=str(ctx.output_dir),
+        state_dir=str(ctx.state_dir),
+    )
+    await store.initialize()
+    try:
+        beats = await store.get_beats_as_dicts(episode)
+    finally:
+        await store.close()
+    if not beats:
+        raise RuntimeError(f"第 {episode} 集没有分镜，无法设计声音层")
+
+    project_dir = Path(str(ctx.output_dir))
+    timeline: list[tuple[dict[str, Any], float, float]] = []
+    cursor = 0.0
+    for beat in beats:
+        beat_number = int(beat.get("beat_number") or 0)
+        video_path = (
+            project_dir
+            / "videos"
+            / "beats"
+            / f"ep{episode:03d}"
+            / f"beat_{beat_number:02d}.mp4"
+        )
+        duration = _probe_media_duration(video_path)
+        if duration <= 0:
+            duration = float(beat.get("duration_seconds") or 0.0) or 4.0
+        timeline.append((beat, cursor, cursor + duration))
+        cursor += duration
+
+    style_hint = ""
+    try:
+        config = load_project_config(ctx.owner_username, ctx.project_name)
+        style_hint = str(
+            config.get("visual_style") or config.get("genre") or ""
+        ).strip()
+    except Exception:  # noqa: BLE001 - 风格提示缺失不影响设计
+        style_hint = ""
+
+    manager.update_progress_for_project(
+        ctx,
+        STAGE,
+        episode,
+        progress=0.05,
+        current_task="正在设计整集声音层",
+        logs=[f"共 {len(timeline)} 镜，预计时长 {cursor:.1f}s"],
+    )
+
+    max_ambience, max_sfx = audio_design_caps()
+
+    def _log(message: str) -> None:
+        manager.update_progress_for_project(ctx, STAGE, episode, logs=[message])
+
+    def _progress(done: int, total: int) -> None:
+        ratio = 0.05 + 0.9 * (done / total if total else 1.0)
+        manager.update_progress_for_project(
+            ctx,
+            STAGE,
+            episode,
+            progress=min(0.95, ratio),
+            current_task=f"正在生成声音层 {done}/{total}",
+        )
+
+    result = await generate_episode_audio_design(
+        project_dir=project_dir,
+        episode=episode,
+        timeline=timeline,
+        style_hint=style_hint,
+        max_ambience=max_ambience,
+        max_sfx=max_sfx,
+        egress_context=_extract_trusted_egress_context(envelope),
+        log=_log,
+        progress=_progress,
+    )
+    manager.update_progress_for_project(
+        ctx,
+        STAGE,
+        episode,
+        progress=1.0,
+        current_task="声音层设计完成",
+        logs=[
+            f"声音层 cue {int(result.get('cue_count') or 0)} 条"
+            f"（新生成 {int(result.get('generated') or 0)}，复用 "
+            f"{int(result.get('reused') or 0)}）"
+        ],
+    )
+    return result
 
 
 def _continue_voice_paused_director_auto(ctx: ProjectContext) -> None:
@@ -229,3 +381,4 @@ async def _run_indextts2_audio(
 
 register_project_task_runner(INDEXTTS2_AUDIO_TASK_TYPE, run_indextts2_audio)
 register_project_task_runner(SYSTEM_VOICE_SETUP_TASK_TYPE, run_system_voice_setup)
+register_project_task_runner(EPISODE_AUDIO_DESIGN_TASK_TYPE, run_episode_audio_design)

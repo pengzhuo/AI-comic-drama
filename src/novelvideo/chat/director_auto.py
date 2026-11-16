@@ -82,6 +82,7 @@ AUTO_TASK_TYPES = frozenset({
     "audio_generation_indextts2",
     "single_video",
     "compose_episode",
+    "episode_audio_design",
 })
 ACTIVE_STATUSES = frozenset({"submitting", "queued", "pending", "running"})
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -107,11 +108,9 @@ LEASE_RENEW_ATTEMPTS = 4
 MAX_LEASE_CLAIM_ATTEMPTS = 60
 #: 巡检间隔：发现「``status=running`` 但没有 worker 持有租约」就重新拉起。
 REAPER_SECONDS = 30.0
-#: 「身份图指定」闸门的服务端兜底宽限：这一档的语义是「不指定就由 AI 生成」，
-#: 本来就没有必须人做主的决定。工作台开着时前端到点自己确认；浏览器不在时由
-#: 巡检兜底，暂停超过这个时长就替客户把答案写下并继续，绝不把项目永久挂在
-#: 「等一次人工点击」上（现场 ``系统标准格式版`` 就这么挂了 24 小时）。
-IDENTITY_GATE_GRACE_SECONDS = 600.0
+# 注：「身份图指定」闸门（``[identity_images]``）**不做**任何自动放行——客户要按自己
+# 的节奏上传形象图，暂停后一直等人工上传或点「跳过，由 AI 生成」。前端工作台不再有
+# 90 秒倒计时，服务端巡检也不再代为确认，两档都要等客户拍板。
 #: 硬暂停（非闸门）的服务端兜底宽限：工作台是「自动驾驶但方向盘在浏览器里」，
 #: 浏览器一关，任何 ``paused`` 就永久停。巡检在这个宽限后替它续跑一次；只碰
 #: :data:`PAUSE_KIND_RETRYABLE` 的暂停（闸门/阻塞/配置缺失/致命一律不碰）。
@@ -988,23 +987,6 @@ class DirectorAutoStore:
             ).fetchall()
         return [run for row in rows if (run := self._row(row)) is not None]
 
-    def paused_identity_gate_before(self, cutoff: str) -> list[DirectorAutoRun]:
-        """暂停在「身份图指定」闸门、且已经等超过 ``cutoff`` 的 run。
-
-        停下来的 run 不再被 worker 推进，所以 ``updated_at`` 就是它写进暂停原因
-        的那一刻；此后没人碰过就一直是它，正好当「停在这个闸门上多久了」的计时钟。
-        ``last_error`` 里带 ``[identity_images]`` 是闸门的稳定标记（见
-        :data:`IDENTITY_IMAGES_GATE_TAG`），与前端识别闸门用的是同一份约定。
-        """
-
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM director_auto_runs "
-                "WHERE status='paused' AND last_error LIKE ? AND updated_at<=?",
-                (f"{IDENTITY_IMAGES_GATE_TAG}%", str(cutoff)),
-            ).fetchall()
-        return [run for row in rows if (run := self._row(row)) is not None]
-
     def paused_kind_before(self, kind: str, cutoff: str) -> list[DirectorAutoRun]:
         """暂停在指定 ``pause_kind``、且已超过 ``cutoff`` 的 run。
 
@@ -1253,6 +1235,7 @@ def _task_label(task: TaskState) -> str:
         "single_video": "视频生成",
         "seedance2_prompt": "2.0 提示词",
         "compose_episode": "成片合成",
+        "episode_audio_design": "配乐/环境音",
     }
     return labels.get(task.task_type, task.task_type)
 
@@ -1726,10 +1709,6 @@ class DirectorAutoCoordinator:
             except Exception:  # noqa: BLE001 - 巡检自己绝不能死
                 logger.exception("director auto progress pass failed")
             try:
-                await self._auto_answer_stale_identity_gates()
-            except Exception:  # noqa: BLE001 - 巡检自己绝不能死
-                logger.exception("director auto identity gate pass failed")
-            try:
                 await self._auto_resume_stale_hard_pauses()
             except Exception:  # noqa: BLE001 - 巡检自己绝不能死
                 logger.exception("director auto recovery pass failed")
@@ -1852,53 +1831,6 @@ class DirectorAutoCoordinator:
         return any(
             task.status in ACTIVE_STATUSES for task in _relevant_tasks(run, tasks)
         )
-
-    async def _auto_answer_stale_identity_gates(self) -> None:
-        """身份图闸门的服务端兜底：没人看着的时候也不会永久卡住。
-
-        这一档的语义就是「不指定就由 AI 生成」，没有必须人做主的决定；工作台开着
-        时前端会给一段宽限期再自动确认，这里负责「浏览器不在」的情况。真正需要
-        客户点头的 ``character_images``（首次角色肖像）与 ``cost_estimate``（付费
-        报价）不在这里放行。
-        """
-
-        from novelvideo.project_config import confirm_identity_images
-
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=IDENTITY_GATE_GRACE_SECONDS)
-        ).isoformat()
-        stale = await asyncio.to_thread(self.store.paused_identity_gate_before, cutoff)
-        for run in stale:
-            episode = int(run.episode or 0)
-            if episode <= 0:
-                # 认不出集号就 fail-closed：闸门本来就没有可写的答案。
-                continue
-            try:
-                await asyncio.to_thread(
-                    confirm_identity_images,
-                    run.username,
-                    run.context.project_name,
-                    episode,
-                )
-                await self.resume_paused(
-                    username=run.username, project_id=run.project_id
-                )
-            except ValueError:
-                # 已被前端或别的路径确认并恢复：好事，不该记成错误。
-                continue
-            except Exception:  # noqa: BLE001 - 兜底失败不能拖垮巡检
-                logger.exception(
-                    "director auto identity gate auto-confirm failed: project_id=%s",
-                    run.project_id,
-                )
-                continue
-            logger.info(
-                "director auto auto-confirmed stale identity gate "
-                "project_id=%s run_id=%s episode=%s",
-                run.project_id,
-                run.run_id,
-                episode,
-            )
 
     async def _reap_stalled_runs(self) -> None:
         """把「worker 悄悄没了」的 run 重新拉起来。

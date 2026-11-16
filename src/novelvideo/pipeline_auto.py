@@ -237,6 +237,12 @@ async def dispatch_next_stage(
         return await _dispatch_seedance2_prompt(ctx, store, current_episode, project_dir, attempted)
     if next_step == "single_video":
         return await _dispatch_single_videos(ctx, store, current_episode, project_dir, attempted)
+    # ``compute_pipeline_status`` 吐出的 ``next_step`` 是 **task_type**
+    # （``STEP_MAP["audio_design"]`` 的右值就是 ``episode_audio_design``），
+    # 不是步骤键名 ``audio_design``；只比对键名会导致该阶段永远不命中、
+    # 回退捏导后无路由可用而空转。两个名字都接受，避免再次踩坑。
+    if next_step in ("audio_design", "episode_audio_design"):
+        return await _dispatch_audio_design(ctx, store, current_episode, attempted)
     if next_step == "compose_episode":
         return await _dispatch_compose(ctx, store, current_episode, attempted)
     return None, None
@@ -1189,6 +1195,7 @@ async def _dispatch_single_videos(
 
     from novelvideo.api.schemas import SingleVideoRequest
     from novelvideo.api.routes.generation import enqueue_single_video_task
+    from novelvideo.seedance2_i2v.pipeline import _first_last_frame_chaining_enabled
     from novelvideo.utils.path_resolver import PathResolver
 
     beats = await store.get_beats_as_dicts(episode)
@@ -1196,6 +1203,18 @@ async def _dispatch_single_videos(
         return None, None
     beats_by_number = {int(beat.get("beat_number") or 0): beat for beat in beats}
     paths = PathResolver(str(project_dir), episode)
+    # 滚动咬合：本 beat 的首帧来自上一 beat 成片的尾帧，所以上一 beat 必须先出片。
+    # 只在咬合开启时串行化，避免默认口径下单集出片被无谓地压成一条流水线。
+    rolling = _first_last_frame_chaining_enabled(getattr(ctx, "state_dir", "") or "")
+    ordered_numbers = sorted(
+        number
+        for number in (int(beat.get("beat_number") or 0) for beat in beats)
+        if number > 0
+    )
+    predecessor = {
+        number: (ordered_numbers[index - 1] if index > 0 else 0)
+        for index, number in enumerate(ordered_numbers)
+    }
     in_flight = await _in_flight_beat_numbers(ctx, "single_video")
     ready = sorted(
         beat_num
@@ -1204,6 +1223,14 @@ async def _dispatch_single_videos(
         and beat_num not in in_flight
         and paths.first_frame_for_video(beat_num).exists()
         and not _single_video_has_trusted_clip(paths.video(beat_num))
+        and (
+            not rolling
+            or predecessor.get(beat_num, 0) == 0
+            or _single_video_has_trusted_clip(paths.video(predecessor[beat_num]))
+            # 上一 beat 还在跑就等它出尾帧；但它要是已经停下（失败/被拒/没首帧）就不
+            # 要连坐，否则一条坏 beat 会把后面整条流水线永久卡死。
+            or predecessor[beat_num] not in in_flight
+        )
     )
     if not ready:
         return None, None
@@ -1300,6 +1327,32 @@ def _single_video_dispatch_error(result: Any) -> str:
     if isinstance(result, dict):
         return str(result.get("error") or result.get("detail") or "")
     return ""
+
+
+async def _dispatch_audio_design(
+    ctx: Any,
+    store: Any,
+    episode: int,
+    attempted: set[str],
+) -> tuple[str | None, str | None]:
+    """「声音层」：为即将合成的这一集生成配乐/环境音/音效。
+
+    排在视频之后、合成之前；runner 自己按每镜视频真实时长累计时间轴，所以这里
+    只需要一个 episode 号。
+    """
+
+    return await _enqueue_once(
+        ctx,
+        attempted,
+        task_type="episode_audio_design",
+        queue_kind="default",
+        episode=episode,
+        signature=f"dispatch:episode_audio_design:{episode}",
+        payload={
+            "episode": episode,
+            "output_dir": str(ctx.output_dir),
+        },
+    )
 
 
 async def _dispatch_compose(

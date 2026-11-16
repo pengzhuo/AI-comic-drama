@@ -30,6 +30,7 @@ from novelvideo.seedance2_i2v.voice_clone import (
     NARRATOR_SPEAKER,
     beat_audio_path,
     dialogue_text,
+    dialogue_voice_keys,
     file_sha256,
     generate_seedance2_dialogue_audio,
     generate_seedance2_narration_audio,
@@ -379,10 +380,23 @@ async def build_indextts2_audio_generation_plan(
                 plan.billable_chars += count_billable_text_chars(text)
             continue
 
-        resolved_voice = await _resolve_dialogue_voice(beat, store)
-        if resolved_voice is None:
-            speaker = str(beat.get("speaker") or "").strip() or "未指定说话身份"
-            plan.errors.append(f"Beat {beat_num:02d} 角色声线缺失：{speaker}")
+        # 一镜多声线：逐条声线都要能解析到参考音频，否则整条 beat 发不出请求。
+        speakers = dialogue_voice_keys(beat) or [""]
+        missing: list[str] = []
+        resolved_voice: tuple[Path, str] | None = None
+        for line_speaker in speakers:
+            line_beat = {**beat, "speaker": line_speaker}
+            resolved = await _resolve_dialogue_voice(line_beat, store)
+            if resolved is None:
+                missing.append(line_speaker or "未指定说话身份")
+                continue
+            if resolved_voice is None:
+                resolved_voice = resolved
+        if missing or resolved_voice is None:
+            plan.errors.append(
+                f"Beat {beat_num:02d} 角色声线缺失："
+                f"{'、'.join(missing) or '未指定说话身份'}"
+            )
             continue
         speaker = str(beat.get("speaker") or "").strip()
         _voice_path, voice_sha256 = resolved_voice

@@ -123,6 +123,36 @@ def test_build_seedance2_multimodal_request_validates_prompt_reference_numbers()
         )
 
 
+def test_build_seedance2_first_last_frame_keeps_reference_audios():
+    """首尾帧链路要同时带参考声线（一镜多声线的默认形态）。
+
+    参考图/视频才与首尾帧互斥；声线不互斥。若这条分支丢掉 ``reference_audios``，
+    模型会自编音色，且提示词里的 ``@音频1`` 会被判成越界引用直接发不出请求。
+    """
+
+    from novelvideo.seedance2_i2v.models import Seedance2I2VMode
+    from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
+
+    params = build_seedance2_huimeng_params(
+        {
+            "mode": Seedance2I2VMode.FIRST_LAST_FRAME.value,
+            "final_prompt": "参考@音频1与@音频2的声线，逐字念出：甲：一。乙：二。",
+            "human_review": False,
+            "human_review_user_set": True,
+        },
+        first_frame="https://example.com/first.png",
+        last_frame="https://example.com/last.png",
+        reference_audios=["https://example.com/a.mp3", "https://example.com/b.mp3"],
+    )
+
+    assert params["first_frame_image"] == "https://example.com/first.png"
+    assert params["last_frame_image"] == "https://example.com/last.png"
+    assert params["reference_audios"] == [
+        "https://example.com/a.mp3",
+        "https://example.com/b.mp3",
+    ]
+
+
 def test_build_seedance2_strict_first_frame_rewrites_stale_image_refs():
     from novelvideo.seedance2_i2v.models import Seedance2I2VMode
     from novelvideo.seedance2_i2v.request import build_seedance2_huimeng_params
@@ -750,6 +780,88 @@ async def test_newapi_seedance2_generator_preserves_config_resolution_and_scene_
     assert metadata["ratio"] == "16:9"
     assert "image_url" not in metadata
     assert "seconds" not in payload
+
+
+async def test_newapi_seedance2_generator_maps_unsupported_ratio_to_adaptive(
+    tmp_path, monkeypatch
+):
+    """项目默认 2:3 不是厂商输出预设，要收敛成标准竖屏 9:16。
+
+    线上实测：``ratio`` 发 ``2:3`` 或社区契约的 ``auto`` 都会被方舟以
+    ``invalid_request`` 打回；模型只认 21:9/16:9/4:3/1:1/3:4/9:16/adaptive。
+    """
+
+    import json
+    from pathlib import Path
+
+    from novelvideo.generators import video_generator as video_module
+    from novelvideo.generators.video_generator import (
+        NewApiVideoGenerator,
+        VideoGenStatus,
+    )
+
+    captured: dict[str, object] = {}
+    generator = NewApiVideoGenerator(
+        api_key="test-key",
+        endpoint="https://newapi.example",
+        model="seedance-2.5",
+        resolution="720p",
+        generate_audio=True,
+    )
+
+    async def fake_reserve(*_args, **_kwargs):
+        return "reservation-1"
+
+    async def fake_confirm(*_args, **_kwargs):
+        return None
+
+    async def fake_refund(*_args, **_kwargs):
+        return None
+
+    async def fake_post_json(_url: str, payload: dict):
+        captured["payload"] = payload
+        return {"id": "task-1", "_newapi_request_id": "req-1"}
+
+    async def fake_get_json(_url: str):
+        return {"status": "completed", "url": "https://example.com/out.mp4"}
+
+    async def fake_download_video(_url: str, output_path: str):
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+        return b"video"
+
+    monkeypatch.setattr(video_module, "_reserve_video_model_call", fake_reserve)
+    monkeypatch.setattr(video_module, "_confirm_video_model_call", fake_confirm)
+    monkeypatch.setattr(video_module, "_refund_video_model_call", fake_refund)
+    monkeypatch.setattr(generator, "_post_json", fake_post_json)
+    monkeypatch.setattr(generator, "_get_json", fake_get_json)
+    monkeypatch.setattr(generator, "_download_video", fake_download_video)
+
+    result = await generator.generate(
+        image_path="https://example.com/first.png",
+        prompt="两人并肩面对镜头对话。",
+        output_path=str(tmp_path / "out.mp4"),
+        duration=6,
+        aspect_ratio="2:3",
+        poll_interval=0,
+        max_polls=1,
+        seedance2_config=json.dumps(
+            {
+                "generate_audio": True,
+                "generate_audio_user_set": True,
+                "human_review": False,
+                "human_review_user_set": True,
+            }
+        ),
+    )
+
+    assert result.status == VideoGenStatus.DONE
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    metadata = payload["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["ratio"] == "9:16"
 
 
 async def test_newapi_video_generator_handles_wrapped_failure_status(

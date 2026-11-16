@@ -333,6 +333,48 @@ class VideoGeneratorBase(ABC):
         # 默认实现，子类可覆盖
         raise NotImplementedError("Subclass should implement generate()")
 
+    @staticmethod
+    def _extract_local_last_frame(video_path: str) -> str:
+        """厂商未返回尾帧时，本地用 ffmpeg 抽成片最后一帧（滚动咬合需要）。
+
+        seedance 网关只回视频、不回尾帧，而相邻 beat 首尾咬合要拿上一 beat 的成片
+        尾帧当下一 beat 的首帧，所以这里补一个 ``returned_last_frames/<stem>.png``，
+        路径与厂商返回尾帧一致。抽帧失败返回空串，调用方退回渲染首帧。
+        """
+
+        try:
+            source = Path(video_path)
+            if not source.is_file() or source.stat().st_size <= 0:
+                return ""
+            output = source.parent / "returned_last_frames" / f"{source.stem}.png"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            for extra in (["-sseof", "-0.05"], []):
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            *extra,
+                            "-i",
+                            str(source),
+                            "-frames:v",
+                            "1",
+                            "-q:v",
+                            "2",
+                            str(output),
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:  # noqa: BLE001 - 换一种抽帧参数再试
+                    continue
+                if output.is_file() and output.stat().st_size > 0:
+                    return output.as_posix()
+        except Exception:  # noqa: BLE001 - 抽帧失败按无尾帧处理
+            return ""
+        return ""
+
 
 class MockVideoGenerator(VideoGeneratorBase):
     """模拟视频生成器（测试用）。
@@ -2052,6 +2094,11 @@ class HuimengVideoGenerator(VideoGeneratorBase):
                     )
                     last_frame_path = last_frame_output_path.as_posix()
                     log("已保存 HuiMeng 返回尾帧")
+                else:
+                    # 网关只回视频、不回尾帧：本地抽最后一帧，保证滚动咬合可用。
+                    last_frame_path = self._extract_local_last_frame(output_path)
+                    if last_frame_path:
+                        log("已本地抽取成片尾帧（厂商未返回）")
             progress(1.0)
             update_request_status(task_id, "completed")
             return VideoGenResult(
@@ -2919,6 +2966,51 @@ class NewApiVideoGenerator(VideoGeneratorBase):
         ):
             return payload
         metadata["ratio"] = "adaptive"
+        return payload
+
+    #: Seedance 视频真正认的比例枚举。``2:3``（项目默认竖屏）和社区契约的 ``auto``
+    #: 都不在其中：发给方舟会被打回光杆 ``invalid_request``（实测）。
+    _SEEDANCE_WIRE_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+
+    def _normalize_seedance2_ratio(self, value: str | None) -> str:
+        """收敛 seedance 出片比例（在按比例算尺寸之前调用）。
+
+        项目默认 ``2:3`` 不在厂商比例枚举里，统一改用标准竖屏 ``9:16``；``adaptive``
+        （跟随输入，视频编辑 / 续写用）与受支持的固定比例原样保留，交给下游算尺寸。
+        """
+
+        ratio = str(value or "").strip()
+        lowered = ratio.lower()
+        if lowered in {"adaptive", "auto"}:
+            return ratio
+        if lowered in {item.lower() for item in self._SEEDANCE_WIRE_RATIOS}:
+            return ratio
+        return "9:16"
+
+    def _normalize_seedance2_wire_ratio(self, payload: dict) -> dict:
+        """最终线上请求兜底：把残留的非枚举比例折到 ``9:16``。
+
+        正常路径在算尺寸前已由 ``_normalize_seedance2_ratio`` 收敛；这里只处理
+        ``auto``（没有参考视频、没被折成 ``adaptive`` 时的漏网值）等，并把与固定
+        比例冲突的 ``width`` / ``height`` 一并处理干净。
+        """
+
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return payload
+        ratio = str(metadata.get("ratio") or "").strip()
+        lowered = ratio.lower()
+        if lowered == "adaptive" or lowered in {
+            item.lower() for item in self._SEEDANCE_WIRE_RATIOS
+        }:
+            return payload
+        dims = self._video_dimensions(metadata.get("resolution"), "9:16")
+        metadata["ratio"] = "9:16"
+        if dims:
+            payload["width"], payload["height"] = dims
+        else:
+            payload.pop("width", None)
+            payload.pop("height", None)
         return payload
 
     @staticmethod
@@ -3939,7 +4031,9 @@ class NewApiVideoGenerator(VideoGeneratorBase):
             config_resolution = str(
                 seedance2_config.get("resolution") or self.resolution or "720p"
             ).strip()
-            config_ratio = str(seedance2_config.get("ratio") or ratio or "9:16").strip()
+            config_ratio = self._normalize_seedance2_ratio(
+                seedance2_config.get("ratio") or ratio or "9:16"
+            )
             seedance2_config.update(
                 {
                     "mode": mode.value,
@@ -4076,7 +4170,10 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                     body, media_type="video"
                 )
                 body = enforce_newapi_video_duration_contract(body)
-                return self._apply_seedance_source_video_ratio(body)
+                body = self._apply_seedance_source_video_ratio(body)
+                if is_seedance2_model:
+                    body = self._normalize_seedance2_wire_ratio(body)
+                return body
 
             wire_candidates = [_wire_payload(payload, metadata)]
             wire_labels = ["首帧原图"]
@@ -4458,6 +4555,11 @@ class NewApiVideoGenerator(VideoGeneratorBase):
                             )
                             last_frame_path = last_frame_output_path.as_posix()
                             log("已保存 DramaClawAPI 返回尾帧")
+                        else:
+                            # 网关只回视频、不回尾帧：本地抽最后一帧，保证滚动咬合可用。
+                            last_frame_path = self._extract_local_last_frame(output_path)
+                            if last_frame_path:
+                                log("已本地抽取成片尾帧（厂商未返回）")
                     progress(1.0)
                     update_request_status(task_id, "completed")
                     if organization_request:

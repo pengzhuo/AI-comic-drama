@@ -27,6 +27,11 @@ from novelvideo.task_backend.registry import register_project_task_runner
 from novelvideo.task_backend.subprocesses import run_project_subprocess
 from novelvideo.task_identity import project_task_state_key
 from novelvideo.task_state import get_task_manager
+from novelvideo.verification.final_cut_qc import (
+    FinalCutReport,
+    inspect_final_cut,
+    write_qc_sidecar,
+)
 from novelvideo.verification.subtitle_font import (
     SubtitleFont,
     SubtitleFontError,
@@ -695,20 +700,60 @@ def _video_has_audio_stream(
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
+#: 成片统一规格：720p 竖屏 / 24fps。逐 clip 归一化与最终拼接都用同一套，避免
+#: 上游模型出片帧率参差（24/25/30 混切）在成片里表现为节拍抖动。
+_COMPOSE_VIDEO_FPS = 24
+
+#: 逐 clip 归一化编码。上游单镜已经过一次有损编码，这里再压一遍要尽量少掉质量，
+#: 所以 CRF 比旧值（23）压低到 18，并把音频升到 192k。
 _COMPOSE_CLIP_ENCODER_ARGS = [
     "-c:v",
     "libx264",
     "-preset",
     "fast",
     "-crf",
-    "23",
+    "18",
+    "-r",
+    str(_COMPOSE_VIDEO_FPS),
     "-c:a",
     "aac",
     "-b:a",
-    "128k",
+    "192k",
+    "-ar",
+    "44100",
+    "-ac",
+    "2",
     "-pix_fmt",
     "yuv420p",
 ]
+
+#: 整集输出编码参数。
+_COMPOSE_FINAL_VIDEO_PRESET = "medium"
+_COMPOSE_FINAL_VIDEO_CRF = "18"
+_COMPOSE_FINAL_AUDIO_BITRATE = "192k"
+_COMPOSE_AUDIO_SAMPLE_RATE = 44100
+
+#: 成片响度归一，对齐短视频平台投放口径：I=-14 LUFS 是主流平台的目标响度，
+#: TP=-1.5 dBTP 给转码留余量，LRA=11 保留对白的动态起伏。单遍（动态）loudnorm
+#: 足够；末尾再挂一道 alimiter 做真峰值硬保护。**限幅必须在最后一次重采样之后**
+#: ——loudnorm 内部跑 192kHz，先限幅再降采样会把峰值重新顶起来（实测能顶到
+#: 0dBTP 以上），所以顺序是 loudnorm → aresample → alimiter。
+_COMPOSE_LOUDNESS_I = -14.0
+_COMPOSE_LOUDNESS_TP = -1.5
+_COMPOSE_LOUDNESS_LRA = 11.0
+_COMPOSE_LIMITER_LIMIT = 0.708  # ≈ -3.0 dBFS，给编码器/重采样的过冲留余量
+_COMPOSE_LIMITER_ATTACK = 5.0
+
+#: 成片质检是否硬失败：默认只报警（先把度量尺跑起来），设 1 才阻断。
+_COMPOSE_QC_STRICT_ENV = "COMPOSE_QC_STRICT"
+
+#: 侧链闪避：人声一开口就把配乐/环境音压下去，说完再抬回来。参数对齐语音类
+#: 内容的常见口径（阈值取 -24dBFS 附近的人声起点，快 attack 慢 release 以免
+#: 抖动）。
+_COMPOSE_DUCK_THRESHOLD = 0.06
+_COMPOSE_DUCK_RATIO = 8.0
+_COMPOSE_DUCK_ATTACK = 15.0
+_COMPOSE_DUCK_RELEASE = 350.0
 
 
 def _beat_prefers_embedded_audio(beat: dict[str, Any]) -> bool:
@@ -1034,6 +1079,156 @@ def _resolve_compose_subtitle_font(
     return font
 
 
+def _compose_qc_strict(envelope: dict[str, Any]) -> bool:
+    """成片质检是否硬失败：payload ``strict_qc`` > env ``COMPOSE_QC_STRICT``。"""
+
+    import os
+
+    payload = envelope.get("payload") or {}
+    if "strict_qc" in payload:
+        return bool(payload.get("strict_qc"))
+    raw = str(os.environ.get(_COMPOSE_QC_STRICT_ENV, "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _run_compose_quality_check(
+    output_path: Path,
+    *,
+    envelope: dict[str, Any],
+    manager,
+    ctx: ProjectContext,
+    episode: int,
+) -> FinalCutReport | None:
+    """成片级质检：量规格/响度/黑屏/冻帧，写 sidecar，按需硬失败。
+
+    质检本身是「度量尺」，量不到（缺 ffprobe/ffmpeg）或量测异常都只记日志，
+    绝不因为质检失败而丢掉已经编好的成片；只有显式开了严格模式才阻断。
+    """
+
+    try:
+        report = inspect_final_cut(output_path)
+    except Exception as exc:  # noqa: BLE001 - 质检异常不得影响成片交付
+        manager.update_progress_for_project(
+            ctx,
+            "compose_episode",
+            episode,
+            logs=[f"成片质检未能完成: {exc}"],
+        )
+        return None
+
+    sidecar = write_qc_sidecar(report, output_path)
+    logs = report.summary_lines()
+    if sidecar is not None:
+        logs.append(f"成片质检结果: {sidecar.name}")
+    manager.update_progress_for_project(
+        ctx,
+        "compose_episode",
+        episode,
+        logs=logs,
+    )
+    if _compose_qc_strict(envelope) and report.issues:
+        raise RuntimeError("成片质检未通过: " + "；".join(report.issues))
+    return report
+
+
+def _compose_audio_inputs_and_filters(
+    *,
+    output_dir: str,
+    episode: int,
+    payload: dict[str, Any],
+    next_input_index: int,
+) -> tuple[list[str], list[str]]:
+    """把整集「声音层」（配乐/环境音/音效）编进合成的音轨总线。
+
+    返回 ``(要追加的 -i 输入, 追加的 filter_complex 片段)``；片段末尾一定产出
+    ``[aout]``（响度母带之后的成片音轨）。没有可用 cue 时退化成「人声 → 响度
+    母带」的旧行为。
+
+    链路：``[outa]`` 旁分成 人声/侧链键 → 配乐+环境音先 amix → 人声做侧链把这条
+    bed 压下去 → 与人声、音效 amix → loudnorm + alimiter。
+    """
+
+    from novelvideo.audio.episode_audio_design import (
+        iter_mixable_cues,
+        load_audio_design_plan,
+    )
+
+    sample_rate = _COMPOSE_AUDIO_SAMPLE_RATE
+    loudnorm = (
+        f"loudnorm=I={_COMPOSE_LOUDNESS_I}:TP={_COMPOSE_LOUDNESS_TP}:"
+        f"LRA={_COMPOSE_LOUDNESS_LRA},"
+        f"aresample={sample_rate},"
+        f"alimiter=limit={_COMPOSE_LIMITER_LIMIT}:"
+        f"attack={_COMPOSE_LIMITER_ATTACK}:level=false"
+    )
+
+    plan = payload.get("audio_design")
+    if not isinstance(plan, list):
+        plan = load_audio_design_plan(output_dir, episode)
+    cues = iter_mixable_cues(plan or [], output_dir)
+    beds = [item for item in cues if item[0].kind in {"bgm", "ambience"}]
+    sfx = [item for item in cues if item[0].kind == "sfx"]
+    if not beds and not sfx:
+        return [], [f"[outa]{loudnorm}[aout]"]
+
+    inputs: list[str] = []
+    filters: list[str] = []
+    bed_labels: list[str] = []
+    sfx_labels: list[str] = []
+    index = next_input_index
+    for cue, path in beds + sfx:
+        inputs.append(path)
+        label = f"cue{index}"
+        start_ms = max(0, int(round(cue.start_seconds * 1000)))
+        filters.append(
+            f"[{index}:a]aformat=sample_fmts=fltp:sample_rates={sample_rate}:"
+            f"channel_layouts=stereo,"
+            f"atrim=duration={cue.duration_seconds:.3f},asetpts=N/SR/TB,"
+            f"volume={cue.gain_db}dB,adelay={start_ms}|{start_ms}[{label}]"
+        )
+        (bed_labels if cue.kind in {"bgm", "ambience"} else sfx_labels).append(
+            f"[{label}]"
+        )
+        index += 1
+
+    mix_labels: list[str] = []
+    if bed_labels:
+        filters.append("[outa]asplit=2[voice][vkey]")
+        filters.append(
+            f"{''.join(bed_labels)}amix=inputs={len(bed_labels)}:"
+            "duration=longest:normalize=0[beds]"
+        )
+        filters.append(
+            f"[beds][vkey]sidechaincompress=threshold={_COMPOSE_DUCK_THRESHOLD}:"
+            f"ratio={_COMPOSE_DUCK_RATIO}:attack={_COMPOSE_DUCK_ATTACK}:"
+            f"release={_COMPOSE_DUCK_RELEASE}:makeup=1[bedduck]"
+        )
+        mix_labels = ["[voice]", "[bedduck]"]
+    else:
+        mix_labels = ["[outa]"]
+    mix_labels.extend(sfx_labels)
+
+    if len(mix_labels) == 1:
+        filters.append(f"{mix_labels[0]}anull[mixed]")
+    else:
+        filters.append(
+            f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:"
+            "duration=first:normalize=0[mixed]"
+        )
+    filters.append(f"[mixed]{loudnorm}[aout]")
+    return inputs, filters
+
+
+def _shot_language_payload(planned: Any) -> dict[str, str] | None:
+    """把 :class:`~novelvideo.shot_language.ShotLanguage` 转成 optimizer 用的 dict。"""
+
+    as_dict = getattr(planned, "as_dict", None)
+    if callable(as_dict):
+        payload = as_dict()
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def run_compose_episode(
     envelope: dict[str, Any], ctx: ProjectContext
 ) -> dict[str, Any]:
@@ -1207,15 +1402,34 @@ def run_compose_episode(
                 f"[{index}:v]scale={target_width}:{target_height}:"
                 f"force_original_aspect_ratio=decrease,"
                 f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:black,"
-                f"setsar=1,format=yuv420p[v{index}]"
+                f"setsar=1,fps={_COMPOSE_VIDEO_FPS},format=yuv420p[v{index}]"
             )
-            filter_parts.append(f"[{index}:a]aresample=44100[a{index}]")
+            filter_parts.append(
+                f"[{index}:a]aresample={_COMPOSE_AUDIO_SAMPLE_RATE}[a{index}]"
+            )
         concat_inputs = "".join(
             f"[v{index}][a{index}]" for index in range(len(video_clips))
         )
         filter_parts.append(
             f"{concat_inputs}concat=n={len(video_clips)}:v=1:a=1[outv][outa]"
         )
+        # 声音层（配乐/环境音/音效）+ 响度母带：产出 [aout]。
+        audio_inputs, audio_filters = _compose_audio_inputs_and_filters(
+            output_dir=output_dir,
+            episode=episode,
+            payload=payload,
+            next_input_index=len(video_clips),
+        )
+        for audio_input in audio_inputs:
+            cmd.extend(["-i", audio_input])
+        filter_parts.extend(audio_filters)
+        if audio_inputs:
+            manager.update_progress_for_project(
+                ctx,
+                "compose_episode",
+                episode,
+                logs=[f"混入声音层音轨 {len(audio_inputs)} 条"],
+            )
         video_map = "[outv]"
         if subtitle_path is not None:
             # libass renders SRT at a constant default PlayRes (~384x288) and
@@ -1236,19 +1450,25 @@ def run_compose_episode(
                 "-map",
                 video_map,
                 "-map",
-                "[outa]",
+                "[aout]",
                 "-c:v",
                 "libx264",
                 "-preset",
-                "fast",
+                _COMPOSE_FINAL_VIDEO_PRESET,
                 "-crf",
-                "23",
+                _COMPOSE_FINAL_VIDEO_CRF,
+                "-r",
+                str(_COMPOSE_VIDEO_FPS),
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",
                 "aac",
                 "-b:a",
-                "128k",
+                _COMPOSE_FINAL_AUDIO_BITRATE,
+                "-ar",
+                str(_COMPOSE_AUDIO_SAMPLE_RATE),
+                "-ac",
+                "2",
                 # 成片必须 faststart（moov 前置）：否则手机浏览器要下完整个文件才能
                 # 起播，196MB 的成片在 iPhone 上就是「无法预览/无法下载」。
                 "-movflags",
@@ -1261,9 +1481,18 @@ def run_compose_episode(
         if result.returncode != 0:
             raise RuntimeError(f"拼接失败: {result.stderr[:500]}")
 
+        qc_report = _run_compose_quality_check(
+            output_path,
+            envelope=envelope,
+            manager=manager,
+            ctx=ctx,
+            episode=episode,
+        )
+
     return {
         "video_path": output_path.as_posix(),
         "add_subtitles_requested": add_subtitles,
+        "qc": qc_report.as_dict() if qc_report is not None else None,
     }
 
 
@@ -1335,6 +1564,20 @@ async def _run_global_optimize_video_async(
         sketches_dir = str(resolver.sketches_dir())
         optimizer = get_global_video_optimizer()
         sorted_beats = sorted(beats, key=lambda beat: beat.get("beat_number", 0))
+        # 分镜规划步（确定性、零模型调用）：先定好每个镜头的景别/机位/运镜。
+        # 它是跨镜头决策（相邻两镜必须有差、对白正打反打交替），所以必须在提示词之前
+        # 算完整集，而不是逐 beat 现编。
+        from novelvideo.shot_language import plan_shot_language_by_number
+
+        shot_plan = plan_shot_language_by_number(sorted_beats)
+        if shot_plan:
+            log(
+                "分镜规划完成："
+                + "；".join(
+                    f"镜{number}={item.shot_size}/{item.shot_angle}"
+                    for number, item in sorted(shot_plan.items())
+                )[:400]
+            )
         updated_count = 0
         failure_messages: list[str] = []
         prev_prompt = None
@@ -1411,6 +1654,7 @@ async def _run_global_optimize_video_async(
                     next_beat=next_beat,
                     prev_prompt=anchor,
                     total_beats=len(sorted_beats),
+                    shot_language=_shot_language_payload(shot_plan.get(beat_num)),
                 )
             except BaseException:
                 record_call(
@@ -1430,7 +1674,7 @@ async def _run_global_optimize_video_async(
                 ok=True,
                 beat=beat_num,
             )
-            return index, beat, str(result["prompt"])
+            return index, beat, result
 
         def _note_failure(
             item: tuple[int, dict[str, Any], str | None], exc: BaseException
@@ -1457,18 +1701,25 @@ async def _run_global_optimize_video_async(
             for outcome in outcomes:
                 if outcome is None:
                     continue
-                _index, beat, prompt = outcome
-                if not prompt:
+                _index, beat, result = outcome
+                if not result or not result.get("prompt"):
                     continue
+                prompt = str(result["prompt"])
                 beat["video_mode"] = "first_frame"
                 beat["video_prompt"] = prompt
                 beat["keyframe_prompt"] = None
+                beat["shot_size"] = str(result.get("shot_size") or "")
+                beat["shot_angle"] = str(result.get("shot_angle") or "")
+                beat["shot_move"] = str(result.get("shot_move") or "")
                 await store.update_beat_asset(
                     episode_number=episode,
                     beat_number=int(beat.get("beat_number") or 0),
                     video_mode="first_frame",
                     video_prompt=prompt,
                     keyframe_prompt=None,
+                    shot_size=beat["shot_size"] or None,
+                    shot_angle=beat["shot_angle"] or None,
+                    shot_move=beat["shot_move"] or None,
                 )
                 updated_count += 1
                 prev_prompt = prompt

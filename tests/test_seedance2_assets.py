@@ -1191,3 +1191,169 @@ def test_identity_prompt_fallback_carries_character_gender():
     character.gender = ""
     unknown_text = _identity_prompt_fallback("乡亲主播_青年时期", [character])
     assert unknown_text == "年轻乡亲，黑色头发，短发自然蓬松无定型，乡村青年身形"
+
+
+def test_reverse_scene_master_used_for_over_the_shoulder_beat(tmp_path):
+    """反打（``shot_angle == "过肩"``）要用场景**反向视角**当背景。
+
+    短剧的正反打是两个相反的机位，不是把同一张背景左右翻转；分镜规划把反打标成
+    「过肩」，这里据此换用 ``reverse_master.png``。
+    """
+
+    from novelvideo.seedance2_i2v.assets import (
+        build_seedance2_project_assets,
+        selected_reference_paths,
+    )
+
+    project_dir = tmp_path / "output" / "alice" / "project"
+    frame = project_dir / "frames" / "ep001" / "beat_01.png"
+    master = project_dir / "assets" / "scenes" / "客厅" / "master.png"
+    reverse = project_dir / "assets" / "scenes" / "客厅" / "reverse_master.png"
+    for image_path in (frame, master, reverse):
+        _write_png(image_path)
+
+    def _build(beat: dict) -> list:
+        return build_seedance2_project_assets(
+            project_output=project_dir,
+            state_dir=tmp_path / "state" / "alice" / "project",
+            episode=1,
+            beat={"beat_number": 1, "scene_ref": {"scene_id": "客厅"}, **beat},
+            mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+        )
+
+    over_shoulder = _build({"shot_angle": "过肩"})
+    assert selected_reference_paths(over_shoulder, "reference_images") == [
+        str(frame),
+        str(reverse),
+    ]
+    # 场景资产的 key / label 仍是场景名（图片编号与提示词引用不能错位）。
+    scene_asset = next(asset for asset in over_shoulder if asset.key == "scene:客厅")
+    assert scene_asset.path == reverse
+    assert scene_asset.label == "场景锚点 · 客厅"
+
+    # 机位不是反打 → 仍用正向 master。
+    front = _build({})
+    assert selected_reference_paths(front, "reference_images") == [str(frame), str(master)]
+
+    # 显式指定反向视角（不加 shot_angle）同样生效。
+    explicit = _build({"scene_ref": {"scene_id": "客厅", "render_anchor_source_id": "reverse"}})
+    assert selected_reference_paths(explicit, "reference_images") == [
+        str(frame),
+        str(reverse),
+    ]
+
+
+def test_reverse_scene_master_falls_back_to_front_when_missing(tmp_path):
+    """没有反向视角图时，反打仍要退回落地的正向 master，不能把场景丢掉。"""
+
+    from novelvideo.seedance2_i2v.assets import (
+        build_seedance2_project_assets,
+        selected_reference_paths,
+    )
+
+    project_dir = tmp_path / "output" / "alice" / "project"
+    frame = project_dir / "frames" / "ep001" / "beat_01.png"
+    master = project_dir / "assets" / "scenes" / "客厅" / "master.png"
+    for image_path in (frame, master):
+        _write_png(image_path)
+
+    assets = build_seedance2_project_assets(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=1,
+        beat={
+            "beat_number": 1,
+            "scene_ref": {"scene_id": "客厅"},
+            "shot_angle": "过肩",
+        },
+        mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+    )
+
+    assert selected_reference_paths(assets, "reference_images") == [str(frame), str(master)]
+
+
+def test_identity_costume_reference_is_attached_when_present(tmp_path):
+    """身份级服装图（``<identity>_costume.png``）存在时作为参考图附加。"""
+
+    from novelvideo.seedance2_i2v.assets import (
+        build_seedance2_project_assets,
+        selected_reference_paths,
+    )
+
+    project_dir = tmp_path / "output" / "alice" / "project"
+    frame = project_dir / "frames" / "ep001" / "beat_01.png"
+    identity = project_dir / "assets" / "characters" / "秦" / "identities" / "青年.png"
+    costume = project_dir / "assets" / "characters" / "秦" / "identities" / "青年_costume.png"
+    for image_path in (frame, identity, costume):
+        _write_png(image_path)
+
+    assets = build_seedance2_project_assets(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=1,
+        beat={"beat_number": 1, "detected_identities": ["秦_青年"]},
+        mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+    )
+
+    assert selected_reference_paths(assets, "reference_images") == [
+        str(frame),
+        str(identity),
+        str(costume),
+    ]
+    costume_asset = next(asset for asset in assets if asset.key == "identity:秦_青年:costume")
+    assert costume_asset.label == "秦 · 服装"
+    assert costume_asset.selected is True
+
+
+def test_reference_images_are_trimmed_to_the_upstream_limit(tmp_path):
+    """参考图超过上游 9 图硬限制时，按优先级裁剪并重排 ``图片N`` 编号。"""
+
+    from novelvideo.seedance2_i2v.assets import (
+        build_seedance2_project_assets,
+        selected_reference_paths,
+    )
+
+    project_dir = tmp_path / "output" / "alice" / "project"
+    frame = project_dir / "frames" / "ep001" / "beat_01.png"
+    _write_png(frame)
+    identities = [f"角色{index:02d}_青年" for index in range(1, 13)]
+    for identity_id in identities:
+        character = identity_id.split("_", 1)[0]
+        _write_png(
+            project_dir / "assets" / "characters" / character / "identities" / "青年.png"
+        )
+
+    assets = build_seedance2_project_assets(
+        project_output=project_dir,
+        state_dir=tmp_path / "state" / "alice" / "project",
+        episode=1,
+        beat={"beat_number": 1, "detected_identities": identities},
+        mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+    )
+
+    selected_paths = selected_reference_paths(assets, "reference_images")
+    assert len(selected_paths) == 9
+    # 首帧优先级最高，一定保住并排在第 1 张。
+    assert selected_paths[0] == str(frame)
+
+    image_assets = [
+        asset
+        for asset in assets
+        if asset.media_type == "image" and asset.key.startswith("identity:")
+    ]
+    kept = [asset for asset in image_assets if asset.selected]
+    dropped = [asset for asset in image_assets if not asset.selected]
+    # 12 个身份 + 首帧 = 13 张，裁到 9 张 → 身份图只剩 8 张。
+    assert len(image_assets) == 12
+    assert len(kept) == 8
+    assert len(dropped) == 4
+    # 保留者编号连续（首帧占了「图片1」），且与 selected_reference_paths 的顺序一致。
+    assert [asset.reference_label for asset in kept] == [
+        f"图片{index}" for index in range(2, 10)
+    ]
+    assert [str(asset.path) for asset in kept] == selected_paths[1:]
+    for asset in dropped:
+        assert asset.request_field == ""
+        assert asset.image_number is None
+        assert asset.reference_label == "未发送"
+        assert "9 张上限" in asset.note

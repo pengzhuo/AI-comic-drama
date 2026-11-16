@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 
 import {
-  useConfirmDirectorGate,
   useDirectorAutoRun,
   usePauseDirectorAutoRun,
   useResumeDirectorAutoRun,
@@ -18,13 +17,12 @@ import {
  * 服务端会在这些地方停下，我们**不再替客户答**，而是把对应卡片摆出来：
  * - 声线策略（`voice_setup`，没有 tag，靠 `last_error` 识别）→ 工作室声线选择卡；
  * - 角色形象图（`character_images`）→ 角色图片指定卡；
+ * - 每集身份图（`identity_images`）→ 身份图指定卡（与角色形象图同一组件）；
  * - **成本闸门**（`cost_estimate`，分镜写完之后）→ 报价卡。
  *
- * 每集身份图（`identity_images`）是**例外**：这一档的语义是「不指定就由 AI 生成」，
- * 没有任何必须人做主的决定。工作台开着时先摆卡片、给一段宽限期让客户仍有机会上传
- * 自己的图，到点自动替他把「跳过」答了（见 `IDENTITY_GATE_GRACE_MS`）；浏览器不在
- * 时由服务端巡检兜底。绝不把工作台挂在「等一次点击」上（现场 `系统标准格式版`
- * 就这么挂了 24 小时）。
+ * 角色形象图与每集身份图都**停下来等客户**：客户可以上传自己的图，或点卡片上的
+ * 「跳过，由 AI 生成」。两档都不再自动放行——身份图不再有 90 秒倒计时，服务端巡检
+ * 也不再代为确认，客户按自己的节奏来。
  *
  * 其余硬暂停（前置未满足、可重试失败、审核未过、跑飞被兜底）→ 自动 `/continue`：
  * 服务端已经改成「单镜做不出来就本地降级 + 跳过并继续」，所以每次续跑都真的会
@@ -39,16 +37,8 @@ import {
  */
 const COST_ESTIMATE_GATE = "cost_estimate";
 
-/** 每集身份图闸门：语义是「不指定就由 AI 生成」，宽限期后自动放行。 */
+/** 每集身份图闸门：与角色形象图同一张卡片、同样是等客户上传或手动跳过。 */
 const IDENTITY_IMAGES_GATE = "identity_images";
-
-/**
- * 身份图闸门的自动放行宽限期（秒）：够客户看到卡片、有时间上传自己的图，又不会让
- * 工作台长时间停着。服务端 `IDENTITY_GATE_GRACE_SECONDS` 是「浏览器不在」时的
- * 兜底，比这里宽松得多。
- */
-export const IDENTITY_GATE_GRACE_SECONDS = 90;
-const IDENTITY_GATE_GRACE_MS = IDENTITY_GATE_GRACE_SECONDS * 1000;
 
 /**
  * 声线策略暂停没有 `[tag]`（后端 `VOICE_POLICY_REQUIRED_ERROR` 被系统声线准备任务按
@@ -145,20 +135,14 @@ export interface StudioRunController {
 
 export function useStudioRun(
   project: string,
-  {
-    auto,
-    identityGraceMs = IDENTITY_GATE_GRACE_MS,
-  }: { auto: boolean; /** 测试用的宽限期覆盖；生产走 {@link IDENTITY_GATE_GRACE_SECONDS}。 */ identityGraceMs?: number },
+  { auto }: { auto: boolean },
 ): StudioRunController {
   const runQuery = useDirectorAutoRun(project, { enabled: true, refetchIntervalMs: 3000 });
   const resumeRun = useResumeDirectorAutoRun(project);
   const stopRun = usePauseDirectorAutoRun(project);
-  const confirmGate = useConfirmDirectorGate(project);
 
   const [needsHuman, setNeedsHuman] = useState<string | null>(null);
   const progressKeyRef = useRef<string>("");
-  /** 已经替客户答过的身份图闸门（`runId:episode`）；真正往前走时清空。 */
-  const identityGateRef = useRef<string>("");
 
   const run = runQuery.data?.data;
   const status = run?.status;
@@ -169,15 +153,13 @@ export function useStudioRun(
   const kind = pauseKindOf(run);
 
   const resumeMutate = resumeRun.mutate;
-  const confirmGateMutate = confirmGate.mutate;
 
-  // 走进度时清掉上一次的提示与身份图记录（恢复预算由服务端在换 stage 时清零）。
+  // 走进度时清掉上一次的提示（恢复预算由服务端在换 stage 时清零）。
   useEffect(() => {
     if (status !== "running" && status !== "completed") return;
     const key = `${runId}:${status}:${episode}`;
     if (progressKeyRef.current === key) return;
     progressKeyRef.current = key;
-    identityGateRef.current = "";
     setNeedsHuman(null);
   }, [episode, runId, status]);
 
@@ -238,35 +220,15 @@ export function useStudioRun(
     // （自动续跑会用默认策略把客户的选择权绕过去）。
     if (kind === "voice_setup") return;
 
-    // 身份图闸门：摆卡片 + 给宽限期，到点替客户点「跳过，由 AI 生成」。
-    // 这一档没有必须人做主的决定，绝不能让工作台停在「等一次点击」上。
-    if (kind === "gate" && gate === IDENTITY_IMAGES_GATE && episode > 0) {
-      setNeedsHuman(
-        `第 ${episode} 集有新身份还没指定形象图：${IDENTITY_GATE_GRACE_MS / 1000} 秒后会自动跳过、由 AI 生成，也可以现在上传自己的图。`,
-      );
-      const key = `${runId}:${episode}`;
-      const timer = window.setTimeout(() => {
-        if (identityGateRef.current === key) return;
-        identityGateRef.current = key;
-        confirmGateMutate(
-          { gate: IDENTITY_IMAGES_GATE, episode },
-          {
-            onError: (error) =>
-              setNeedsHuman(
-                `身份图闸门自动放行失败：${error.message}。可点卡片上的「跳过，由 AI 生成」重试。`,
-              ),
-          },
-        );
-      }, identityGraceMs);
-      return () => window.clearTimeout(timer);
-    }
-
-    // 其余图片闸门 / 成本闸门：一律交给对应卡片由客户点头，不再自动确认。
+    // 图片闸门 / 成本闸门：一律交给对应卡片由客户点头，绝不自动确认。
+    // 身份图闸门不再有 90 秒倒计时——客户可以按自己的节奏上传形象图，或手动跳过。
     if (kind === "gate" && gate && episode > 0) {
       setNeedsHuman(
         gate === COST_ESTIMATE_GATE
           ? "已完成分镜与制作报价，请确认报价后再继续生成画面与视频。"
-          : "有角色形象图还没指定：可以上传自己的图，或直接跳过由 AI 生成。",
+          : gate === IDENTITY_IMAGES_GATE
+            ? `第 ${episode} 集有新身份还没指定身份图：可以上传自己的图，或直接跳过由 AI 生成。`
+            : "有角色形象图还没指定：可以上传自己的图，或直接跳过由 AI 生成。",
       );
       return;
     }
@@ -282,14 +244,11 @@ export function useStudioRun(
     return () => window.clearTimeout(timer);
   }, [
     auto,
-    confirmGateMutate,
     episode,
     gate,
-    identityGraceMs,
     kind,
     resumeMutate,
     resumeRun.isPending,
-    runId,
     status,
   ]);
 

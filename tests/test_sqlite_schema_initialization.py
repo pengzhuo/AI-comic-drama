@@ -10,8 +10,10 @@ from pathlib import Path
 
 import pytest
 
+from novelvideo.models import NovelVisualBeat
 from novelvideo.sqlite_store import (
     _PROJECT_STORE_SCHEMA_VERSION,
+    SQLITE_SCHEMA_SQL,
     SQLiteStore,
 )
 from novelvideo.task_state import TaskStateManager
@@ -477,3 +479,66 @@ def test_old_task_schema_request_does_not_poison_recreated_project(
             ).fetchone()[0]
             == 1
         )
+
+
+@pytest.mark.asyncio
+async def test_legacy_project_store_migration_adds_shot_language_columns(tmp_path):
+    """存量 v5 库缺 ``beats.shot_size`` / ``shot_angle`` / ``shot_move``：升版后必须补齐。
+
+    回归 ``9f43df34``（短剧镜头语言）：新增这三列时漏了 ``_PROJECT_STORE_SCHEMA_VERSION``
+    的版本号，老库会跳过初始化；保存剧本时 ``add_visual_beats`` 按显式列名插入，直接报
+    "table beats has no column named shot_size"。这里复刻当时的库状态并断言迁移补列。
+    """
+
+    db_path = tmp_path / "data.db"
+
+    def _without_beat_column(sql: str, column: str) -> str:
+        return "".join(
+            line
+            for line in sql.splitlines(keepends=True)
+            if not line.strip().startswith(f"{column} ")
+        )
+
+    legacy_sql = SQLITE_SCHEMA_SQL
+    for column in ("shot_size", "shot_angle", "shot_move"):
+        legacy_sql = _without_beat_column(legacy_sql, column)
+
+    with sqlite3.connect(db_path) as db:
+        db.executescript(legacy_sql)
+        columns = {row[1] for row in db.execute("PRAGMA table_info(beats)")}
+        assert not ({"shot_size", "shot_angle", "shot_move"} & columns)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS novelvideo_schema_components "
+            "(component TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+        )
+        db.execute(
+            "INSERT INTO novelvideo_schema_components VALUES ('project_store', 5)"
+        )
+
+    store = SQLiteStore(
+        "alice/demo", output_dir=str(tmp_path), state_dir=str(tmp_path)
+    )
+    try:
+        await store.initialize()
+        with sqlite3.connect(db_path) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(beats)")}
+            assert {"shot_size", "shot_angle", "shot_move"} <= columns
+        # 迁移后按镜头语言列插入必须成功（旧库缺列时这里会直接抛错）。
+        await store.add_visual_beats(
+            [
+                NovelVisualBeat(
+                    episode_number=1,
+                    beat_number=1,
+                    shot_size="特写",
+                    shot_angle="平视",
+                    shot_move="推",
+                )
+            ]
+        )
+        beats = await store.get_beats_for_episode(1)
+        assert beats[0].shot_size == "特写"
+        assert beats[0].shot_angle == "平视"
+        assert beats[0].shot_move == "推"
+    finally:
+        await store.close()

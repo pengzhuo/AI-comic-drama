@@ -24,17 +24,37 @@ DEFAULT_EPISODE_TARGET_SECONDS = 60.0
 DEFAULT_EPISODE_MERGE_FLOOR_SECONDS = 45.0
 # 单集（或单个自然单元）超过该值视为“超过太多”，按自然子边界拆分。
 DEFAULT_EPISODE_SPLIT_THRESHOLD_SECONDS = 90.0
-# 单个镜头的目标上限，决定“最少镜头数”：取视频模型允许的最长时长
-# （Seedance2.5 = 30s；2.0 系列仍由各自的时长边界在生成器处回落到 15s）。
-DEFAULT_SHOT_TARGET_SECONDS = 30.0
-# 拆分单条超长朗读 beat 时的保护系数：TTS 实测语速通常比字数估算略慢，直接按
-# “估算 == 模型上限”切分会卡在边界上，实际音频仍可能溢出。
-SHOT_SPLIT_SAFETY = 0.9
+# 单镜目标时长：专业短剧镜头语言的甜点区。
+#
+# 旧口径是「取视频模型上限、镜头越少越好」（30s 一镜）——那是「AI 长片」的节奏，
+# 不是短剧：镜头越长，模型越难同时守住人脸、场景与动作，成片也就越像「会动的
+# PPT」。短剧靠**切点**叙事：正打/反打/特写来回切，每镜只交代一个动作或一句台词。
+# 所以反过来把单镜压到 3–8s，让镜头数由**内容**（台词/动作的切点）决定。
+#
+# 上限 8s 而不是更长，是因为再长就需要模型在一条 prompt 里演完两个节拍，质量会掉。
+DEFAULT_SHOT_TARGET_SECONDS = 6.0
+DEFAULT_SHOT_MIN_SECONDS = 3.0
+DEFAULT_SHOT_MAX_SECONDS = 8.0
+# 拆分单条超长朗读 beat 时的保护系数：TTS 实测语速通常比字数估算略慢，且逐行合成
+# 拼接还会叠加静音，直接按“估算 == 模型上限”切分会卡在边界上，实际音频仍可能溢出。
+SHOT_SPLIT_SAFETY = 0.85
 DEFAULT_INTRO_SECONDS = 3.0
 DEFAULT_OUTRO_SECONDS = 2.0
 
 # 空旁白（纯画面 beat）给一个名义时长，避免在合并时被当成 0 秒吞掉。
 _SILENCE_NOMINAL_SECONDS = 2.0
+
+# 单个镜头最多几条参考声线：Seedance2 单次请求参考音频合计 ≤15s
+# (``seedance2_i2v.pipeline.MAX_SEEDANCE2_REFERENCE_AUDIO_TOTAL_SECONDS``)。角色参考
+# 声线实测 7.4–8.3s/条，2 条 14.8s 贴边通过、3 条 22s 直接被拒；所以一镜最多 2 个
+# 说话人。超了就另起一镜。
+MAX_DIALOGUE_SPEAKERS_PER_SHOT = 2
+
+# 一镜多声线时每条台词单独合成再拼接，逐行有固定的头尾静音开销。实测（凤凰村真实
+# 声线，IndexTTS2）：每行约 1.0–1.3s（两行 +2.2s、四行 +5.0s），且同一文本的 TTS
+# 采样有 ±20% 波动。取 1.3s/行的保守值：合并出的 beat 估算不会低于实际音频，避免
+# 溢出模型单镜上限、成片末尾被截断。
+DIALOGUE_LINE_OVERHEAD_SECONDS = 1.3
 
 # 句末标点（中英文）。分句与拼接都以此为准。
 _SENTENCE_END = "。！？!?…；;"
@@ -85,6 +105,46 @@ def default_dialogue_chars_per_second() -> float:
         return 4.45
 
 
+def shot_duration_window(
+    video_backend: str | None = None,
+) -> tuple[float, float]:
+    """单镜时长的可用窗口 ``(最短, 最长)``：短剧口径夹在模型的时长边界内。
+
+    例如 Seedance2.5 只接受 4–30s，所以「3–8s」的实际窗口是 **4–8s**——低于模型
+    最短时长的镜头根本发不出请求，不能为了「切得碎」而越过这条硬边界。
+    """
+
+    minimum = DEFAULT_SHOT_MIN_SECONDS
+    maximum = DEFAULT_SHOT_MAX_SECONDS
+    value = str(video_backend or "").strip()
+    if value:
+        try:
+            from novelvideo.video_duration import video_duration_bounds_for_backend
+
+            model_min, model_max = video_duration_bounds_for_backend(value)
+        except Exception:  # noqa: BLE001 - 配置缺失时用短剧默认窗口
+            model_min, model_max = (None, None)
+        if model_min and float(model_min) > 0:
+            minimum = max(minimum, float(model_min))
+        if model_max and float(model_max) > 0:
+            maximum = min(maximum, float(model_max))
+    if maximum < minimum:
+        maximum = minimum
+    return minimum, maximum
+
+
+def default_shot_target_seconds(video_backend: str | None = None) -> float:
+    """单镜预算：短剧镜头语言的甜点区（默认 6s），用模型的时长边界夹紧。
+
+    旧口径取模型上限（2.5 → 30s）来「尽量少切几刀」；新口径取
+    :data:`DEFAULT_SHOT_TARGET_SECONDS`（6s）再夹进模型的可用窗口，于是同一批台词
+    换模型时**镜头数基本不变**，只保证每镜都在模型可生成的时长范围内。
+    """
+
+    minimum, maximum = shot_duration_window(video_backend)
+    return min(max(float(DEFAULT_SHOT_TARGET_SECONDS), minimum), maximum)
+
+
 def estimate_duration_seconds(
     text: str | None, *, chars_per_second: float | None = None
 ) -> float:
@@ -105,6 +165,8 @@ class PacingSettings:
     merge_floor_seconds: float = DEFAULT_EPISODE_MERGE_FLOOR_SECONDS
     split_threshold_seconds: float = DEFAULT_EPISODE_SPLIT_THRESHOLD_SECONDS
     shot_target_seconds: float = DEFAULT_SHOT_TARGET_SECONDS
+    shot_min_seconds: float = DEFAULT_SHOT_MIN_SECONDS
+    shot_max_seconds: float = DEFAULT_SHOT_MAX_SECONDS
     intro_seconds: float = DEFAULT_INTRO_SECONDS
     outro_seconds: float = DEFAULT_OUTRO_SECONDS
 
@@ -116,23 +178,36 @@ class PacingSettings:
 
     @property
     def max_shots(self) -> int:
-        """一集最多几个镜头（向上取整）。"""
+        """一集最多几个镜头（按单镜**目标**时长向上取整）。"""
 
         return max(1, int(math.ceil(self.content_budget_seconds / max(self.shot_target_seconds, 0.1))))
 
+    @property
+    def min_shots(self) -> int:
+        """一集最少几个镜头（每镜都吃满 :attr:`shot_max_seconds` 时的下限）。
+
+        用来判断一次分镜是不是「切得太少」（远低于这个数说明镜头太长）。
+        """
+
+        return max(1, int(math.ceil(self.content_budget_seconds / max(self.shot_max_seconds, 0.1))))
+
     def normalized(self) -> "PacingSettings":
-        """保证 merge_floor < target < split_threshold 的自洽。"""
+        """保证 ``merge_floor ≤ target ≤ split_threshold`` 与单镜窗口自洽。"""
 
         target = self.episode_target_seconds
         floor = min(self.merge_floor_seconds, target)
         threshold = max(self.split_threshold_seconds, target + 1.0)
-        shot = self.shot_target_seconds
+        shot_min = max(0.1, float(self.shot_min_seconds))
+        shot_max = max(shot_min, float(self.shot_max_seconds))
+        shot = min(max(float(self.shot_target_seconds), shot_min), shot_max)
         return replace(
             self,
             episode_target_seconds=target,
             merge_floor_seconds=floor,
             split_threshold_seconds=threshold,
             shot_target_seconds=shot,
+            shot_min_seconds=shot_min,
+            shot_max_seconds=shot_max,
         )
 
 
@@ -140,6 +215,7 @@ def resolve_pacing_settings(config: dict | None = None) -> PacingSettings:
     """把（项目）配置 + 环境变量合成一套节奏参数。"""
 
     data = dict(config or {})
+    backends_window = shot_duration_window(data.get("video_backend"))
     settings = PacingSettings(
         episode_target_seconds=_env_float(
             "EPISODE_TARGET_SECONDS", DEFAULT_EPISODE_TARGET_SECONDS
@@ -150,9 +226,14 @@ def resolve_pacing_settings(config: dict | None = None) -> PacingSettings:
         split_threshold_seconds=_env_float(
             "EPISODE_SPLIT_THRESHOLD_SECONDS", DEFAULT_EPISODE_SPLIT_THRESHOLD_SECONDS
         ),
+        # 单镜预算默认落在短剧甜点区（6s，再按模型时长边界夹紧）。环境变量/项目
+        # 配置显式给了 ``shot_target_seconds`` 时仍以显式值为准。
         shot_target_seconds=_env_float(
-            "SHOT_TARGET_SECONDS", DEFAULT_SHOT_TARGET_SECONDS
+            "SHOT_TARGET_SECONDS",
+            default_shot_target_seconds(data.get("video_backend")),
         ),
+        shot_min_seconds=_env_float("SHOT_MIN_SECONDS", backends_window[0]),
+        shot_max_seconds=_env_float("SHOT_MAX_SECONDS", backends_window[1]),
         intro_seconds=_env_float("EPISODE_INTRO_SECONDS", DEFAULT_INTRO_SECONDS),
         outro_seconds=_env_float("EPISODE_OUTRO_SECONDS", DEFAULT_OUTRO_SECONDS),
     )
@@ -170,6 +251,12 @@ def resolve_pacing_settings(config: dict | None = None) -> PacingSettings:
         ),
         shot_target_seconds=_to_float(
             data.get("shot_target_seconds"), settings.shot_target_seconds
+        ),
+        shot_min_seconds=_to_float(
+            data.get("shot_min_seconds"), settings.shot_min_seconds
+        ),
+        shot_max_seconds=_to_float(
+            data.get("shot_max_seconds"), settings.shot_max_seconds
         ),
     )
     return settings.normalized()
@@ -407,8 +494,35 @@ def _audio_key(beat: Any) -> tuple[str, str, str]:
     )
 
 
+def _dialogue_speaker(beat: Any) -> str:
+    """对白 beat 的说话人（身份 id）；非对白/无说话人返回空串。"""
+
+    if str(getattr(beat, "audio_type", "") or "").strip().lower() != "dialogue":
+        return ""
+    return str(getattr(beat, "speaker", "") or "").strip()
+
+
+def _dialogue_line_count(beat: Any) -> int:
+    """对白 beat 要逐行单独合成的台词行数（非对白返回 0）。
+
+    一镜多声线按 ``说话人：台词`` 逐行标注；每条非空行都会单独 TTS 一次，行数决定
+    拼接时叠加的头尾静音总量，因此估时要按**行数**而不是 beat 数算开销。
+    """
+
+    if not _dialogue_speaker(beat):
+        return 0
+    text = str(getattr(beat, "narration_segment", "") or "")
+    return max(1, len([line for line in text.splitlines() if line.strip()]))
+
+
 def _merge_key(beat: Any) -> tuple[str, str, str, str, str]:
     audio_type, speaker, speaker_kind = _audio_key(beat)
+    # **按说话人区分**：对白不再跨说话人合并（旧口径把相邻的不同说话人并成一条
+    # “一镜多声线”）。跨说话人合并有三个硬伤：① 两句台词塞进一镜，镜头被拉长到
+    # 十几秒、一段视频里要念两个音色（串味、嘴形对不上）；② 合并只保留**头一句**的
+    # 画面锚点，拆开后其余台词复用头一句画面（画面/声音对不上）；③ 逐行拼接的头尾
+    # 静音把实际音频撑过模型单镜上限，成片被截断。让每个说话人各自成镜，逐行画面与
+    # 声线才能一一对应；同一说话人的相邻台词仍会按节奏合并。
     return (
         str(getattr(beat, "time_of_day", "") or ""),
         _scene_key(beat),
@@ -452,22 +566,53 @@ def _clone_beat(beat: Any, **updates: Any) -> Any:
     return clone
 
 
+def _merge_group_narration(items: Sequence[Any], indices: Sequence[int]) -> str:
+    """把一组相邻 beat 的朗读文本拼成一条。
+
+    同组只有一个说话人（或非对白）时沿用旧的“逗号相接”口径；**跨说话人的对白**
+    按 ``说话人：台词`` 逐行拼接，让下游（参考声线 / 字幕 / 逐行配音）按行还原声线，
+    实现“一镜多声线”。任一行拿不到说话人时退回纯文本拼接——宁可不标说话人，
+    也不能把台词安到别人头上。
+    """
+
+    lines: list[tuple[str, str]] = []
+    speakers: list[str] = []
+    for index in indices:
+        beat = items[index]
+        if _is_silence_beat(beat):
+            continue
+        text = str(getattr(beat, "narration_segment", "") or "").strip()
+        if not text:
+            continue
+        speaker = _dialogue_speaker(beat)
+        lines.append((speaker, text))
+        if speaker and speaker not in speakers:
+            speakers.append(speaker)
+
+    if len(speakers) > 1 and all(speaker for speaker, _ in lines):
+        return "\n".join(f"{speaker}：{text}" for speaker, text in lines)
+    return _join_narration(text for _, text in lines)
+
+
 def compact_beats_for_shots(
     beats: Sequence[Any],
     *,
     shot_target_seconds: float = DEFAULT_SHOT_TARGET_SECONDS,
+    shot_max_seconds: float = DEFAULT_SHOT_MAX_SECONDS,
     max_shots: int | None = None,
     chars_per_second: float | None = None,
 ) -> list[Any]:
-    """把相邻 beat 合并成更少、更长的镜头。
+    """把相邻 beat 合并成**时长合理**的镜头（默认每镜 ~6s，硬上限 8s）。
 
     - 只合并音频上下文一致的相邻 beat（同 ``audio_type``/``speaker``/``speaker_kind``
       /``time_of_day``/``scene``），保证配音不串。
     - 纯画面 ``silence`` 过场 beat（△ 空镜行）不单独成镜，直接并入相邻的对白/旁白
       组；宿主镜取对白/旁白 beat，画面锚点也优先取对白/旁白画面。
-    - 累积预估时长达到单镜目标就断开。
-    - 若给 ``max_shots``，先按 ``max(单镜目标, 总时长/max_shots)`` 放宽单镜预算，
-      尽量压到镜头数上限。
+    - 累积预估时长到达单镜目标就断开；``shot_max_seconds`` 是硬上限（合并后的镜头
+      不再长于它）。单条 beat 自身就超过硬上限时不在这里拆——留给
+      :func:`split_long_beats_for_shots` 按句拆。
+    - 若给 ``max_shots``，先按 ``max(单镜目标, 总时长/max_shots)`` 放宽单镜预算
+      （但仍不超过硬上限），尽量压到镜头数上限。
     """
 
     items = [b for b in beats]
@@ -479,24 +624,33 @@ def compact_beats_for_shots(
         estimate_duration_seconds(getattr(b, "narration_segment", "") or "", chars_per_second=rate)
         for b in items
     ]
+    # 对白逐行单独合成再拼接：每条台词都有固定的头尾静音开销，按字数估时要把这份
+    # 开销按**行数**算进去，否则合并出的 beat 实际音频会溢出模型单镜上限、成片截断。
+    durations = [
+        d + DIALOGUE_LINE_OVERHEAD_SECONDS * _dialogue_line_count(b)
+        for b, d in zip(items, durations)
+    ]
     # 纯画面 beat 给一个名义时长，避免被合并时当成 0 秒吞掉。
     durations = [d if d > 0 else _SILENCE_NOMINAL_SECONDS for d in durations]
     total = sum(durations)
 
-    effective = float(shot_target_seconds)
+    limit = float(shot_target_seconds) or DEFAULT_SHOT_TARGET_SECONDS
+    hard_max = max(float(shot_max_seconds) or DEFAULT_SHOT_MAX_SECONDS, limit)
     if max_shots and max_shots > 0:
-        effective = max(effective, total / max_shots)
-    if effective <= 0:
-        effective = float(shot_target_seconds) or DEFAULT_SHOT_TARGET_SECONDS
+        limit = max(limit, total / max_shots)
+    limit = min(limit, hard_max)
+    if limit <= 0:
+        limit = DEFAULT_SHOT_TARGET_SECONDS
 
     merged: list[Any] = []
     group_indices: list[int] = []
     group_seconds = 0.0
     group_key: tuple | None = None
     group_has_speech = False
+    group_speakers: list[str] = []
 
     def flush() -> None:
-        nonlocal group_indices, group_seconds, group_key, group_has_speech
+        nonlocal group_indices, group_seconds, group_key, group_has_speech, group_speakers
         if not group_indices:
             return
         # 宿主镜：优先取组内第一个对白/旁白 beat，避免纯过场 beat 当宿主而丢掉音色。
@@ -506,9 +660,7 @@ def compact_beats_for_shots(
                 group_indices[0],
             )
         ]
-        narration = _join_narration(
-            getattr(items[i], "narration_segment", "") for i in group_indices
-        )
+        narration = _merge_group_narration(items, group_indices)
         # 画面锚点优先取对白/旁白的画面；组内只有过场时才退回过场画面。
         visual = ""
         for i in group_indices:
@@ -545,6 +697,7 @@ def compact_beats_for_shots(
         group_seconds = 0.0
         group_key = None
         group_has_speech = False
+        group_speakers = []
 
     for index, beat in enumerate(items):
         key = _merge_key(beat)
@@ -555,13 +708,33 @@ def compact_beats_for_shots(
                 flush()
             else:
                 group_key = key
-        if group_indices and group_seconds + durations[index] > effective:
+        # 单镜最多 MAX_DIALOGUE_SPEAKERS_PER_SHOT 条参考声线：再加一个说话人就先收口，
+        # 免得凑成一条要 4 段参考音频、直接发不出请求的 beat。
+        if group_indices and not silence:
+            speaker = _dialogue_speaker(beat)
+            if (
+                speaker
+                and speaker not in group_speakers
+                and len(group_speakers) >= MAX_DIALOGUE_SPEAKERS_PER_SHOT
+            ):
+                flush()
+        if (
+            group_indices
+            and group_has_speech
+            and group_seconds + durations[index] > limit
+        ):
+            # 只有已经攒到台词的组才按预算收口；纯过场组（还没等到台词）继续攒，
+            # 交给下一段对白/旁白，绝不单独成镜（否则会出现一堆 4s 无声过场镜头，
+            # 既拖节奏又多花钱）。
             flush()
         group_indices.append(index)
         group_seconds += durations[index]
         if not silence:
             group_key = key
             group_has_speech = True
+            speaker = _dialogue_speaker(beat)
+            if speaker and speaker not in group_speakers:
+                group_speakers.append(speaker)
     flush()
     return merged
 
@@ -639,6 +812,65 @@ def _split_text_for_budget(
     return [chunk for chunk in chunks if chunk]
 
 
+#: 说话人前缀分隔符：一镜多声线文本由 :func:`_merge_group_narration` 统一用全角冒号
+#: 拼成 ``说话人：台词``，这里拆行时只认它。
+_SPEAKER_LABEL_SEP = "："
+
+
+def _split_speaker_label(line: str) -> tuple[str, str]:
+    """把 ``说话人：台词`` 拆成 ``(说话人, 台词)``；没有说话人前缀时返回 ``("", 原文)``。
+
+    ``说话人（动作）：台词`` 这类带括注的脚本形态，括注留在说话人一侧；前缀原样
+    保留，回填时再拼回去，不丢信息。
+    """
+
+    raw = (line or "").strip()
+    if not raw:
+        return "", ""
+    speaker, sep, text = raw.partition(_SPEAKER_LABEL_SEP)
+    speaker = speaker.strip()
+    text = text.strip()
+    if not sep or not speaker or not text:
+        return "", raw
+    return speaker, text
+
+
+def _split_multi_speaker_beat_for_shots(
+    narration: str, *, cap: float, rate: float
+) -> list[tuple[str, str]] | None:
+    """把一镜多声线的多行文本拆成**单说话人**、各自成镜的 ``(文本, 说话人)``。
+
+    一镜多声线（``说话人：台词`` 逐行）如果整段塞进一条 seedance2 请求，模型要在
+    同一段视频里念两个音色——既容易串味，又让镜头被拉长到十几二十秒（质量骤降）。
+    这里按**行**拆：每行连同它的说话人前缀单独成镜；某一行自身仍超预算时，只在该
+    行**台词内**再按句/字数拆，说话人前缀回填到每个子块，绝不让台词脱离说话人。
+
+    返回 ``None`` 表示没必要拆（不足两行有效台词），调用方原样保留。
+    """
+
+    lines = [line.strip() for line in str(narration or "").splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return None
+
+    pieces: list[tuple[str, str]] = []
+    for line in lines:
+        speaker, text = _split_speaker_label(line)
+        if not text:
+            continue
+        label = f"{speaker}{_SPEAKER_LABEL_SEP}" if speaker else ""
+        chunks = _split_text_for_budget(
+            text, budget_seconds=cap, chars_per_second=rate
+        )
+        if len(chunks) <= 1:
+            pieces.append((f"{label}{text}", speaker))
+            continue
+        for chunk in chunks:
+            pieces.append((f"{label}{chunk}", speaker))
+    if len(pieces) <= 1:
+        return None
+    return pieces
+
+
 def split_long_beats_for_shots(
     beats: Sequence[Any],
     *,
@@ -652,9 +884,12 @@ def split_long_beats_for_shots(
     旁白仍会超过视频模型的单镜上限（Seedance2.5 = 30s），成片只能截断、末尾覆盖不到。
     这里在合并之后补一刀：
 
-    - 只处理有朗读文本，且估算时长超过 ``max_seconds * safety`` 的 beat；
-    - 优先在句末标点切分，其次子句标点，单句仍超长时按字数硬切；
-    - 拆出的多条 beat 继承 speaker/``audio_type``/画面/场景/时间，序号整体重排；
+    - 单说话人 beat：估算时长超过 ``max_seconds * safety`` 时，优先在句末标点切分，
+      其次子句标点，单句仍超长时按字数硬切；
+    - **一镜多声线**（``compact_beats_for_shots`` 合并出的 ``说话人：台词`` 多行）：
+      按**行**拆，每行连同说话人前缀单独成镜，保证每镜只有一个说话人（一条请求只念
+      一个音色）；某行自身仍超长时在该行台词内再拆，前缀回填到每个子块；
+    - 拆出的多条 beat 继承 ``audio_type``/画面/场景/时间，说话人按各自行还原，序号整体重排；
     - 手工分镜（``is_manual_shot``，或带显式 ``duration_seconds``）与纯画面 beat 不动。
 
     ``safety`` 用来留余量：TTS 实测语速通常比字数估算略慢，直接把门槛压到估算上限
@@ -673,7 +908,8 @@ def split_long_beats_for_shots(
     expanded: list[Any] = []
     split_any = False
     for beat in items:
-        narration = str(getattr(beat, "narration_segment", "") or "").strip()
+        raw_narration = str(getattr(beat, "narration_segment", "") or "")
+        narration = raw_narration.strip()
         if (
             not narration
             or getattr(beat, "is_manual_shot", False)
@@ -681,6 +917,30 @@ def split_long_beats_for_shots(
         ):
             expanded.append(beat)
             continue
+
+        # 一镜多声线：按行拆成单说话人镜头（见上），跨说话人的合并镜头不再整段发出。
+        if "\n" in raw_narration:
+            pieces = _split_multi_speaker_beat_for_shots(
+                raw_narration, cap=cap, rate=rate
+            )
+            if pieces is None:
+                expanded.append(beat)
+                continue
+            split_any = True
+            for text, speaker in pieces:
+                expanded.append(
+                    _clone_beat(
+                        beat,
+                        narration_segment=text,
+                        speaker=speaker or str(getattr(beat, "speaker", "") or ""),
+                        estimated_duration=estimate_duration_seconds(
+                            text, chars_per_second=rate
+                        ),
+                        duration_seconds=None,
+                    )
+                )
+            continue
+
         if estimate_duration_seconds(narration, chars_per_second=rate) <= cap:
             expanded.append(beat)
             continue

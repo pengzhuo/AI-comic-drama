@@ -17,6 +17,7 @@ from novelvideo.seedance2_i2v.assets import (
     apply_prompt_audio_selection,
     build_seedance2_project_assets,
     selected_reference_paths,
+    trim_seedance2_reference_images,
     validate_seedance2_reference_image,
 )
 from novelvideo.seedance2_i2v.character_voice_storage import (
@@ -320,7 +321,7 @@ async def generate_seedance2_prompt_for_panel(
         next_beat=next_beat,
         prop_menu=prop_menu,
     )
-    _append_seedance2_user_reference_assets(assets, config)
+    assets = _append_seedance2_user_reference_assets(assets, config)
     initial_prompt = _seedance2_initial_prompt(beat)
     reference_prompt = str(
         manual_prompt_reference
@@ -902,7 +903,7 @@ def build_seedance2_video_panel_state(
         prop_menu=prop_menu,
         state_dir=state_dir,
     )
-    _append_seedance2_user_reference_assets(assets, config)
+    assets = _append_seedance2_user_reference_assets(assets, config)
     prompt_source = config.prompt_source or "saved"
     final_prompt = config.final_prompt
     initial_prompt = _seedance2_initial_prompt(beat)
@@ -983,7 +984,7 @@ def _sync_seedance2_asset_paths(
         next_beat=next_beat,
         prop_menu=prop_menu,
     )
-    _append_seedance2_user_reference_assets(assets, config)
+    assets = _append_seedance2_user_reference_assets(assets, config)
     assets = apply_prompt_audio_selection(assets, str(config.final_prompt or ""))
     auto_images = selected_reference_paths(assets, "reference_images")
     auto_audios = selected_reference_paths(assets, "reference_audios")
@@ -1007,7 +1008,7 @@ def _seedance2_user_reference_paths(
 def _append_seedance2_user_reference_assets(
     assets: list[Seedance2ResolvedAsset],
     config: Any,
-) -> None:
+) -> list[Seedance2ResolvedAsset]:
     auto_image_paths = {
         str(asset.path)
         for asset in assets
@@ -1064,6 +1065,7 @@ def _append_seedance2_user_reference_assets(
                 reference_label=f"音频{audio_count}",
             )
         )
+    return trim_seedance2_reference_images(assets)
 
 
 def _seedance2_default_prompt(

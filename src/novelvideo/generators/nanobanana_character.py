@@ -55,6 +55,15 @@ from novelvideo.egress_context import (
 )
 
 
+#: 角色身份图（4 面板 reference sheet：全脸特写 + 正面全身 + 45° 三分 + 背面全身）的出图规格。
+#: 16:9 的 1K 只有约 1024px 宽，四个面板均分下来每张脸才 ~256px，作为身份锚点太糊，
+#: 下游每镜参考的都是这张脸。升到 2K（约 2048px 宽，每张脸 ~512px）才真正锁得住。
+#: 可用 ``DRAMACLAW_CHARACTER_SHEET_IMAGE_SIZE`` 回退（如 ``1K``）。
+CHARACTER_SHEET_IMAGE_SIZE = (
+    os.environ.get("DRAMACLAW_CHARACTER_SHEET_IMAGE_SIZE", "").strip() or "2K"
+)
+
+
 def _default_ethnicity_instruction(ethnicity: str) -> str:
     value = (ethnicity or "").strip()
     if not value:
@@ -596,7 +605,7 @@ class NanoBananaCharacterGenerator:
 
             # 统一流程：生成 body 到临时文件 → 拼接 portrait → 删 temp
             aspect_ratio = "16:9"  # 4面板: 全脸+正+三分+背面
-            image_size = "1K"
+            image_size = CHARACTER_SHEET_IMAGE_SIZE
             body_label = "4面板 reference sheet"
 
             temp_body_path = output_path.replace(".png", "_body_temp.png")
@@ -819,7 +828,7 @@ MUST AVOID:
                 prompt=prompt,
                 output_path=composite_path,
                 aspect_ratio="16:9",
-                image_size="1K",
+                image_size=CHARACTER_SHEET_IMAGE_SIZE,
             )
             if not image_bytes:
                 return CharacterReferenceResult(

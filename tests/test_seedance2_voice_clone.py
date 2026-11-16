@@ -722,3 +722,171 @@ def test_dialogue_emotion_prompt_reuses_the_leading_performance_note():
         dialogue_emotion_prompt({"narration_segment": "许知意（os）：我恨他们。"}) == ""
     )
     assert dialogue_emotion_prompt({"narration_segment": "你终于来了。"}) == ""
+
+
+def test_dialogue_text_strips_labels_on_every_line():
+    from novelvideo.seedance2_i2v.voice_clone import dialogue_text
+
+    # 一镜多声线：每行都带说话人标签，逐行剥掉后相接。
+    assert (
+        dialogue_text({"narration_segment": "甲：你好。\n乙：好久不见。"})
+        == "你好。 好久不见。"
+    )
+
+
+def test_narration_beat_text_drops_script_and_ui_labels():
+    from novelvideo.seedance2_i2v.voice_clone import narration_beat_text
+
+    # 旁白标注不是台词：系统VO/秦岚VO/秦岚OS/字幕 前缀都不能被念出来。
+    assert (
+        narration_beat_text({"narration_segment": "系统VO：叮！你的脖子断了。"})
+        == "叮！你的脖子断了。"
+    )
+    assert (
+        narration_beat_text({"narration_segment": "秦岚VO：数百年前，全球诡异降临。"})
+        == "数百年前，全球诡异降临。"
+    )
+    assert (
+        narration_beat_text({"narration_segment": "秦岚OS：不行，属性提升会衰减。"})
+        == "不行，属性提升会衰减。"
+    )
+    assert narration_beat_text({"narration_segment": "字幕：【阴归路】副本"}) == "【阴归路】副本"
+    # 系统 UI 标记（【特效】：）同样不念。
+    assert (
+        narration_beat_text(
+            {"narration_segment": "【特效】：被诡异攻击概率永久提升1000%"}
+        )
+        == "被诡异攻击概率永久提升1000%"
+    )
+
+
+def test_narration_beat_text_keeps_plain_narration_and_never_empties():
+    from novelvideo.seedance2_i2v.voice_clone import narration_beat_text
+
+    assert narration_beat_text({"narration_segment": "生灵涂炭"}) == "生灵涂炭"
+    # 不是说话人标签的冒号短语原样保留。
+    assert (
+        narration_beat_text({"narration_segment": "我说的是：今天是我的生日。"})
+        == "我说的是：今天是我的生日。"
+    )
+    # 整行都是标注时退回原文，绝不吐空（否则该 beat 直接发不出声）。
+    assert narration_beat_text({"narration_segment": "字幕："}) == "字幕："
+
+
+def test_dialogue_lines_and_voice_keys_parse_multi_speaker_text():
+    from novelvideo.seedance2_i2v.voice_clone import dialogue_lines, dialogue_voice_keys
+
+    beat = {
+        "audio_type": "dialogue",
+        "speaker": "甲",
+        "narration_segment": "甲：你好。\n乙：好久不见。",
+    }
+    assert dialogue_lines(beat) == [("甲", "你好"), ("乙", "好久不见")]
+    assert dialogue_voice_keys(beat) == ["甲", "乙"]
+
+    # 单说话人/无标签时退回 (speaker, dialogue_text)。
+    single = {"audio_type": "dialogue", "speaker": "谢铮", "narration_segment": "你终于来了。"}
+    assert dialogue_lines(single) == [("谢铮", "你终于来了。")]
+    assert dialogue_voice_keys(single) == ["谢铮"]
+
+
+@pytest.mark.asyncio
+async def test_seedance2_voice_clone_generates_multi_voice_beat(tmp_path, monkeypatch):
+    from novelvideo.models import NovelCharacter
+    from novelvideo.seedance2_i2v import voice_clone
+
+    project_dir = tmp_path / "project"
+    for name in ("甲", "乙"):
+        ref = project_dir / "assets" / "characters" / name / f"voice_{name}.wav"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(name.encode())
+
+    characters = [
+        NovelCharacter(
+            name="甲",
+            gender="男",
+            reference_audio_path="assets/characters/甲/voice_甲.wav",
+        ),
+        NovelCharacter(
+            name="乙",
+            gender="女",
+            reference_audio_path="assets/characters/乙/voice_乙.wav",
+        ),
+    ]
+
+    generator = _FakeGenerator()
+    captured = {}
+
+    def fake_concat(parts, output_path):
+        captured["parts"] = list(parts)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_bytes(b"concat-audio")
+        return True
+
+    monkeypatch.setattr(voice_clone, "_concat_audio_files", fake_concat)
+
+    result = await voice_clone.generate_seedance2_dialogue_audio(
+        beat={
+            "audio_type": "dialogue",
+            "speaker": "甲",
+            "narration_segment": "甲：你好。\n乙：好久不见。",
+        },
+        episode=1,
+        beat_num=2,
+        store=_FakeStore(project_dir, characters),
+        generator=generator,
+        audio_url_builder=lambda path: f"data://{Path(path).name}",
+    )
+
+    assert result.success is True
+    # 每条台词各用各自声线的参考音频，逐行合成后再拼成一条。
+    assert [call["prompt"] for call in generator.calls] == ["你好", "好久不见"]
+    assert [call["audio_url"] for call in generator.calls] == [
+        "data://voice_甲.wav",
+        "data://voice_乙.wav",
+    ]
+    assert len(captured["parts"]) == 2
+    output = project_dir / "audio" / "ep001" / "beat_02.mp3"
+    assert output.read_bytes() == b"concat-audio"
+
+
+@pytest.mark.asyncio
+async def test_seedance2_voice_clone_multi_voice_fails_when_one_voice_missing(
+    tmp_path, monkeypatch
+):
+    from novelvideo.models import NovelCharacter
+    from novelvideo.seedance2_i2v import voice_clone
+
+    project_dir = tmp_path / "project"
+    ref = project_dir / "assets" / "characters" / "甲" / "voice_甲.wav"
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_bytes("甲".encode())
+
+    characters = [
+        NovelCharacter(
+            name="甲",
+            gender="男",
+            reference_audio_path="assets/characters/甲/voice_甲.wav",
+        )
+    ]
+
+    monkeypatch.setattr(
+        voice_clone, "_concat_audio_files", lambda parts, out: pytest.fail("不应拼接")
+    )
+
+    result = await voice_clone.generate_seedance2_dialogue_audio(
+        beat={
+            "audio_type": "dialogue",
+            "speaker": "甲",
+            "narration_segment": "甲：你好。\n乙：好久不见。",
+        },
+        episode=1,
+        beat_num=2,
+        store=_FakeStore(project_dir, characters),
+        generator=_FakeGenerator(),
+        audio_url_builder=lambda path: f"data://{Path(path).name}",
+    )
+
+    assert result is not None
+    assert result.success is False
+    assert "乙" in (result.error or "")

@@ -36,18 +36,54 @@ def test_resolve_pacing_settings_defaults_and_overrides():
     assert settings.episode_target_seconds == 60.0
     assert settings.merge_floor_seconds == 45.0
     assert settings.split_threshold_seconds == 90.0
-    assert settings.shot_target_seconds == 30.0
+    # 短剧镜头语言：单镜默认 6s（甜点区），可用窗口 3–8s。
+    assert settings.shot_target_seconds == 6.0
+    assert settings.shot_min_seconds == 3.0
+    assert settings.shot_max_seconds == 8.0
     # 正片预算 = 60 - 3 - 2
     assert settings.content_budget_seconds == 55.0
-    # 55 / 30 -> 2 镜
-    assert settings.max_shots == 2
+    # 55 / 6 -> 10 镜；每镜都吃满 8s 时下限 7 镜
+    assert settings.max_shots == 10
+    assert settings.min_shots == 7
 
     overridden = resolve_pacing_settings({"shot_target_seconds": 8})
     assert overridden.shot_target_seconds == 8.0
     assert overridden.max_shots == 7  # ceil(55/8)
 
     # 非法值回退默认
-    assert resolve_pacing_settings({"shot_target_seconds": -1}).shot_target_seconds == 30.0
+    assert resolve_pacing_settings({"shot_target_seconds": -1}).shot_target_seconds == 6.0
+
+
+def test_resolve_pacing_settings_uses_selected_model_duration_window(monkeypatch):
+    # 未显式配置单镜预算时取短剧甜点区（6s），再按所选模型的时长边界夹紧：
+    # 换模型时镜头数基本不变，但绝不会发出模型不接受的时长。
+    settings = resolve_pacing_settings({"video_backend": "newapi_seedance-2.5"})
+    assert settings.shot_target_seconds == 6.0
+    assert (settings.shot_min_seconds, settings.shot_max_seconds) == (4.0, 8.0)
+
+    mini = resolve_pacing_settings({"video_backend": "newapi_seedance-2.0-mini"})
+    assert (mini.shot_min_seconds, mini.shot_max_seconds) == (4.0, 8.0)
+
+    # 未知后端：回退短剧默认窗口。
+    unknown = resolve_pacing_settings({"video_backend": "unknown-backend"})
+    assert unknown.shot_target_seconds == 6.0
+    assert (unknown.shot_min_seconds, unknown.shot_max_seconds) == (3.0, 8.0)
+
+    # 模型上限比甜点区还窄时，单镜目标被夹到模型上限。
+    from novelvideo import config as config_module
+
+    monkeypatch.setattr(config_module, "NEWAPI_VIDEO_DURATION_BOUNDS", "tiny:4-5")
+    narrowed = resolve_pacing_settings({"video_backend": "newapi_tiny"})
+    assert narrowed.shot_target_seconds == 5.0
+    assert (narrowed.shot_min_seconds, narrowed.shot_max_seconds) == (4.0, 5.0)
+
+    # 显式配置仍优先于模型窗口。
+    assert (
+        resolve_pacing_settings(
+            {"video_backend": "newapi_seedance-2.5", "shot_target_seconds": 8}
+        ).shot_target_seconds
+        == 8.0
+    )
 
 
 def test_condense_text_keeps_head_and_last_sentence():
@@ -146,13 +182,83 @@ def test_compact_beats_folds_silence_into_neighbor():
     merged = compact_beats_for_shots(beats, shot_target_seconds=15)
     # 纯过场 beat 不再单独成镜
     assert all(b.audio_type != "silence" for b in merged)
-    # 甲的两句 + 中间空镜并为一镜；乙单独一镜
+    # 按说话人分镜：换人就断开，乙 另起一镜（保证逐行画面与声线一一对应）。
     assert len(merged) == 2
     assert merged[0].speaker == "甲"
-    assert merged[0].narration_segment.count("对白") == 2
+    assert merged[0].narration_segment == "对白一，对白二"
+    # 同说话人不逐行标人——保持纯文本合并口径。
+    assert "\n" not in merged[0].narration_segment
+    assert merged[1].speaker == "乙"
+    assert merged[1].narration_segment == "对白三"
     # 画面锚点取对白镜，而非首个空镜
     assert merged[0].visual_description == "画面1"
-    assert merged[1].speaker == "乙"
+    assert merged[1].visual_description == "画面5"
+
+
+def test_compact_beats_same_speaker_keeps_plain_text():
+    beats = [
+        _beat(1, "甲句一", audio_type="dialogue", speaker="甲"),
+        _beat(2, "甲句二", audio_type="dialogue", speaker="甲"),
+    ]
+    merged = compact_beats_for_shots(beats, shot_target_seconds=30)
+    assert len(merged) == 1
+    # 单一说话人不必逐行标人——保持旧的纯文本合并口径。
+    assert "\n" not in merged[0].narration_segment
+    assert "甲句一" in merged[0].narration_segment
+    assert "甲句二" in merged[0].narration_segment
+
+
+def test_compact_beats_keeps_different_speakers_separate():
+    # 跨说话人**不合并**：每句台词各占一镜，画面/声线逐行对应，避免十几秒双声线长镜。
+    beats = [
+        _beat(1, "一", audio_type="dialogue", speaker="甲"),
+        _beat(2, "二", audio_type="dialogue", speaker="乙"),
+        _beat(3, "三", audio_type="dialogue", speaker="丙"),
+        _beat(4, "四", audio_type="dialogue", speaker="丁"),
+    ]
+    merged = compact_beats_for_shots(beats, shot_target_seconds=30)
+    assert len(merged) == 4
+    assert [b.speaker for b in merged] == ["甲", "乙", "丙", "丁"]
+    assert [b.narration_segment for b in merged] == ["一", "二", "三", "四"]
+    assert all("\n" not in b.narration_segment for b in merged)
+
+
+def test_compact_beats_counts_per_line_overhead_for_dialogue():
+    # 对白逐行合成再拼接，每行有头尾静音开销（实测 ≈1.3s/行），估时要算进去：
+    # 33/4.45 ≈ 7.42s，两行 14.83s 本可合并，加上 2×1.3s 拼接开销后 17.4s > 15s。
+    beats = [
+        _beat(1, "字" * 33, audio_type="dialogue", speaker="甲"),
+        _beat(2, "词" * 33, audio_type="dialogue", speaker="甲"),
+    ]
+    merged = compact_beats_for_shots(beats, shot_target_seconds=15, chars_per_second=4.45)
+    assert len(merged) == 2
+
+
+def test_dialogue_line_count_counts_nonempty_lines():
+    from novelvideo.pacing import _dialogue_line_count
+
+    assert _dialogue_line_count(
+        _beat(1, "甲：一\n乙：二", audio_type="dialogue", speaker="甲")
+    ) == 2
+    # 空行不算行。
+    assert _dialogue_line_count(
+        _beat(1, "甲：一\n\n乙：二", audio_type="dialogue", speaker="甲")
+    ) == 2
+    assert _dialogue_line_count(
+        _beat(1, "甲：一", audio_type="dialogue", speaker="甲")
+    ) == 1
+    # 非对白不逐行合成，没有逐行开销。
+    assert _dialogue_line_count(_beat(1, "旁白一\n旁白二")) == 0
+
+
+def test_compact_beats_does_not_charge_dialogue_overhead_for_narration():
+    # 旁白走单次合成，没有逐行拼接开销；同样的字数应并成一镜。
+    beats = [
+        _beat(1, "字" * 33),
+        _beat(2, "词" * 33),
+    ]
+    merged = compact_beats_for_shots(beats, shot_target_seconds=15, chars_per_second=4.45)
+    assert len(merged) == 1
 
 
 def test_compact_beats_leading_silence_joins_following_speech():
@@ -173,6 +279,19 @@ def test_compact_beats_silence_only_keeps_one_group():
     )
     assert len(merged) == 1
     assert merged[0].audio_type == "silence"
+
+
+def test_compact_beats_leading_silence_run_never_becomes_its_own_shot():
+    # 一连串过场 beat（▲空镜/字幕/人物行）本身没有台词：即便名义时长早就超过单镜
+    # 预算，也必须攒着并入下一段对白，不能各自变成 4s 无声镜头（拖节奏又费钱）。
+    beats: list[Any] = [_silence(i) for i in range(1, 6)]
+    beats.append(_beat(6, "台词", audio_type="dialogue", speaker="甲"))
+    merged = compact_beats_for_shots(beats, shot_target_seconds=6)
+    assert len(merged) == 1
+    assert merged[0].audio_type == "dialogue"
+    assert merged[0].speaker == "甲"
+    # 画面锚点取对白镜，而非首个空镜。
+    assert merged[0].visual_description == "画面6"
 
 
 def test_pacing_settings_normalized():
@@ -226,10 +345,61 @@ def test_split_long_beats_leaves_short_and_manual_untouched():
     assert split_long_beats_for_shots([short], max_seconds=15) == [short]
     assert split_long_beats_for_shots([], max_seconds=15) == []
 
-    manual = _beat(2, "字" * 174, audio_type="dialogue", speaker="甲")
+
+def test_split_long_beats_separates_multi_speaker_lines_into_single_speaker_shots():
+    # 一镜多声线：整段发一条 seedance2 请求会让模型在一段视频里念两个音色（串味），
+    # 还常把镜头拉长到十几二十秒。按**行**拆开，每行连同说话人前缀单独成镜。
+    beat = _beat(
+        1,
+        "甲：" + "字" * 174 + "\n乙：" + "字" * 174,
+        audio_type="dialogue",
+        speaker="甲",
+    )
+    split = split_long_beats_for_shots([beat], max_seconds=15, chars_per_second=5.8)
+    assert len(split) >= 2
+    # 每镜只有一个说话人，台词里不再有换行。
+    assert all("\n" not in b.narration_segment for b in split)
+    assert all(b.narration_segment.startswith(f"{b.speaker}：") for b in split)
+    # 说话人随各自的行还原（第一条是甲，最后一条是乙），序号连续重排。
+    assert split[0].speaker == "甲"
+    assert split[-1].speaker == "乙"
+    assert [b.beat_number for b in split] == list(range(1, len(split) + 1))
+    # 台词一字不差、不重复（前缀不算台词）。
+    spoken = "".join(b.narration_segment.split("：", 1)[1] for b in split)
+    assert spoken.count("字") == 2 * 174
+    # 每镜台词都在单镜预算内。
+    cap = 15 * 0.85
+    for beat_piece in split:
+        text = beat_piece.narration_segment.split("：", 1)[1]
+        assert (
+            estimate_duration_seconds(text, chars_per_second=5.8) <= cap + 1e-6
+        )
+
+
+def test_split_long_beats_separates_short_multi_speaker_beat_too():
+    # 即便整段不长，也拆成单说话人镜头——复现基线「一镜一说话人」。
+    beat = _beat(1, "甲：你来了\n乙：我来了", audio_type="dialogue", speaker="甲")
+    split = split_long_beats_for_shots([beat], max_seconds=15, chars_per_second=5.8)
+    assert [b.narration_segment for b in split] == ["甲：你来了", "乙：我来了"]
+    assert [b.speaker for b in split] == ["甲", "乙"]
+    # 非对白多行（无说话人前缀）沿用 beat 自身声明的说话人，不丢信息。
+    plain = _beat(2, "第一行\n第二行", audio_type="dialogue", speaker="甲")
+    plain_split = split_long_beats_for_shots([plain], max_seconds=15)
+    assert [b.narration_segment for b in plain_split] == ["第一行", "第二行"]
+    assert all(b.speaker == "甲" for b in plain_split)
+
+
+def test_split_long_beats_keeps_manual_shot_untouched():
+    manual = _beat(1, "字" * 174, audio_type="dialogue", speaker="甲")
     manual.is_manual_shot = True
     manual.duration_seconds = 20.0
     assert split_long_beats_for_shots([manual], max_seconds=15) == [manual]
+    # 手工分镜即使带多行说话人也整段不拆。
+    manual_multi = _beat(2, "甲：一\n乙：二", audio_type="dialogue", speaker="甲")
+    manual_multi.is_manual_shot = True
+    assert (
+        split_long_beats_for_shots([manual_multi], max_seconds=15) == [manual_multi]
+    )
 
 
 def test_compact_then_split_keeps_every_shot_within_cap():

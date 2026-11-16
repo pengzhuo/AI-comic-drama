@@ -191,7 +191,7 @@ async def test_mainline_canvas_enqueue_carries_effective_feature_price(
         if "frame" in entry
         else "director_control_to_sketch" if entry == "director" else "sketch_regen"
     )
-    params = {"size": "1K"}
+    params = {"size": "2K" if "frame" in entry else "1K"}
     if selection == "newapi_gpt_image2":
         params["quality"] = quality
     assert captured["payload"]["billing"] == {
@@ -5754,7 +5754,7 @@ async def test_skill_run_frame_accepts_plain_canvas_image_as_sketch_input(
         "feature_key": "mainline.render_regen",
         "pricing_kind": "image",
         "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["newapi_gpt_image2"]["model"],
-        "pricing_params": {"size": "1K", "quality": "medium"},
+        "pricing_params": {"size": "2K", "quality": "medium"},
     }
     assert captured["payload"]["config"]["canvas_sketch_paths"]["8"].endswith(
         "/freezone/plain_sketch.png"

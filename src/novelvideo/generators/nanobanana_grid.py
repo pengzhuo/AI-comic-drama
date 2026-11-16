@@ -1378,6 +1378,25 @@ REGEN_MODE_CONFIGS: Dict[str, dict] = {
     },
 }
 
+# 首帧（render）单格模式的出图规格：首帧是视频的第 0 帧，1K 会成为整条成片的清晰度上限，
+# 所以默认真出 2K（约 1152×2048，高于 720p 成片，给视频模型留足细节）。
+# 可用 ``DRAMACLAW_SINGLE_CELL_IMAGE_SIZE`` 回退（如 "1K"）。草图（sketch）仍保持 1K：
+# 它只是给模型看构图的草稿，最终画面由 render 决定。
+SINGLE_CELL_IMAGE_SIZE = (
+    os.environ.get("DRAMACLAW_SINGLE_CELL_IMAGE_SIZE", "").strip() or "2K"
+)
+for _single_cell_mode_key in sorted(
+    {SINGLE_CELL_RENDER_MODE_KEY, *SINGLE_CELL_RENDER_MODE_BY_ASPECT.values()}
+):
+    _single_cell_config = REGEN_MODE_CONFIGS.get(_single_cell_mode_key)
+    if _single_cell_config is None:
+        continue
+    _single_cell_config["image_size"] = SINGLE_CELL_IMAGE_SIZE
+    _single_cell_config["label"] = (
+        f"{_single_cell_mode_key.replace('-', ':')} {SINGLE_CELL_IMAGE_SIZE}"
+    )
+del _single_cell_mode_key, _single_cell_config
+
 
 def get_sketch_default_mode_key(aspect_ratio: str = DEFAULT_SKETCH_ASPECT_RATIO) -> str:
     target = aspect_ratio.replace(":", "-")

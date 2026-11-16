@@ -200,7 +200,7 @@ def _default_project_config() -> dict:
         "user_grid_plan": {},
         "regen_file_map": {},
         "custom_styles": {},
-        # 节奏：每集≈目标时长、镜头尽量少。默认全局 60s，可按项目覆盖。
+        # 节奏：每集≈目标时长；短剧镜头语言按 3–8s 一镜切分（默认 6s，见 pacing）。
         "episode_planning_mode": "duration",
         "episode_target_seconds": DEFAULT_EPISODE_TARGET_SECONDS,
         "episode_merge_floor_seconds": DEFAULT_EPISODE_MERGE_FLOOR_SECONDS,
@@ -1098,5 +1098,40 @@ def script_process_digest_override_from_state_dir(state_dir: str | Path) -> bool
     """按项目目录读「理解账注入」的项目级覆盖；没配返回 ``None``。"""
 
     return project_script_process_digest(
+        load_project_config_file_from_state_dir(state_dir)
+    )
+
+
+#: 「相邻 beat 首尾帧逐帧咬合」开关（``project_config.json``）：缺失 = 跟随部署级
+#: 默认（默认开启），显式布尔 = 该项目单独开/关。开启时 Beat N 的尾帧取
+#: Beat N+1 的首帧，保证镜头之间画面绝对连续。语义见 ``seedance2_i2v/pipeline.py``。
+FIRST_LAST_FRAME_CHAINING_KEY = "first_last_frame_chaining"
+
+
+def project_first_last_frame_chaining(config: dict | None) -> bool | None:
+    """读项目级「首尾帧咬合」开关：``None`` = 没配（跟随部署级默认）。"""
+
+    if not isinstance(config, dict) or FIRST_LAST_FRAME_CHAINING_KEY not in config:
+        return None
+    value = config.get(FIRST_LAST_FRAME_CHAINING_KEY)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+    return None
+
+
+def first_last_frame_chaining_override_from_state_dir(
+    state_dir: str | Path,
+) -> bool | None:
+    """按项目目录读「首尾帧咬合」的项目级覆盖；没配返回 ``None``。"""
+
+    return project_first_last_frame_chaining(
         load_project_config_file_from_state_dir(state_dir)
     )

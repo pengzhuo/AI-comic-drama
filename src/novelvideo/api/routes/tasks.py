@@ -68,6 +68,7 @@ _TASK_TYPE_LABELS = {
     "single_video": "生成单镜视频",
     "global_optimize_video": "全局优化视频",
     "compose_episode": "合成剧集",
+    "episode_audio_design": "配乐/环境音设计",
     "audio_generation": "生成音频",
     "indextts2_audio_generation": "生成音频",
     "audio_generation_indextts2": "生成音频",

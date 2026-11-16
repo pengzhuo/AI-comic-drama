@@ -2220,6 +2220,18 @@ class CogneeStore:
                         existing.keyframe_prompt if existing else "",
                     )
                     or "",
+                    shot_size=beat_payload.get(
+                        "shot_size", existing.shot_size if existing else ""
+                    )
+                    or "",
+                    shot_angle=beat_payload.get(
+                        "shot_angle", existing.shot_angle if existing else ""
+                    )
+                    or "",
+                    shot_move=beat_payload.get(
+                        "shot_move", existing.shot_move if existing else ""
+                    )
+                    or "",
                     shot_order=(
                         beat_payload.get("shot_order")
                         if beat_payload.get("shot_order") is not None
@@ -2295,6 +2307,9 @@ class CogneeStore:
                     video_mode=getattr(beat, "video_mode", "first_frame"),
                     video_prompt=getattr(beat, "video_prompt", "") or "",
                     keyframe_prompt=getattr(beat, "keyframe_prompt", "") or "",
+                    shot_size=getattr(beat, "shot_size", "") or "",
+                    shot_angle=getattr(beat, "shot_angle", "") or "",
+                    shot_move=getattr(beat, "shot_move", "") or "",
                 )
             )
 
@@ -2372,6 +2387,9 @@ class CogneeStore:
         video_mode: str = None,
         video_prompt: str = None,
         keyframe_prompt: str = None,
+        shot_size: str = None,
+        shot_angle: str = None,
+        shot_move: str = None,
         seedance2_config_json: str = None,
         time_of_day: str = None,
         shot_order: int | None = None,
@@ -2392,6 +2410,9 @@ class CogneeStore:
             video_mode=video_mode,
             video_prompt=video_prompt,
             keyframe_prompt=keyframe_prompt,
+            shot_size=shot_size,
+            shot_angle=shot_angle,
+            shot_move=shot_move,
             seedance2_config_json=seedance2_config_json,
             time_of_day=time_of_day,
             shot_order=shot_order,

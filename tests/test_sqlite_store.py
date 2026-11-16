@@ -1418,6 +1418,8 @@ async def test_beats_schema_uses_current_columns(tmp_project):
     assert "scene_ref_json" in columns
     assert "prop_refs_json" not in columns
     assert "video_prompt" in columns
+    # 分镜规划（镜头语言）：景别/机位/运镜。
+    assert {"shot_size", "shot_angle", "shot_move"}.issubset(set(columns))
 
 
 @pytest.mark.asyncio

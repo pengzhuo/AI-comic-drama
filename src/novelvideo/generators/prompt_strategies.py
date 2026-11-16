@@ -37,6 +37,32 @@ from novelvideo.models import (  # noqa: F401
 from novelvideo.services.style_service import StyleService  # noqa: F401
 
 
+def _planned_shot_language_clause(beat: dict) -> str:
+    """分镜规划定下的景别/机位/运镜，拼成草图提示词里的一句话。
+
+    草图是画面的构图源头（渲染阶段被明确禁止改机位），所以镜头语言必须写进**草图**
+    提示词才真正落地；否则规划值只活在视频提示词里，与草图实际画出的景别互相打架。
+    没有规划（老数据 / 未开节奏）时返回空串，提示词一字不变。
+    """
+
+    size = str((beat or {}).get("shot_size", "") or "").strip()
+    angle = str((beat or {}).get("shot_angle", "") or "").strip()
+    move = str((beat or {}).get("shot_move", "") or "").strip()
+    if not (size or angle or move):
+        return ""
+    parts = [part for part in (size, angle, move) if part]
+    clause = "、".join(parts)
+    if angle == "过肩":
+        return (
+            f"镜头语言：{clause}。画成过肩反打——前景人物留在画面一侧，"
+            "与之对话的人物在对面入画，使这一镜是上一镜的反向视角。"
+        )
+    return (
+        f"镜头语言：{clause}。严格按此景别取景（特写=头肩，中景=腰部以上，"
+        "全景=人物全身且保留所处空间）。"
+    )
+
+
 class RenderModeStrategy:
     """Render 模式：基于草图渲染（使用文本格式，效果更稳定）。"""
 
@@ -746,8 +772,14 @@ LAYOUT (CRITICAL - MUST BE EXACT):
 
             visual_desc = visual_desc.rstrip("。！？，、；：")
 
-            # Sketch 模式：Nanobanana 自主构图（Master Director），不注入导演手册的镜头语言
+            # Sketch 模式：Nanobanana 自主构图（Master Director），不注入导演手册的镜头语言。
+            # 但分镜规划定下的景别/机位要落进草图提示词：草图是构图源头，渲染阶段被明确
+            # 禁止改机位，镜头语言只能在这里落地（没有规划时提示词一字不变）。
             panel_desc = visual_desc
+            if ctx.mode == PromptMode.SKETCH:
+                shot_clause = _planned_shot_language_clause(beat)
+                if shot_clause:
+                    panel_desc = f"{visual_desc}。{shot_clause}"
             # 默认 sketch 不再注入大段 BLOCKING 约束；仅在 render 模式或 3GS director 修图模式下保留几何约束
             blocking_hints = (
                 []

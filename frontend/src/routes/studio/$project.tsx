@@ -25,10 +25,7 @@ import {
   waitForStudioBeatVideo,
 } from "@/features/studio/studio-api";
 import { useStudioPolling } from "@/features/studio/use-studio-polling";
-import {
-  IDENTITY_GATE_GRACE_SECONDS,
-  useStudioRun,
-} from "@/features/studio/use-studio-run";
+import { useStudioRun } from "@/features/studio/use-studio-run";
 import {
   useClearBlockedShot,
   useStartProjectAutoRun,
@@ -318,9 +315,6 @@ function StudioProjectPage() {
           gate={gateKind}
           episode={activeGateEpisode}
           variant="card"
-          autoSkipSeconds={
-            gateKind === "identity_images" ? IDENTITY_GATE_GRACE_SECONDS : undefined
-          }
           onResolved={() => undefined}
         />
       ) : gateKind === "voice_setup" ? (

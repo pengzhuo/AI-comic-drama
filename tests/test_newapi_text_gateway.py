@@ -510,10 +510,56 @@ def test_global_video_optimizer_wraps_plain_text_output_locally(monkeypatch, tmp
         "beat_number": 1,
         "video_mode": "first_frame",
         "prompt": "镜头缓缓推近，黑衣男子抬手推门。",
+        # 未传 shot_language 时三个镜头语言字段留空（不注入、不落库）。
+        "shot_size": "",
+        "shot_angle": "",
+        "shot_move": "",
     }
     task = seen["user_prompt"][0]
     assert "Output the Chinese motion prompt directly" in task
     assert "Output JSON" not in task
+
+
+def test_global_video_optimizer_injects_locked_shot_language(monkeypatch, tmp_path):
+    """分镜规划定下的镜头语言必须出现在提示词里，并原样回传三个字段。"""
+
+    import asyncio
+    from types import SimpleNamespace
+
+    from novelvideo.agents.global_video_optimizer import GlobalVideoPromptOptimizer
+
+    sketch_path = tmp_path / "beat_01.png"
+    sketch_path.write_bytes(b"fake-image")
+    seen = {}
+
+    class FakeAgent:
+        async def run(self, user_prompt):
+            seen["user_prompt"] = user_prompt
+            return SimpleNamespace(output="中近景过肩反打，男子开口说话。")
+
+    optimizer = GlobalVideoPromptOptimizer()
+    monkeypatch.setattr(optimizer, "_get_agent", lambda _language: FakeAgent())
+    monkeypatch.setattr(optimizer, "_compress_image", lambda _path: b"compressed")
+
+    result = asyncio.run(
+        optimizer.optimize_single_beat(
+            beat={"beat_number": 2, "visual_description": "男子开口"},
+            sketch_image_path=str(sketch_path),
+            character_color_map={},
+            shot_language={
+                "shot_size": "中近景",
+                "shot_angle": "过肩",
+                "shot_move": "固定",
+            },
+        )
+    )
+
+    assert result["shot_size"] == "中近景"
+    assert result["shot_angle"] == "过肩"
+    assert result["shot_move"] == "固定"
+    task = seen["user_prompt"][0]
+    assert "Shot Language (LOCKED by the storyboard planner)" in task
+    assert "中近景 / 过肩 / 固定" in task
 
 
 def test_global_video_optimizer_keeps_legacy_global_video_model_fallback(monkeypatch):

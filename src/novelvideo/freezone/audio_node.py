@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import subprocess
 import uuid
@@ -40,6 +41,8 @@ from novelvideo.seedance2_i2v.voice_clone import (
 )
 from novelvideo.skills.ai_film_process import append_audio_directive
 from novelvideo.freezone.paths import outputs_dir
+
+logger = logging.getLogger(__name__)
 
 USER_VOICE_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".webm"}
 USER_VOICE_SCOPE = "user_custom"
@@ -940,6 +943,100 @@ async def _write_newapi_audio_speech(
         if isinstance(exc, Exception):
             raise RuntimeError("NewAPI audio generation failed") from None
         raise
+
+
+#: 主流程「声音层」（配乐/环境音/音效）与原 Freezone 音乐共用同一网关模型。
+DEFAULT_MUSIC_MODEL = "LingShan-MU-11"
+
+
+async def generate_music_audio_file(
+    *,
+    output_path: Path,
+    prompt: str,
+    music_length_ms: int,
+    model: str = DEFAULT_MUSIC_MODEL,
+    force_instrumental: bool = True,
+    output_format: str = "mp3_44100_128",
+    response_format: str = "mp3",
+    egress_context: TrustedEgressContext | None = None,
+    business_task_id: str | None = None,
+) -> dict[str, Any]:
+    """把「音乐/环境音/音效」生成收敛到一处，写到调用方指定的路径。
+
+    与 :func:`generate_freezone_audio_eleven_music` 同一条网关契约
+    （``/v1/audio/speech`` + ``metadata.music_length_ms``）；区别只在输出路径
+    与计费来源。计费预扣是**尽力而为**：预扣失败不阻断生成（与 ``_confirm`` /
+    ``_refund`` 同样的容错口径），否则一次余额问题会把整集卡在声音层。
+    """
+
+    from novelvideo.ports import update_current_model_call_log
+
+    clean_prompt = str(prompt or "").strip()
+    if not clean_prompt:
+        raise ValueError("prompt is required")
+    length = int(music_length_ms or 0)
+    if length < 3_000 or length > 600_000:
+        raise ValueError("music_length_ms must be between 3000 and 600000")
+
+    fmt = str(response_format or "mp3").strip() or "mp3"
+    model_name = str(model or DEFAULT_MUSIC_MODEL).strip() or DEFAULT_MUSIC_MODEL
+    metadata: dict[str, Any] = {
+        "music_length_ms": length,
+        "force_instrumental": bool(force_instrumental),
+        "respect_sections_durations": True,
+        "output_format": str(output_format or "mp3_44100_128").strip()
+        or "mp3_44100_128",
+    }
+    reservation_id = ""
+    try:
+        reservation_id = await _reserve_music_model_call(
+            model_name,
+            music_length_ms=length,
+            source="mainline_audio_design",
+        )
+    except Exception:  # noqa: BLE001 - 计费预扣失败不阻断生成
+        logger.warning("music credit reservation failed; continuing unbilled")
+
+    try:
+        request_payload = {
+            "model": model_name,
+            "input": clean_prompt,
+            "response_format": fmt,
+            "metadata": metadata,
+        }
+        await update_current_model_call_log(request_payload=request_payload)
+        write_kwargs: dict[str, Any] = {
+            "output_path": output_path,
+            "model": model_name,
+            "input_text": clean_prompt,
+            "response_format": fmt,
+            "metadata": metadata,
+            "timeout_seconds": 900.0,
+        }
+        if egress_context is not None:
+            write_kwargs.update(
+                egress_context=egress_context,
+                business_task_id=business_task_id
+                or f"mainline-audio-design:{output_path.name}",
+            )
+        response_payload = await _write_newapi_audio_speech(**write_kwargs)
+        await update_current_model_call_log(response_payload=response_payload)
+        if not output_path.exists() or output_path.stat().st_size <= 0:
+            raise RuntimeError("NewAPI music audio file was not created")
+        await _confirm_music_model_call(model=model_name, reservation_id=reservation_id)
+    except Exception as exc:
+        await update_current_model_call_log(error_message=type(exc).__name__)
+        await _refund_music_model_call(
+            reservation_id,
+            source="mainline_audio_design",
+            error=type(exc).__name__,
+        )
+        raise
+    return {
+        "model": model_name,
+        "content_type": _audio_mime_type(fmt),
+        "content_length": output_path.stat().st_size,
+    }
 
 
 async def generate_freezone_audio_eleven_music(

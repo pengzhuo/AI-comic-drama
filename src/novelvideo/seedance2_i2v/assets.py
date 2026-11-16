@@ -39,7 +39,9 @@ from novelvideo.seedance2_i2v.voice_clone import (
     resolve_character_voice,
 )
 from novelvideo.utils.path_resolver import PathResolver
+from novelvideo.utils.path_resolver import canonical_identity_costume_path
 from novelvideo.utils.path_resolver import canonical_scene_master_path
+from novelvideo.utils.path_resolver import canonical_scene_reverse_master_path
 from novelvideo.utils.path_resolver import canonical_prop_reference_path
 
 MIN_REFERENCE_ASPECT_RATIO = 0.4
@@ -233,6 +235,15 @@ def _identity_asset_path(project_output: Path, identity_id: str) -> Path:
     return project_output / "assets" / "characters" / character / "identities" / f"{identity}.png"
 
 
+def _identity_costume_asset_path(project_output: Path, identity_id: str) -> Path:
+    """身份级服装参考图（``.../<identity>_costume.png``）；不存在时返回该槽位路径。"""
+
+    character, identity = _split_identity_label(identity_id)
+    if not identity:
+        return project_output / "assets" / "characters" / character / "portrait_costume.png"
+    return canonical_identity_costume_path(project_output, character, identity)
+
+
 def _prop_asset_path(project_output: Path, prop_id: str) -> Path:
     return canonical_prop_reference_path(project_output, prop_id)
 
@@ -353,8 +364,26 @@ def _scene_asset_path(project_output: Path, beat: dict[str, Any]) -> Path:
     return _beat_scene_asset(project_output, beat)[1]
 
 
+def _beat_prefers_reverse_scene(beat: dict[str, Any]) -> bool:
+    """本 beat 是否应改用场景**反向视角**当背景。
+
+    短剧的正反打不是把同一张背景左右翻转，而是两个相反的机位：正打看场景正面、反打看
+    反向。分镜规划把反打标成 ``shot_angle == "过肩"``，这里据此换用
+    ``reverse_master.png``；用户手动指定 ``render_anchor_source_id == "reverse"`` 时同理。
+    """
+
+    if _text(beat.get("shot_angle")) == "过肩":
+        return True
+    scene_ref = beat_scene_ref(beat)
+    return bool(scene_ref and _text(getattr(scene_ref, "render_anchor_source_id", "")) == "reverse")
+
+
 def _beat_scene_asset(project_output: Path, beat: dict[str, Any]) -> tuple[str, Path]:
     scene_label = _beat_scene_label(project_output, beat)
+    if _beat_prefers_reverse_scene(beat):
+        reverse_path = canonical_scene_reverse_master_path(project_output, scene_label)
+        if reverse_path.exists():
+            return scene_label, reverse_path
     scene_path = canonical_scene_master_path(project_output, scene_label)
     if scene_path.exists():
         return scene_label, scene_path
@@ -919,6 +948,7 @@ def build_seedance2_project_assets(
     next_beat: dict[str, Any] | None = None,
     characters: list[Any] | None = None,
     prop_menu: list[Any] | None = None,
+    first_frame_override: Path | None = None,
 ) -> list[Seedance2ResolvedAsset]:
     """Resolve project assets in the order used for Seedance 2.0 requests."""
 
@@ -1066,15 +1096,21 @@ def build_seedance2_project_assets(
             )
 
     paths = PathResolver(project_output, episode)
-    first_frame_source = paths.frame(beat_num)
-    first_frame_path = (
-        paths.valid_video_input_frame(
-            beat_num,
-            slot="first_frame",
-            source_path=first_frame_source,
+    if first_frame_override is not None and Path(first_frame_override).is_file():
+        # 滚动咬合：本 beat 的首帧改用上一 beat 成片的尾帧，逐帧接住画面，
+        # 这样同一镜里仍然可以带原生参考声线（尾帧参数与参考声线互斥）。
+        first_frame_source = Path(first_frame_override)
+        first_frame_path = first_frame_source
+    else:
+        first_frame_source = paths.frame(beat_num)
+        first_frame_path = (
+            paths.valid_video_input_frame(
+                beat_num,
+                slot="first_frame",
+                source_path=first_frame_source,
+            )
+            or first_frame_source
         )
-        or first_frame_source
-    )
     if mode == Seedance2I2VMode.FIRST_FRAME:
         add_image(
             key="first_frame",
@@ -1159,6 +1195,20 @@ def build_seedance2_project_assets(
             required=False,
             fallback_text=identity_fallback,
         )
+        # 服装参考：同一张脸 × 不同造型的一致性来源。只在真的有这张图时才附加
+        # （身份图已经锁脸，服装图锁衣服；两者互补，缺一不可）。
+        costume_path = _identity_costume_asset_path(project_output, identity_id)
+        if costume_path.exists():
+            add_image(
+                key=f"identity:{identity_id}:costume",
+                label=f"{character} · 服装",
+                path=costume_path,
+                selected=True,
+                request_field="reference_images",
+                note="同一角色的服装/造型参考，保持跨镜造型一致。",
+                identity_id=identity_id,
+                required=False,
+            )
 
     prop_ids: list[str] = []
     for prop_id in resolve_beat_prop_ids(
@@ -1212,7 +1262,7 @@ def build_seedance2_project_assets(
 
     add_voice_reference_audio()
 
-    return assets
+    return trim_seedance2_reference_images(assets)
 
 
 def selected_reference_paths(assets: list[Seedance2ResolvedAsset], request_field: str) -> list[str]:
@@ -1221,6 +1271,84 @@ def selected_reference_paths(assets: list[Seedance2ResolvedAsset], request_field
         for asset in assets
         if asset.selected and asset.request_field == request_field and asset.path.exists()
     ]
+
+
+#: 上游对单次请求参考图数量的硬限制（``request.py`` 超了直接报错，不会自动丢弃）。
+MAX_SEEDANCE2_REFERENCE_IMAGES = 9
+
+#: 超出上限时的保留优先级（数字越小越先保留）。同优先级保留**先出现**的。
+_REFERENCE_IMAGE_KEEP_ORDER: tuple[tuple[str, int], ...] = (
+    ("first_frame", 0),
+    ("last_frame", 0),
+    ("identity:", 1),
+    (":costume", 2),
+    ("scene:", 3),
+    ("prop:", 4),
+    ("user_image:", 5),
+)
+
+
+def _reference_image_keep_priority(key: str) -> int:
+    text = str(key or "")
+    for prefix, priority in _REFERENCE_IMAGE_KEEP_ORDER:
+        if text.startswith(prefix):
+            return priority
+    return 9
+
+
+def trim_seedance2_reference_images(
+    assets: list[Seedance2ResolvedAsset],
+    limit: int = MAX_SEEDANCE2_REFERENCE_IMAGES,
+) -> list[Seedance2ResolvedAsset]:
+    """把要发的参考图压到 ``limit`` 张以内，并按最终顺序重排 ``图片N`` 编号。
+
+    加了场景反向视角与服装参考之后很容易撞到上游 9 图硬限制（撞了就整条请求报错）。这里
+    按优先级裁剪：首/尾帧 > 身份图 > 服装 > 场景 > 道具 > 用户图；被裁掉的置为未发送并
+    在 note 里说明原因，其余按列表顺序重新编号，保证 ``图片N`` 与
+    :func:`selected_reference_paths` 的顺序一致（提示词里引用的编号也就不会错位）。
+    """
+
+    selected = [
+        (index, asset)
+        for index, asset in enumerate(assets)
+        if asset.selected and asset.request_field == "reference_images"
+    ]
+    if len(selected) <= limit:
+        return assets
+    keep_indexes = {
+        index
+        for index, _asset in sorted(
+            selected,
+            key=lambda pair: (_reference_image_keep_priority(pair[1].key), pair[0]),
+        )[:limit]
+    }
+    trimmed: list[Seedance2ResolvedAsset] = []
+    renumber = 0
+    for index, asset in enumerate(assets):
+        if not (asset.selected and asset.request_field == "reference_images"):
+            trimmed.append(asset)
+            continue
+        if index not in keep_indexes:
+            trimmed.append(
+                replace(
+                    asset,
+                    selected=False,
+                    request_field="",
+                    image_number=None,
+                    reference_label="未发送",
+                    note=(
+                        f"{asset.note}；参考图超过 {limit} 张上限，已按优先级省略"
+                        if asset.note
+                        else f"参考图超过 {limit} 张上限，已按优先级省略"
+                    ),
+                )
+            )
+            continue
+        renumber += 1
+        trimmed.append(
+            replace(asset, image_number=renumber, reference_label=f"图片{renumber}")
+        )
+    return trimmed
 
 
 def _user_reference_paths(config_paths: list[str], auto_paths: set[str]) -> list[str]:
@@ -1236,7 +1364,12 @@ def append_seedance2_user_reference_assets(
     *,
     reference_image_paths: list[str],
     reference_audio_paths: list[str],
-) -> None:
+) -> list[Seedance2ResolvedAsset]:
+    """追加用户手选的参考图/音频，并把参考图压到上游上限以内。
+
+    返回**新的**资产列表（``Seedance2ResolvedAsset`` 是不可变 dataclass，裁剪时会重建），
+    调用方必须接住返回值。
+    """
     auto_image_paths = {
         str(asset.path)
         for asset in assets
@@ -1287,6 +1420,7 @@ def append_seedance2_user_reference_assets(
                 reference_label=f"音频{audio_count}",
             )
         )
+    return trim_seedance2_reference_images(assets)
 
 
 def apply_prompt_audio_selection(

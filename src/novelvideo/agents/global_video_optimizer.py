@@ -332,6 +332,7 @@ class GlobalVideoPromptOptimizer:
         next_beat: dict | None = None,
         prev_prompt: str | None = None,
         total_beats: int = 0,
+        shot_language: dict | None = None,
     ) -> dict:
         """为单个 beat 生成导演级视频提示词。
 
@@ -339,6 +340,7 @@ class GlobalVideoPromptOptimizer:
             beat: beat 数据 (visual_description, narration_segment, etc.)
             sketch_image_path: 该 beat 的草图帧路径
             character_color_map: 角色颜色→外貌映射
+            shot_language: 分镜规划步定下的镜头语言（景别/机位/运镜），必须遵守
 
         Returns:
             {"beat_number": int, "video_mode": "first_frame", "prompt": str}
@@ -376,6 +378,35 @@ class GlobalVideoPromptOptimizer:
         if audio_type == "dialogue":
             spk_label = identity_to_color.get(speaker, speaker) if speaker else ""
             dialogue_hint = f"\n## Dialogue Beat\nSpeaker: {spk_label}. Prompt MUST include speaking action (lips moving AND a visible expression AND a gesture AND a locked gaze) delivered at a natural, brisk pace like a real person (never \"unhurried / 平稳 / 不紧不慢\"). Dialogue text will be appended by the system.\n"
+
+        # 分镜规划步已经定好这一镜的景别/机位/运镜——它是**跨镜**决策（相邻两镜必须有
+        # 差、正打反打交替），所以这里只要求遵循，不允许模型自行改回「中景平视」。
+        shot_language_section = ""
+        shot_language_value = {
+            "shot_size": "",
+            "shot_angle": "",
+            "shot_move": "",
+        }
+        if isinstance(shot_language, dict) and any(shot_language.values()):
+            shot_size = str(shot_language.get("shot_size") or "").strip()
+            shot_angle = str(shot_language.get("shot_angle") or "").strip()
+            shot_move = str(shot_language.get("shot_move") or "").strip()
+            shot_language_value = {
+                "shot_size": shot_size,
+                "shot_angle": shot_angle,
+                "shot_move": shot_move,
+            }
+            label = " / ".join(
+                part for part in (shot_size, shot_angle, shot_move) if part
+            )
+            shot_language_section = (
+                "\n## Shot Language (LOCKED by the storyboard planner)\n"
+                f"- This shot is: {label}\n"
+                "- Open the clip on exactly this framing/angle; do NOT re-frame to a "
+                "generic medium eye-level shot.\n"
+                "- Keep the framing stable for the whole clip unless the planned move "
+                "says otherwise.\n"
+            )
 
         # Clip clock: decide how many shots the clip should hold, so a long line
         # is covered by cuts instead of one slowed-down take.
@@ -436,7 +467,7 @@ class GlobalVideoPromptOptimizer:
 
 ## Beat {bn} Context
 {beat_context}
-{dialogue_hint}{continuity_section}
+{dialogue_hint}{shot_language_section}{continuity_section}
 ## Clip Clock
 - Clip length: {clip_seconds:.1f}s
 - Shot plan: {shot_plan}
@@ -457,6 +488,7 @@ class GlobalVideoPromptOptimizer:
 8. Give every character a visible performance (gaze, blink, brow/cheek/jaw, gesture, breath) — no blank or frozen faces, no robotic or mechanical motion
 9. State the look is photorealistic live-action with real skin texture; no cartoon / animated / 3D-render / plastic-wax wording
 10. Never use slow-motion camera or speech wording
+11. Obey the locked Shot Language framing/angle exactly; it is a cross-shot storyboard decision — do not normalise every shot back to a medium eye-level view
 
 ## Output Language
 {language_instruction}
@@ -504,6 +536,7 @@ Output the {output_label} motion prompt directly. No JSON, explanation, or markd
             "beat_number": bn,
             "video_mode": "first_frame",
             "prompt": prompt,
+            **shot_language_value,
         }
 
         # Append dialogue line if applicable

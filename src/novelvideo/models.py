@@ -914,6 +914,22 @@ class VisualBeat(BaseModel):
     # 注：尾帧路径不需要存储，动态获取下一个 beat 的 frame_path
 
     # ==========================================================================
+    # 镜头语言（分镜规划步产出；三个都为空表示「尚未规划」，下游按原逻辑兜底）
+    # ==========================================================================
+    shot_size: str = Field(
+        default="",
+        description="景别：大特写/特写/近景/中近景/中景/全景/远景/大远景",
+    )
+    shot_angle: str = Field(
+        default="",
+        description="机位/角度：平视/过肩/俯视/仰视/侧面/背面/第一人称",
+    )
+    shot_move: str = Field(
+        default="",
+        description="运镜：固定/推/拉/摇/移/跟/升降/手持",
+    )
+
+    # ==========================================================================
     # Action Beat 专属字段（2.0 短剧模式）
     # ==========================================================================
 
@@ -1441,6 +1457,11 @@ class NovelVisualBeat(BaseModel):
     video_mode: str = Field(default="first_frame", description="first_frame / keyframe")
     video_prompt: str = Field(default="", description="视频运动提示词")
     keyframe_prompt: str = Field(default="", description="首尾帧过渡提示词")
+
+    # 镜头语言（分镜规划步产出）
+    shot_size: str = Field(default="", description="景别：大特写/特写/近景/中近景/中景/全景/远景/大远景")
+    shot_angle: str = Field(default="", description="机位/角度：平视/过肩/俯视/仰视/侧面/背面/第一人称")
+    shot_move: str = Field(default="", description="运镜：固定/推/拉/摇/移/跟/升降/手持")
 
     # Seedance 2.0 per-beat config overrides (Stage B; Stage A persists '{}' default)
     seedance2_config_json: str = Field(

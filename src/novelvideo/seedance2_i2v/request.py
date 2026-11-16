@@ -244,9 +244,21 @@ def build_seedance2_huimeng_params(
             raise ValueError("first_frame is required for Seedance 2.0 first-last-frame mode")
         if not last_frame:
             raise ValueError("last_frame is required for Seedance 2.0 first-last-frame mode")
+        # 首尾帧和参考声线不互斥：参考图/视频才与首尾帧互斥，声线要照发，否则模型
+        # 自编音色（跨镜音色/口型失去依据），提示词里的 @音频N 也会被判成越界引用。
+        audios = clean_reference_list(reference_audios)
+        if len(audios) > 3:
+            raise ValueError("reference_audios supports at most 3 audios")
         params["first_frame_image"] = first_frame
         params["last_frame_image"] = last_frame
-        return _finalize_params(params, config, image_count=2)
+        if audios:
+            params["reference_audios"] = audios
+        return _finalize_params(
+            params,
+            config,
+            image_count=2,
+            audio_count=len(audios),
+        )
 
     if config.mode == Seedance2I2VMode.MULTIMODAL_REFERENCE:
         images = clean_reference_list(reference_images)

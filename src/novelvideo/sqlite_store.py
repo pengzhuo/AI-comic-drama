@@ -234,6 +234,9 @@ CREATE TABLE IF NOT EXISTS beats (
     video_mode             TEXT DEFAULT 'first_frame',
     video_prompt           TEXT DEFAULT '',
     keyframe_prompt        TEXT DEFAULT '',
+    shot_size              TEXT DEFAULT '',
+    shot_angle           TEXT DEFAULT '',
+    shot_move            TEXT DEFAULT '',
     shot_order             INTEGER,
     duration_seconds       REAL,
     is_manual_shot         INTEGER DEFAULT 0,
@@ -399,7 +402,12 @@ _PROJECT_STORE_SCHEMA_COMPONENT = "project_store"
 # MIGRATION CONTRACT: increment this whenever SQLITE_SCHEMA_SQL or any
 # _ensure_*_columns migration above changes. Existing databases skip the
 # initializer after this version has been recorded.
-_PROJECT_STORE_SCHEMA_VERSION = 5
+#
+# v6: 短剧镜头语言新增 ``beats.shot_size`` / ``shot_angle`` / ``shot_move``
+#     （见 ``_ensure_beat_current_columns``）。这三列上次漏了版本号，老库会在
+#     保存剧本 ``add_visual_beats`` 时因缺列直接失败（"table beats has no column
+#     named shot_size"），所以补一次版本让迁移对存量库生效。
+_PROJECT_STORE_SCHEMA_VERSION = 6
 
 
 def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
@@ -593,6 +601,9 @@ class SQLiteStore:
             "video_mode": "TEXT DEFAULT 'first_frame'",
             "video_prompt": "TEXT DEFAULT ''",
             "keyframe_prompt": "TEXT DEFAULT ''",
+            "shot_size": "TEXT DEFAULT ''",
+            "shot_angle": "TEXT DEFAULT ''",
+            "shot_move": "TEXT DEFAULT ''",
             "shot_order": "INTEGER",
             "duration_seconds": "REAL",
             "is_manual_shot": "INTEGER DEFAULT 0",
@@ -2587,6 +2598,9 @@ class SQLiteStore:
             video_mode=row["video_mode"] if "video_mode" in row.keys() else "first_frame",
             video_prompt=row["video_prompt"] if "video_prompt" in row.keys() else "",
             keyframe_prompt=row["keyframe_prompt"] if "keyframe_prompt" in row.keys() else "",
+            shot_size=row["shot_size"] if "shot_size" in row.keys() else "",
+            shot_angle=row["shot_angle"] if "shot_angle" in row.keys() else "",
+            shot_move=row["shot_move"] if "shot_move" in row.keys() else "",
             seedance2_config_json=(
                 row["seedance2_config_json"] if "seedance2_config_json" in row.keys() else "{}"
             ),
@@ -2683,6 +2697,9 @@ class SQLiteStore:
                     "video_mode": getattr(b, "video_mode", "first_frame"),
                     "video_prompt": getattr(b, "video_prompt", ""),
                     "keyframe_prompt": getattr(b, "keyframe_prompt", ""),
+                    "shot_size": getattr(b, "shot_size", ""),
+                    "shot_angle": getattr(b, "shot_angle", ""),
+                    "shot_move": getattr(b, "shot_move", ""),
                     "seedance2_config_json": getattr(b, "seedance2_config_json", "{}"),
                     "detected_identities": normalize_detected_identities(
                         json.loads(b.detected_identities_json or "[]")
@@ -2732,6 +2749,9 @@ class SQLiteStore:
         video_mode: str | None = None,
         video_prompt: str | None = None,
         keyframe_prompt: str | None = None,
+        shot_size: str | None = None,
+        shot_angle: str | None = None,
+        shot_move: str | None = None,
         seedance2_config_json: str | None = None,
         time_of_day: str | None = None,
         shot_order: int | None = None,
@@ -2769,6 +2789,12 @@ class SQLiteStore:
             properties["video_prompt"] = video_prompt
         if keyframe_prompt is not None:
             properties["keyframe_prompt"] = keyframe_prompt
+        if shot_size is not None:
+            properties["shot_size"] = shot_size
+        if shot_angle is not None:
+            properties["shot_angle"] = shot_angle
+        if shot_move is not None:
+            properties["shot_move"] = shot_move
         if seedance2_config_json is not None:
             properties["seedance2_config_json"] = str(seedance2_config_json or "{}")
         if time_of_day is not None:
@@ -2817,8 +2843,9 @@ class SQLiteStore:
                    detected_identities_json, detected_props_json, scene_ref_json,
                    audio_type, speaker, speaker_kind, time_of_day,
                    video_mode, video_prompt, keyframe_prompt,
+                   shot_size, shot_angle, shot_move,
                    shot_order, duration_seconds, is_manual_shot, source_text_sha256)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(episode_number, beat_number) DO UPDATE SET
                    narration=excluded.narration, visual_description=excluded.visual_description,
                    detected_identities_json=excluded.detected_identities_json,
@@ -2830,6 +2857,9 @@ class SQLiteStore:
                    video_mode=excluded.video_mode,
                    video_prompt=excluded.video_prompt,
                    keyframe_prompt=excluded.keyframe_prompt,
+                   shot_size=excluded.shot_size,
+                   shot_angle=excluded.shot_angle,
+                   shot_move=excluded.shot_move,
                    shot_order=excluded.shot_order,
                    duration_seconds=excluded.duration_seconds,
                    is_manual_shot=excluded.is_manual_shot,
@@ -2850,6 +2880,9 @@ class SQLiteStore:
                     getattr(b, "video_mode", "first_frame"),
                     getattr(b, "video_prompt", ""),
                     getattr(b, "keyframe_prompt", ""),
+                    getattr(b, "shot_size", "") or "",
+                    getattr(b, "shot_angle", "") or "",
+                    getattr(b, "shot_move", "") or "",
                     getattr(b, "shot_order", None),
                     getattr(b, "duration_seconds", None),
                     1 if getattr(b, "is_manual_shot", False) else 0,

@@ -131,7 +131,7 @@ describe("DirectorCharacterImagesCard", () => {
     expect(confirmed[0]).toEqual({ episode: 3 });
   });
 
-  it("身份图卡片把「N 秒后自动跳过」摆出来（工作台不再像假死）", async () => {
+  it("身份图卡片不再提「自动跳过」——等客户上传或手动跳过", async () => {
     server.use(
       http.get("http://localhost:3000/api/v1/projects/demo/pipeline/status", () =>
         HttpResponse.json({
@@ -153,13 +153,13 @@ describe("DirectorCharacterImagesCard", () => {
         project="demo"
         gate="identity_images"
         episode={1}
-        autoSkipSeconds={90}
         onResolved={() => undefined}
       />,
       { wrapper },
     );
 
-    expect(await screen.findByText(/90 秒后未指定会自动跳过，由 AI 生成/)).toBeTruthy();
+    expect(await screen.findByText("身份图指定")).toBeTruthy();
+    expect(screen.queryByText(/自动跳过/)).toBeNull();
   });
 
   it("角色肖像卡片不提自动跳过（那一档必须客户点头）", async () => {

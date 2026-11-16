@@ -556,6 +556,21 @@ class PathResolver:
         """视频路径。"""
         return self.output_dir / "videos" / "beats" / self._ep_str / f"beat_{beat_num:02d}.mp4"
 
+    def returned_last_frame(self, beat_num: int) -> Path:
+        """本 beat 成片尾帧（``return_last_frame``）的路径前缀（扩展名由上游决定）。
+
+        生成器把厂商返回的尾帧落到 ``videos/beats/epNNN/returned_last_frames/`` 下，
+        文件名的扩展名来自返回 URL（``.png`` / ``.jpg`` …），所以这里只给基名。
+        """
+        return (
+            self.output_dir
+            / "videos"
+            / "beats"
+            / self._ep_str
+            / "returned_last_frames"
+            / f"beat_{beat_num:02d}"
+        )
+
     # === 视频提示词 ===
 
     def video_prompt(self, beat_num: int) -> Path:

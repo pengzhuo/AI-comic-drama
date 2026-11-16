@@ -14,6 +14,10 @@ from typing import Any
 from starlette.concurrency import run_in_threadpool
 
 from novelvideo.asset_references import asset_reference_gaps_for_store
+from novelvideo.audio.episode_audio_design import (
+    audio_design_enabled,
+    audio_design_plan_path,
+)
 from novelvideo.project_context import ProjectContext
 from novelvideo.screenplay_preprocess import has_preprocess_result
 from novelvideo.script_process import has_script_process_result
@@ -44,6 +48,7 @@ STEP_MAP: dict[str, tuple[str | None, str]] = {
     "tts": (None, "TTS 配音"),
     "seedance2_prompt": ("seedance2_prompt", "Seedance 2.0 提示词"),
     "video": ("single_video", "视频生成"),
+    "audio_design": ("episode_audio_design", "配乐/环境音设计"),
     "compose": ("compose_episode", "合成导出"),
     "done": (None, "全部完成"),
 }
@@ -435,6 +440,12 @@ async def compute_pipeline_status(
         or _all_or_empty([beat_seedance2_prompt_ready(b) for b in beats])
     )
 
+    # 「声音层」只在**还没合成**的集上要求：已出成片的集不再回头补（否则全站
+    # 历史项目都会被自动协调器翻一遍）。
+    has_audio_design = audio_design_enabled() and audio_design_plan_path(
+        project_dir, target_ep
+    ).exists()
+
     episode_status = {
         "identity_plan": has_identity_plan,
         "identity_images": has_identity_images,
@@ -457,6 +468,7 @@ async def compute_pipeline_status(
         "video": _beat_file_series_complete(
             project_dir / "videos" / "beats" / f"ep{target_ep:03d}", "mp4", beats
         ),
+        "audio_design": has_audio_design,
     }
 
     next_step = "done"
@@ -503,7 +515,9 @@ async def compute_pipeline_status(
             "errors": [],
         }
     if next_step == "done" and not final_video_path(project_dir, target_ep).exists():
-        next_step = "compose"
+        # 合成前先过声音层（配乐/环境音/音效）：只有即将合成的集才会被要求，
+        # 已出成片的集不受影响。
+        next_step = "compose" if episode_status["audio_design"] else "audio_design"
 
     task_type, step_name = STEP_MAP[next_step]
     return {
